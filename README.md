@@ -8,7 +8,7 @@
   \____\__,_|_.__/|_|\___| |_____\__,_|\__,_|_| |_|\___|_| |_|\___|_|
 </pre>
 
-<strong>Rule-based Minecraft mod-list launcher for building, resolving, caching, and launching curated packs.</strong>
+<strong>Rule-based Minecraft mod-loader</strong>
 
 <p>Tauri 2 · SolidJS · TypeScript · Rust · Modrinth integration · local-first cache</p>
 
