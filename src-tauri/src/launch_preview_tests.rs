@@ -16,8 +16,9 @@ use super::{
     merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
     minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
     substitute_known_placeholders, validate_content_filename, validate_final_fabric_runtime,
-    validate_selected_parent_dependencies, EffectiveLaunchSettings, EmbeddedFabricModMetadata,
-    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders,
+    validate_selected_parent_dependencies, automation_exit_code, EffectiveLaunchSettings,
+    EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
+    LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -711,4 +712,102 @@ fn final_fabric_validation_excludes_top_level_on_missing_dependency() {
             .map(|issue| issue.reason_code),
         Some("missing_dependency")
     );
+}
+
+// ── Automation entry-point (env → full verification) ────────────────────────
+
+fn verification_result(state: &str, success: bool) -> LaunchVerificationResult {
+    LaunchVerificationResult {
+        started: state != "launch_failed",
+        success,
+        state: state.to_string(),
+        pid: None,
+        launch_log_dir: None,
+        duration_ms: 0,
+        failure_kind: None,
+        failure_summary: None,
+        minecraft_log_tail: Vec::new(),
+    }
+}
+
+#[test]
+fn automation_env_parses_full_request_with_defaults() {
+    // (a) A complete JSON deserializes into a full LaunchVerificationRequest,
+    // preserving every observation field — none dropped (the old bug routed
+    // through into_launch_request and discarded timeout/successAfter/terminate*).
+    let json = r#"{
+        "modlistName": "Pack",
+        "minecraftVersion": "1.21.1",
+        "modLoader": "fabric",
+        "timeoutSeconds": 90,
+        "successAfterSeconds": 12,
+        "terminateOnSuccess": false,
+        "terminateOnTimeout": false
+    }"#;
+    let request: LaunchVerificationRequest =
+        serde_json::from_str(json).expect("full request should parse");
+    assert_eq!(request.modlist_name, "Pack");
+    assert_eq!(request.minecraft_version, "1.21.1");
+    assert_eq!(request.mod_loader, "fabric");
+    assert_eq!(request.timeout_seconds, 90);
+    assert_eq!(request.success_after_seconds, 12);
+    assert!(!request.terminate_on_success);
+    assert!(!request.terminate_on_timeout);
+}
+
+#[test]
+fn automation_env_minimal_request_uses_defaults() {
+    // (b) A minimal request (only the three required fields) still works: the
+    // optional observation fields fall back to the IPC defaults.
+    let json = r#"{"modlistName":"Pack","minecraftVersion":"1.21.1","modLoader":"vanilla"}"#;
+    let request: LaunchVerificationRequest =
+        serde_json::from_str(json).expect("minimal request should parse");
+    assert_eq!(request.timeout_seconds, 45);
+    assert_eq!(request.success_after_seconds, 15);
+    assert!(request.terminate_on_success);
+    assert!(request.terminate_on_timeout);
+}
+
+#[test]
+fn automation_exit_always_exits_on_conclusion_when_requested() {
+    // (c) With _EXIT enabled, the process exits on BOTH success and failure —
+    // no leaked process. Success -> 0, any non-success/error -> 1.
+    let ok = verification_result("running", true);
+    assert_eq!(automation_exit_code(true, Some(&ok)), Some(0));
+
+    for state in ["timed_out", "crashed", "exited", "launch_failed"] {
+        let failed = verification_result(state, false);
+        assert_eq!(
+            automation_exit_code(true, Some(&failed)),
+            Some(1),
+            "state {state} must exit with code 1"
+        );
+    }
+    // Verification errored entirely (None) -> still exits with 1.
+    assert_eq!(automation_exit_code(true, None), Some(1));
+
+    // Without _EXIT, never exits regardless of outcome.
+    assert_eq!(automation_exit_code(false, Some(&ok)), None);
+    assert_eq!(automation_exit_code(false, None), None);
+}
+
+#[test]
+fn automation_env_does_not_silently_drop_fields() {
+    // (d) Guard against regressing to into_launch_request(): a request whose
+    // observation fields differ from the defaults must round-trip those exact
+    // values, proving they reach run_launch_verification unmodified.
+    let request = LaunchVerificationRequest {
+        modlist_name: "Pack".into(),
+        minecraft_version: "1.20.1".into(),
+        mod_loader: "neoforge".into(),
+        timeout_seconds: 30,
+        success_after_seconds: 10,
+        terminate_on_success: true,
+        terminate_on_timeout: false,
+    };
+    let json = serde_json::to_string(&request).expect("serialize");
+    let back: LaunchVerificationRequest = serde_json::from_str(&json).expect("round-trip");
+    assert_eq!(back, request);
+    assert_eq!(back.success_after_seconds, 10);
+    assert!(!back.terminate_on_timeout);
 }

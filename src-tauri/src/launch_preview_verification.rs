@@ -55,49 +55,40 @@ pub fn maybe_start_automation_verifier(
 
     tauri::async_runtime::spawn(async move {
         append_automation_trace(&launcher_paths, "automation task started");
-        let result = run_launch_pipeline(
-            app_handle.clone(),
-            launcher_paths.clone(),
-            request.into_launch_request(),
-        )
-        .await;
-        let launch_failed = result.is_err();
+        // Route through the SAME verification path as verify_launch_command, so
+        // the env entry-point observes the launch (timeout/successAfter/terminate*)
+        // and emits a full LaunchVerificationResult with the 5 states.
+        let verification =
+            run_launch_verification(app_handle.clone(), launcher_paths.clone(), request).await;
 
-        let output_result = match result {
-            Ok(started_launch) => {
+        let output_result = match &verification {
+            Ok(result) => {
                 append_automation_trace(
                     &launcher_paths,
                     &format!(
-                        "launch pipeline started minecraft: pid={} log_dir={}",
-                        started_launch.pid,
-                        started_launch.launch_log_dir.display()
+                        "verification finished: state={} success={} pid={:?} log_dir={:?}",
+                        result.state, result.success, result.pid, result.launch_log_dir
                     ),
                 );
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "started": true,
-                    "success": false,
-                    "state": "started",
-                    "pid": started_launch.pid,
-                    "launchLogDir": started_launch.launch_log_dir.display().to_string(),
-                }))
-                .context("failed to serialize automation launch start")
+                serde_json::to_string_pretty(result)
+                    .context("failed to serialize automation verification result")
             }
             Err(error) => {
                 let detail = format!("{error:#}");
                 let _ = emit_launch_failure(&app_handle, &detail);
                 append_automation_trace(
                     &launcher_paths,
-                    &format!("launch pipeline failed before spawn: {detail}"),
+                    &format!("verification failed to run: {detail}"),
                 );
                 serde_json::to_string_pretty(&serde_json::json!({
                     "started": false,
                     "success": false,
-                    "state": "launch_failed",
-                    "failureKind": "launch_failed",
+                    "state": "automation_error",
+                    "failureKind": "automation_error",
                     "failureSummary": detail,
                     "launchLogDir": current_launch_log_session().map(|session| session.dir().display().to_string()),
                 }))
-                .context("failed to serialize automation launch failure")
+                .context("failed to serialize automation verification error")
             }
         };
 
@@ -122,16 +113,40 @@ pub fn maybe_start_automation_verifier(
             }
         }
 
-        if launch_failed {
-            set_active_launch_log_session(None);
-        }
+        // run_launch_verification already terminates Minecraft per terminate_on_*;
+        // clear the tracked session so nothing leaks before we exit.
+        set_active_launch_log_session(None);
 
-        if should_exit && launch_failed {
-            app_handle.exit(1);
+        if let Some(code) = automation_exit_code(should_exit, verification.as_ref().ok()) {
+            append_automation_trace(
+                &launcher_paths,
+                &format!("automation exit requested with code {code}"),
+            );
+            app_handle.exit(code);
         }
     });
 
     Ok(())
+}
+
+/// Decide the process exit code for the automation entry-point.
+///
+/// Returns `None` when the process should keep running (exit not requested).
+/// When exit IS requested, the process always exits once verification concludes
+/// — code 0 when the launch verified as running/success, code 1 otherwise
+/// (any non-success state, or a verification error). Minecraft itself is already
+/// terminated by `run_launch_verification` per `terminate_on_*`.
+pub(super) fn automation_exit_code(
+    should_exit: bool,
+    verification: Option<&LaunchVerificationResult>,
+) -> Option<i32> {
+    if !should_exit {
+        return None;
+    }
+    match verification {
+        Some(result) if result.success => Some(0),
+        _ => Some(1),
+    }
 }
 
 pub(super) async fn run_launch_verification(

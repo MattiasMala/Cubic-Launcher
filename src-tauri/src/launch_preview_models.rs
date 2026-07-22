@@ -231,6 +231,16 @@ fn default_terminate_on_timeout() -> bool {
 }
 
 fn automation_cache_only_override() -> Option<bool> {
+    // S2: only honor CUBIC_AUTOMATION_CACHE_ONLY_MODE when the automation
+    // entry-point is active. This prevents an inherited env value from silently
+    // overriding the user's cache_only_mode in a normal production launch.
+    if std::env::var("CUBIC_AUTOMATION_VERIFY_REQUEST")
+        .ok()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let value = std::env::var("CUBIC_AUTOMATION_CACHE_ONLY_MODE").ok()?;
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" => Some(true),
