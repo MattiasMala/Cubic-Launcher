@@ -497,6 +497,16 @@ pub fn save_incompatibilities_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
+    for incompat in &input.rules {
+        if modlist.find_rule(&incompat.loser_id).is_none() {
+            bail!(
+                "unknown loser rule id in incompatibilities batch: {}",
+                incompat.loser_id
+            );
+        }
+    }
+
+
     for rule in &mut modlist.rules {
         clear_exclude_if_tree(rule);
     }
@@ -525,6 +535,8 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
     let rule = modlist
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
+
+    rule.exclude_if = input.exclude_if.clone();
 
     rule.requires = input.requires.clone();
     rule.version_rules = input
@@ -558,6 +570,28 @@ pub fn save_advanced_batch_from_root(
     input: &SaveAdvancedBatchInput,
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
+
+    for mod_id in input
+        .requires_entries
+        .iter()
+        .map(|entry| entry.mod_id.as_str())
+        .chain(
+            input
+                .version_rules_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str()),
+        )
+        .chain(
+            input
+                .custom_configs_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str()),
+        )
+    {
+        if modlist.find_rule(mod_id).is_none() {
+            bail!("unknown rule id in advanced batch: {}", mod_id);
+        }
+    }
 
     fn clear_advanced(rule: &mut Rule) {
         rule.requires.clear();

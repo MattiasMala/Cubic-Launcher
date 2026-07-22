@@ -327,3 +327,71 @@ fn save_rule_advanced_updates_fields() {
 
     fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn advanced_batch_with_unknown_id_preserves_config() {
+    let root = unique_test_root();
+    let mut rule = simple_rule("sodium");
+    rule.requires = vec!["fabric-api".into()];
+    rule.version_rules = vec![VersionRule {
+        kind: VersionRuleKind::Only,
+        mc_versions: vec!["1.21.1".into()],
+        loader: "fabric".into(),
+    }];
+    rule.custom_configs = vec![CustomConfig {
+        mc_versions: vec!["1.21.1".into()],
+        loader: "fabric".into(),
+        target_path: "config/sodium.json".into(),
+        files: vec!["sodium.json".into()],
+    }];
+    setup_modlist(&root, "Pack", vec![rule.clone()]);
+
+    let result = save_advanced_batch_from_root(
+        &root,
+        &SaveAdvancedBatchInput {
+            modlist_name: "Pack".into(),
+            requires_entries: vec![RequiresEntry {
+                mod_id: "ghost".into(),
+                requires: vec!["fabric-api".into()],
+            }],
+            version_rules_entries: vec![],
+            custom_configs_entries: vec![],
+        },
+    );
+
+    assert!(result.is_err());
+    let reloaded = load_modlist(&root, "Pack").unwrap();
+    let reloaded_rule = reloaded.find_rule("sodium").unwrap();
+    assert_eq!(reloaded_rule.requires, rule.requires);
+    assert_eq!(reloaded_rule.version_rules, rule.version_rules);
+    assert_eq!(reloaded_rule.custom_configs, rule.custom_configs);
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn save_rule_advanced_persists_exclude_if() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    save_rule_advanced_from_root(
+        &root,
+        &SaveRuleAdvancedInput {
+            modlist_name: "Pack".into(),
+            mod_id: "sodium".into(),
+            exclude_if: vec!["optifine".into()],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+        },
+    )
+    .unwrap();
+
+    let reloaded = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        reloaded.find_rule("sodium").unwrap().exclude_if,
+        vec!["optifine"]
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
