@@ -46,6 +46,17 @@ pub fn run() {
             database::initialize_database(launcher_paths.database_path())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
 
+            {
+                let connection =
+                    rusqlite::Connection::open(launcher_paths.database_path())
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                database::migrate_account_tokens_from_profile_data(
+                    &connection,
+                    token_storage::KeyringSecretStore::new(),
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
+
             app.manage(launcher_paths.clone());
 
             if launch_preview::automation_mode_enabled() {
