@@ -143,6 +143,10 @@ impl LoaderMetadataClient {
             ModLoader::Fabric,
             minecraft_version,
             selected.loader.version.clone(),
+            selected
+                .launcher_meta
+                .as_ref()
+                .and_then(|launcher_meta| launcher_meta.min_java_version),
             profile,
         ))
     }
@@ -219,6 +223,7 @@ impl LoaderMetadataClient {
             ModLoader::Quilt,
             minecraft_version,
             selected.loader.version.clone(),
+            None,
             profile,
         ))
     }
@@ -600,6 +605,7 @@ fn loader_metadata_from_profile(
     mod_loader: ModLoader,
     minecraft_version: &str,
     loader_version: String,
+    min_java_version: Option<u32>,
     profile: LauncherProfile,
 ) -> LoaderMetadata {
     let arguments = profile.arguments.unwrap_or_default();
@@ -628,7 +634,7 @@ fn loader_metadata_from_profile(
         maven_files: Vec::new(),
         jvm_arguments: arguments.jvm,
         game_arguments: arguments.game,
-        min_java_version: None,
+        min_java_version,
     }
 }
 
@@ -859,8 +865,13 @@ mod tests {
     #[test]
     fn converts_fabric_profile_into_loader_metadata() {
         let profile: LauncherProfile = serde_json::from_str(fabric_profile_json()).unwrap();
-        let metadata =
-            loader_metadata_from_profile(ModLoader::Fabric, "1.21.1", "0.16.14".into(), profile);
+        let metadata = loader_metadata_from_profile(
+            ModLoader::Fabric,
+            "1.21.1",
+            "0.16.14".into(),
+            None,
+            profile,
+        );
 
         assert_eq!(
             metadata.main_class,
@@ -869,6 +880,31 @@ mod tests {
         assert_eq!(metadata.loader_version, "0.16.14");
         assert_eq!(metadata.libraries.len(), 2);
         assert_eq!(metadata.jvm_arguments.len(), 1);
+    }
+
+    #[test]
+    fn fabric_min_java_version_is_propagated() {
+        let entry: FabricLoaderVersionEntry = serde_json::from_str(
+            r#"{
+              "loader": { "version": "0.16.14", "stable": true },
+              "launcherMeta": { "min_java_version": 21 }
+            }"#,
+        )
+        .unwrap();
+        let min_java_version = entry
+            .launcher_meta
+            .and_then(|launcher_meta| launcher_meta.min_java_version);
+        let profile: LauncherProfile = serde_json::from_str(fabric_profile_json()).unwrap();
+        let metadata = loader_metadata_from_profile(
+            ModLoader::Fabric,
+            "1.21.1",
+            "0.16.14".into(),
+            min_java_version,
+            profile,
+        );
+
+        assert_eq!(min_java_version, Some(21));
+        assert_eq!(metadata.min_java_version, Some(21));
     }
 
     #[test]
