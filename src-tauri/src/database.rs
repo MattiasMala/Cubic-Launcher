@@ -91,6 +91,7 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     connection.execute_batch(SCHEMA_SQL)?;
     migrate_mod_cache_schema(&connection)?;
     migrate_mod_cache_target_key(&connection)?;
+    migrate_strip_plaintext_tokens_from_profile_data(&connection)?;
 
     Ok(())
 }
@@ -230,6 +231,47 @@ fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// SECURITY (C1): older builds stored `mc_access_token`/`ms_refresh_token` in
+/// cleartext inside `profile_data`. The encrypted `access_token_enc` /
+/// `refresh_token_enc` columns already hold those values, so this strips the
+/// plaintext copies from `profile_data` for every existing account.
+///
+/// Idempotent: rows whose profile_data has no token keys (or is NULL/invalid)
+/// are left untouched.
+fn migrate_strip_plaintext_tokens_from_profile_data(connection: &Connection) -> Result<()> {
+    let rows: Vec<(String, Option<String>)> = {
+        let mut statement =
+            connection.prepare("SELECT microsoft_id, profile_data FROM accounts")?;
+        let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for (microsoft_id, profile_data) in rows {
+        let Some(profile_data) = profile_data else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(mut map)) =
+            serde_json::from_str::<serde_json::Value>(&profile_data)
+        else {
+            continue;
+        };
+
+        let had_tokens = map.remove("mc_access_token").is_some()
+            | map.remove("ms_refresh_token").is_some();
+        if !had_tokens {
+            continue;
+        }
+
+        let cleaned = serde_json::Value::Object(map).to_string();
+        connection.execute(
+            "UPDATE accounts SET profile_data = ?1 WHERE microsoft_id = ?2",
+            rusqlite::params![cleaned, microsoft_id],
+        )?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -362,6 +404,90 @@ mod tests {
                 params!["mod-b", "version-b", "shared.jar", "1.21.6", "fabric", Option::<String>::None, Option::<String>::None, false],
             )
             .expect("second insert with same filename should succeed after migration");
+
+        drop(connection);
+        fs::remove_file(&database_path).expect("database file should be removable");
+        fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
+    }
+
+    #[test]
+    fn migration_strips_plaintext_tokens_and_is_idempotent() {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("parent directory should exist");
+
+        // Fresh schema, then insert a legacy account with plaintext tokens in
+        // profile_data plus a populated encrypted refresh column.
+        initialize_database(&database_path).expect("initial init should succeed");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO accounts (microsoft_id, xbox_gamertag, minecraft_uuid, access_token_enc, refresh_token_enc, profile_data, is_active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "ms-legacy",
+                    "PlayerLegacy",
+                    "uuid-legacy",
+                    vec![1u8, 2, 3],
+                    vec![4u8, 5, 6],
+                    r#"{"username":"PlayerLegacy","uuid":"uuid-legacy","mc_access_token":"SECRET_MC","ms_refresh_token":"SECRET_MS"}"#,
+                    true
+                ],
+            )
+            .expect("legacy account should insert");
+        // Account without tokens in profile_data must be left untouched.
+        connection
+            .execute(
+                "INSERT INTO accounts (microsoft_id, profile_data, is_active) VALUES (?1, ?2, ?3)",
+                params!["ms-clean", r#"{"username":"PlayerClean","uuid":"uuid-clean"}"#, false],
+            )
+            .expect("clean account should insert");
+        drop(connection);
+
+        // Re-run init to trigger the migration.
+        initialize_database(&database_path).expect("migration run should succeed");
+
+        let connection = Connection::open(&database_path).expect("database should reopen");
+        let legacy_profile: String = connection
+            .query_row(
+                "SELECT profile_data FROM accounts WHERE microsoft_id = 'ms-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy profile should load");
+        let legacy_refresh_enc: Vec<u8> = connection
+            .query_row(
+                "SELECT refresh_token_enc FROM accounts WHERE microsoft_id = 'ms-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy encrypted refresh should load");
+
+        // Plaintext tokens removed; display metadata preserved.
+        assert!(!legacy_profile.contains("SECRET_MC"));
+        assert!(!legacy_profile.contains("SECRET_MS"));
+        assert!(!legacy_profile.contains("mc_access_token"));
+        assert!(!legacy_profile.contains("ms_refresh_token"));
+        assert!(legacy_profile.contains("PlayerLegacy"));
+        assert!(legacy_profile.contains("uuid-legacy"));
+        // Encrypted column untouched — launch path can still decrypt from it.
+        assert_eq!(legacy_refresh_enc, vec![4u8, 5, 6]);
+
+        // Idempotent: a third run does not change the already-cleaned row.
+        let profile_after_first = legacy_profile.clone();
+        drop(connection);
+        initialize_database(&database_path).expect("third init should succeed");
+        let connection = Connection::open(&database_path).expect("database should reopen");
+        let profile_after_second: String = connection
+            .query_row(
+                "SELECT profile_data FROM accounts WHERE microsoft_id = 'ms-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy profile should load again");
+        assert_eq!(profile_after_first, profile_after_second);
 
         drop(connection);
         fs::remove_file(&database_path).expect("database file should be removable");
