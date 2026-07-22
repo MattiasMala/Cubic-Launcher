@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -396,6 +396,16 @@ pub fn save_global_settings(
     connection: &Connection,
     settings: &ShellGlobalSettingsInput,
 ) -> Result<()> {
+    if settings.min_ram_mb == 0 {
+        bail!("min_ram_mb must be greater than zero");
+    }
+    if settings.max_ram_mb == 0 {
+        bail!("max_ram_mb must be greater than zero");
+    }
+    if settings.min_ram_mb > settings.max_ram_mb {
+        bail!("min_ram_mb cannot exceed max_ram_mb");
+    }
+
     let values = [
         ("min_ram_mb", settings.min_ram_mb.to_string()),
         ("max_ram_mb", settings.max_ram_mb.to_string()),
@@ -791,5 +801,42 @@ mod tests {
         );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+    #[test]
+    fn save_global_settings_rejects_invalid_ram() {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE global_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );",
+            )
+            .expect("global settings schema should initialize");
+
+        let settings = |min_ram_mb, max_ram_mb| ShellGlobalSettingsInput {
+            min_ram_mb,
+            max_ram_mb,
+            custom_jvm_args: String::new(),
+            profiler_enabled: false,
+            cache_only_mode: false,
+            wrapper_command: String::new(),
+            java_path_override: String::new(),
+        };
+
+        let error = save_global_settings(&connection, &settings(0, 4096))
+            .expect_err("zero minimum RAM should be rejected");
+        assert_eq!(error.to_string(), "min_ram_mb must be greater than zero");
+
+        let error = save_global_settings(&connection, &settings(1024, 0))
+            .expect_err("zero maximum RAM should be rejected");
+        assert_eq!(error.to_string(), "max_ram_mb must be greater than zero");
+
+        let error = save_global_settings(&connection, &settings(8192, 4096))
+            .expect_err("minimum RAM above maximum RAM should be rejected");
+        assert_eq!(error.to_string(), "min_ram_mb cannot exceed max_ram_mb");
+
+        save_global_settings(&connection, &settings(1024, 4096))
+            .expect("valid RAM settings should save");
     }
 }
