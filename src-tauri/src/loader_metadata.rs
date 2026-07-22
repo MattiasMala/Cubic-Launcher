@@ -928,4 +928,48 @@ mod tests {
             .game_arguments
             .contains(&"--launchTarget".to_string()));
     }
+
+    fn prism_neoforge_detail_json() -> &'static str {
+        // Shape mirrors live Prism meta for net.neoforged/21.1.242.json: modern
+        // NeoForge still ships game args via the (Prism-synthesized) legacy
+        // `minecraftArguments` string, NOT an `arguments.game` array.
+        r#"{
+          "mainClass": "io.github.zekerzhayard.forgewrapper.installer.Main",
+          "minecraftArguments": "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --launchTarget forgeclient --fml.neoForgeVersion 21.1.242 --fml.fmlVersion 4.0.43 --fml.mcVersion 1.21.1",
+          "libraries": [
+            {
+              "name": "net.neoforged.fancymodloader:loader:4.0.43",
+              "downloads": {
+                "artifact": {
+                  "url": "https://maven.neoforged.net/releases/net/neoforged/fancymodloader/loader/4.0.43/loader-4.0.43.jar",
+                  "path": "net/neoforged/fancymodloader/loader/4.0.43/loader-4.0.43.jar",
+                  "sha1": "fb10b7bf2f568a9676ad8b426b19c23badbbd98a",
+                  "size": 505633
+                }
+              }
+            }
+          ]
+        }"#
+    }
+
+    #[test]
+    fn converts_prism_neoforge_detail_populates_game_arguments() {
+        let detail: PrismPackageVersionDetail =
+            serde_json::from_str(prism_neoforge_detail_json()).unwrap();
+        let metadata =
+            loader_metadata_from_prism(ModLoader::NeoForge, "1.21.1", "21.1.242".into(), detail);
+
+        // ForgeWrapper requires these game args; empty args would crash it with
+        // IndexOutOfBounds on --fml.mcVersion.
+        assert!(!metadata.game_arguments.is_empty());
+        assert!(metadata
+            .game_arguments
+            .contains(&"--launchTarget".to_string()));
+        assert!(metadata
+            .game_arguments
+            .contains(&"--fml.mcVersion".to_string()));
+        assert!(metadata
+            .game_arguments
+            .contains(&"1.21.1".to_string()));
+    }
 }
