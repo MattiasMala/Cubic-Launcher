@@ -63,6 +63,7 @@ pub fn build_launch_command(request: &JavaLaunchRequest) -> Result<PreparedLaunc
             let wrapper_parts = split_argument_string(wrapper_command);
             if let Some((program, wrapper_args)) = wrapper_parts.split_first() {
                 let mut args = wrapper_args.to_vec();
+                args.push(request.java_binary_path.to_string_lossy().to_string());
                 args.extend(java_invocation_args);
 
                 return Ok(PreparedLaunchCommand {
@@ -341,7 +342,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "pre-existing: build_launch_command wrapper branch omits java binary; out of pass-1 scope"]
     fn prepends_wrapper_command_on_linux() {
         let mut request = sample_request();
         request.java_binary_path = PathBuf::from("/usr/bin/java");
