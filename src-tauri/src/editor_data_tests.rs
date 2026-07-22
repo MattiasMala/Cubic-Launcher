@@ -87,6 +87,17 @@ fn load_editor_snapshot_returns_rows_and_incompatibilities() {
 }
 
 #[test]
+fn load_modlist_rejects_traversal_name() {
+    let root = unique_test_root();
+    setup_modlist(&root, "../x", vec![simple_rule("sodium")]);
+
+    let result = load_editor_snapshot_from_root(&root, "../x");
+
+    fs::remove_dir_all(&root).unwrap();
+    assert!(result.is_err());
+}
+
+#[test]
 fn add_mod_rule_appends_rule() {
     let root = unique_test_root();
     setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
@@ -107,6 +118,30 @@ fn add_mod_rule_appends_rule() {
     assert_eq!(snapshot.rows[1].mod_id, "lithium");
 
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn add_local_rule_rejects_traversal_mod_id() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![]);
+    let source_path = root.join("source.jar");
+    fs::write(&source_path, b"test jar").unwrap();
+
+    let result = add_mod_rule_from_root(
+        &root,
+        &AddModRuleInput {
+            modlist_name: "Pack".into(),
+            mod_id: "../evil".into(),
+            source: "local".into(),
+            file_name: Some(source_path.to_string_lossy().into_owned()),
+        },
+    );
+    let escaped_path = root.join("mod-lists").join("Pack").join("evil.jar");
+    let escaped_path_exists = escaped_path.exists();
+
+    fs::remove_dir_all(&root).unwrap();
+    assert!(result.is_err());
+    assert!(!escaped_path_exists);
 }
 
 #[test]

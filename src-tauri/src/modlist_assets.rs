@@ -10,6 +10,7 @@ use tauri::State;
 use zip::write::FileOptions;
 
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::{contained_join, validate_path_component};
 use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
 
 const MODLIST_PRESENTATION_FILENAME: &str = "modlist-presentation.json";
@@ -163,18 +164,32 @@ pub struct InstanceFileNode {
 pub fn list_instance_files_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-    #[allow(unused_variables)] relative_path: Option<String>,
+    relative_path: Option<String>,
 ) -> Result<Vec<InstanceFileNode>, String> {
-    let instances_dir = launcher_paths
+    list_instance_files_from_root(
+        launcher_paths.root_dir(),
+        &modlist_name,
+        relative_path.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn list_instance_files_from_root(
+    root_dir: &Path,
+    modlist_name: &str,
+    relative_path: Option<&str>,
+) -> Result<Vec<InstanceFileNode>> {
+    validate_path_component(modlist_name)?;
+    let instances_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
-        .join(&modlist_name)
+        .join(modlist_name)
         .join("instances");
     if !instances_dir.exists() {
         return Ok(vec![]);
     }
 
-    let target = match &relative_path {
-        Some(rel) if !rel.is_empty() => instances_dir.join(rel),
+    let target = match relative_path {
+        Some(rel) if !rel.is_empty() => contained_join(&instances_dir, rel)?,
         _ => instances_dir.clone(),
     };
     if !target.exists() {
@@ -182,7 +197,7 @@ pub fn list_instance_files_command(
     }
 
     // Determine depth for filtering (0 = listing instance roots, 1 = inside an instance)
-    let depth = match &relative_path {
+    let depth = match relative_path {
         Some(rel) if !rel.is_empty() => rel.matches('/').count() as u32 + 1,
         _ => 0,
     };
@@ -225,12 +240,15 @@ pub fn list_instance_files_command(
 }
 
 #[tauri::command]
-pub fn read_image_as_data_url_command(path: String) -> Result<String, String> {
-    read_image_as_data_url(&path).map_err(|e| e.to_string())
+pub fn read_image_as_data_url_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    path: String,
+) -> Result<String, String> {
+    read_image_as_data_url(launcher_paths.root_dir(), &path).map_err(|e| e.to_string())
 }
 
-fn read_image_as_data_url(path: &str) -> Result<String> {
-    let p = std::path::Path::new(path);
+fn read_image_as_data_url(root_dir: &Path, path: &str) -> Result<String> {
+    let p = contained_join(root_dir, path)?;
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
@@ -243,7 +261,7 @@ fn read_image_as_data_url(path: &str) -> Result<String> {
         "ico" => "image/x-icon",
         _ => "image/png",
     };
-    let bytes = fs::read(p).with_context(|| format!("failed to read image at {}", p.display()))?;
+    let bytes = fs::read(&p).with_context(|| format!("failed to read image at {}", p.display()))?;
     let b64 = BASE64.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
 }
@@ -252,6 +270,7 @@ pub fn load_modlist_presentation_from_root(
     root_dir: &Path,
     modlist_name: &str,
 ) -> Result<ModlistPresentation> {
+    validate_path_component(modlist_name)?;
     // Presentation is stored in the separate modlist-presentation.json file.
     let presentation_path = modlist_presentation_path(root_dir, modlist_name);
     if !presentation_path.exists() {
@@ -277,6 +296,7 @@ pub fn save_modlist_presentation_from_root(
     root_dir: &Path,
     input: &SaveModlistPresentationInput,
 ) -> Result<()> {
+    validate_path_component(&input.modlist_name)?;
     let presentation = ModlistPresentation {
         display_name: input
             .display_name
@@ -309,6 +329,7 @@ pub fn load_modlist_groups_from_root(
     root_dir: &Path,
     modlist_name: &str,
 ) -> Result<ModlistGroupLayout> {
+    validate_path_component(modlist_name)?;
     let layout_path = modlist_group_layout_path(root_dir, modlist_name);
     if !layout_path.exists() {
         return Ok(default_group_layout());
@@ -333,6 +354,7 @@ pub fn save_modlist_groups_from_root(
     root_dir: &Path,
     input: &SaveModlistGroupsInput,
 ) -> Result<()> {
+    validate_path_component(&input.modlist_name)?;
     let layout = ModlistGroupLayout {
         tags: input.tags.clone(),
         aesthetic_groups: input.aesthetic_groups.clone(),
@@ -358,6 +380,7 @@ pub fn save_modlist_groups_from_root(
 }
 
 pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> Result<()> {
+    validate_path_component(&input.modlist_name)?;
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let modlist_dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     anyhow::ensure!(
@@ -525,7 +548,7 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
             } else {
                 // User selected specific paths from the instance tree
                 for sel_path in &input.selected_other_paths {
-                    let full_path = instances_dir.join(sel_path);
+                    let full_path = contained_join(&instances_dir, sel_path)?;
                     if full_path.is_file() {
                         add_file_if_exists(
                             &mut archive,
@@ -761,11 +784,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        export_modlist_from_root, load_modlist_groups_from_root,
-        load_modlist_presentation_from_root, save_modlist_groups_from_root,
-        save_modlist_presentation_from_root, ExportModlistInput, ModlistGroupLayout, PersistedTag,
-        SaveModlistGroupsInput, SaveModlistPresentationInput, MODLIST_GROUP_LAYOUT_FILENAME,
-        MODLIST_PRESENTATION_FILENAME,
+        export_modlist_from_root, list_instance_files_from_root, load_modlist_groups_from_root,
+        load_modlist_presentation_from_root, read_image_as_data_url,
+        save_modlist_groups_from_root, save_modlist_presentation_from_root, ExportModlistInput,
+        ModlistGroupLayout, PersistedTag, SaveModlistGroupsInput, SaveModlistPresentationInput,
+        MODLIST_GROUP_LAYOUT_FILENAME, MODLIST_PRESENTATION_FILENAME,
     };
     use crate::rules::{ModlistPresentation, RULES_FILENAME};
 
@@ -869,6 +892,185 @@ mod tests {
                 collapsed_alts: input.collapsed_alts,
             }
         );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn list_assets_rejects_traversal_relative_path() {
+        let root_dir = unique_test_root();
+        let instance_dir = root_dir
+            .join("mod-lists")
+            .join("Safe Pack")
+            .join("instances")
+            .join("1.21-fabric");
+        fs::create_dir_all(&instance_dir).expect("instance directory should exist");
+        fs::write(instance_dir.join("options.txt"), b"safe")
+            .expect("instance file should exist");
+
+        assert!(
+            list_instance_files_from_root(&root_dir, "Safe Pack", Some("../../etc")).is_err(),
+            "a relative path escaping the instances directory must be rejected"
+        );
+        assert!(
+            list_instance_files_from_root(&root_dir, "../Unsafe Pack", None).is_err(),
+            "a mod-list name containing a separator must be rejected"
+        );
+
+        let nodes =
+            list_instance_files_from_root(&root_dir, "Safe Pack", Some("1.21-fabric"))
+                .expect("a contained relative path should be listed");
+        assert!(nodes.iter().any(|node| node.name == "options.txt"));
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn export_rejects_traversal_selected_path() {
+        let root_dir = unique_test_root();
+        let instances_dir = root_dir
+            .join("mod-lists")
+            .join("Safe Pack")
+            .join("instances");
+        fs::create_dir_all(instances_dir.join("profile"))
+            .expect("instance directory should exist");
+        fs::write(instances_dir.join("profile").join("options.txt"), b"safe")
+            .expect("selected file should exist");
+
+        let traversal_result = export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Safe Pack".into(),
+                destination_path: root_dir.join("traversal.zip").display().to_string(),
+                rules_json: false,
+                mod_jars: false,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: true,
+                selected_other_paths: vec!["../../etc/passwd".into()],
+            },
+        );
+        assert!(
+            traversal_result.is_err(),
+            "a selected path escaping the instances directory must be rejected"
+        );
+
+        let valid_archive_path = root_dir.join("valid.zip");
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Safe Pack".into(),
+                destination_path: valid_archive_path.display().to_string(),
+                rules_json: false,
+                mod_jars: false,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: true,
+                selected_other_paths: vec!["profile/options.txt".into()],
+            },
+        )
+        .expect("a contained selected path should export");
+
+        let archive_file =
+            fs::File::open(&valid_archive_path).expect("valid export archive should open");
+        let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+        assert!(
+            archive
+                .by_name("Safe Pack/instances/profile/options.txt")
+                .is_ok(),
+            "the contained selected file should be exported"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn export_rejects_traversal_modlist_name() {
+        let root_dir = unique_test_root();
+        let result = export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "../Unsafe Pack".into(),
+                destination_path: root_dir.join("unsafe.zip").display().to_string(),
+                rules_json: false,
+                mod_jars: false,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: false,
+                selected_other_paths: Vec::new(),
+            },
+        );
+
+        assert!(result.is_err(), "a traversal mod-list name must be rejected");
+        assert!(
+            !root_dir.join("unsafe.zip").exists(),
+            "validation must happen before creating the archive"
+        );
+    }
+
+    #[test]
+    fn presentation_rejects_traversal_modlist_name() {
+        let root_dir = unique_test_root();
+        assert!(
+            load_modlist_presentation_from_root(&root_dir, "..").is_err(),
+            "loading must reject a traversal mod-list name"
+        );
+
+        let input = SaveModlistPresentationInput {
+            modlist_name: "..".into(),
+            display_name: None,
+            icon_label: "x".into(),
+            icon_accent: String::new(),
+            notes: String::new(),
+            icon_image: None,
+        };
+        assert!(
+            save_modlist_presentation_from_root(&root_dir, &input).is_err(),
+            "saving must reject a traversal mod-list name"
+        );
+    }
+
+    #[test]
+    fn groups_reject_traversal_modlist_name() {
+        let root_dir = unique_test_root();
+        assert!(
+            load_modlist_groups_from_root(&root_dir, "..").is_err(),
+            "loading must reject a traversal mod-list name"
+        );
+
+        let input = SaveModlistGroupsInput {
+            modlist_name: "..".into(),
+            tags: Vec::new(),
+            aesthetic_groups: Vec::new(),
+            collapsed_alts: Vec::new(),
+        };
+        assert!(
+            save_modlist_groups_from_root(&root_dir, &input).is_err(),
+            "saving must reject a traversal mod-list name"
+        );
+    }
+
+    #[test]
+    fn read_image_rejects_escape_and_reads_root_relative_path() {
+        let root_dir = unique_test_root();
+        let image_path = root_dir.join("icons").join("icon.png");
+        fs::create_dir_all(image_path.parent().expect("image should have a parent"))
+            .expect("image directory should exist");
+        fs::write(&image_path, b"image").expect("image should exist");
+
+        assert!(
+            read_image_as_data_url(&root_dir, "../outside.png").is_err(),
+            "an image path escaping the launcher root must be rejected"
+        );
+        let data_url = read_image_as_data_url(&root_dir, "icons/icon.png")
+            .expect("a launcher-root-relative image should be read");
+        assert!(data_url.starts_with("data:image/png;base64,"));
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

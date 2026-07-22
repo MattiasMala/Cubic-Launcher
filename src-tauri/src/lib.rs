@@ -22,6 +22,7 @@ pub mod mod_cache;
 pub mod modlist_assets;
 pub mod modlist_manager;
 pub mod modrinth;
+pub mod path_safety;
 pub mod offline_account;
 pub mod process_streaming;
 pub mod resolver;

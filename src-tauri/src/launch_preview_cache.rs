@@ -27,6 +27,7 @@ use crate::mod_cache::{
 };
 use crate::modrinth::ModrinthVersion;
 use crate::process_streaming::ProcessLogStream;
+use crate::path_safety::validate_path_component;
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
@@ -520,6 +521,20 @@ pub(super) fn persist_dependency_links(
     Ok(())
 }
 
+pub(super) fn local_mod_jar_path(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    file_name: &str,
+) -> Result<PathBuf> {
+    validate_path_component(modlist_name)?;
+    validate_path_component(file_name)?;
+    Ok(launcher_paths
+        .modlists_dir()
+        .join(modlist_name)
+        .join("local-jars")
+        .join(file_name))
+}
+
 pub(super) fn build_cached_mod_jars(
     app_handle: &tauri::AppHandle,
     selected_mods: &[SelectedMod],
@@ -531,10 +546,6 @@ pub(super) fn build_cached_mod_jars(
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
-    let local_jars_dir = launcher_paths
-        .modlists_dir()
-        .join(modlist_name)
-        .join("local-jars");
     let mod_loader = target.mod_loader.as_modrinth_loader();
 
     // Local mods: JAR lives at local-jars/{mod_id}.jar; copy to cache/mods/.
@@ -545,7 +556,7 @@ pub(super) fn build_cached_mod_jars(
 
         let file_name = format!("{}.jar", selected.mod_id);
         if seen.insert(file_name.clone()) {
-            let source = local_jars_dir.join(&file_name);
+            let source = local_mod_jar_path(launcher_paths, modlist_name, &file_name)?;
             let dest =
                 cached_local_artifact_path(launcher_paths.mods_cache_dir(), mod_loader, &file_name);
             if source.exists() && !jar_metadata_allows_target(&source, target)? {

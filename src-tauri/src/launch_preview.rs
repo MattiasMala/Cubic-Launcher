@@ -621,7 +621,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Refreshing mods, loader libraries, configs and launch metadata.",
     )?;
 
-    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target);
+    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
     let instance_mods_dir = instance_root.join("mods");
     let instance_config_dir = instance_root.join("config");
     let instance_natives_dir = instance_root.join("natives");

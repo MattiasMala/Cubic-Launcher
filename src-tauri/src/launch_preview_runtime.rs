@@ -21,6 +21,7 @@ use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
 use crate::offline_account::deterministic_offline_uuid;
+use crate::path_safety::{contained_join, validate_path_component};
 use crate::process_streaming::{spawn_and_stream_process, ProcessEventSink, ProcessLogStream};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -55,7 +56,7 @@ async fn materialize_loader_artifacts(
 
     for library in artifacts {
         let relative_path = relative_loader_library_path(library)?;
-        let destination_path = library_root.join(&relative_path);
+        let destination_path = contained_loader_library_path(library_root, &relative_path)?;
 
         if !destination_path.exists() {
             // Determine the download URL: prefer explicit download artifact,
@@ -84,6 +85,16 @@ async fn materialize_loader_artifacts(
     Ok(paths)
 }
 
+pub(super) fn contained_loader_library_path(
+    library_root: &Path,
+    relative_path: &Path,
+) -> Result<PathBuf> {
+    let relative_path = relative_path
+        .to_str()
+        .context("loader library path is not valid UTF-8")?;
+    contained_join(library_root, relative_path)
+}
+
 pub(super) async fn prepare_forge_wrapper_launch(
     http_client: &reqwest::Client,
     library_root: &Path,
@@ -94,7 +105,8 @@ pub(super) async fn prepare_forge_wrapper_launch(
         return Ok(None);
     };
 
-    let installer_path = library_root.join(&installer_artifact.relative_path);
+    let installer_path =
+        contained_loader_library_path(library_root, &installer_artifact.relative_path)?;
     if !installer_path.exists() {
         download_file(http_client, &installer_artifact.url, &installer_path).await?;
     }
@@ -518,8 +530,9 @@ pub(super) fn build_instance_root(
     launcher_paths: &LauncherPaths,
     modlist_name: &str,
     target: &ResolutionTarget,
-) -> PathBuf {
-    launcher_paths
+) -> Result<PathBuf> {
+    validate_path_component(modlist_name)?;
+    Ok(launcher_paths
         .modlists_dir()
         .join(modlist_name)
         .join("instances")
@@ -527,7 +540,7 @@ pub(super) fn build_instance_root(
             "{}-{}",
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
-        ))
+        )))
 }
 
 pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
@@ -758,7 +771,7 @@ pub(super) async fn select_or_download_java(
         package,
         os,
         arch,
-    );
+    )?;
 
     // Download the archive.
     adoptium

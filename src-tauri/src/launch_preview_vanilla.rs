@@ -104,7 +104,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         "Preparing a clean vanilla instance without mod or content-pack materialization.",
     )?;
 
-    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target);
+    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
     let instance_mods_dir = instance_root.join("mods");
     let instance_natives_dir = instance_root.join("natives");
     let instance_library_dir = instance_root.join("libraries");

@@ -10,6 +10,7 @@ use tauri::State;
 // live in `editor_data_tests.rs`, so new editor behavior should usually extend
 // those files instead of growing unrelated modules.
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::validate_path_component;
 use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
 };
@@ -145,6 +146,7 @@ fn set_enabled_recursive(rule: &mut Rule, enabled: bool) {
 }
 
 fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {
+    validate_path_component(modlist_name)?;
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let rules_path = launcher_paths
         .modlists_dir()
@@ -160,6 +162,7 @@ fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {
 }
 
 fn save_modlist(root_dir: &Path, modlist_name: &str, modlist: &ModList) -> Result<()> {
+    validate_path_component(modlist_name)?;
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let rules_path = launcher_paths
         .modlists_dir()
@@ -185,6 +188,7 @@ pub fn load_editor_snapshot_from_root(
 }
 
 pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Result<()> {
+    validate_path_component(&input.mod_id)?;
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
     if modlist.contains_mod_id(&input.mod_id) {

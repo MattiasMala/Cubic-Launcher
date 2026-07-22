@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use crate::content_packs::{load_content_list, ContentEntry, ContentList};
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::ModrinthClient;
+use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::VersionRuleKind;
@@ -33,6 +34,10 @@ fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str)
     true
 }
 
+pub(super) fn validate_content_filename(filename: &str) -> Result<()> {
+    validate_path_component(filename)
+}
+
 /// Resolve, download and install content packs into the instance.
 pub(super) async fn resolve_and_install_content_packs(
     app_handle: &tauri::AppHandle,
@@ -43,6 +48,7 @@ pub(super) async fn resolve_and_install_content_packs(
     target: &ResolutionTarget,
     instance_root: &Path,
 ) -> Result<()> {
+    validate_path_component(modlist_name)?;
     let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
     let cache_dir = launcher_paths.content_packs_cache_dir();
     std::fs::create_dir_all(cache_dir).with_context(|| {
@@ -97,6 +103,7 @@ pub(super) async fn resolve_and_install_content_packs(
                         .max_by(|a, b| a.date_published.cmp(&b.date_published));
                     if let Some(version) = best {
                         if let Some(file) = version.primary_file() {
+                            validate_content_filename(&file.filename)?;
                             let cached_path = cache_dir.join(&file.filename);
                             let was_cached = cached_path.exists();
                             if !was_cached {
@@ -220,6 +227,7 @@ async fn install_datapacks(
                     .max_by(|a, b| a.date_published.cmp(&b.date_published));
                 if let Some(version) = best {
                     if let Some(file) = version.primary_file() {
+                        validate_content_filename(&file.filename)?;
                         let cached_path = cache_dir.join(&file.filename);
                         let was_cached = cached_path.exists();
                         if !was_cached {

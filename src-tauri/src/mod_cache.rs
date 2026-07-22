@@ -16,7 +16,19 @@ use sha1::{Digest, Sha1};
 // slugs; the project alias table bridges those identifiers for cache-only
 // launch.
 use crate::modrinth::ModrinthVersion;
+use crate::path_safety::validate_path_component;
 use crate::resolver::ResolutionTarget;
+
+pub fn validate_cache_key(
+    mod_loader: &str,
+    version_id: &str,
+    jar_filename: &str,
+) -> Result<()> {
+    validate_path_component(mod_loader)?;
+    validate_path_component(version_id)?;
+    validate_path_component(jar_filename)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModCacheRecord {
@@ -331,6 +343,12 @@ impl SqliteModCacheRepository<'_> {
         &self,
         record: ModCacheRecord,
     ) -> Result<Option<ModCacheRecord>> {
+        validate_cache_key(
+            &record.mod_loader,
+            &record.modrinth_version_id,
+            &record.jar_filename,
+        )?;
+
         let artifact_path = cached_artifact_path_for_record(&self.mods_cache_dir, &record);
         if artifact_path.exists() {
             return Ok(Some(record));
@@ -450,12 +468,15 @@ pub fn cache_record_from_version(
         )
     })?;
 
+    let mod_loader = target.mod_loader.as_modrinth_loader();
+    validate_cache_key(mod_loader, &version.id, &primary_file.filename)?;
+
     Ok(ModCacheRecord {
         modrinth_project_id: version.project_id.clone(),
         modrinth_version_id: version.id.clone(),
         jar_filename: primary_file.filename.clone(),
         mc_version: target.minecraft_version.clone(),
-        mod_loader: target.mod_loader.as_modrinth_loader().to_string(),
+        mod_loader: mod_loader.to_string(),
         file_hash: primary_file.hashes.get("sha1").cloned(),
         download_url: Some(primary_file.url.clone()),
         is_local: false,
@@ -473,12 +494,15 @@ pub fn pending_download_from_version(
         )
     })?;
 
+    let mod_loader = target.mod_loader.as_modrinth_loader();
+    validate_cache_key(mod_loader, &version.id, &primary_file.filename)?;
+
     Ok(PendingDownload {
         modrinth_project_id: version.project_id.clone(),
         modrinth_version_id: version.id.clone(),
         jar_filename: primary_file.filename.clone(),
         mc_version: target.minecraft_version.clone(),
-        mod_loader: target.mod_loader.as_modrinth_loader().to_string(),
+        mod_loader: mod_loader.to_string(),
         file_hash: primary_file.hashes.get("sha1").cloned(),
         download_url: primary_file.url.clone(),
         file_size: primary_file.size,
@@ -502,8 +526,8 @@ mod tests {
 
     use super::{
         build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
-        legacy_cached_artifact_path, pending_download_from_version, ModCacheLookup, ModCacheRecord,
-        SqliteModCacheRepository,
+        legacy_cached_artifact_path, pending_download_from_version, validate_cache_key,
+        ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -563,6 +587,14 @@ mod tests {
                 .find(|record| record.modrinth_version_id == version_id)
                 .cloned())
         }
+    }
+
+    #[test]
+    fn cache_key_rejects_traversal_filename() {
+        assert!(validate_cache_key("fabric", "version-1", "../../x.jar").is_err());
+        assert!(validate_cache_key("fabric", "..", "safe.jar").is_err());
+        assert!(validate_cache_key("../fabric", "version-1", "safe.jar").is_err());
+        assert!(validate_cache_key("fabric", "version-1", "safe.jar").is_ok());
     }
 
     #[test]
