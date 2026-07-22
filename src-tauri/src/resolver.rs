@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -148,21 +148,28 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     })
 }
 
-/// Collect all mod IDs and their requires across the entire rule tree.
-fn collect_all_requires(rules: &[Rule]) -> Vec<(String, Vec<String>)> {
-    let mut result = Vec::new();
+/// Collect all mod IDs, their requires, and enabled states across the entire rule tree.
+fn collect_all_requires(
+    rules: &[Rule],
+) -> (Vec<(String, Vec<String>)>, HashMap<String, bool>) {
+    let mut requires = Vec::new();
+    let mut enabled = HashMap::new();
     for rule in rules {
-        result.push((rule.mod_id.clone(), rule.requires.clone()));
-        result.extend(collect_all_requires(&rule.alternatives));
+        requires.push((rule.mod_id.clone(), rule.requires.clone()));
+        enabled.insert(rule.mod_id.clone(), rule.enabled);
+        let (alternative_requires, alternative_enabled) =
+            collect_all_requires(&rule.alternatives);
+        requires.extend(alternative_requires);
+        enabled.extend(alternative_enabled);
     }
-    result
+    (requires, enabled)
 }
 
 /// Detect mutual requires (A requires B AND B requires A) and remove both
 /// directions so the resolver doesn't deadlock.
 fn strip_mutual_requires(rules: &mut Vec<Rule>) {
     // Build a set of all mutual pairs.
-    let all_reqs = collect_all_requires(rules);
+    let (all_reqs, enabled_map) = collect_all_requires(rules);
     let req_set: HashSet<(&str, &str)> = all_reqs
         .iter()
         .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())))
@@ -170,7 +177,10 @@ fn strip_mutual_requires(rules: &mut Vec<Rule>) {
 
     let mut mutual_pairs = HashSet::new();
     for &(a, b) in &req_set {
-        if req_set.contains(&(b, a)) {
+        if req_set.contains(&(b, a))
+            && enabled_map.get(a) == Some(&true)
+            && enabled_map.get(b) == Some(&true)
+        {
             mutual_pairs.insert((a.to_string(), b.to_string()));
         }
     }
@@ -930,4 +940,25 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn mutual_requires_with_disabled_peer_does_not_resolve() {
+        let mut a = simple_rule("A");
+        a.requires = vec!["B".into()];
+        let mut disabled_b = simple_rule("B");
+        disabled_b.enabled = false;
+        disabled_b.requires = vec!["A".into()];
+
+        let result = resolve_modlist(&modlist(vec![a, disabled_b]), &target()).unwrap();
+        assert!(!result.active_mods.contains("A"));
+
+        let mut a = simple_rule("A");
+        a.requires = vec!["B".into()];
+        let mut b = simple_rule("B");
+        b.requires = vec!["A".into()];
+
+        let result = resolve_modlist(&modlist(vec![a, b]), &target()).unwrap();
+        assert!(result.active_mods.contains("A"));
+        assert!(result.active_mods.contains("B"));
+    }
+
 }
