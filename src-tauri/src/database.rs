@@ -241,7 +241,7 @@ fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
 /// before stripping it.
 pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
     connection: &Connection,
-    _secret_store: S,
+    secret_store: S,
 ) -> Result<()> {
     let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = {
         let mut statement = connection
@@ -250,6 +250,8 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
             statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
+
+    let cipher = AccountTokenCipher::new(secret_store);
 
     for (microsoft_id, refresh_token_enc, profile_data) in rows {
         let Some(profile_data) = profile_data else {
@@ -272,20 +274,48 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
 
-        let enc_present = refresh_token_enc
-            .as_ref()
-            .is_some_and(|bytes| !bytes.is_empty());
-
         let mut removed_refresh = false;
-        if refresh_plaintext.is_some() {
-            if enc_present {
-                // The encrypted column holds a copy; safe to drop the plaintext.
+        let mut new_refresh_enc: Option<Vec<u8>> = None;
+
+        if let Some(plaintext) = &refresh_plaintext {
+            // Does the encrypted column already hold exactly this token?
+            let enc_matches_plaintext = refresh_token_enc
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .and_then(|bytes| cipher.decrypt_token(bytes).ok())
+                .as_deref()
+                == Some(plaintext.as_str());
+
+            if enc_matches_plaintext {
+                // Already consistent — the encrypted copy is authoritative; drop
+                // the redundant plaintext.
                 map.remove("ms_refresh_token");
                 removed_refresh = true;
+            } else {
+                // enc is NULL/empty, stale (Beta rotation wrote the fresh token
+                // only to profile_data), or undecryptable. The profile_data token
+                // is authoritative: re-encrypt it into refresh_token_enc, then
+                // strip the plaintext so the launch path (which reads enc)
+                // recovers the fresh token.
+                match cipher.encrypt_token(plaintext) {
+                    Ok(ciphertext) => {
+                        new_refresh_enc = Some(ciphertext);
+                        map.remove("ms_refresh_token");
+                        removed_refresh = true;
+                    }
+                    // Cipher/keyring unavailable: DEFER — never destroy the only
+                    // copy. The plaintext stays until it can be re-encrypted.
+                    Err(_) => {}
+                }
             }
-            // enc NULL/empty: DEFER — keep the plaintext, it is the only copy.
         }
 
+        if let Some(ciphertext) = new_refresh_enc {
+            connection.execute(
+                "UPDATE accounts SET refresh_token_enc = ?1 WHERE microsoft_id = ?2",
+                rusqlite::params![ciphertext, microsoft_id],
+            )?;
+        }
         if removed_access || removed_refresh {
             let cleaned = serde_json::Value::Object(map).to_string();
             connection.execute(
@@ -621,7 +651,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED until fix(C1-rotation): fresh profile token must win over stale enc"]
     fn migration_recovers_fresh_rotated_token_over_stale_enc() {
         let (database_path, parent_dir) = fresh_db();
         let store = MemorySecretStore::default();
@@ -657,7 +686,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED until fix(C1-rotation): divergence re-encryption must be idempotent"]
     fn migration_divergence_fix_is_idempotent() {
         let (database_path, parent_dir) = fresh_db();
         let store = MemorySecretStore::default();
