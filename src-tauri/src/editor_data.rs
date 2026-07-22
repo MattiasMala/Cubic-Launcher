@@ -10,6 +10,7 @@ use tauri::State;
 // live in `editor_data_tests.rs`, so new editor behavior should usually extend
 // those files instead of growing unrelated modules.
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::validate_path_component;
 use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
 };
@@ -145,6 +146,7 @@ fn set_enabled_recursive(rule: &mut Rule, enabled: bool) {
 }
 
 fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {
+    validate_path_component(modlist_name)?;
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let rules_path = launcher_paths
         .modlists_dir()
@@ -160,6 +162,7 @@ fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {
 }
 
 fn save_modlist(root_dir: &Path, modlist_name: &str, modlist: &ModList) -> Result<()> {
+    validate_path_component(modlist_name)?;
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let rules_path = launcher_paths
         .modlists_dir()
@@ -185,6 +188,7 @@ pub fn load_editor_snapshot_from_root(
 }
 
 pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Result<()> {
+    validate_path_component(&input.mod_id)?;
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
     if modlist.contains_mod_id(&input.mod_id) {
@@ -497,6 +501,16 @@ pub fn save_incompatibilities_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
+    for incompat in &input.rules {
+        if modlist.find_rule(&incompat.loser_id).is_none() {
+            bail!(
+                "unknown loser rule id in incompatibilities batch: {}",
+                incompat.loser_id
+            );
+        }
+    }
+
+
     for rule in &mut modlist.rules {
         clear_exclude_if_tree(rule);
     }
@@ -525,6 +539,8 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
     let rule = modlist
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
+
+    rule.exclude_if = input.exclude_if.clone();
 
     rule.requires = input.requires.clone();
     rule.version_rules = input
@@ -558,6 +574,28 @@ pub fn save_advanced_batch_from_root(
     input: &SaveAdvancedBatchInput,
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
+
+    for mod_id in input
+        .requires_entries
+        .iter()
+        .map(|entry| entry.mod_id.as_str())
+        .chain(
+            input
+                .version_rules_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str()),
+        )
+        .chain(
+            input
+                .custom_configs_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str()),
+        )
+    {
+        if modlist.find_rule(mod_id).is_none() {
+            bail!("unknown rule id in advanced batch: {}", mod_id);
+        }
+    }
 
     fn clear_advanced(rule: &mut Rule) {
         rule.requires.clear();

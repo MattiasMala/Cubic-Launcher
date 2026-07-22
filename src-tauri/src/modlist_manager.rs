@@ -6,6 +6,7 @@ use tauri::State;
 
 use crate::editor_data::{add_mod_rule_from_root, AddModRuleInput};
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::{contained_join, validate_path_component};
 use crate::rules::{ModList, RULES_FILENAME};
 use std::io;
 
@@ -45,6 +46,7 @@ pub fn create_modlist_from_root(
     if name.is_empty() {
         bail!("mod-list name cannot be empty");
     }
+    validate_path_component(&name)?;
 
     let author = if input.author.trim().is_empty() {
         "Author".to_string()
@@ -115,6 +117,7 @@ pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<(
     if name.is_empty() {
         bail!("mod-list name cannot be empty");
     }
+    validate_path_component(name)?;
 
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let modlist_dir = launcher_paths.modlists_dir().join(name);
@@ -206,6 +209,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         } else {
             archive_root.clone()
         };
+        validate_path_component(&base_name)?;
 
         let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
@@ -236,7 +240,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
                 continue;
             }
 
-            let dest_path = modlist_dir.join(&relative);
+            let dest_path = contained_join(&modlist_dir, &relative)?;
             if let Some(parent) = dest_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -265,6 +269,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
             .and_then(|s| s.to_str())
             .unwrap_or("Imported")
             .to_string();
+        validate_path_component(&base_name)?;
         let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
         std::fs::create_dir_all(&modlist_dir)
@@ -286,6 +291,7 @@ pub fn copy_local_jar_command(
 }
 
 pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> Result<()> {
+    validate_path_component(&input.modlist_name)?;
     let source_path = Path::new(&input.source_path);
 
     let file_name = source_path
@@ -309,6 +315,7 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
     if mod_id.is_empty() {
         bail!("JAR filename has no stem: '{}'", file_name);
     }
+    validate_path_component(&mod_id)?;
 
     // Check if a rule with this mod_id already exists
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
@@ -372,14 +379,18 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
 mod tests {
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::Write;
+
+    use zip::write::FileOptions;
 
     use crate::editor_data::load_editor_snapshot_from_root;
     use crate::rules::ModList;
 
     use super::{
-        copy_local_jar_from_root, create_modlist_from_root, CopyLocalJarInput, CreateModlistInput,
+        copy_local_jar_from_root, create_modlist_from_root, delete_modlist_from_root,
+        import_modlist_from_root, CopyLocalJarInput, CreateModlistInput,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -388,6 +399,18 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("cubic-modlist-mgr-test-{ts}"))
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            archive
+                .start_file(*name, FileOptions::default())
+                .unwrap();
+            archive.write_all(contents).unwrap();
+        }
+        archive.finish().unwrap();
     }
 
     #[test]
@@ -478,6 +501,105 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_traversal_name() {
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+
+        let result = create_modlist_from_root(
+            &root,
+            &CreateModlistInput {
+                name: "../evil".into(),
+                author: "Author".into(),
+                description: String::new(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(!root.join("evil").exists());
+
+        create_modlist_from_root(
+            &root,
+            &CreateModlistInput {
+                name: "Safe Pack".into(),
+                author: "Author".into(),
+                description: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(root.join("mod-lists").join("Safe Pack").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn delete_rejects_traversal_name() {
+        let test_root = unique_test_root();
+        let root = test_root.join("launcher").join("root");
+        let victim = test_root.join("launcher").join("victim");
+        fs::create_dir_all(root.join("mod-lists").join("Safe Pack")).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("marker.txt"), b"keep me").unwrap();
+
+        let result = delete_modlist_from_root(&root, "../../victim");
+        assert!(result.is_err());
+        assert!(victim.join("marker.txt").exists());
+
+        delete_modlist_from_root(&root, "Safe Pack").unwrap();
+        assert!(!root.join("mod-lists").join("Safe Pack").exists());
+
+        fs::remove_dir_all(&test_root).unwrap();
+    }
+
+    #[test]
+    fn import_zip_rejects_slip_entry() {
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+
+        let malicious_zip = root.join("malicious.zip");
+        write_test_zip(
+            &malicious_zip,
+            &[
+                ("Safe Pack/note.txt", b"safe" as &[u8]),
+                ("../outside.txt", b"escaped" as &[u8]),
+            ],
+        );
+
+        let result =
+            import_modlist_from_root(&root, malicious_zip.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(!root.join("mod-lists").join("outside.txt").exists());
+
+        let valid_zip = root.join("valid.zip");
+        write_test_zip(
+            &valid_zip,
+            &[("Valid Pack/note.txt", b"valid" as &[u8])],
+        );
+        let imported_name =
+            import_modlist_from_root(&root, valid_zip.to_str().unwrap()).unwrap();
+        assert_eq!(imported_name, "Valid Pack");
+        assert!(root
+            .join("mod-lists")
+            .join("Valid Pack")
+            .join("note.txt")
+            .exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn import_zip_rejects_unsafe_archive_base_name() {
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+        let archive_path = root.join("...zip");
+        write_test_zip(&archive_path, &[]);
+
+        let result =
+            import_modlist_from_root(&root, archive_path.to_str().unwrap());
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn copy_local_jar_places_file_and_adds_rule() {
         let root = unique_test_root();
         let modlist_dir = root.join("mod-lists").join("Test Pack");
@@ -521,6 +643,62 @@ mod tests {
     }
 
     #[test]
+    fn copy_local_jar_rejects_unsafe_components() {
+        let root = unique_test_root();
+        let source_dir = root.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let ordinary_jar = source_dir.join("ordinary.jar");
+        fs::write(&ordinary_jar, b"fake").unwrap();
+        let escaped_modlist_dir = root.join("escape");
+        fs::create_dir_all(escaped_modlist_dir.join("local-jars")).unwrap();
+        ModList {
+            modlist_name: "../escape".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: vec![],
+        }
+        .write_to_file(&escaped_modlist_dir.join("rules.json"))
+        .unwrap();
+        let traversal_result = copy_local_jar_from_root(
+            &root,
+            &CopyLocalJarInput {
+                source_path: ordinary_jar.to_string_lossy().into_owned(),
+                modlist_name: "../escape".into(),
+            },
+        );
+        assert!(traversal_result.is_err());
+        assert!(!escaped_modlist_dir
+            .join("local-jars")
+            .join("ordinary.jar")
+            .exists());
+
+        let modlist_dir = root.join("mod-lists").join("Safe Pack");
+        fs::create_dir_all(modlist_dir.join("local-jars")).unwrap();
+        ModList {
+            modlist_name: "Safe Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: vec![],
+        }
+        .write_to_file(&modlist_dir.join("rules.json"))
+        .unwrap();
+        let unsafe_id_jar = source_dir.join("...jar");
+        fs::write(&unsafe_id_jar, b"fake").unwrap();
+        let unsafe_id_result = copy_local_jar_from_root(
+            &root,
+            &CopyLocalJarInput {
+                source_path: unsafe_id_jar.to_string_lossy().into_owned(),
+                modlist_name: "Safe Pack".into(),
+            },
+        );
+        assert!(unsafe_id_result.is_err());
+        assert!(!modlist_dir.join("local-jars").join("...jar").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn copy_local_jar_rejects_non_jar_files() {
         let root = unique_test_root();
         fs::create_dir_all(root.join("mod-lists").join("Any Pack")).unwrap();
@@ -551,6 +729,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "existing-mod".into(),
                 source: ModSource::Local,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],

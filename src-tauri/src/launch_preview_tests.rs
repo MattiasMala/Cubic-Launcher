@@ -3,22 +3,24 @@ use std::path::PathBuf;
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
 use crate::dependencies::DependencyLink;
-use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthVersion};
+use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     build_instance_root, build_modded_classpath_entries, build_top_level_owner_map,
-    collect_selected_project_ids, embedded_min_java_requirement,
+    deduplicate_versions,
+    collect_selected_project_ids, contained_loader_library_path, embedded_min_java_requirement,
     fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, maven_artifact_relative_path,
-    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
-    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
-    substitute_known_placeholders, validate_final_fabric_runtime,
+    forge_wrapper_installer_artifact, load_modlist, local_mod_jar_path,
+    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
+    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
+    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
+    substitute_known_placeholders, validate_content_filename, validate_final_fabric_runtime,
     validate_selected_parent_dependencies, EffectiveLaunchSettings, EmbeddedFabricModMetadata,
     EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
-use crate::loader_metadata::{LoaderLibrary, LoaderMetadata};
+use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
 
 fn global_settings() -> ShellGlobalSettings {
     ShellGlobalSettings {
@@ -78,6 +80,80 @@ fn maven_coordinates_expand_to_standard_artifact_path() {
     assert_eq!(
         maven_artifact_relative_path("org.lwjgl:lwjgl:3.3.3:natives-windows").unwrap(),
         PathBuf::from("org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows.jar")
+    );
+}
+
+#[test]
+fn loader_library_path_traversal_is_contained() {
+    let malicious = LoaderLibrary {
+        name: "example:malicious:1.0".into(),
+        url: None,
+        download: Some(LibraryDownloadArtifact {
+            url: "https://example.invalid/outside.jar".into(),
+            path: Some("../../outside.jar".into()),
+            sha1: None,
+            size: None,
+        }),
+    };
+    let relative_path = relative_loader_library_path(&malicious).unwrap();
+    assert!(
+        contained_loader_library_path(PathBuf::from("/libraries").as_path(), &relative_path)
+            .is_err()
+    );
+
+    let valid = LoaderLibrary {
+        name: "example:valid:1.0".into(),
+        url: None,
+        download: Some(LibraryDownloadArtifact {
+            url: "https://example.invalid/valid.jar".into(),
+            path: Some("org/example/valid.jar".into()),
+            sha1: None,
+            size: None,
+        }),
+    };
+    let relative_path = relative_loader_library_path(&valid).unwrap();
+    assert_eq!(
+        contained_loader_library_path(PathBuf::from("/libraries").as_path(), &relative_path)
+            .unwrap(),
+        PathBuf::from("/libraries/org/example/valid.jar")
+    );
+}
+
+#[test]
+fn content_filename_traversal_is_rejected() {
+    let mut version = sample_version("content-pack", "content-pack-1");
+    version.files.push(ModrinthFile {
+        hashes: HashMap::new(),
+        url: "https://example.invalid/evil.jar".into(),
+        filename: "../../evil.jar".into(),
+        primary: true,
+        size: 1,
+    });
+
+    let primary_file = version.primary_file().unwrap();
+    assert!(validate_content_filename(&primary_file.filename).is_err());
+    assert!(validate_content_filename("/absolute/evil.jar").is_err());
+
+    version.files[0].filename = "content pack.zip".into();
+    let primary_file = version.primary_file().unwrap();
+    validate_content_filename(&primary_file.filename).unwrap();
+}
+
+#[test]
+fn modlist_and_local_jar_path_traversal_is_rejected() {
+    let launcher_paths = crate::launcher_paths::LauncherPaths::new("workspace-root");
+    let target = ResolutionTarget {
+        minecraft_version: "1.21.1".into(),
+        mod_loader: ModLoader::Fabric,
+    };
+
+    assert!(load_modlist(&launcher_paths, "../Pack").is_err());
+    assert!(build_instance_root(&launcher_paths, "../Pack", &target).is_err());
+    assert!(local_mod_jar_path(&launcher_paths, "../Pack", "local.jar").is_err());
+    assert!(local_mod_jar_path(&launcher_paths, "Pack", "../evil.jar").is_err());
+    assert_eq!(
+        local_mod_jar_path(&launcher_paths, "Pack", "local.jar").unwrap(),
+        PathBuf::from("workspace-root/mod-lists/Pack/local-jars/local.jar")
     );
 }
 
@@ -178,7 +254,7 @@ fn instance_root_uses_version_and_loader_suffix() {
     };
 
     assert_eq!(
-        build_instance_root(&launcher_paths, "Pack", &target),
+        build_instance_root(&launcher_paths, "Pack", &target).unwrap(),
         PathBuf::from("workspace-root")
             .join("mod-lists")
             .join("Pack")
@@ -473,6 +549,54 @@ fn exact_parent_dependency_check_uses_project_ids() {
         excluded,
         std::collections::HashSet::from(["YL57xq9U".to_string()])
     );
+}
+
+#[test]
+fn exact_parent_conflict_excludes_parent_leaving_single_project_version() {
+    // S1 end-to-end shape: Iris pins Sodium@old by exact VersionId while
+    // Sodium@new is selected top-level. The production pipeline validates the
+    // exact-version conflict, excludes Iris, then dedups — so only ONE Sodium
+    // version survives instead of loading both old and new.
+    let mut iris = sample_version("YL57xq9U", "iris-1");
+    iris.dependencies.push(ModrinthDependency {
+        version_id: Some("sodium-0.6.12".into()),
+        project_id: Some("AANobbMI".into()),
+        dependency_type: DependencyType::Required,
+        file_name: None,
+    });
+    let sodium_new = ModrinthVersion {
+        id: "sodium-0.6.13".into(),
+        ..sample_version("AANobbMI", "sodium-0.6.13")
+    };
+    let parent_versions = vec![iris.clone(), sodium_new.clone()];
+    let selected_parent_versions = parent_versions
+        .iter()
+        .map(|version| (version.project_id.clone(), version.clone()))
+        .collect::<HashMap<_, _>>();
+    let selected_project_ids = collect_selected_project_ids(&parent_versions);
+
+    // Mirror the production sequence in launch_preview.rs.
+    let excluded = validate_selected_parent_dependencies(
+        &parent_versions,
+        &selected_parent_versions,
+        &selected_project_ids,
+    );
+    let final_parent_versions = parent_versions
+        .into_iter()
+        .filter(|version| !excluded.contains(&version.project_id))
+        .collect::<Vec<_>>();
+    // The conflicting dependency (Iris's Sodium@old) rides on the excluded
+    // parent and is filtered out upstream, so it is not fetched.
+    let final_dependency_versions: Vec<ModrinthVersion> = Vec::new();
+    let resolved = deduplicate_versions(final_parent_versions, final_dependency_versions);
+
+    let sodium_versions = resolved
+        .iter()
+        .filter(|version| version.project_id == "AANobbMI")
+        .map(|version| version.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(sodium_versions, vec!["sodium-0.6.13".to_string()]);
+    assert!(!resolved.iter().any(|version| version.project_id == "YL57xq9U"));
 }
 
 #[test]

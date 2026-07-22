@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::validate_path_component;
 use crate::mod_cache::ModCacheRecord;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
@@ -71,6 +72,7 @@ pub(super) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
 }
 
 pub(super) fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<ModList> {
+    validate_path_component(modlist_name)?;
     let rules_path = launcher_paths
         .modlists_dir()
         .join(modlist_name)

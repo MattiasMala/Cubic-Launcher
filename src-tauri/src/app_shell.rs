@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -151,15 +151,10 @@ pub async fn microsoft_login_command(
                 microsoft_id: login_result.microsoft_id.clone(),
                 xbox_gamertag: Some(login_result.minecraft_username.clone()),
                 minecraft_uuid: Some(login_result.minecraft_uuid.clone()),
-                profile_data: Some(
-                    serde_json::json!({
-                        "username": login_result.minecraft_username,
-                        "uuid": login_result.minecraft_uuid,
-                        "mc_access_token": login_result.minecraft_access_token,
-                        "ms_refresh_token": login_result.microsoft_refresh_token,
-                    })
-                    .to_string(),
-                ),
+                profile_data: Some(account_profile_data_json(
+                    &login_result.minecraft_username,
+                    &login_result.minecraft_uuid,
+                )),
             },
             ManagedAccountTokens {
                 access_token: login_result.minecraft_access_token.clone(),
@@ -172,6 +167,20 @@ pub async fn microsoft_login_command(
     Ok(login_result
         .xbox_gamertag
         .unwrap_or(login_result.microsoft_id))
+}
+
+/// Build the profile_data JSON stored for an account.
+///
+/// SECURITY (C1): profile_data is persisted UNENCRYPTED, so it MUST contain
+/// only non-sensitive display metadata (username, uuid). Access/refresh tokens
+/// live exclusively in the AES-GCM encrypted `access_token_enc`/`refresh_token_enc`
+/// columns and MUST NOT be written here.
+pub fn account_profile_data_json(username: &str, uuid: &str) -> String {
+    serde_json::json!({
+        "username": username,
+        "uuid": uuid,
+    })
+    .to_string()
 }
 
 #[tauri::command]
@@ -396,6 +405,16 @@ pub fn save_global_settings(
     connection: &Connection,
     settings: &ShellGlobalSettingsInput,
 ) -> Result<()> {
+    if settings.min_ram_mb == 0 {
+        bail!("min_ram_mb must be greater than zero");
+    }
+    if settings.max_ram_mb == 0 {
+        bail!("max_ram_mb must be greater than zero");
+    }
+    if settings.min_ram_mb > settings.max_ram_mb {
+        bail!("min_ram_mb cannot exceed max_ram_mb");
+    }
+
     let values = [
         ("min_ram_mb", settings.min_ram_mb.to_string()),
         ("max_ram_mb", settings.max_ram_mb.to_string()),
@@ -560,8 +579,8 @@ mod tests {
     use crate::rules::{ModList, ModSource, Rule};
 
     use super::{
-        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
-        ShellGlobalSettingsInput, ShellModListOverridesInput,
+        account_profile_data_json, load_shell_snapshot_from_root, save_global_settings,
+        save_modlist_overrides, ShellGlobalSettingsInput, ShellModListOverridesInput,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -571,6 +590,18 @@ mod tests {
             .as_nanos();
 
         env::temp_dir().join(format!("cubic-launcher-shell-snapshot-test-{timestamp}"))
+    }
+
+    #[test]
+    fn account_profile_data_json_excludes_tokens() {
+        let json = account_profile_data_json("PlayerOne", "uuid-1");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("profile data should be valid json");
+
+        assert_eq!(parsed.get("username").and_then(|v| v.as_str()), Some("PlayerOne"));
+        assert_eq!(parsed.get("uuid").and_then(|v| v.as_str()), Some("uuid-1"));
+        assert!(parsed.get("mc_access_token").is_none());
+        assert!(parsed.get("ms_refresh_token").is_none());
     }
 
     #[test]
@@ -610,6 +641,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "sodium".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],
@@ -791,5 +823,42 @@ mod tests {
         );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+    #[test]
+    fn save_global_settings_rejects_invalid_ram() {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE global_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );",
+            )
+            .expect("global settings schema should initialize");
+
+        let settings = |min_ram_mb, max_ram_mb| ShellGlobalSettingsInput {
+            min_ram_mb,
+            max_ram_mb,
+            custom_jvm_args: String::new(),
+            profiler_enabled: false,
+            cache_only_mode: false,
+            wrapper_command: String::new(),
+            java_path_override: String::new(),
+        };
+
+        let error = save_global_settings(&connection, &settings(0, 4096))
+            .expect_err("zero minimum RAM should be rejected");
+        assert_eq!(error.to_string(), "min_ram_mb must be greater than zero");
+
+        let error = save_global_settings(&connection, &settings(1024, 0))
+            .expect_err("zero maximum RAM should be rejected");
+        assert_eq!(error.to_string(), "max_ram_mb must be greater than zero");
+
+        let error = save_global_settings(&connection, &settings(8192, 4096))
+            .expect_err("minimum RAM above maximum RAM should be rejected");
+        assert_eq!(error.to_string(), "min_ram_mb cannot exceed max_ram_mb");
+
+        save_global_settings(&connection, &settings(1024, 4096))
+            .expect("valid RAM settings should save");
     }
 }

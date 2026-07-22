@@ -4,6 +4,8 @@ use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use serde::Deserialize;
 
+use crate::path_safety::validate_path_component;
+
 const ADOPTIUM_API_BASE_URL: &str = "https://api.adoptium.net/v3";
 
 #[derive(Debug, Clone)]
@@ -193,18 +195,20 @@ pub fn plan_runtime_download(
     package: AdoptiumPackage,
     os: &str,
     architecture: &str,
-) -> JavaRuntimeDownloadPlan {
+) -> Result<JavaRuntimeDownloadPlan> {
+    validate_path_component(&package.name)?;
+
     let install_dir = launcher_java_runtimes_dir.join(format!("java-{}", java_version));
     let archive_path = launcher_java_runtimes_dir.join(&package.name);
 
-    JavaRuntimeDownloadPlan {
+    Ok(JavaRuntimeDownloadPlan {
         java_version,
         os: os.to_string(),
         architecture: architecture.to_string(),
         install_dir,
         archive_path,
         package,
-    }
+    })
 }
 
 pub fn host_adoptium_os() -> &'static str {
@@ -326,13 +330,30 @@ mod tests {
             size: 42,
         };
 
-        let plan = plan_runtime_download(Path::new("java-runtimes"), 17, package, "windows", "x64");
+        let plan =
+            plan_runtime_download(Path::new("java-runtimes"), 17, package, "windows", "x64")
+                .expect("valid package name should produce a download plan");
 
         assert_eq!(plan.install_dir, Path::new("java-runtimes").join("java-17"));
         assert_eq!(
             plan.archive_path,
             Path::new("java-runtimes").join("OpenJDK17U-jre_x64_windows_hotspot_17.0.12_7.zip")
         );
+    }
+
+    #[test]
+    fn plan_runtime_download_rejects_traversal_package_name() {
+        let package = AdoptiumPackage {
+            name: "../../evil.zip".into(),
+            link: "https://example.invalid/evil.zip".into(),
+            checksum: "checksum".into(),
+            size: 42,
+        };
+
+        let result =
+            plan_runtime_download(Path::new("java-runtimes"), 17, package, "windows", "x64");
+
+        assert!(result.is_err());
     }
 
     #[test]

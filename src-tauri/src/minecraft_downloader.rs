@@ -8,6 +8,7 @@ use tauri::{Emitter, State};
 use tokio::task::JoinSet;
 
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::contained_join;
 use crate::process_streaming::{ProcessLogEvent, ProcessLogStream, MINECRAFT_LOG_EVENT};
 
 const VERSION_MANIFEST_URL: &str =
@@ -607,7 +608,7 @@ async fn ensure_libraries(
         // Download the main artifact (non-native).
         if let Some(artifact) = &downloads.artifact {
             if let Some(path) = &artifact.path {
-                let dest = libraries_dir.join(path);
+                let dest = contained_join(libraries_dir, path)?;
                 download_file_verified(client, &artifact.url, &dest, &artifact.sha1).await?;
                 library_paths.push(dest);
             }
@@ -618,7 +619,7 @@ async fn ensure_libraries(
             if let Some(classifiers) = &downloads.classifiers {
                 if let Some(native_artifact) = classifiers.get(native_key.as_str()) {
                     if let Some(path) = &native_artifact.path {
-                        let dest = libraries_dir.join(path);
+                        let dest = contained_join(libraries_dir, path)?;
                         download_file_verified(
                             client,
                             &native_artifact.url,
@@ -664,11 +665,15 @@ async fn ensure_assets(
     let to_download: Vec<String> = asset_index
         .objects
         .values()
-        .map(|obj| obj.hash.clone())
-        .filter(|hash| {
+        .map(|obj| {
+            let hash = &obj.hash;
             let prefix = &hash[..2];
-            !objects_dir.join(prefix).join(hash).exists()
+            let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
+            Ok((hash.clone(), dest))
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(hash, dest)| (!dest.exists()).then_some(hash))
         .collect();
 
     if to_download.is_empty() {
@@ -695,7 +700,8 @@ async fn ensure_assets(
 
             join_set.spawn(async move {
                 let prefix = &hash[..2];
-                let dest = objects_dir.join(prefix).join(&hash);
+                let dest =
+                    contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
                 if dest.exists() {
                     return Ok(());
                 }
@@ -803,6 +809,17 @@ mod tests {
     #[test]
     fn library_allowed_with_no_rules() {
         assert!(library_allowed_on_current_os(&[]));
+    }
+
+    #[test]
+    fn library_path_traversal_is_contained() {
+        let libraries_dir = Path::new("/cache/libraries");
+
+        assert!(contained_join(libraries_dir, "../../outside.jar").is_err());
+        assert_eq!(
+            contained_join(libraries_dir, "org/example/library/1.0/library-1.0.jar").unwrap(),
+            libraries_dir.join("org/example/library/1.0/library-1.0.jar")
+        );
     }
 
     #[test]

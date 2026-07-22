@@ -178,11 +178,12 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
     }
 
     pub fn list_accounts(&self) -> Result<Vec<PlaintextAccountRecord>> {
-        self.accounts_repository
+        Ok(self
+            .accounts_repository
             .list_accounts()?
             .into_iter()
-            .map(|account| self.decrypt_account(account))
-            .collect()
+            .filter_map(|account| self.decrypt_account(account).ok())
+            .collect())
     }
 
     pub fn set_active_account(&self, microsoft_id: &str) -> Result<()> {
@@ -243,6 +244,7 @@ mod tests {
 
     use super::{
         AccountTokenCipher, EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore,
+        TOKEN_ENCRYPTION_VERSION, TOKEN_NONCE_LENGTH,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -359,4 +361,53 @@ mod tests {
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
+    #[test]
+    fn list_accounts_skips_corrupted_blob() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository =
+            EncryptedAccountsRepository::new(&connection, MemorySecretStore::default());
+
+        repository
+            .upsert_account(&PlaintextAccountRecord {
+                microsoft_id: "account-valid".into(),
+                xbox_gamertag: Some("ValidPlayer".into()),
+                minecraft_uuid: Some("valid-uuid".into()),
+                access_token: Some("valid-access-token".into()),
+                refresh_token: Some("valid-refresh-token".into()),
+                profile_data: None,
+                is_active: false,
+            })
+            .expect("valid account should store");
+
+        let mut corrupted_payload = vec![TOKEN_ENCRYPTION_VERSION];
+        corrupted_payload.extend_from_slice(&[0; TOKEN_NONCE_LENGTH + 16]);
+        connection
+            .execute(
+                r#"
+                INSERT INTO accounts (
+                    microsoft_id,
+                    access_token_enc,
+                    last_login,
+                    is_active
+                ) VALUES (?1, ?2, CURRENT_TIMESTAMP, FALSE)
+                "#,
+                rusqlite::params!["account-corrupted", corrupted_payload],
+            )
+            .expect("corrupted account should store");
+
+        let accounts = repository
+            .list_accounts()
+            .expect("corrupted account should be skipped");
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].microsoft_id, "account-valid");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
 }

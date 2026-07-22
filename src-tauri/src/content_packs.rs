@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::validate_path_component;
 use crate::rules::VersionRule;
 
 // ── Schema ──────────────────────────────────────────────────────────────────
@@ -158,11 +159,16 @@ pub struct VersionRuleSnapshot {
     pub loader: String,
 }
 
+fn validate_content_modlist_name(name: &str) -> Result<(), String> {
+    validate_path_component(name).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn load_content_list_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: LoadContentInput,
 ) -> Result<ContentSnapshot, String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
     Ok(ContentSnapshot {
@@ -208,6 +214,7 @@ pub fn add_content_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: AddContentInput,
 ) -> Result<(), String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
 
@@ -228,6 +235,7 @@ pub fn remove_content_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: RemoveContentInput,
 ) -> Result<(), String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
     list.entries.retain(|e| e.id != input.id);
@@ -244,6 +252,7 @@ pub fn reorder_content_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: ReorderContentInput,
 ) -> Result<(), String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
 
@@ -266,6 +275,7 @@ pub fn save_content_groups_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveContentGroupsInput,
 ) -> Result<(), String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
 
@@ -288,6 +298,7 @@ pub fn save_content_version_rules_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveContentVersionRulesInput,
 ) -> Result<(), String> {
+    validate_content_modlist_name(&input.modlist_name)?;
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
 
@@ -296,4 +307,18 @@ pub fn save_content_version_rules_command(
     }
 
     save_content_list(&dir, &list).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_content_modlist_name;
+
+    #[test]
+    fn content_command_rejects_traversal_modlist_name() {
+        assert!(validate_content_modlist_name("../x").is_err());
+        assert!(validate_content_modlist_name("nested/x").is_err());
+        assert!(validate_content_modlist_name(r"nested\x").is_err());
+        assert!(validate_content_modlist_name("/absolute").is_err());
+        assert!(validate_content_modlist_name("safe modlist").is_ok());
+    }
 }

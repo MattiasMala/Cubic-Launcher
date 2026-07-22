@@ -21,6 +21,7 @@ use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
 use crate::offline_account::deterministic_offline_uuid;
+use crate::path_safety::{contained_join, validate_path_component};
 use crate::process_streaming::{spawn_and_stream_process, ProcessEventSink, ProcessLogStream};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -55,7 +56,7 @@ async fn materialize_loader_artifacts(
 
     for library in artifacts {
         let relative_path = relative_loader_library_path(library)?;
-        let destination_path = library_root.join(&relative_path);
+        let destination_path = contained_loader_library_path(library_root, &relative_path)?;
 
         if !destination_path.exists() {
             // Determine the download URL: prefer explicit download artifact,
@@ -84,6 +85,16 @@ async fn materialize_loader_artifacts(
     Ok(paths)
 }
 
+pub(super) fn contained_loader_library_path(
+    library_root: &Path,
+    relative_path: &Path,
+) -> Result<PathBuf> {
+    let relative_path = relative_path
+        .to_str()
+        .context("loader library path is not valid UTF-8")?;
+    contained_join(library_root, relative_path)
+}
+
 pub(super) async fn prepare_forge_wrapper_launch(
     http_client: &reqwest::Client,
     library_root: &Path,
@@ -94,7 +105,8 @@ pub(super) async fn prepare_forge_wrapper_launch(
         return Ok(None);
     };
 
-    let installer_path = library_root.join(&installer_artifact.relative_path);
+    let installer_path =
+        contained_loader_library_path(library_root, &installer_artifact.relative_path)?;
     if !installer_path.exists() {
         download_file(http_client, &installer_artifact.url, &installer_path).await?;
     }
@@ -518,8 +530,9 @@ pub(super) fn build_instance_root(
     launcher_paths: &LauncherPaths,
     modlist_name: &str,
     target: &ResolutionTarget,
-) -> PathBuf {
-    launcher_paths
+) -> Result<PathBuf> {
+    validate_path_component(modlist_name)?;
+    Ok(launcher_paths
         .modlists_dir()
         .join(modlist_name)
         .join("instances")
@@ -527,7 +540,7 @@ pub(super) fn build_instance_root(
             "{}-{}",
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
-        ))
+        )))
 }
 
 pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
@@ -538,11 +551,12 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
         )
     })?;
 
-    // Read the raw active account; no decryption is needed because we use profile_data.
-    // Extract all data from DB BEFORE any async work (Connection is not Send).
+    // SECURITY (C1): decrypt the active account from the AES-GCM encrypted
+    // columns. profile_data no longer carries tokens. Extract everything BEFORE
+    // async work (Connection is not Send).
     let raw_account = {
-        use crate::microsoft_auth::AccountsRepository as RawRepo;
-        RawRepo::new(&connection)
+        use crate::token_storage::{EncryptedAccountsRepository, KeyringSecretStore};
+        EncryptedAccountsRepository::new(&connection, KeyringSecretStore::new())
             .load_active_account()
             .ok()
             .flatten()
@@ -564,17 +578,14 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
 
         let uuid = format_uuid_with_dashes(
             &raw.minecraft_uuid
+                .clone()
                 .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
         );
 
         let microsoft_id = raw.microsoft_id.clone();
 
-        // Try to refresh the Minecraft access token using the stored MS refresh token.
-        let ms_refresh = profile.as_ref().and_then(|v| {
-            v.get("ms_refresh_token")
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        });
+        // Refresh the Minecraft access token using the decrypted MS refresh token.
+        let ms_refresh = raw.refresh_token.clone();
 
         if let Some(refresh_token) = ms_refresh {
             if !refresh_token.is_empty() {
@@ -629,20 +640,34 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
                                     "[Auth] Full auth chain OK: username={}",
                                     login.minecraft_username
                                 );
-                                // Update stored tokens in profile_data.
-                                let new_profile = serde_json::json!({
-                                    "username": login.minecraft_username,
-                                    "uuid": login.minecraft_uuid,
-                                    "mc_access_token": login.minecraft_access_token,
-                                    "ms_refresh_token": ms_tokens.refresh_token.as_deref()
-                                        .unwrap_or(&refresh_token),
-                                });
+                                // SECURITY (C1): persist rotated tokens into the
+                                // encrypted columns; profile_data stays token-free.
+                                let rotated_refresh = ms_tokens
+                                    .refresh_token
+                                    .clone()
+                                    .unwrap_or_else(|| refresh_token.clone());
+                                let new_profile = crate::app_shell::account_profile_data_json(
+                                    &login.minecraft_username,
+                                    &login.minecraft_uuid,
+                                );
                                 if let Ok(conn) = Connection::open(&db_path) {
-                                    use crate::microsoft_auth::AccountsRepository as RawRepo;
-                                    let _ = RawRepo::new(&conn).update_profile_data(
-                                        &microsoft_id,
-                                        &new_profile.to_string(),
-                                    );
+                                    use crate::token_storage::{
+                                        EncryptedAccountsRepository, KeyringSecretStore,
+                                        PlaintextAccountRecord,
+                                    };
+                                    let _ = EncryptedAccountsRepository::new(
+                                        &conn,
+                                        KeyringSecretStore::new(),
+                                    )
+                                    .upsert_account(&PlaintextAccountRecord {
+                                        microsoft_id: microsoft_id.clone(),
+                                        xbox_gamertag: raw.xbox_gamertag.clone(),
+                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
+                                        access_token: Some(login.minecraft_access_token.clone()),
+                                        refresh_token: Some(rotated_refresh),
+                                        profile_data: Some(new_profile),
+                                        is_active: true,
+                                    });
                                 }
 
                                 return Ok(PlayerIdentity {
@@ -758,7 +783,7 @@ pub(super) async fn select_or_download_java(
         package,
         os,
         arch,
-    );
+    )?;
 
     // Download the archive.
     adoptium

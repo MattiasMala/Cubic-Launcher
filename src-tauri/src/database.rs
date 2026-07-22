@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use crate::token_storage::{AccountTokenCipher, SecretStore};
 
 pub const DATABASE_FILENAME: &str = "launcher_data.db";
 
@@ -230,6 +231,103 @@ fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// SECURITY (C1): older builds stored `mc_access_token`/`ms_refresh_token` in
+/// cleartext inside `profile_data`. This migrates each account's `profile_data`
+/// to remove those plaintext copies while guaranteeing the refresh token
+/// survives in the encrypted `refresh_token_enc` column (see phases below).
+///
+/// Takes a `SecretStore` so it can build the same `AccountTokenCipher` the
+/// launch path uses, allowing it to re-encrypt an authoritative profile token
+/// before stripping it.
+pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
+    connection: &Connection,
+    secret_store: S,
+) -> Result<()> {
+    let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = {
+        let mut statement = connection
+            .prepare("SELECT microsoft_id, refresh_token_enc, profile_data FROM accounts")?;
+        let mapped =
+            statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let cipher = AccountTokenCipher::new(secret_store);
+
+    for (microsoft_id, refresh_token_enc, profile_data) in rows {
+        let Some(profile_data) = profile_data else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(mut map)) =
+            serde_json::from_str::<serde_json::Value>(&profile_data)
+        else {
+            continue;
+        };
+
+        // mc_access_token is short-lived and re-derived from the refresh token,
+        // so stripping it is always safe.
+        let removed_access = map.remove("mc_access_token").is_some();
+
+        let refresh_plaintext = map
+            .get("ms_refresh_token")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        let mut removed_refresh = false;
+        let mut new_refresh_enc: Option<Vec<u8>> = None;
+
+        if let Some(plaintext) = &refresh_plaintext {
+            // Does the encrypted column already hold exactly this token?
+            let enc_matches_plaintext = refresh_token_enc
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .and_then(|bytes| cipher.decrypt_token(bytes).ok())
+                .as_deref()
+                == Some(plaintext.as_str());
+
+            if enc_matches_plaintext {
+                // Already consistent — the encrypted copy is authoritative; drop
+                // the redundant plaintext.
+                map.remove("ms_refresh_token");
+                removed_refresh = true;
+            } else {
+                // enc is NULL/empty, stale (Beta rotation wrote the fresh token
+                // only to profile_data), or undecryptable. The profile_data token
+                // is authoritative: re-encrypt it into refresh_token_enc, then
+                // strip the plaintext so the launch path (which reads enc)
+                // recovers the fresh token.
+                match cipher.encrypt_token(plaintext) {
+                    Ok(ciphertext) => {
+                        new_refresh_enc = Some(ciphertext);
+                        map.remove("ms_refresh_token");
+                        removed_refresh = true;
+                    }
+                    // Cipher/keyring unavailable: DEFER — never destroy the only
+                    // copy. The plaintext stays until it can be re-encrypted.
+                    Err(_) => {}
+                }
+            }
+        }
+
+        if let Some(ciphertext) = new_refresh_enc {
+            connection.execute(
+                "UPDATE accounts SET refresh_token_enc = ?1 WHERE microsoft_id = ?2",
+                rusqlite::params![ciphertext, microsoft_id],
+            )?;
+        }
+        if removed_access || removed_refresh {
+            let cleaned = serde_json::Value::Object(map).to_string();
+            connection.execute(
+                "UPDATE accounts SET profile_data = ?1 WHERE microsoft_id = ?2",
+                rusqlite::params![cleaned, microsoft_id],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -237,9 +335,39 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use rusqlite::{params, Connection};
 
-    use super::{initialize_database, DATABASE_FILENAME};
+    use super::{
+        initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME,
+    };
+    use crate::token_storage::{AccountTokenCipher, SecretStore};
+
+    #[derive(Clone, Default)]
+    struct MemorySecretStore {
+        values: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl SecretStore for MemorySecretStore {
+        fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self
+                .values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .get(key)
+                .cloned())
+        }
+
+        fn set_secret(&self, key: &str, secret: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .expect("secret store mutex poisoned")
+                .insert(key.to_string(), secret.to_string());
+            Ok(())
+        }
+    }
 
     fn unique_test_database_path() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -366,5 +494,229 @@ mod tests {
         drop(connection);
         fs::remove_file(&database_path).expect("database file should be removable");
         fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
+    }
+
+    // Helpers for the token-migration suite.
+    fn insert_account(
+        connection: &Connection,
+        microsoft_id: &str,
+        refresh_token_enc: Option<Vec<u8>>,
+        profile_data: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO accounts (microsoft_id, xbox_gamertag, minecraft_uuid, access_token_enc, refresh_token_enc, profile_data, is_active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    microsoft_id,
+                    "Player",
+                    "uuid",
+                    Option::<Vec<u8>>::None,
+                    refresh_token_enc,
+                    profile_data,
+                    true
+                ],
+            )
+            .expect("account should insert");
+    }
+
+    fn profile_of(connection: &Connection, microsoft_id: &str) -> String {
+        connection
+            .query_row(
+                "SELECT profile_data FROM accounts WHERE microsoft_id = ?1",
+                params![microsoft_id],
+                |row| row.get(0),
+            )
+            .expect("profile should load")
+    }
+
+    fn refresh_enc_of(connection: &Connection, microsoft_id: &str) -> Option<Vec<u8>> {
+        connection
+            .query_row(
+                "SELECT refresh_token_enc FROM accounts WHERE microsoft_id = ?1",
+                params![microsoft_id],
+                |row| row.get(0),
+            )
+            .expect("refresh enc should load")
+    }
+
+    /// What the launch path would recover: decrypt(enc) if present, else the
+    /// plaintext left in profile_data (deferral fallback).
+    fn recoverable_refresh<S: SecretStore + Clone>(
+        connection: &Connection,
+        microsoft_id: &str,
+        store: S,
+    ) -> Option<String> {
+        if let Some(enc) = refresh_enc_of(connection, microsoft_id) {
+            if let Ok(token) = AccountTokenCipher::new(store).decrypt_token(&enc) {
+                return Some(token);
+            }
+        }
+        let profile = profile_of(connection, microsoft_id);
+        serde_json::from_str::<serde_json::Value>(&profile)
+            .ok()
+            .and_then(|v| {
+                v.get("ms_refresh_token")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+            })
+    }
+
+    fn fresh_db() -> (PathBuf, PathBuf) {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("parent directory should exist");
+        initialize_database(&database_path).expect("init should succeed");
+        (database_path, parent_dir)
+    }
+
+    #[test]
+    fn migration_strips_consistent_tokens_and_is_idempotent() {
+        let (database_path, parent_dir) = fresh_db();
+        let store = MemorySecretStore::default();
+        let enc_consistent = AccountTokenCipher::new(store.clone())
+            .encrypt_token("FRESH")
+            .expect("encrypt should succeed");
+
+        let connection = Connection::open(&database_path).expect("db open");
+        insert_account(
+            &connection,
+            "ms-consistent",
+            Some(enc_consistent),
+            r#"{"username":"PlayerLegacy","uuid":"uuid-legacy","mc_access_token":"SECRET_MC","ms_refresh_token":"FRESH"}"#,
+        );
+        insert_account(
+            &connection,
+            "ms-clean",
+            None,
+            r#"{"username":"PlayerClean","uuid":"uuid-clean"}"#,
+        );
+
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("migration should succeed");
+
+        let profile = profile_of(&connection, "ms-consistent");
+        assert!(!profile.contains("SECRET_MC"));
+        assert!(!profile.contains("FRESH"));
+        assert!(!profile.contains("mc_access_token"));
+        assert!(!profile.contains("ms_refresh_token"));
+        assert!(profile.contains("PlayerLegacy"));
+        assert_eq!(
+            recoverable_refresh(&connection, "ms-consistent", store.clone()),
+            Some("FRESH".to_string())
+        );
+        // Clean account left untouched.
+        assert_eq!(
+            profile_of(&connection, "ms-clean"),
+            r#"{"username":"PlayerClean","uuid":"uuid-clean"}"#
+        );
+
+        // Idempotent: a second run does not change the already-migrated rows.
+        let profile_first = profile_of(&connection, "ms-consistent");
+        let enc_first = refresh_enc_of(&connection, "ms-consistent");
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("second migration should succeed");
+        assert_eq!(profile_of(&connection, "ms-consistent"), profile_first);
+        assert_eq!(refresh_enc_of(&connection, "ms-consistent"), enc_first);
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temp dir removable");
+    }
+
+    #[test]
+    fn migration_preserves_refresh_when_enc_null() {
+        let (database_path, parent_dir) = fresh_db();
+        let store = MemorySecretStore::default();
+        let connection = Connection::open(&database_path).expect("db open");
+        insert_account(
+            &connection,
+            "ms-enc-null",
+            None,
+            r#"{"username":"P","uuid":"u","ms_refresh_token":"ONLY_COPY"}"#,
+        );
+
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("migration should succeed");
+
+        // The only copy of the refresh token must survive somewhere recoverable.
+        assert_eq!(
+            recoverable_refresh(&connection, "ms-enc-null", store.clone()),
+            Some("ONLY_COPY".to_string())
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temp dir removable");
+    }
+
+    #[test]
+    fn migration_recovers_fresh_rotated_token_over_stale_enc() {
+        let (database_path, parent_dir) = fresh_db();
+        let store = MemorySecretStore::default();
+        let enc_stale = AccountTokenCipher::new(store.clone())
+            .encrypt_token("STALE_LOGIN")
+            .expect("encrypt should succeed");
+
+        let connection = Connection::open(&database_path).expect("db open");
+        // Beta divergence: fresh rotated token lives ONLY in profile_data; enc
+        // holds the now-stale login token.
+        insert_account(
+            &connection,
+            "ms-diverged",
+            Some(enc_stale),
+            r#"{"username":"P","uuid":"u","mc_access_token":"MC","ms_refresh_token":"FRESH_ROTATED"}"#,
+        );
+
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("migration should succeed");
+
+        // Launch reads from enc: it MUST recover the fresh token, not the stale one.
+        assert_eq!(
+            recoverable_refresh(&connection, "ms-diverged", store.clone()),
+            Some("FRESH_ROTATED".to_string())
+        );
+        // Plaintext must be gone from profile_data (security intent of C1).
+        let profile = profile_of(&connection, "ms-diverged");
+        assert!(!profile.contains("FRESH_ROTATED"));
+        assert!(!profile.contains("ms_refresh_token"));
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temp dir removable");
+    }
+
+    #[test]
+    fn migration_divergence_fix_is_idempotent() {
+        let (database_path, parent_dir) = fresh_db();
+        let store = MemorySecretStore::default();
+        let enc_stale = AccountTokenCipher::new(store.clone())
+            .encrypt_token("STALE_LOGIN")
+            .expect("encrypt should succeed");
+
+        let connection = Connection::open(&database_path).expect("db open");
+        insert_account(
+            &connection,
+            "ms-diverged",
+            Some(enc_stale),
+            r#"{"username":"P","uuid":"u","ms_refresh_token":"FRESH_ROTATED"}"#,
+        );
+
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("first migration should succeed");
+        let profile_first = profile_of(&connection, "ms-diverged");
+        let enc_first = refresh_enc_of(&connection, "ms-diverged");
+
+        migrate_account_tokens_from_profile_data(&connection, store.clone())
+            .expect("second migration should succeed");
+        // Second run changes nothing and still recovers the fresh token.
+        assert_eq!(profile_of(&connection, "ms-diverged"), profile_first);
+        assert_eq!(refresh_enc_of(&connection, "ms-diverged"), enc_first);
+        assert_eq!(
+            recoverable_refresh(&connection, "ms-diverged", store.clone()),
+            Some("FRESH_ROTATED".to_string())
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temp dir removable");
     }
 }

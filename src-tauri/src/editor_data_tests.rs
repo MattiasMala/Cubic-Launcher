@@ -87,6 +87,17 @@ fn load_editor_snapshot_returns_rows_and_incompatibilities() {
 }
 
 #[test]
+fn load_modlist_rejects_traversal_name() {
+    let root = unique_test_root();
+    setup_modlist(&root, "../x", vec![simple_rule("sodium")]);
+
+    let result = load_editor_snapshot_from_root(&root, "../x");
+
+    fs::remove_dir_all(&root).unwrap();
+    assert!(result.is_err());
+}
+
+#[test]
 fn add_mod_rule_appends_rule() {
     let root = unique_test_root();
     setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
@@ -107,6 +118,30 @@ fn add_mod_rule_appends_rule() {
     assert_eq!(snapshot.rows[1].mod_id, "lithium");
 
     fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn add_local_rule_rejects_traversal_mod_id() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![]);
+    let source_path = root.join("source.jar");
+    fs::write(&source_path, b"test jar").unwrap();
+
+    let result = add_mod_rule_from_root(
+        &root,
+        &AddModRuleInput {
+            modlist_name: "Pack".into(),
+            mod_id: "../evil".into(),
+            source: "local".into(),
+            file_name: Some(source_path.to_string_lossy().into_owned()),
+        },
+    );
+    let escaped_path = root.join("mod-lists").join("Pack").join("evil.jar");
+    let escaped_path_exists = escaped_path.exists();
+
+    fs::remove_dir_all(&root).unwrap();
+    assert!(result.is_err());
+    assert!(!escaped_path_exists);
 }
 
 #[test]
@@ -324,6 +359,74 @@ fn save_rule_advanced_updates_fields() {
     assert_eq!(snapshot.rows[0].requires, vec!["fabric-api"]);
     assert_eq!(snapshot.rows[0].version_rules.len(), 1);
     assert_eq!(snapshot.rows[0].custom_configs.len(), 1);
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn advanced_batch_with_unknown_id_preserves_config() {
+    let root = unique_test_root();
+    let mut rule = simple_rule("sodium");
+    rule.requires = vec!["fabric-api".into()];
+    rule.version_rules = vec![VersionRule {
+        kind: VersionRuleKind::Only,
+        mc_versions: vec!["1.21.1".into()],
+        loader: "fabric".into(),
+    }];
+    rule.custom_configs = vec![CustomConfig {
+        mc_versions: vec!["1.21.1".into()],
+        loader: "fabric".into(),
+        target_path: "config/sodium.json".into(),
+        files: vec!["sodium.json".into()],
+    }];
+    setup_modlist(&root, "Pack", vec![rule.clone()]);
+
+    let result = save_advanced_batch_from_root(
+        &root,
+        &SaveAdvancedBatchInput {
+            modlist_name: "Pack".into(),
+            requires_entries: vec![RequiresEntry {
+                mod_id: "ghost".into(),
+                requires: vec!["fabric-api".into()],
+            }],
+            version_rules_entries: vec![],
+            custom_configs_entries: vec![],
+        },
+    );
+
+    assert!(result.is_err());
+    let reloaded = load_modlist(&root, "Pack").unwrap();
+    let reloaded_rule = reloaded.find_rule("sodium").unwrap();
+    assert_eq!(reloaded_rule.requires, rule.requires);
+    assert_eq!(reloaded_rule.version_rules, rule.version_rules);
+    assert_eq!(reloaded_rule.custom_configs, rule.custom_configs);
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn save_rule_advanced_persists_exclude_if() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    save_rule_advanced_from_root(
+        &root,
+        &SaveRuleAdvancedInput {
+            modlist_name: "Pack".into(),
+            mod_id: "sodium".into(),
+            exclude_if: vec!["optifine".into()],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+        },
+    )
+    .unwrap();
+
+    let reloaded = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        reloaded.find_rule("sodium").unwrap().exclude_if,
+        vec!["optifine"]
+    );
 
     fs::remove_dir_all(&root).unwrap();
 }

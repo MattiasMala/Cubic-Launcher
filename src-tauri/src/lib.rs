@@ -22,6 +22,7 @@ pub mod mod_cache;
 pub mod modlist_assets;
 pub mod modlist_manager;
 pub mod modrinth;
+pub mod path_safety;
 pub mod offline_account;
 pub mod process_streaming;
 pub mod resolver;
@@ -44,6 +45,17 @@ pub fn run() {
 
             database::initialize_database(launcher_paths.database_path())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+            {
+                let connection =
+                    rusqlite::Connection::open(launcher_paths.database_path())
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                database::migrate_account_tokens_from_profile_data(
+                    &connection,
+                    token_storage::KeyringSecretStore::new(),
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
 
             app.manage(launcher_paths.clone());
 

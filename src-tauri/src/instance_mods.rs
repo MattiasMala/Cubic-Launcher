@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::path_safety::validate_path_component;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedModJar {
     pub jar_filename: String,
@@ -20,6 +22,10 @@ pub fn prepare_instance_mods_directory(
     instance_mods_dir: &Path,
     jars: &[CachedModJar],
 ) -> Result<PreparedInstanceMods> {
+    for jar in jars {
+        validate_path_component(&jar.jar_filename)?;
+    }
+
     fs::create_dir_all(instance_mods_dir).with_context(|| {
         format!(
             "failed to create instance mods directory at {}",
@@ -251,4 +257,34 @@ mod tests {
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
+
+    #[test]
+    fn prepare_rejects_traversal_jar_filename() {
+        let root_dir = unique_test_root();
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+        let instance_mods_dir = root_dir.join("instance").join("mods");
+        let escaped_path = root_dir.join("instance").join("evil.jar");
+        let source_path = mods_cache_dir.join("evil-source.jar");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache dir should be created");
+        fs::write(&source_path, b"evil").expect("malicious source fixture should exist");
+
+        let result = prepare_instance_mods_directory(
+            &mods_cache_dir,
+            &instance_mods_dir,
+            &[CachedModJar {
+                jar_filename: "../evil.jar".into(),
+                cache_path: source_path,
+            }],
+        );
+
+        assert!(result.is_err(), "traversal filename should be rejected");
+        assert!(
+            !escaped_path.exists(),
+            "rejected filename must not create a link outside the mods directory"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
 }

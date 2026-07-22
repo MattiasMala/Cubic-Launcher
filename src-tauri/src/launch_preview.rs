@@ -439,6 +439,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &selected_project_ids,
         )
         .await?;
+        // S1: exclude a top-level parent whose exact required dependency version
+        // conflicts with a different top-level selection of the same project, so
+        // we never load two versions of the same project. (e.g. Iris pins
+        // Sodium@old while Sodium@new is selected top-level -> drop Iris.)
+        let selected_parent_versions = parent_versions
+            .iter()
+            .map(|version| (version.project_id.clone(), version.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let exact_conflict_parents = validate_selected_parent_dependencies(
+            &parent_versions,
+            &selected_parent_versions,
+            &selected_project_ids,
+        );
+        dependency_resolution
+            .excluded_parents
+            .extend(exact_conflict_parents);
         for excluded_id in &dependency_resolution.excluded_parents {
             emit_log(
                 &app_handle,
@@ -621,7 +637,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Refreshing mods, loader libraries, configs and launch metadata.",
     )?;
 
-    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target);
+    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
     let instance_mods_dir = instance_root.join("mods");
     let instance_config_dir = instance_root.join("config");
     let instance_natives_dir = instance_root.join("natives");
