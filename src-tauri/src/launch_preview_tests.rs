@@ -8,6 +8,7 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     build_instance_root, build_modded_classpath_entries, build_top_level_owner_map,
+    deduplicate_versions,
     collect_selected_project_ids, contained_loader_library_path, embedded_min_java_requirement,
     fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
     forge_wrapper_installer_artifact, load_modlist, local_mod_jar_path,
@@ -548,6 +549,54 @@ fn exact_parent_dependency_check_uses_project_ids() {
         excluded,
         std::collections::HashSet::from(["YL57xq9U".to_string()])
     );
+}
+
+#[test]
+fn exact_parent_conflict_excludes_parent_leaving_single_project_version() {
+    // S1 end-to-end shape: Iris pins Sodium@old by exact VersionId while
+    // Sodium@new is selected top-level. The production pipeline validates the
+    // exact-version conflict, excludes Iris, then dedups — so only ONE Sodium
+    // version survives instead of loading both old and new.
+    let mut iris = sample_version("YL57xq9U", "iris-1");
+    iris.dependencies.push(ModrinthDependency {
+        version_id: Some("sodium-0.6.12".into()),
+        project_id: Some("AANobbMI".into()),
+        dependency_type: DependencyType::Required,
+        file_name: None,
+    });
+    let sodium_new = ModrinthVersion {
+        id: "sodium-0.6.13".into(),
+        ..sample_version("AANobbMI", "sodium-0.6.13")
+    };
+    let parent_versions = vec![iris.clone(), sodium_new.clone()];
+    let selected_parent_versions = parent_versions
+        .iter()
+        .map(|version| (version.project_id.clone(), version.clone()))
+        .collect::<HashMap<_, _>>();
+    let selected_project_ids = collect_selected_project_ids(&parent_versions);
+
+    // Mirror the production sequence in launch_preview.rs.
+    let excluded = validate_selected_parent_dependencies(
+        &parent_versions,
+        &selected_parent_versions,
+        &selected_project_ids,
+    );
+    let final_parent_versions = parent_versions
+        .into_iter()
+        .filter(|version| !excluded.contains(&version.project_id))
+        .collect::<Vec<_>>();
+    // The conflicting dependency (Iris's Sodium@old) rides on the excluded
+    // parent and is filtered out upstream, so it is not fetched.
+    let final_dependency_versions: Vec<ModrinthVersion> = Vec::new();
+    let resolved = deduplicate_versions(final_parent_versions, final_dependency_versions);
+
+    let sodium_versions = resolved
+        .iter()
+        .filter(|version| version.project_id == "AANobbMI")
+        .map(|version| version.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(sodium_versions, vec!["sodium-0.6.13".to_string()]);
+    assert!(!resolved.iter().any(|version| version.project_id == "YL57xq9U"));
 }
 
 #[test]
