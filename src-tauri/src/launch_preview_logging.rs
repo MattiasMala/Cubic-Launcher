@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,10 @@ const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
 
 static ACTIVE_LAUNCH_LOG_SESSION: Mutex<Option<Arc<LaunchLogSession>>> = Mutex::new(None);
 
+/// Monotonic counter guaranteeing distinct launch log directories even for two
+/// launches of the same (modlist, mc version, loader) triple within one second.
+static LAUNCH_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub(super) struct LaunchLogSession {
     dir: PathBuf,
@@ -41,15 +46,18 @@ impl LaunchLogSession {
         modlist_name: &str,
         target: &ResolutionTarget,
     ) -> Result<Arc<Self>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let sequence = LAUNCH_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let launch_id = format!(
-            "{}-{}-{}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            "{}-{}-{}-{}-{}-{}",
+            now.as_secs(),
             sanitize_log_path_component(modlist_name),
             sanitize_log_path_component(&target.minecraft_version),
             sanitize_log_path_component(target.mod_loader.as_modrinth_loader()),
+            now.subsec_nanos(),
+            sequence,
         );
         let dir = launcher_paths.launch_logs_dir().join(launch_id);
         std::fs::create_dir_all(&dir)
@@ -524,7 +532,47 @@ fn unique_error_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogUiThrottleState, ProcessLogEvent, ProcessLogStream};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{LaunchLogSession, LogUiThrottleState, ProcessLogEvent, ProcessLogStream};
+    use crate::launcher_paths::LauncherPaths;
+    use crate::resolver::{ModLoader, ResolutionTarget};
+
+    fn unique_test_root() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cubic-launch-log-test-{nanos}"))
+    }
+
+    #[test]
+    fn create_disambiguates_same_triple_within_same_second() {
+        let root = unique_test_root();
+        let launcher_paths = LauncherPaths::new(&root);
+        launcher_paths
+            .create_required_directories()
+            .expect("dirs should create");
+        let target = ResolutionTarget {
+            minecraft_version: "1.21.1".into(),
+            mod_loader: ModLoader::Fabric,
+        };
+
+        // Two launches of the identical (modlist, mc version, loader) triple
+        // back-to-back (same wall-clock second) must not share a log dir.
+        let first = LaunchLogSession::create(&launcher_paths, "My Pack", &target)
+            .expect("first session should create");
+        let second = LaunchLogSession::create(&launcher_paths, "My Pack", &target)
+            .expect("second session should create");
+
+        assert_ne!(
+            first.dir(),
+            second.dir(),
+            "same-second launches of the same triple must get distinct log dirs"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     fn stdout(line: &str) -> ProcessLogEvent {
         ProcessLogEvent {
