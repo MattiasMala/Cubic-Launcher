@@ -127,10 +127,39 @@ impl ProfilerConfig {
 }
 
 pub fn split_argument_string(arguments: &str) -> Vec<String> {
-    arguments
-        .split_whitespace()
-        .map(ToString::to_string)
-        .collect()
+    let mut parsed_arguments = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = None;
+    let mut has_token = false;
+
+    for character in arguments.chars() {
+        match in_quote {
+            Some(quote) if character == quote => {
+                in_quote = None;
+            }
+            Some(_) => current.push(character),
+            None if matches!(character, '"' | '\'') => {
+                in_quote = Some(character);
+                has_token = true;
+            }
+            None if character.is_whitespace() => {
+                if has_token {
+                    parsed_arguments.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            None => {
+                current.push(character);
+                has_token = true;
+            }
+        }
+    }
+
+    if has_token {
+        parsed_arguments.push(current);
+    }
+
+    parsed_arguments
 }
 
 pub fn join_classpath_entries(classpath_entries: &[PathBuf]) -> String {
@@ -208,6 +237,27 @@ mod tests {
             split_argument_string("  -Xmx4G   -Dfoo=bar  "),
             vec!["-Xmx4G", "-Dfoo=bar"]
         );
+    }
+
+    #[test]
+    fn split_argument_string_preserves_quoted_spaces() {
+        assert_eq!(
+            split_argument_string("-Dfoo=\"a b\""),
+            vec!["-Dfoo=a b"]
+        );
+        assert_eq!(
+            split_argument_string("-Xmx2G -Dbar=baz"),
+            vec!["-Xmx2G", "-Dbar=baz"]
+        );
+        assert_eq!(
+            split_argument_string("--arg 'x y z'"),
+            vec!["--arg", "x y z"]
+        );
+        assert_eq!(
+            split_argument_string("   "),
+            Vec::<String>::new()
+        );
+        assert_eq!(split_argument_string(""), Vec::<String>::new());
     }
 
     #[test]
