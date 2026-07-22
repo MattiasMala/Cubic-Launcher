@@ -243,14 +243,15 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
     connection: &Connection,
     _secret_store: S,
 ) -> Result<()> {
-    let rows: Vec<(String, Option<String>)> = {
-        let mut statement =
-            connection.prepare("SELECT microsoft_id, profile_data FROM accounts")?;
-        let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = {
+        let mut statement = connection
+            .prepare("SELECT microsoft_id, refresh_token_enc, profile_data FROM accounts")?;
+        let mapped =
+            statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    for (microsoft_id, profile_data) in rows {
+    for (microsoft_id, refresh_token_enc, profile_data) in rows {
         let Some(profile_data) = profile_data else {
             continue;
         };
@@ -260,17 +261,38 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
             continue;
         };
 
-        let had_tokens = map.remove("mc_access_token").is_some()
-            | map.remove("ms_refresh_token").is_some();
-        if !had_tokens {
-            continue;
+        // mc_access_token is short-lived and re-derived from the refresh token,
+        // so stripping it is always safe.
+        let removed_access = map.remove("mc_access_token").is_some();
+
+        let refresh_plaintext = map
+            .get("ms_refresh_token")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+
+        let enc_present = refresh_token_enc
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty());
+
+        let mut removed_refresh = false;
+        if refresh_plaintext.is_some() {
+            if enc_present {
+                // The encrypted column holds a copy; safe to drop the plaintext.
+                map.remove("ms_refresh_token");
+                removed_refresh = true;
+            }
+            // enc NULL/empty: DEFER — keep the plaintext, it is the only copy.
         }
 
-        let cleaned = serde_json::Value::Object(map).to_string();
-        connection.execute(
-            "UPDATE accounts SET profile_data = ?1 WHERE microsoft_id = ?2",
-            rusqlite::params![cleaned, microsoft_id],
-        )?;
+        if removed_access || removed_refresh {
+            let cleaned = serde_json::Value::Object(map).to_string();
+            connection.execute(
+                "UPDATE accounts SET profile_data = ?1 WHERE microsoft_id = ?2",
+                rusqlite::params![cleaned, microsoft_id],
+            )?;
+        }
     }
 
     Ok(())
@@ -574,7 +596,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED until fix(C1-guard): enc-NULL must not destroy the only plaintext copy"]
     fn migration_preserves_refresh_when_enc_null() {
         let (database_path, parent_dir) = fresh_db();
         let store = MemorySecretStore::default();
