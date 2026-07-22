@@ -551,6 +551,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "existing-mod".into(),
                 source: ModSource::Local,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],

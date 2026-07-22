@@ -260,6 +260,7 @@ mod tests {
                 Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec!["optifine".into()],
                     requires: vec!["lithium".into()],
                     version_rules: vec![VersionRule {
@@ -276,6 +277,7 @@ mod tests {
                     alternatives: vec![Rule {
                         mod_id: "rubidium".into(),
                         source: ModSource::Modrinth,
+                        enabled: true,
                         exclude_if: vec![],
                         requires: vec![],
                         version_rules: vec![],
@@ -286,6 +288,7 @@ mod tests {
                 Rule {
                     mod_id: "OptiFine-1.21.1".into(),
                     source: ModSource::Local,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![VersionRule {
@@ -325,6 +328,7 @@ mod tests {
                 Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![],
@@ -334,6 +338,7 @@ mod tests {
                 Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![],
@@ -354,6 +359,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "sodium".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],
@@ -361,6 +367,7 @@ mod tests {
                 alternatives: vec![Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![],
@@ -381,6 +388,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],

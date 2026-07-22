@@ -435,6 +435,7 @@ mod tests {
 
     use super::{
         collect_required_dependency_requests, resolve_dependency_requests, DependencyLink,
+        build_dependency_candidate, finalize_dependency_candidates,
         DependencyRequest, DependencyResolution, DependencySelector,
     };
 

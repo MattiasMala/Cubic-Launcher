@@ -678,6 +678,7 @@ mod tests {
             Rule {
                 mod_id: "embeddium".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec!["sodium".into()],
                 requires: vec![],
                 version_rules: vec![],
@@ -706,6 +707,7 @@ mod tests {
             Rule {
                 mod_id: "sodium".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec!["fabric-api".into()],
                 version_rules: vec![],
@@ -723,6 +725,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "sodium".into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec!["fabric-api".into()],
             version_rules: vec![],
@@ -745,6 +748,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "sodium".into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![VersionRule {
@@ -772,6 +776,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "optifine".into(),
             source: ModSource::Local,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![VersionRule {
@@ -792,6 +797,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "optifine".into(),
             source: ModSource::Local,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![VersionRule {
@@ -812,6 +818,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "sodium".into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![VersionRule {
@@ -858,6 +865,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "a".into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec!["missing".into()], // fails
             version_rules: vec![],
@@ -866,6 +874,7 @@ mod tests {
                 Rule {
                     mod_id: "b".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec!["also-missing".into()], // also fails
                     version_rules: vec![],
@@ -891,6 +900,7 @@ mod tests {
         let ml = modlist(vec![Rule {
             mod_id: "a".into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec!["missing".into()],
             version_rules: vec![],
@@ -898,6 +908,7 @@ mod tests {
             alternatives: vec![Rule {
                 mod_id: "b".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec!["also-missing".into()],
                 version_rules: vec![],
@@ -923,6 +934,7 @@ mod tests {
             Rule {
                 mod_id: "mod-b".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec!["sodium".into()],
                 requires: vec![],
                 version_rules: vec![],

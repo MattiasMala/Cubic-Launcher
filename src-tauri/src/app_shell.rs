@@ -620,6 +620,7 @@ mod tests {
             rules: vec![Rule {
                 mod_id: "sodium".into(),
                 source: ModSource::Modrinth,
+                enabled: true,
                 exclude_if: vec![],
                 requires: vec![],
                 version_rules: vec![],
