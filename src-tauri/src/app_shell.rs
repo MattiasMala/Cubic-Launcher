@@ -151,15 +151,10 @@ pub async fn microsoft_login_command(
                 microsoft_id: login_result.microsoft_id.clone(),
                 xbox_gamertag: Some(login_result.minecraft_username.clone()),
                 minecraft_uuid: Some(login_result.minecraft_uuid.clone()),
-                profile_data: Some(
-                    serde_json::json!({
-                        "username": login_result.minecraft_username,
-                        "uuid": login_result.minecraft_uuid,
-                        "mc_access_token": login_result.minecraft_access_token,
-                        "ms_refresh_token": login_result.microsoft_refresh_token,
-                    })
-                    .to_string(),
-                ),
+                profile_data: Some(account_profile_data_json(
+                    &login_result.minecraft_username,
+                    &login_result.minecraft_uuid,
+                )),
             },
             ManagedAccountTokens {
                 access_token: login_result.minecraft_access_token.clone(),
@@ -172,6 +167,20 @@ pub async fn microsoft_login_command(
     Ok(login_result
         .xbox_gamertag
         .unwrap_or(login_result.microsoft_id))
+}
+
+/// Build the profile_data JSON stored for an account.
+///
+/// SECURITY (C1): profile_data is persisted UNENCRYPTED, so it MUST contain
+/// only non-sensitive display metadata (username, uuid). Access/refresh tokens
+/// live exclusively in the AES-GCM encrypted `access_token_enc`/`refresh_token_enc`
+/// columns and MUST NOT be written here.
+pub fn account_profile_data_json(username: &str, uuid: &str) -> String {
+    serde_json::json!({
+        "username": username,
+        "uuid": uuid,
+    })
+    .to_string()
 }
 
 #[tauri::command]
@@ -570,8 +579,8 @@ mod tests {
     use crate::rules::{ModList, ModSource, Rule};
 
     use super::{
-        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
-        ShellGlobalSettingsInput, ShellModListOverridesInput,
+        account_profile_data_json, load_shell_snapshot_from_root, save_global_settings,
+        save_modlist_overrides, ShellGlobalSettingsInput, ShellModListOverridesInput,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -581,6 +590,18 @@ mod tests {
             .as_nanos();
 
         env::temp_dir().join(format!("cubic-launcher-shell-snapshot-test-{timestamp}"))
+    }
+
+    #[test]
+    fn account_profile_data_json_excludes_tokens() {
+        let json = account_profile_data_json("PlayerOne", "uuid-1");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("profile data should be valid json");
+
+        assert_eq!(parsed.get("username").and_then(|v| v.as_str()), Some("PlayerOne"));
+        assert_eq!(parsed.get("uuid").and_then(|v| v.as_str()), Some("uuid-1"));
+        assert!(parsed.get("mc_access_token").is_none());
+        assert!(parsed.get("ms_refresh_token").is_none());
     }
 
     #[test]

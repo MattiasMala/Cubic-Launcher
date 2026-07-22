@@ -551,11 +551,12 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
         )
     })?;
 
-    // Read the raw active account; no decryption is needed because we use profile_data.
-    // Extract all data from DB BEFORE any async work (Connection is not Send).
+    // SECURITY (C1): decrypt the active account from the AES-GCM encrypted
+    // columns. profile_data no longer carries tokens. Extract everything BEFORE
+    // async work (Connection is not Send).
     let raw_account = {
-        use crate::microsoft_auth::AccountsRepository as RawRepo;
-        RawRepo::new(&connection)
+        use crate::token_storage::{EncryptedAccountsRepository, KeyringSecretStore};
+        EncryptedAccountsRepository::new(&connection, KeyringSecretStore::new())
             .load_active_account()
             .ok()
             .flatten()
@@ -577,17 +578,14 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
 
         let uuid = format_uuid_with_dashes(
             &raw.minecraft_uuid
+                .clone()
                 .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
         );
 
         let microsoft_id = raw.microsoft_id.clone();
 
-        // Try to refresh the Minecraft access token using the stored MS refresh token.
-        let ms_refresh = profile.as_ref().and_then(|v| {
-            v.get("ms_refresh_token")
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        });
+        // Refresh the Minecraft access token using the decrypted MS refresh token.
+        let ms_refresh = raw.refresh_token.clone();
 
         if let Some(refresh_token) = ms_refresh {
             if !refresh_token.is_empty() {
@@ -642,20 +640,34 @@ pub(super) async fn load_player_identity(launcher_paths: &LauncherPaths) -> Resu
                                     "[Auth] Full auth chain OK: username={}",
                                     login.minecraft_username
                                 );
-                                // Update stored tokens in profile_data.
-                                let new_profile = serde_json::json!({
-                                    "username": login.minecraft_username,
-                                    "uuid": login.minecraft_uuid,
-                                    "mc_access_token": login.minecraft_access_token,
-                                    "ms_refresh_token": ms_tokens.refresh_token.as_deref()
-                                        .unwrap_or(&refresh_token),
-                                });
+                                // SECURITY (C1): persist rotated tokens into the
+                                // encrypted columns; profile_data stays token-free.
+                                let rotated_refresh = ms_tokens
+                                    .refresh_token
+                                    .clone()
+                                    .unwrap_or_else(|| refresh_token.clone());
+                                let new_profile = crate::app_shell::account_profile_data_json(
+                                    &login.minecraft_username,
+                                    &login.minecraft_uuid,
+                                );
                                 if let Ok(conn) = Connection::open(&db_path) {
-                                    use crate::microsoft_auth::AccountsRepository as RawRepo;
-                                    let _ = RawRepo::new(&conn).update_profile_data(
-                                        &microsoft_id,
-                                        &new_profile.to_string(),
-                                    );
+                                    use crate::token_storage::{
+                                        EncryptedAccountsRepository, KeyringSecretStore,
+                                        PlaintextAccountRecord,
+                                    };
+                                    let _ = EncryptedAccountsRepository::new(
+                                        &conn,
+                                        KeyringSecretStore::new(),
+                                    )
+                                    .upsert_account(&PlaintextAccountRecord {
+                                        microsoft_id: microsoft_id.clone(),
+                                        xbox_gamertag: raw.xbox_gamertag.clone(),
+                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
+                                        access_token: Some(login.minecraft_access_token.clone()),
+                                        refresh_token: Some(rotated_refresh),
+                                        profile_data: Some(new_profile),
+                                        is_active: true,
+                                    });
                                 }
 
                                 return Ok(PlayerIdentity {
