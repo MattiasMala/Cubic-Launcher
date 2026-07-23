@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use anyhow::{bail, Context, Result};
 use tauri::State;
 
@@ -11,9 +9,7 @@ use tauri::State;
 // orchestrator makes launch behavior easier to audit without returning to one
 // very large mixed-responsibility file.
 use crate::app_shell::load_shell_snapshot_from_root;
-use crate::dependencies::{
-    collect_required_dependency_requests, resolve_required_dependencies_with_client,
-};
+use crate::dependencies::DependencyResolution;
 use crate::instance_configs::{prepare_instance_config_directory, CachedConfigPlacement};
 use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_version_for_minecraft;
@@ -48,9 +44,6 @@ use artifacts::*;
 mod cache;
 use cache::*;
 
-#[path = "launch_preview_dependency_resolution.rs"]
-mod dependency_resolution;
-use dependency_resolution::*;
 
 #[path = "launch_preview_models.rs"]
 mod models;
@@ -340,7 +333,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         emit_log(
             &app_handle,
             ProcessLogStream::Stdout,
-            "[Cache] Cache-only mode enabled. Reusing cached artifacts only; uncached mods and dependencies will be skipped."
+            "[Cache] Cache-only mode enabled. Reusing cached artifacts only; uncached mods are skipped."
                 .to_string(),
         )?;
 
@@ -349,60 +342,25 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         let parent_artifact_values = parent_artifacts.into_values().collect::<Vec<_>>();
         let (parent_versions, cached_parent_records) =
             split_remote_artifacts(&parent_artifact_values);
-        let mut selected_project_ids = collect_selected_project_ids(&parent_versions);
-        selected_project_ids.extend(
-            cached_parent_records
-                .iter()
-                .map(|record| record.modrinth_project_id.clone()),
-        );
 
-        let mut dependency_requests = collect_required_dependency_requests(&parent_versions)?;
-        let cached_parent_ids = cached_parent_records
-            .iter()
-            .map(|record| record.modrinth_project_id.clone())
-            .collect::<Vec<_>>();
-        dependency_requests.extend(load_cached_dependency_requests(
+        // DESIGN: the launcher does not manage dependencies. Detect & report the
+        // requirements the selected mods DECLARE (best-effort over the live
+        // parent versions; cached-only records carry no dep metadata offline),
+        // then download ONLY what the user selected.
+        let notices = detect_dependency_notices(
             &launcher_paths,
-            &cached_parent_ids,
-        )?);
+            &http_client,
+            &modrinth_client,
+            &target,
+            &parent_versions,
+        )
+        .await;
+        emit_dependency_notices(&app_handle, &notices)?;
 
-        let (dependency_resolution, dependency_artifacts) =
-            resolve_dependency_requests_with_cache_fallback(
-                &launcher_paths,
-                &dependency_requests,
-                &selected_project_ids,
-                &target,
-            )
-            .await?;
-
-        if !dependency_resolution.excluded_parents.is_empty() {
-            for excluded_id in &dependency_resolution.excluded_parents {
-                emit_log(
-                        &app_handle,
-                        ProcessLogStream::Stdout,
-                        format!(
-                            "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
-                            excluded_id
-                        ),
-                    )?;
-            }
-        }
-
-        let filtered_parent_artifacts = parent_artifact_values
-            .into_iter()
-            .filter(|artifact| {
-                !dependency_resolution
-                    .excluded_parents
-                    .contains(remote_artifact_project_id(artifact))
-            })
-            .collect::<Vec<_>>();
-        let mut all_artifacts = filtered_parent_artifacts;
-        all_artifacts.extend(dependency_artifacts);
-        let (live_versions, cached_records) = split_remote_artifacts(&all_artifacts);
         (
-            live_versions,
-            cached_records,
-            dependency_resolution,
+            parent_versions,
+            cached_parent_records,
+            DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             Vec::new(),
         )
@@ -431,99 +389,26 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                     .map(|version| (selected.mod_id.clone(), version.project_id.clone()))
             })
             .collect::<Vec<_>>();
-        let selected_project_ids = collect_selected_project_ids(&parent_versions);
-        let mut dependency_resolution = resolve_required_dependencies_with_client(
-            &parent_versions,
-            &target,
-            &modrinth_client,
-            &selected_project_ids,
-        )
-        .await?;
-        // S1: exclude a top-level parent whose exact required dependency version
-        // conflicts with a different top-level selection of the same project, so
-        // we never load two versions of the same project. (e.g. Iris pins
-        // Sodium@old while Sodium@new is selected top-level -> drop Iris.)
-        let selected_parent_versions = parent_versions
-            .iter()
-            .map(|version| (version.project_id.clone(), version.clone()))
-            .collect::<std::collections::HashMap<_, _>>();
-        let exact_conflict_parents = validate_selected_parent_dependencies(
-            &parent_versions,
-            &selected_parent_versions,
-            &selected_project_ids,
-        );
-        dependency_resolution
-            .excluded_parents
-            .extend(exact_conflict_parents);
-        for excluded_id in &dependency_resolution.excluded_parents {
-            emit_log(
-                &app_handle,
-                ProcessLogStream::Stdout,
-                format!(
-                    "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
-                    excluded_id
-                ),
-            )?;
-        }
-        let final_parent_versions = parent_versions
-            .into_iter()
-            .filter(|version| {
-                !dependency_resolution
-                    .excluded_parents
-                    .contains(&version.project_id)
-            })
-            .collect::<Vec<_>>();
-        let allowed_parent_ids = final_parent_versions
-            .iter()
-            .map(|version| version.project_id.clone())
-            .collect::<HashSet<_>>();
-        dependency_resolution
-            .links
-            .retain(|link| allowed_parent_ids.contains(&link.parent_mod_id));
-        let allowed_dependency_ids = dependency_resolution
-            .links
-            .iter()
-            .map(|link| link.dependency_id.clone())
-            .collect::<HashSet<_>>();
-        dependency_resolution
-            .resolved_dependencies
-            .retain(|dependency| allowed_dependency_ids.contains(&dependency.dependency_id));
-        let mut final_dependency_versions = fetch_dependency_versions(
-            &dependency_resolution.resolved_dependencies,
-            &modrinth_client,
-        )
-        .await?;
-        final_dependency_versions
-            .retain(|version| allowed_dependency_ids.contains(&version.project_id));
-        resolve_embedded_metadata_dependencies(
-            &app_handle,
+
+        // DESIGN: no auto-resolution, no pinning, no parent exclusion, no
+        // constraint-solving. Each selected mod is the latest exact-tagged
+        // version, independent of what the others declare. We DETECT declared
+        // requirements (Modrinth metadata incl. version_id pins + embedded
+        // fabric.mod.json predicates) and REPORT them; the user decides.
+        let notices = detect_dependency_notices(
             &launcher_paths,
             &http_client,
             &modrinth_client,
             &target,
-            &final_parent_versions,
-            &mut final_dependency_versions,
-            &mut dependency_resolution,
+            &parent_versions,
         )
-        .await?;
-        suppress_redundant_bundled_dependencies(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &target,
-            &final_parent_versions,
-            &mut final_dependency_versions,
-            &mut dependency_resolution,
-        )
-        .await?;
-        launch_log_session.append_summary_line(&format!(
-            "excluded_top_level_mods={}",
-            dependency_resolution.excluded_parents.len()
-        ))?;
+        .await;
+        emit_dependency_notices(&app_handle, &notices)?;
+
         (
-            deduplicate_versions(final_parent_versions, final_dependency_versions),
+            parent_versions,
             Vec::new(),
-            dependency_resolution,
+            DependencyResolution::default(),
             required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
