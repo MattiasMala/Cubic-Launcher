@@ -646,3 +646,206 @@ pub(super) fn validate_selected_parent_dependencies(
 
     excluded_parents
 }
+
+// ── Informational dependency detection (no auto-management) ──────────────────
+//
+// The launcher does NOT manage dependencies. It DETECTS what each selected mod
+// DECLARES it needs — from Modrinth metadata (incl. a version_id pin) and from
+// the embedded fabric.mod.json version predicates — evaluates it against what is
+// actually in the modlist for the EXACT target, and reports mismatches as
+// informational notices. It never downloads a declared dependency, never pins,
+// never excludes a parent. The user decides (manual jar / removal); Fabric is
+// the runtime safety net.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DependencyNoticeKind {
+    /// A declared required dependency's project is not in the modlist at all.
+    Missing,
+    /// The dependency project IS in the modlist, but the requirement declares a
+    /// version (Modrinth version_id pin, or an embedded predicate) that the
+    /// selected exact-tagged version does not satisfy.
+    VersionUnsatisfied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DependencyNotice {
+    pub(super) requiring_project_id: String,
+    pub(super) dependency_id: String,
+    pub(super) kind: DependencyNoticeKind,
+    pub(super) detail: String,
+}
+
+/// Pure core: notices from Modrinth-declared REQUIRED dependencies of the
+/// selected top-level versions, evaluated against the selected set.
+///
+/// - dependency project not selected                 → Missing
+/// - dependency selected but pinned version_id differs from the selected
+///   version's id                                    → VersionUnsatisfied
+///
+/// `selected_versions` maps project_id → the selected ModrinthVersion.
+/// `pin_labels` maps a pinned version_id → a human label (version_number) when
+/// known (resolved only to REPORT, never to download); missing labels fall back
+/// to the raw id.
+pub(super) fn detect_modrinth_declared_notices(
+    parent_versions: &[ModrinthVersion],
+    selected_versions: &HashMap<String, ModrinthVersion>,
+    pin_labels: &HashMap<String, String>,
+) -> Vec<DependencyNotice> {
+    let mut notices = Vec::new();
+
+    for parent in parent_versions {
+        for dependency in &parent.dependencies {
+            if dependency.dependency_type != DependencyType::Required {
+                continue;
+            }
+            let Some(project_id) = dependency
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            let pin = dependency
+                .version_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            match selected_versions.get(project_id) {
+                None => {
+                    let want = pin
+                        .map(|id| {
+                            format!(
+                                " {}",
+                                pin_labels.get(id).cloned().unwrap_or_else(|| id.to_string())
+                            )
+                        })
+                        .unwrap_or_default();
+                    notices.push(DependencyNotice {
+                        requiring_project_id: parent.project_id.clone(),
+                        dependency_id: project_id.to_string(),
+                        kind: DependencyNoticeKind::Missing,
+                        detail: format!(
+                            "'{}' declares it requires '{}'{} — not present in this mod-list for this Minecraft version.",
+                            parent.project_id, project_id, want
+                        ),
+                    });
+                }
+                Some(selected) => {
+                    if let Some(pin) = pin {
+                        if pin != selected.id {
+                            let want = pin_labels
+                                .get(pin)
+                                .cloned()
+                                .unwrap_or_else(|| pin.to_string());
+                            notices.push(DependencyNotice {
+                                requiring_project_id: parent.project_id.clone(),
+                                dependency_id: project_id.to_string(),
+                                kind: DependencyNoticeKind::VersionUnsatisfied,
+                                detail: format!(
+                                    "'{}' declares it requires '{}' version {} — the mod-list has version {} for this Minecraft version.",
+                                    parent.project_id, project_id, want, selected.version_number
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    notices
+}
+
+/// Pure core: convert an embedded-predicate FabricValidationIssue into a notice.
+/// `incompatible_dependency_version`/`breaks_conflict` → VersionUnsatisfied;
+/// `missing_dependency` → Missing.
+pub(super) fn fabric_issue_to_notice(
+    requiring_project_id: &str,
+    issue: &FabricValidationIssue,
+) -> DependencyNotice {
+    let kind = match issue.reason_code {
+        "missing_dependency" => DependencyNoticeKind::Missing,
+        _ => DependencyNoticeKind::VersionUnsatisfied,
+    };
+    DependencyNotice {
+        requiring_project_id: requiring_project_id.to_string(),
+        dependency_id: issue.dependency_id.clone().unwrap_or_default(),
+        kind,
+        detail: format!(
+            "'{}' (embedded '{}'): {}",
+            requiring_project_id, issue.mod_id, issue.detail
+        ),
+    }
+}
+
+/// Async wrapper: gather Modrinth-declared + embedded-predicate notices for the
+/// selected top-level versions. Network is used ONLY to read a pin's label and
+/// to read embedded metadata from the already-cached jars — never to download a
+/// declared dependency. Best-effort: network failures degrade to raw ids /
+/// skipped embedded checks, never block the launch.
+pub(super) async fn detect_dependency_notices(
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    parent_versions: &[ModrinthVersion],
+) -> Vec<DependencyNotice> {
+    let selected_versions: HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|version| (version.project_id.clone(), version.clone()))
+        .collect();
+
+    // Resolve pin labels for reporting only (best-effort).
+    let mut pin_labels = HashMap::new();
+    for parent in parent_versions {
+        for dependency in &parent.dependencies {
+            if dependency.dependency_type != DependencyType::Required {
+                continue;
+            }
+            if let Some(pin) = dependency
+                .version_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if !pin_labels.contains_key(pin) {
+                    if let Ok(Some(version)) = client.fetch_version(pin).await {
+                        pin_labels.insert(pin.to_string(), version.version_number);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut notices =
+        detect_modrinth_declared_notices(parent_versions, &selected_versions, &pin_labels);
+
+    // Embedded fabric.mod.json predicates over the selected jars (already cached).
+    if let Ok(metadata_entries) =
+        load_embedded_fabric_metadata_for_versions(launcher_paths, http_client, parent_versions, target)
+            .await
+    {
+        let owner_map = build_top_level_owner_map(parent_versions, &[]);
+        let issues = validate_final_fabric_runtime(&metadata_entries, &owner_map);
+        for (requiring_project_id, issue) in issues {
+            let notice = fabric_issue_to_notice(&requiring_project_id, &issue);
+            // De-dup against a Modrinth-declared notice for the same pair.
+            if !notices.iter().any(|existing| {
+                existing.requiring_project_id == notice.requiring_project_id
+                    && existing.dependency_id == notice.dependency_id
+            }) {
+                notices.push(notice);
+            }
+        }
+    }
+
+    notices.sort_by(|left, right| {
+        left.requiring_project_id
+            .cmp(&right.requiring_project_id)
+            .then_with(|| left.dependency_id.cmp(&right.dependency_id))
+    });
+    notices
+}

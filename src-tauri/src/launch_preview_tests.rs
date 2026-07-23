@@ -16,9 +16,10 @@ use super::{
     merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
     minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
     substitute_known_placeholders, validate_content_filename, validate_final_fabric_runtime,
-    validate_selected_parent_dependencies, automation_exit_code, EffectiveLaunchSettings,
+    validate_selected_parent_dependencies, automation_exit_code, detect_modrinth_declared_notices,
+    fabric_issue_to_notice, DependencyNoticeKind, EffectiveLaunchSettings,
     EmbeddedFabricModMetadata, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
+    FabricValidationIssue, LaunchPlaceholders, LaunchVerificationRequest, LaunchVerificationResult,
     OwnedEmbeddedFabricModMetadata, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -810,4 +811,115 @@ fn automation_env_does_not_silently_drop_fields() {
     assert_eq!(back, request);
     assert_eq!(back.success_after_seconds, 10);
     assert!(!back.terminate_on_timeout);
+}
+
+// ── Informational dependency detection (no auto-management) ──────────────────
+
+fn version_with_required_dep(
+    project_id: &str,
+    version_id: &str,
+    dep_project: &str,
+    dep_version_id: Option<&str>,
+) -> ModrinthVersion {
+    let mut v = sample_version(project_id, version_id);
+    v.dependencies.push(ModrinthDependency {
+        version_id: dep_version_id.map(|s| s.to_string()),
+        project_id: Some(dep_project.to_string()),
+        dependency_type: DependencyType::Required,
+        file_name: None,
+    });
+    v
+}
+
+#[test]
+fn iris_pinned_dep_produces_notice_without_excluding_or_downloading() {
+    // Iris (YL57xq9U) requires sodium (AANobbMI) pinned to version_id vf7UgZpC
+    // (sodium 0.9.1, not tagged for 26.1). The mod-list has sodium 0.8.9
+    // (version id 'sodium-0.8.9') top-level. Under the new design: Iris is NOT
+    // excluded, the pin is NOT downloaded — a single informational notice is
+    // produced reporting the version mismatch.
+    let iris = version_with_required_dep("YL57xq9U", "iris-1.11.2", "AANobbMI", Some("vf7UgZpC"));
+    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
+    let parent_versions = vec![iris.clone(), sodium.clone()];
+    let selected: std::collections::HashMap<String, ModrinthVersion> = parent_versions
+        .iter()
+        .map(|v| (v.project_id.clone(), v.clone()))
+        .collect();
+    let mut pin_labels = std::collections::HashMap::new();
+    pin_labels.insert("vf7UgZpC".to_string(), "0.9.1".to_string());
+
+    let notices = detect_modrinth_declared_notices(&parent_versions, &selected, &pin_labels);
+
+    assert_eq!(notices.len(), 1, "exactly one notice for the pin mismatch");
+    let notice = &notices[0];
+    assert_eq!(notice.requiring_project_id, "YL57xq9U");
+    assert_eq!(notice.dependency_id, "AANobbMI");
+    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
+    assert!(notice.detail.contains("0.9.1"), "reports the declared version");
+    // Both mods remain selectable — detection never mutates the selection.
+    assert!(selected.contains_key("YL57xq9U") && selected.contains_key("AANobbMI"));
+}
+
+#[test]
+fn missing_declared_dependency_produces_missing_notice() {
+    // A parent requires a project that is NOT in the mod-list at all.
+    let parent = version_with_required_dep("parent", "parent-1", "absent-dep", None);
+    let parent_versions = vec![parent.clone()];
+    let selected: std::collections::HashMap<String, ModrinthVersion> =
+        parent_versions.iter().map(|v| (v.project_id.clone(), v.clone())).collect();
+
+    let notices = detect_modrinth_declared_notices(
+        &parent_versions,
+        &selected,
+        &std::collections::HashMap::new(),
+    );
+
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].kind, DependencyNoticeKind::Missing);
+    assert_eq!(notices[0].dependency_id, "absent-dep");
+}
+
+#[test]
+fn satisfied_declared_dependency_produces_no_notice() {
+    // Parent requires sodium project with NO pin; sodium is present. No notice.
+    let parent = version_with_required_dep("parent", "parent-1", "AANobbMI", None);
+    let sodium = sample_version("AANobbMI", "sodium-0.8.9");
+    let parent_versions = vec![parent, sodium];
+    let selected: std::collections::HashMap<String, ModrinthVersion> =
+        parent_versions.iter().map(|v| (v.project_id.clone(), v.clone())).collect();
+
+    let notices = detect_modrinth_declared_notices(
+        &parent_versions,
+        &selected,
+        &std::collections::HashMap::new(),
+    );
+    assert!(notices.is_empty(), "present unpinned dependency yields no notice");
+}
+
+#[test]
+fn rso_embedded_incompatible_version_maps_to_version_unsatisfied_notice() {
+    // RSO (Bh37bMuy) embedded fabric.mod.json requires sodium >=0.9.1 while
+    // sodium 0.8.9 is present -> the predicate-aware validator yields an
+    // incompatible_dependency_version issue, which becomes a
+    // "present but older" VersionUnsatisfied notice.
+    let issue = FabricValidationIssue {
+        reason_code: "incompatible_dependency_version",
+        owner_project_id: "Bh37bMuy".into(),
+        mod_id: "reeses_sodium_options".into(),
+        dependency_id: Some("sodium".into()),
+        detail: "embedded metadata requires 'sodium' with a compatible version, but only incompatible versions are present".into(),
+    };
+    let notice = fabric_issue_to_notice("Bh37bMuy", &issue);
+    assert_eq!(notice.kind, DependencyNoticeKind::VersionUnsatisfied);
+    assert_eq!(notice.requiring_project_id, "Bh37bMuy");
+    assert_eq!(notice.dependency_id, "sodium");
+
+    let missing = FabricValidationIssue {
+        reason_code: "missing_dependency",
+        owner_project_id: "Bh37bMuy".into(),
+        mod_id: "reeses_sodium_options".into(),
+        dependency_id: Some("sodium".into()),
+        detail: "embedded metadata requires 'sodium', which is missing".into(),
+    };
+    assert_eq!(fabric_issue_to_notice("Bh37bMuy", &missing).kind, DependencyNoticeKind::Missing);
 }
