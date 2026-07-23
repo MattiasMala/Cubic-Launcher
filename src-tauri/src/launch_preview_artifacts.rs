@@ -32,6 +32,14 @@ pub(super) enum RemoteArtifact {
     Live(ModrinthVersion),
     Cached(ModCacheRecord),
 }
+/// Pick the latest candidate by `date_published` (RFC3339 UTC, so lexicographic
+/// comparison is chronological). Deterministic regardless of the order the
+/// Modrinth API returned the versions in. Candidates are already filtered to the
+/// exact/wildcard-compatible set by `fetch_project_versions`.
+fn select_latest_by_date(mut versions: Vec<ModrinthVersion>) -> Option<ModrinthVersion> {
+    versions.sort_by(|a, b| b.date_published.cmp(&a.date_published));
+    versions.into_iter().next()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DownloadArtifact {
@@ -112,7 +120,7 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
             .await
         {
             Ok(candidate_versions) => {
-                if let Some(version) = candidate_versions.into_iter().next() {
+                if let Some(version) = select_latest_by_date(candidate_versions) {
                     versions.insert(selected.mod_id.clone(), version);
                 }
             }
@@ -436,4 +444,36 @@ pub(super) fn collect_top_level_version_candidates(
     }
 
     top_level_candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_version(id: &str, date_published: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: id.into(),
+            project_id: "example-project".into(),
+            version_number: id.into(),
+            name: id.into(),
+            game_versions: vec!["26.1".into()],
+            loaders: vec!["fabric".into()],
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            date_published: date_published.into(),
+        }
+    }
+
+    #[test]
+    fn select_latest_by_date_is_order_independent() {
+        let january = test_version("january", "2024-01-01T00:00:00Z");
+        let june = test_version("june", "2024-06-01T00:00:00Z");
+        let march = test_version("march", "2024-03-01T00:00:00Z");
+
+        let first = select_latest_by_date(vec![january.clone(), june.clone(), march.clone()]);
+        let second = select_latest_by_date(vec![march, january, june.clone()]);
+
+        assert_eq!(first, Some(june.clone()));
+        assert_eq!(second, Some(june));
+    }
 }
