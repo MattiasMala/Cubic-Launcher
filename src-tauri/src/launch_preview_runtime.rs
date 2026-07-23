@@ -798,23 +798,9 @@ pub(super) async fn select_or_download_java(
     )?;
     let archive_path = plan.archive_path.clone();
     let install_dir = plan.install_dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::open(&archive_path)
-            .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
-        archive.extract(&install_dir).with_context(|| {
-            format!(
-                "failed to extract Java archive to {}",
-                install_dir.display()
-            )
-        })?;
-        // Clean up archive file.
-        let _ = std::fs::remove_file(&archive_path);
-        Ok(())
-    })
-    .await
-    .context("Java extraction task panicked")??;
+    tokio::task::spawn_blocking(move || extract_java_archive(&archive_path, &install_dir))
+        .await
+        .context("Java extraction task panicked")??;
 
     // Re-scan and select.
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
@@ -829,6 +815,65 @@ pub(super) async fn select_or_download_java(
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// Extract a downloaded JRE archive into `install_dir`, dispatching on the
+/// archive format by extension.
+///
+/// Adoptium ships `.tar.gz` on Linux/macOS and `.zip` on Windows. The tar path
+/// preserves the unix mode bits stored in the archive, so the extracted `java`
+/// binary keeps its executable permission; the previous zip-only code failed
+/// outright on the `.tar.gz` archives (`invalid Zip archive`), making the first
+/// launch impossible on unix. The archive file is removed after a successful
+/// extraction.
+fn extract_java_archive(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let name = archive_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(archive_path, install_dir)?;
+    } else if name.ends_with(".zip") {
+        extract_zip(archive_path, install_dir)?;
+    } else {
+        bail!(
+            "unsupported Java archive format for {} (expected .tar.gz or .zip)",
+            archive_path.display()
+        );
+    }
+
+    let _ = std::fs::remove_file(archive_path);
+    Ok(())
+}
+
+fn extract_tar_gz(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    // Preserve the mode bits recorded in the tar entries so the extracted
+    // `bin/java` retains its executable permission.
+    archive.set_preserve_permissions(true);
+    archive.unpack(install_dir).with_context(|| {
+        format!(
+            "failed to extract Java tar.gz archive to {}",
+            install_dir.display()
+        )
+    })
+}
+
+fn extract_zip(archive_path: &Path, install_dir: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
+    archive.extract(install_dir).with_context(|| {
+        format!(
+            "failed to extract Java zip archive to {}",
+            install_dir.display()
+        )
+    })
 }
 
 pub(super) fn format_uuid_with_dashes(uuid: &str) -> String {
@@ -925,7 +970,10 @@ mod tests {
 
     use zip::write::FileOptions;
 
-    use super::{forge_profile_libraries_from_json, read_forge_installer_profile_libraries};
+    use super::{
+        extract_java_archive, forge_profile_libraries_from_json,
+        read_forge_installer_profile_libraries,
+    };
 
     fn forge_version_json() -> &'static str {
         r#"{
@@ -1011,5 +1059,67 @@ mod tests {
         assert!(libraries
             .iter()
             .any(|library| library.name == "org.apache.logging.log4j:log4j-core:2.15.0"));
+    }
+
+    #[test]
+    fn extract_java_archive_unpacks_tar_gz_preserving_exec_bit() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "cubic-java-extract-{unique}-{}",
+            std::process::id()
+        ));
+        let archive_path = base.with_extension("tar.gz");
+        let install_dir = base.join("install");
+
+        // Build a REAL .tar.gz fixture (not mocked): a bin/java entry with mode
+        // 0o755, mirroring an Adoptium JRE layout.
+        let script = b"#!/bin/sh\necho harness-java\n";
+        {
+            let file = std::fs::File::create(&archive_path).expect("archive create");
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "jdk-17/bin/java", &script[..])
+                .expect("append java entry");
+            builder.into_inner().expect("finish tar").finish().expect("finish gz");
+        }
+
+        extract_java_archive(&archive_path, &install_dir).expect("tar.gz should extract");
+
+        let extracted = install_dir.join("jdk-17/bin/java");
+        assert!(extracted.exists(), "java binary should be extracted");
+        assert_eq!(
+            std::fs::read(&extracted).expect("read extracted java"),
+            script,
+            "extracted content must match"
+        );
+        // The archive file is removed after a successful extraction.
+        assert!(!archive_path.exists(), "archive should be cleaned up");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&extracted)
+                .expect("stat extracted java")
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o111,
+                0,
+                "tar extraction must preserve the executable bit (mode={mode:o})"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
