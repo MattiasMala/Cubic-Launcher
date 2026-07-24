@@ -135,20 +135,27 @@ def run_combo(
     binary: str | None = None,
     display: str = "xvfb",
     external_margin_s: int = 120,
-    reset_db_before: bool = True,
+    reset_db_before: bool = False,
 ) -> ComboResult:
     """Launch one combo and return the validated result.
 
     The launcher writes verification.json to CUBIC_AUTOMATION_VERIFY_OUTPUT; we
     also enforce an external safety timeout of timeoutSeconds + margin so a hung
     process is always killed.
+
+    reset_db_before defaults to False: the DB is seeded ONCE at workspace setup,
+    and the cache pass relies on modlist_settings (cache_only) + accumulated
+    mod_cache surviving across launches. Resetting per-launch would wipe both.
+    (The launcher still re-runs its token migration at every startup, so the
+    token-free security property holds regardless.)
     """
     binary_path = _resolve_binary(binary)
     output_path = workspace.launcher_root / f"verify-{spec.loader}-{spec.mc_version}.json"
     if output_path.exists():
         output_path.unlink()
 
-    # Fresh, token-free DB each launch; cache/ and mod-lists/ are preserved.
+    # Opt-in only: fresh, token-free DB for this launch (re-seed to keep an
+    # active account). Off by default so cache/settings persist across the matrix.
     if reset_db_before:
         workspace.reset_database()
         workspace.seed_offline_account()

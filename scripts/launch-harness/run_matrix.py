@@ -138,17 +138,28 @@ def run_matrix(
     timeout: int,
     report_dir: Path,
     keep: bool,
+    workspace_path: str | None = None,
 ) -> bool:
     combos = ci_matrix() if scope == "ci" else full_local_matrix()
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    with HarnessWorkspace(keep=keep) as ws:
-        print(f"[harness] workspace root: {ws.launcher_root}")
-        ws.seed_offline_account()
-        # Base modlists: reuse one empty modlist name for all base combos.
-        ws.create_modlist(vanilla_modlist(BASE_MODLIST))
-        # H6 fixture available for opt-in modded runs (not in the base matrix).
-        ws.create_modlist(h6_modlist())
+    if workspace_path is not None:
+        # Reuse an existing external data root (e.g. a hand-created instance):
+        # never reset/zero it, seed only if the account is absent, and never
+        # clobber existing modlists.
+        ws_ctx = HarnessWorkspace(data_home=Path(workspace_path))
+        reuse = True
+    else:
+        ws_ctx = HarnessWorkspace(keep=keep)
+        reuse = False
+
+    with ws_ctx as ws:
+        mode = "REUSE (persistent)" if reuse else "fresh (temp)"
+        print(f"[harness] workspace root: {ws.launcher_root}  [{mode}]")
+        ws.seed_offline_account()  # idempotent: no-op if already seeded
+        # Base modlists: never clobber a hand-created one in reuse mode.
+        ws.create_modlist(vanilla_modlist(BASE_MODLIST), overwrite=not reuse)
+        ws.create_modlist(h6_modlist(), overwrite=not reuse)
 
         started = time.monotonic()
         api_results = _run_pass(
@@ -220,6 +231,12 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--report-dir", default="scripts/launch-harness/reports")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="reuse an existing persistent data root (XDG_DATA_HOME); seed only if "
+        "absent, never reset/clobber. e.g. ~/cubic-harness-data",
+    )
     args = parser.parse_args()
 
     ok = run_matrix(
@@ -230,5 +247,6 @@ if __name__ == "__main__":
         timeout=args.timeout,
         report_dir=Path(args.report_dir),
         keep=args.keep,
+        workspace_path=args.workspace,
     )
     raise SystemExit(0 if ok else 1)

@@ -14,6 +14,7 @@ stdlib-only.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -98,25 +99,46 @@ class HarnessWorkspace:
             env = ws.launcher_env()   # inject into the binary's environment
     """
 
-    def __init__(self, keep: bool = False, base_dir: Path | None = None):
-        self._keep = keep
-        # mkdtemp always lives under the system temp dir (or base_dir) — never $HOME.
-        self._tmp_root = Path(
-            tempfile.mkdtemp(prefix="cubic-harness-", dir=base_dir)
-        ).resolve()
-        # XDG_DATA_HOME = tmp_root ; launcher root = tmp_root/com.cubic.launcher
+    def __init__(
+        self,
+        keep: bool = False,
+        base_dir: Path | None = None,
+        data_home: Path | None = None,
+    ):
+        if data_home is not None:
+            # Persistent, caller-provided data root — reused across runs, never
+            # deleted. Used by `--workspace` so a hand-created instance and the
+            # matrix share one data root.
+            root = Path(data_home).expanduser().resolve()
+            _refuse_dangerous_data_home(root)
+            self._persistent = True
+            self._keep = True
+            root.mkdir(parents=True, exist_ok=True)
+            self._tmp_root = root
+        else:
+            self._persistent = False
+            self._keep = keep
+            # mkdtemp always lives under the system temp dir (or base_dir) — never $HOME.
+            self._tmp_root = Path(
+                tempfile.mkdtemp(prefix="cubic-harness-", dir=base_dir)
+            ).resolve()
+        # XDG_DATA_HOME = root ; launcher root = root/com.cubic.launcher
         self.xdg_data_home = self._tmp_root
         self.launcher_root = self._tmp_root / APP_IDENTIFIER
-        self._assert_under_tmp(self.launcher_root)
+        self._assert_under_root(self.launcher_root)
         self.launcher_root.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def persistent(self) -> bool:
+        return self._persistent
 
     # ---- safety ---------------------------------------------------------------
 
-    def _assert_under_tmp(self, path: Path) -> None:
+    def _assert_under_root(self, path: Path) -> None:
         resolved = Path(path).resolve()
         if self._tmp_root not in resolved.parents and resolved != self._tmp_root:
             raise RuntimeError(
-                f"REFUSING to write outside the temp root: {resolved} not under {self._tmp_root}"
+                f"REFUSING to write outside the workspace root: {resolved} not under {self._tmp_root}"
             )
 
     # ---- paths ----------------------------------------------------------------
@@ -150,24 +172,30 @@ class HarnessWorkspace:
         mc_access_token / ms_refresh_token — so the startup token migration
         (KeyringSecretStore) never touches the real keyring.
         """
-        self._assert_under_tmp(self.database_path)
+        self._assert_under_root(self.database_path)
         # Deterministic offline-style uuid string for display; the launcher
         # recomputes its own offline uuid when needed.
         profile_data = json.dumps({"username": username, "uuid": _offline_uuid(username)})
         connection = sqlite3.connect(self.database_path)
         try:
             connection.executescript(ACCOUNTS_DDL)
-            connection.execute(
-                """
-                INSERT INTO accounts
-                    (microsoft_id, xbox_gamertag, minecraft_uuid,
-                     access_token_enc, refresh_token_enc, last_login,
-                     profile_data, is_active)
-                VALUES (?, ?, NULL, NULL, NULL, NULL, ?, 1)
-                """,
-                (microsoft_id, username, profile_data),
-            )
-            connection.commit()
+            # Idempotent: skip if this account already exists (persistent reuse).
+            existing = connection.execute(
+                "SELECT 1 FROM accounts WHERE microsoft_id = ?",
+                (microsoft_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO accounts
+                        (microsoft_id, xbox_gamertag, minecraft_uuid,
+                         access_token_enc, refresh_token_enc, last_login,
+                         profile_data, is_active)
+                    VALUES (?, ?, NULL, NULL, NULL, NULL, ?, 1)
+                    """,
+                    (microsoft_id, username, profile_data),
+                )
+                connection.commit()
         finally:
             connection.close()
 
@@ -179,15 +207,18 @@ class HarnessWorkspace:
         API-populated cache is reused.
         """
         if self.database_path.exists():
-            self._assert_under_tmp(self.database_path)
+            self._assert_under_root(self.database_path)
             self.database_path.unlink()
 
-    def create_modlist(self, modlist: Modlist) -> Path:
+    def create_modlist(self, modlist: Modlist, overwrite: bool = True) -> Path:
         target = self.modlists_dir / modlist.name
-        self._assert_under_tmp(target)
+        self._assert_under_root(target)
+        rules_path = target / "rules.json"
+        if rules_path.exists() and not overwrite:
+            # Reuse mode: never clobber an existing (possibly hand-created) modlist.
+            return target
         (target / "local-jars").mkdir(parents=True, exist_ok=True)
         (target / "custom_configs").mkdir(parents=True, exist_ok=True)
-        rules_path = target / "rules.json"
         rules_path.write_text(json.dumps(modlist.to_json(), indent=2) + "\n")
         return target
 
@@ -198,7 +229,7 @@ class HarnessWorkspace:
         load_shell_snapshot_from_root. Used to flip the whole matrix into the
         cache pass without changing global settings.
         """
-        self._assert_under_tmp(self.database_path)
+        self._assert_under_root(self.database_path)
         connection = sqlite3.connect(self.database_path)
         try:
             connection.execute(
@@ -241,6 +272,28 @@ class HarnessWorkspace:
     def __exit__(self, *_exc) -> None:
         self.cleanup()
 
+
+def _refuse_dangerous_data_home(root: Path) -> None:
+    """Refuse persistent data roots that would collide with the user's real data.
+
+    Guards against pointing --workspace at $HOME, the real XDG_DATA_HOME, or the
+    default ~/.local/share (any of which would let the harness seed/mutate the
+    user's actual launcher data or account rows).
+    """
+    root = root.resolve()
+    home = Path.home().resolve()
+    real_xdg_env = os.environ.get("XDG_DATA_HOME")
+    dangerous = {home, home / ".local" / "share"}
+    if real_xdg_env:
+        dangerous.add(Path(real_xdg_env).expanduser().resolve())
+    if root in dangerous:
+        raise RuntimeError(
+            f"REFUSING persistent workspace at {root}: it collides with the user's "
+            f"real data dir. Choose a dedicated path (e.g. ~/cubic-harness-data)."
+        )
+    # Also refuse if the real launcher data dir would live directly inside it.
+    if (root / APP_IDENTIFIER).resolve() == (home / ".local" / "share" / APP_IDENTIFIER):
+        raise RuntimeError(f"REFUSING persistent workspace at {root}: resolves to the real launcher dir.")
 
 def _offline_uuid(username: str) -> str:
     """A stable, offline-style UUID string for display only.
