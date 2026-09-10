@@ -750,11 +750,13 @@ pub async fn backfill_availability(
             .unwrap_or_default();
     let split = split_ids_by_cached_hash(&ids_to_check, &hash_by_mod_id);
     let bulk_hash_count = split.hashed.len();
+    // Availability only asks whether a compatible version exists, so the
+    // release → beta → alpha installation preference does not apply here.
     let bulk_outcome = resolve_bulk_availability(&split, |hashes| {
         let target = &target;
         async move {
             client
-                .fetch_latest_versions_by_hash(&hashes, target)
+                .fetch_versions_by_hash_any_channel(&hashes, target)
                 .await
         }
     })
