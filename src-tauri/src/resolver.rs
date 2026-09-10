@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +10,8 @@ use tauri::State;
 use tokio::sync::Semaphore;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::modrinth::ModrinthClient;
+use crate::mod_cache::SqliteModCacheRepository;
+use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::rules::{ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
 
 /// Look up cached Modrinth availability from the database.
@@ -495,28 +497,216 @@ pub async fn resolve_modlist_command(
     Ok(ids.into_iter().collect())
 }
 
-/// Pre-populates the modrinth_availability table for all Modrinth-sourced mods
-/// in a modlist that don't already have a cached result for the given version+loader.
-/// Runs in the background so it doesn't block the UI.
-#[tauri::command]
-pub async fn backfill_availability_command(
-    launcher_paths: State<'_, LauncherPaths>,
-    modlist_name: String,
-    mc_version: String,
-    mod_loader: String,
-) -> Result<(), String> {
-    let rules_path = launcher_paths
-        .modlists_dir()
-        .join(&modlist_name)
-        .join(RULES_FILENAME);
+/// What one backfill pass decided. The command itself discards it: the pass
+/// runs in the background and would otherwise leave no evidence of what it
+/// asked, retried or wrote, which is what an off-line equivalence check needs.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BackfillOutcome {
+    /// Exactly the rows handed to `db_availability_set`, in persist order:
+    /// `(mod_id, available)`.
+    pub persisted: Vec<(String, bool)>,
+    /// Hashes sent to the bulk cascade; 0 means no bulk call was issued.
+    pub bulk_hash_count: usize,
+    /// `GET /project/{id}/version` requests issued by the per-project stage.
+    pub per_project_request_count: usize,
+    /// Mod ids whose cached hash the bulk response omitted, retried per
+    /// project (D22).
+    pub omitted_mod_ids: Vec<String>,
+    /// Set when the bulk call itself failed and its whole set fell back.
+    pub bulk_error: Option<String>,
+}
 
-    let modlist = ModList::read_from_file(&rules_path).map_err(|e| e.to_string())?;
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HashSplit {
+    hashed: Vec<(String, String)>,
+    unhashed: Vec<String>,
+}
 
-    if parse_mod_loader(&mod_loader).map_err(|e| e.to_string())? == ModLoader::Vanilla {
-        return Ok(());
+struct BulkStageOutcome {
+    available_mod_ids: Vec<String>,
+    per_project_mod_ids: Vec<String>,
+    omitted_mod_ids: Vec<String>,
+    bulk_error: Option<String>,
+}
+
+fn load_cached_hashes_for_backfill(
+    launcher_paths: &LauncherPaths,
+    mod_ids: &[String],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, String>> {
+    let connection = Connection::open(launcher_paths.database_path())?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+    let mut hash_by_mod_id = HashMap::new();
+
+    for mod_id in mod_ids {
+        if let Some(hash) = repository
+            .find_cached_file_hash_by_project_or_alias(mod_id, target)?
+            .filter(|hash| !hash.is_empty())
+        {
+            hash_by_mod_id.insert(mod_id.clone(), hash);
+        }
     }
 
-    let mut all_modrinth_ids: Vec<String> = Vec::new();
+    Ok(hash_by_mod_id)
+}
+
+fn split_ids_by_cached_hash(
+    ids: &[String],
+    hash_by_mod_id: &HashMap<String, String>,
+) -> HashSplit {
+    let mut split = HashSplit::default();
+    let mut seen = HashSet::new();
+
+    for mod_id in ids {
+        if !seen.insert(mod_id.as_str()) {
+            continue;
+        }
+
+        match hash_by_mod_id.get(mod_id) {
+            Some(hash) => split.hashed.push((mod_id.clone(), hash.clone())),
+            None => split.unhashed.push(mod_id.clone()),
+        }
+    }
+
+    split
+}
+
+async fn resolve_bulk_availability<Fetch, Fut>(
+    split: &HashSplit,
+    fetch_bulk: Fetch,
+) -> BulkStageOutcome
+where
+    Fetch: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = anyhow::Result<HashMap<String, ModrinthVersion>>>,
+{
+    if split.hashed.is_empty() {
+        return BulkStageOutcome {
+            available_mod_ids: Vec::new(),
+            per_project_mod_ids: split.unhashed.clone(),
+            omitted_mod_ids: Vec::new(),
+            bulk_error: None,
+        };
+    }
+
+    let hashes = split
+        .hashed
+        .iter()
+        .map(|(_, hash)| hash.clone())
+        .collect::<Vec<_>>();
+
+    match fetch_bulk(hashes).await {
+        Ok(versions_by_hash) => {
+            let mut available_mod_ids = Vec::new();
+            let mut omitted_mod_ids = Vec::new();
+            for (mod_id, hash) in &split.hashed {
+                if versions_by_hash.contains_key(hash) {
+                    available_mod_ids.push(mod_id.clone());
+                } else {
+                    // An omission can also mean an unknown hash, so retry it per project.
+                    omitted_mod_ids.push(mod_id.clone());
+                }
+            }
+
+            let mut per_project_mod_ids = omitted_mod_ids.clone();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+            BulkStageOutcome {
+                available_mod_ids,
+                per_project_mod_ids,
+                omitted_mod_ids,
+                bulk_error: None,
+            }
+        }
+        Err(error) => {
+            // A bulk failure must not make the entire hashed set unavailable.
+            let mut per_project_mod_ids = split
+                .hashed
+                .iter()
+                .map(|(mod_id, _)| mod_id.clone())
+                .collect::<Vec<_>>();
+            per_project_mod_ids.extend(split.unhashed.iter().cloned());
+            BulkStageOutcome {
+                available_mod_ids: Vec::new(),
+                per_project_mod_ids,
+                omitted_mod_ids: Vec::new(),
+                bulk_error: Some(format!("{error:#}")),
+            }
+        }
+    }
+}
+
+async fn check_availability_concurrently<Check, Fut>(
+    mod_ids: Vec<String>,
+    permits: usize,
+    check: Check,
+) -> Vec<(String, bool)>
+where
+    Check: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    let semaphore = Arc::new(Semaphore::new(permits));
+
+    for mod_id in mod_ids {
+        let check = check.clone();
+        let permit_source = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = permit_source.acquire_owned().await.ok()?;
+            match check(mod_id.clone()).await {
+                Ok(available) => Some((mod_id, available)),
+                Err(_) => None,
+            }
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(join_result) = tasks.join_next().await {
+        if let Ok(Some(result)) = join_result {
+            results.push(result);
+        }
+    }
+    results
+}
+
+fn merge_backfill_entries(
+    bulk_available: &[String],
+    per_project: &[(String, bool)],
+) -> Vec<(String, bool)> {
+    let mut merged = Vec::with_capacity(bulk_available.len() + per_project.len());
+    let mut seen = HashSet::new();
+
+    for mod_id in bulk_available {
+        if seen.insert(mod_id.as_str()) {
+            merged.push((mod_id.clone(), true));
+        }
+    }
+    for (mod_id, available) in per_project {
+        if seen.insert(mod_id.as_str()) {
+            merged.push((mod_id.clone(), *available));
+        }
+    }
+
+    merged
+}
+
+pub async fn backfill_availability(
+    launcher_paths: &LauncherPaths,
+    client: &ModrinthClient,
+    modlist_name: &str,
+    mc_version: &str,
+    mod_loader: &str,
+) -> Result<BackfillOutcome, String> {
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(modlist_name)
+        .join(RULES_FILENAME);
+    let modlist = ModList::read_from_file(&rules_path).map_err(|e| e.to_string())?;
+    let parsed_loader = parse_mod_loader(mod_loader).map_err(|e| e.to_string())?;
+
+    if parsed_loader == ModLoader::Vanilla {
+        return Ok(BackfillOutcome::default());
+    }
+
+    let mut all_modrinth_ids = Vec::new();
     fn collect_modrinth_ids(rules: &[Rule], out: &mut Vec<String>) {
         for rule in rules {
             if rule.source == ModSource::Modrinth {
@@ -528,12 +718,12 @@ pub async fn backfill_availability_command(
     collect_modrinth_ids(&modlist.rules, &mut all_modrinth_ids);
 
     if all_modrinth_ids.is_empty() {
-        return Ok(());
+        return Ok(BackfillOutcome::default());
     }
 
     let db_path = launcher_paths.database_path();
-    let cached = db_availability_get(&db_path, &all_modrinth_ids, &mc_version, &mod_loader);
-    // Only skip mods that are cached as *available*.  Mods cached as
+    let cached = db_availability_get(&db_path, &all_modrinth_ids, mc_version, mod_loader);
+    // Only skip mods that are cached as *available*. Mods cached as
     // unavailable are re-checked because mod authors frequently add
     // version support after initial release.
     let skip_ids: HashSet<String> = cached
@@ -541,47 +731,112 @@ pub async fn backfill_availability_command(
         .filter(|(_, available)| *available)
         .map(|(id, _)| id.clone())
         .collect();
-
-    let ids_to_check: Vec<String> = all_modrinth_ids
+    let ids_to_check = all_modrinth_ids
         .into_iter()
         .filter(|id| !skip_ids.contains(id))
-        .collect();
+        .collect::<Vec<_>>();
 
     if ids_to_check.is_empty() {
-        return Ok(());
+        return Ok(BackfillOutcome::default());
     }
 
     let target = ResolutionTarget {
-        minecraft_version: mc_version.clone(),
-        mod_loader: parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?,
+        minecraft_version: mc_version.to_string(),
+        mod_loader: parsed_loader,
     };
-
-    let client = ModrinthClient::new();
-    let mut tasks = tokio::task::JoinSet::new();
-
-    for mod_id in ids_to_check {
-        let client = client.clone();
-        let target = target.clone();
-        tasks.spawn(async move {
-            let result = client.fetch_project_versions(&mod_id, &target).await;
-            match result {
-                Ok(v) => Some((mod_id, !v.is_empty())),
-                Err(_) => None,
-            }
-        });
-    }
-
-    let mut to_persist = Vec::new();
-    while let Some(join_result) = tasks.join_next().await {
-        if let Ok(Some((mod_id, available))) = join_result {
-            to_persist.push((mod_id, mc_version.clone(), mod_loader.clone(), available));
+    // Opening or querying mod_cache may fail; fall back to per-project requests.
+    let hash_by_mod_id =
+        load_cached_hashes_for_backfill(launcher_paths, &ids_to_check, &target)
+            .unwrap_or_default();
+    let split = split_ids_by_cached_hash(&ids_to_check, &hash_by_mod_id);
+    let bulk_hash_count = split.hashed.len();
+    let bulk_outcome = resolve_bulk_availability(&split, |hashes| {
+        let target = &target;
+        async move {
+            client
+                .fetch_latest_versions_by_hash(&hashes, target)
+                .await
         }
+    })
+    .await;
+
+    // The endpoint reports neither "unknown hash" nor "no version for this
+    // target": both are omissions. Naming them is the only diagnostic it
+    // offers (D23).
+    if let Some(error) = &bulk_outcome.bulk_error {
+        eprintln!(
+            "[Backfill] bulk availability lookup failed for {bulk_hash_count} cached hashes; falling back to one request per mod ({error})"
+        );
+    } else if !bulk_outcome.omitted_mod_ids.is_empty() {
+        eprintln!(
+            "[Backfill] bulk availability lookup omitted {}; retrying one request per mod",
+            bulk_outcome.omitted_mod_ids.join(", ")
+        );
     }
 
-    if !to_persist.is_empty() {
-        db_availability_set(&db_path, &to_persist);
+    let per_project_request_count = bulk_outcome.per_project_mod_ids.len();
+    let check_client = client.clone();
+    let check_target = target.clone();
+    // Match resolve_modlist_command's limit so both paths share the same API pressure.
+    let per_project = check_availability_concurrently(
+        bulk_outcome.per_project_mod_ids,
+        10,
+        move |mod_id| {
+            let client = check_client.clone();
+            let target = check_target.clone();
+            async move {
+                client
+                    .fetch_project_versions(&mod_id, &target)
+                    .await
+                    .map(|versions| !versions.is_empty())
+            }
+        },
+    )
+    .await;
+    let persisted = merge_backfill_entries(&bulk_outcome.available_mod_ids, &per_project);
+    let entries = persisted
+        .iter()
+        .map(|(mod_id, available)| {
+            (
+                mod_id.clone(),
+                mc_version.to_string(),
+                mod_loader.to_string(),
+                *available,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !entries.is_empty() {
+        db_availability_set(&db_path, &entries);
     }
 
+    Ok(BackfillOutcome {
+        persisted,
+        bulk_hash_count,
+        per_project_request_count,
+        omitted_mod_ids: bulk_outcome.omitted_mod_ids,
+        bulk_error: bulk_outcome.bulk_error,
+    })
+}
+
+/// Pre-populates the modrinth_availability table for all Modrinth-sourced mods
+/// in a modlist that don't already have a cached result for the given version+loader.
+/// Runs in the background so it doesn't block the UI.
+#[tauri::command]
+pub async fn backfill_availability_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    mc_version: String,
+    mod_loader: String,
+) -> Result<(), String> {
+    let client = ModrinthClient::new();
+    backfill_availability(
+        &launcher_paths,
+        &client,
+        &modlist_name,
+        &mc_version,
+        &mod_loader,
+    )
+    .await?;
     Ok(())
 }
 
@@ -622,6 +877,8 @@ fn alt_itself_viable(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::rules::{ModSource, Rule, VersionRule, VersionRuleKind};
 
     use super::*;
@@ -653,6 +910,271 @@ mod tests {
             description: "Test".into(),
             rules,
         }
+    }
+
+    fn cached_hashes(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(mod_id, hash)| (mod_id.to_string(), hash.to_string()))
+            .collect()
+    }
+
+    fn modrinth_version(id: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: id.into(),
+            project_id: format!("{id}-project"),
+            version_number: "1.0.0".into(),
+            name: id.into(),
+            game_versions: vec!["1.21.1".into()],
+            loaders: vec!["fabric".into()],
+            version_type: "release".into(),
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            date_published: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_hashed_mods_are_persisted_available_without_per_project_requests() {
+        let ids = vec!["sodium".to_string(), "lithium".to_string()];
+        let split = split_ids_by_cached_hash(
+            &ids,
+            &cached_hashes(&[("sodium", "hash-a"), ("lithium", "hash-b")]),
+        );
+        let bulk_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_bulk_calls = bulk_calls.clone();
+        let bulk = resolve_bulk_availability(&split, move |hashes| {
+            recorded_bulk_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(hashes, vec!["hash-a".to_string(), "hash-b".to_string()]);
+                Ok(HashMap::from([
+                    ("hash-a".to_string(), modrinth_version("sodium-version")),
+                    ("hash-b".to_string(), modrinth_version("lithium-version")),
+                ]))
+            }
+        })
+        .await;
+
+        let per_project_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_per_project_calls = per_project_calls.clone();
+        let per_project = check_availability_concurrently(
+            bulk.per_project_mod_ids.clone(),
+            10,
+            move |_mod_id| {
+                let calls = recorded_per_project_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+        let persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
+
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(per_project_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            persisted,
+            vec![("sodium".to_string(), true), ("lithium".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn unhashed_mods_skip_bulk_and_are_persisted_from_per_project_checks() {
+        let ids = vec!["sodium".to_string(), "lithium".to_string()];
+        let split = split_ids_by_cached_hash(&ids, &HashMap::new());
+        let bulk_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_bulk_calls = bulk_calls.clone();
+        let bulk = resolve_bulk_availability(&split, move |_hashes| {
+            recorded_bulk_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(HashMap::new()) }
+        })
+        .await;
+
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(bulk.per_project_mod_ids, ids);
+
+        let per_project_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_per_project_calls = per_project_calls.clone();
+        let per_project = check_availability_concurrently(
+            bulk.per_project_mod_ids.clone(),
+            10,
+            move |_mod_id| {
+                let calls = recorded_per_project_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+        let mut persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
+        persisted.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(per_project_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            persisted,
+            vec![("lithium".to_string(), true), ("sodium".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_hash_coverage_persists_each_mod_once_through_the_right_path() {
+        let ids = vec![
+            "sodium".to_string(),
+            "polytone".to_string(),
+            "lithium".to_string(),
+            "sodium".to_string(),
+        ];
+        let split = split_ids_by_cached_hash(
+            &ids,
+            &cached_hashes(&[("sodium", "hash-a"), ("lithium", "hash-b")]),
+        );
+        let bulk_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_bulk_calls = bulk_calls.clone();
+        let bulk = resolve_bulk_availability(&split, move |hashes| {
+            recorded_bulk_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(hashes, vec!["hash-a".to_string(), "hash-b".to_string()]);
+                Ok(HashMap::from([
+                    ("hash-a".to_string(), modrinth_version("sodium-version")),
+                    ("hash-b".to_string(), modrinth_version("lithium-version")),
+                ]))
+            }
+        })
+        .await;
+
+        assert_eq!(bulk.per_project_mod_ids, vec!["polytone"]);
+        let per_project = check_availability_concurrently(
+            bulk.per_project_mod_ids.clone(),
+            10,
+            |mod_id| async move {
+                assert_eq!(mod_id, "polytone");
+                Ok(false)
+            },
+        )
+        .await;
+        let persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
+
+        assert_eq!(bulk_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            persisted,
+            vec![
+                ("sodium".to_string(), true),
+                ("lithium".to_string(), true),
+                ("polytone".to_string(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_bulk_hash_is_retried_before_availability_is_persisted() {
+        let ids = vec!["sodium".to_string(), "lithium".to_string()];
+        let split = split_ids_by_cached_hash(
+            &ids,
+            &cached_hashes(&[("sodium", "hash-a"), ("lithium", "hash-b")]),
+        );
+        let bulk = resolve_bulk_availability(&split, |_hashes| async {
+            Ok(HashMap::from([(
+                "hash-a".to_string(),
+                modrinth_version("sodium-version"),
+            )]))
+        })
+        .await;
+
+        assert_eq!(bulk.omitted_mod_ids, vec!["lithium"]);
+        assert_eq!(bulk.per_project_mod_ids, vec!["lithium"]);
+        let without_retry = merge_backfill_entries(&bulk.available_mod_ids, &[]);
+        assert!(!without_retry
+            .iter()
+            .any(|(mod_id, _available)| mod_id == "lithium"));
+
+        let per_project = check_availability_concurrently(
+            bulk.per_project_mod_ids.clone(),
+            10,
+            |mod_id| async move {
+                assert_eq!(mod_id, "lithium");
+                Ok(true)
+            },
+        )
+        .await;
+        let persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
+
+        assert_eq!(
+            persisted,
+            vec![("sodium".to_string(), true), ("lithium".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_errors_are_not_persisted_and_bulk_errors_fall_back_per_project() {
+        let ids = vec!["sodium".to_string(), "broken-mod".to_string()];
+        let split =
+            split_ids_by_cached_hash(&ids, &cached_hashes(&[("sodium", "hash-a")]));
+        let bulk = resolve_bulk_availability(&split, |_hashes| async {
+            Err::<HashMap<String, ModrinthVersion>, _>(anyhow::anyhow!("connection reset"))
+        })
+        .await;
+
+        assert_eq!(bulk.bulk_error.as_deref(), Some("connection reset"));
+        assert_eq!(
+            bulk.per_project_mod_ids,
+            vec!["sodium".to_string(), "broken-mod".to_string()]
+        );
+        let per_project = check_availability_concurrently(
+            bulk.per_project_mod_ids.clone(),
+            10,
+            |mod_id| async move {
+                if mod_id == "broken-mod" {
+                    Err(anyhow::anyhow!("request failed"))
+                } else {
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+        let persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
+
+        assert_eq!(persisted, vec![("sodium".to_string(), true)]);
+        assert!(!persisted
+            .iter()
+            .any(|(mod_id, _available)| mod_id == "broken-mod"));
+    }
+
+    /// The bug this pass exists to close: the per-project stage used to spawn
+    /// one unbounded task per mod, so a 300-mod modlist could put 300 requests
+    /// in flight against a 300-per-minute limit.
+    #[tokio::test]
+    async fn per_project_checks_never_exceed_the_permitted_concurrency() {
+        let mod_ids = (0..24).map(|index| format!("mod-{index}")).collect::<Vec<_>>();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let observed_in_flight = in_flight.clone();
+        let observed_peak = peak_in_flight.clone();
+
+        let checked = check_availability_concurrently(mod_ids.clone(), 3, move |_mod_id| {
+            let in_flight = observed_in_flight.clone();
+            let peak = observed_peak.clone();
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(true)
+            }
+        })
+        .await;
+
+        assert_eq!(checked.len(), mod_ids.len());
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "the per-project stage put {peak} requests in flight with 3 permits"
+        );
+        assert!(
+            peak > 1,
+            "the stage serialized every request, so the permit count buys nothing"
+        );
     }
 
     #[test]
@@ -972,5 +1494,4 @@ mod tests {
         assert!(result.active_mods.contains("A"));
         assert!(result.active_mods.contains("B"));
     }
-
 }
