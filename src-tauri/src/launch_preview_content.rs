@@ -81,6 +81,7 @@ pub(super) async fn resolve_and_install_content_packs(
         // manifest, and only the difference is removed. Nothing else in the
         // directory is touched.
         let mut installed: Vec<String> = Vec::new();
+        let mut lookups_complete = true;
 
         if !active_entries.is_empty() {
             std::fs::create_dir_all(&instance_dir)
@@ -153,6 +154,9 @@ pub(super) async fn resolve_and_install_content_packs(
                     }
                 }
                 Err(error) => {
+                    // Not an answer: we do not know which file this entry wants,
+                    // so nothing may be removed on this pass.
+                    lookups_complete = false;
                     emit_log(
                         app_handle,
                         ProcessLogStream::Stdout,
@@ -170,6 +174,7 @@ pub(super) async fn resolve_and_install_content_packs(
             instance_subdir,
             &instance_dir,
             &installed,
+            lookups_complete,
         )?;
         for name in removed {
             emit_log(
@@ -218,6 +223,7 @@ async fn install_datapacks(
 
     let instance_dir = instance_root.join("datapacks");
     let mut installed: Vec<String> = Vec::new();
+    let mut lookups_complete = true;
 
     if !active_entries.is_empty() {
         std::fs::create_dir_all(&instance_dir)
@@ -272,6 +278,9 @@ async fn install_datapacks(
                 }
             }
             Err(error) => {
+                // Not an answer: we do not know which file this entry wants, so
+                // nothing may be removed on this pass.
+                lookups_complete = false;
                 emit_log(
                     app_handle,
                     ProcessLogStream::Stdout,
@@ -289,6 +298,7 @@ async fn install_datapacks(
         "datapacks",
         &instance_dir,
         &installed,
+        lookups_complete,
     )?;
     for name in removed {
         emit_log(

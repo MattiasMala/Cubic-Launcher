@@ -160,22 +160,57 @@ fn present_entries(instance_dir: &Path) -> Result<Vec<PresentEntry>> {
     Ok(entries)
 }
 
+/// Names to keep in the manifest when the installed set cannot be trusted to be
+/// complete: everything the previous manifest listed, plus what we did install.
+///
+/// `ContentEntry` stores only an id, never a filename, so a failed version
+/// lookup cannot be mapped back to the file it produced last time. The only
+/// conservative answer is to carry the whole previous list forward.
+pub fn carry_forward(previous: &[String], installed: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut merged = Vec::with_capacity(previous.len() + installed.len());
+
+    for name in previous.iter().chain(installed.iter()) {
+        if seen.insert(name.as_str()) {
+            merged.push(name.clone());
+        }
+    }
+
+    merged
+}
+
 /// Remove the links we installed last time and no longer want, then rewrite the
-/// manifest with `installed`. Returns the names actually removed.
+/// manifest. Returns the names actually removed.
 ///
 /// `instance_dir` is the category directory inside `instance_root`; it may not
 /// exist yet. Nothing is written when there is no manifest and nothing was
 /// installed, so instances without content packs stay clean.
+///
+/// `installed_is_complete` is `false` when at least one entry's version lookup
+/// failed — a Modrinth error, not an answer. `installed` is then an incomplete
+/// picture of what should be linked, so nothing is removed and the manifest
+/// keeps the previous names alongside the new ones. A transient API failure
+/// must not delete a pack the user still wants; it leaves one too many instead.
 pub fn sync_managed_content_dir(
     instance_root: &Path,
     category: &str,
     instance_dir: &Path,
     installed: &[String],
+    installed_is_complete: bool,
 ) -> Result<Vec<String>> {
     let manifest_path = manifest_path(instance_root, category);
     let previous = read_manifest_files(&manifest_path);
 
     if installed.is_empty() && !manifest_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    if !installed_is_complete {
+        write_manifest(
+            &manifest_path,
+            category,
+            &carry_forward(&previous, installed),
+        )?;
         return Ok(Vec::new());
     }
 
@@ -201,8 +236,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        manifest_path, plan_stale_removals, read_manifest_files, sync_managed_content_dir,
-        ManagedContentManifest, PresentEntry,
+        carry_forward, manifest_path, plan_stale_removals, read_manifest_files,
+        sync_managed_content_dir, ManagedContentManifest, PresentEntry,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -323,6 +358,7 @@ mod tests {
             "resourcepacks",
             &instance_dir,
             &names(&["managed.zip"]),
+            true,
         )
         .expect("first sync should succeed");
 
@@ -342,7 +378,7 @@ mod tests {
 
         assert_eq!(read_manifest_files(&path), names(&["managed.zip"]));
 
-        sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[])
+        sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[], true)
             .expect("second sync should succeed");
 
         assert!(escaped.exists(), "traversal entry must not delete anything");
@@ -360,7 +396,7 @@ mod tests {
         fs::write(manifest_path(&root_dir, "shaderpacks"), b"{ not json")
             .expect("corrupt manifest should be written");
 
-        let removals = sync_managed_content_dir(&root_dir, "shaderpacks", &instance_dir, &[])
+        let removals = sync_managed_content_dir(&root_dir, "shaderpacks", &instance_dir, &[], true)
             .expect("sync should succeed despite the corrupt manifest");
 
         assert!(removals.is_empty());
@@ -380,7 +416,7 @@ mod tests {
         let instance_dir = fixture_instance(&root_dir, "datapacks");
         fs::write(instance_dir.join("user.zip"), b"user").expect("user fixture should exist");
 
-        let removals = sync_managed_content_dir(&root_dir, "datapacks", &instance_dir, &[])
+        let removals = sync_managed_content_dir(&root_dir, "datapacks", &instance_dir, &[], true)
             .expect("sync should succeed");
 
         assert!(removals.is_empty());
@@ -406,6 +442,7 @@ mod tests {
             "resourcepacks",
             &instance_dir,
             &names(&["kept.zip", "dropped.zip"]),
+            true,
         )
         .expect("first sync should succeed");
 
@@ -414,6 +451,7 @@ mod tests {
             "resourcepacks",
             &instance_dir,
             &names(&["kept.zip"]),
+            true,
         )
         .expect("second sync should succeed");
 
@@ -427,5 +465,52 @@ mod tests {
         );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn failed_version_lookup_removes_nothing_and_keeps_the_old_names() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        for name in ["still-wanted.zip", "lookup-failed.zip"] {
+            fs::write(instance_dir.join(name), name.as_bytes()).expect("fixture should exist");
+        }
+
+        sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["still-wanted.zip", "lookup-failed.zip"]),
+            true,
+        )
+        .expect("first sync should succeed");
+
+        // Second launch: Modrinth answered for one entry and errored for the
+        // other, so `installed` is missing a file that is still wanted.
+        let removals = sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["still-wanted.zip"]),
+            false,
+        )
+        .expect("second sync should succeed");
+
+        assert!(removals.is_empty(), "a lookup failure must not delete");
+        assert!(instance_dir.join("lookup-failed.zip").exists());
+        assert_eq!(
+            read_manifest_files(&manifest_path(&root_dir, "resourcepacks")),
+            names(&["still-wanted.zip", "lookup-failed.zip"]),
+            "the name we could not resolve stays in the manifest"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn carry_forward_merges_without_duplicates_and_keeps_order() {
+        assert_eq!(
+            carry_forward(&names(&["a.zip", "b.zip"]), &names(&["b.zip", "c.zip"])),
+            names(&["a.zip", "b.zip", "c.zip"])
+        );
     }
 }
