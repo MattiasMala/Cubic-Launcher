@@ -9,6 +9,7 @@ mod database;
 pub mod debug_trace;
 pub mod editor_data;
 pub mod instance_configs;
+pub mod instance_content;
 pub mod instance_mods;
 pub mod java_runtime;
 pub mod launch_command;
