@@ -434,6 +434,58 @@ impl ModrinthClient {
         .await
     }
 
+    /// Looks up whether each SHA-1 has at least one compatible version for the
+    /// target.
+    ///
+    /// This caller only needs that existence boolean, for which the channel
+    /// does not matter, so one unfiltered request per chunk is sufficient.
+    /// Launching is different: the channel decides which jar is
+    /// installed, so `fetch_latest_versions_by_hash` deliberately keeps its
+    /// release → beta → alpha cascade. Do not unify these methods: they answer
+    /// different questions.
+    ///
+    /// An omitted hash remains ambiguous: it can mean either that no version
+    /// exists for the target or that Modrinth does not know the hash.
+    pub async fn fetch_versions_by_hash_any_channel(
+        &self,
+        sha1_hashes: &[String],
+        target: &ResolutionTarget,
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        resolve_hashes_any_channel(sha1_hashes, |chunk| {
+            self.post_version_files_lookup(chunk, target)
+        })
+        .await
+    }
+
+    async fn post_version_files_lookup(
+        &self,
+        sha1_hashes: Vec<String>,
+        target: &ResolutionTarget,
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        let url = build_version_files_update_url(&self.base_url)?;
+        let body = build_version_files_lookup_body(&sha1_hashes, target);
+
+        let response = send_with_retry(|| self.http_client.post(url.clone()).json(&body))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query Modrinth compatible versions for {} hashes",
+                    sha1_hashes.len()
+                )
+            })?
+            .error_for_status()
+            .with_context(|| {
+                "Modrinth returned an error for a bulk compatible-version lookup"
+            })?;
+
+        response
+            .json::<HashMap<String, ModrinthVersion>>()
+            .await
+            .with_context(|| {
+                "failed to deserialize Modrinth bulk compatible-version lookup"
+            })
+    }
+
     async fn post_version_files_update(
         &self,
         sha1_hashes: Vec<String>,
@@ -654,6 +706,16 @@ pub(crate) struct VersionFilesUpdateRequest<'a> {
     version_types: [&'a str; 1],
 }
 
+/// Kept separate from `VersionFilesUpdateRequest` so the installation lookup
+/// cannot accidentally lose its required channel filter.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct VersionFilesLookupRequest<'a> {
+    hashes: &'a [String],
+    algorithm: &'static str,
+    loaders: [&'static str; 1],
+    game_versions: [&'a str; 1],
+}
+
 pub(crate) fn build_version_files_update_body<'a>(
     hashes: &'a [String],
     target: &'a ResolutionTarget,
@@ -665,6 +727,18 @@ pub(crate) fn build_version_files_update_body<'a>(
         loaders: [target.mod_loader.as_modrinth_loader()],
         game_versions: [target.minecraft_version.as_str()],
         version_types: [version_type],
+    }
+}
+
+pub(crate) fn build_version_files_lookup_body<'a>(
+    hashes: &'a [String],
+    target: &'a ResolutionTarget,
+) -> VersionFilesLookupRequest<'a> {
+    VersionFilesLookupRequest {
+        hashes,
+        algorithm: "sha1",
+        loaders: [target.mod_loader.as_modrinth_loader()],
+        game_versions: [target.minecraft_version.as_str()],
     }
 }
 
@@ -756,6 +830,27 @@ where
     Ok(found)
 }
 
+/// Drives the availability lookup: normalize once, split only at the request
+/// guard, and preserve the endpoint's map as the complete account of which
+/// hashes were found.
+pub(crate) async fn resolve_hashes_any_channel<F, Fut>(
+    sha1_hashes: &[String],
+    mut fetch_stage: F,
+) -> Result<HashMap<String, ModrinthVersion>>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<HashMap<String, ModrinthVersion>>>,
+{
+    let normalized = normalize_sha1_hashes(sha1_hashes);
+    let mut found = HashMap::with_capacity(normalized.len());
+
+    for chunk in hash_chunks(&normalized, MAX_HASHES_PER_UPDATE_REQUEST) {
+        found.extend(fetch_stage(chunk.to_vec()).await?);
+    }
+
+    Ok(found)
+}
+
 pub fn filter_compatible_versions(
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
@@ -805,11 +900,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        build_project_versions_url, build_version_files_update_body,
-        build_version_files_update_url, build_version_url, build_versions_url,
-        filter_compatible_versions, normalize_version_ids, resolve_hash_cascade,
-        select_latest_compatible_version, sort_versions_by_target_preference, DependencyType,
-        ModrinthVersion, MAX_HASHES_PER_UPDATE_REQUEST,
+        build_project_versions_url, build_version_files_lookup_body,
+        build_version_files_update_body, build_version_files_update_url, build_version_url,
+        build_versions_url, filter_compatible_versions, normalize_version_ids,
+        resolve_hash_cascade, resolve_hashes_any_channel, select_latest_compatible_version,
+        sort_versions_by_target_preference, DependencyType, ModrinthVersion,
+        MAX_HASHES_PER_UPDATE_REQUEST,
     };
     use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -1177,6 +1273,117 @@ mod tests {
                 "game_versions": ["1.21.1"],
                 "version_types": ["beta"]
             })
+        );
+    }
+
+    #[test]
+    fn lookup_body_omits_channel_filter_while_update_body_keeps_it() {
+        let hashes = vec!["aa".to_string(), "bb".to_string()];
+        let target = target();
+        let lookup = serde_json::to_value(build_version_files_lookup_body(&hashes, &target))
+            .expect("lookup body should serialize");
+        let update =
+            serde_json::to_value(build_version_files_update_body(&hashes, &target, "beta"))
+                .expect("update body should serialize");
+
+        assert_eq!(
+            lookup,
+            serde_json::json!({
+                "hashes": ["aa", "bb"],
+                "algorithm": "sha1",
+                "loaders": ["fabric"],
+                "game_versions": ["1.21.1"]
+            })
+        );
+        assert!(!lookup.as_object().expect("body should be an object").contains_key("version_types"));
+        assert!(update.as_object().expect("body should be an object").contains_key("version_types"));
+    }
+
+    #[tokio::test]
+    async fn any_channel_uses_one_request_for_all_hashes() {
+        let hashes = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let mut calls = Vec::new();
+
+        resolve_hashes_any_channel(&hashes, |chunk| {
+            calls.push(chunk);
+            async { Ok(HashMap::new()) }
+        })
+        .await
+        .expect("lookup should succeed");
+
+        assert_eq!(calls, vec![hashes]);
+    }
+
+    #[tokio::test]
+    async fn any_channel_lowercases_deduplicates_and_discards_blank_hashes() {
+        let hashes = vec![
+            " AABBCC ".to_string(),
+            "aabbcc".to_string(),
+            String::new(),
+            "   ".to_string(),
+        ];
+        let mut calls = Vec::new();
+
+        resolve_hashes_any_channel(&hashes, |chunk| {
+            calls.push(chunk);
+            async { Ok(HashMap::new()) }
+        })
+        .await
+        .expect("lookup should succeed");
+
+        assert_eq!(calls, vec![vec!["aabbcc".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn any_channel_issues_no_request_without_usable_hashes() {
+        let hashes = vec![String::new(), "   ".to_string()];
+        let mut calls = Vec::new();
+
+        let found = resolve_hashes_any_channel(&hashes, |chunk| {
+            calls.push(chunk);
+            async { Ok(HashMap::new()) }
+        })
+        .await
+        .expect("lookup should succeed");
+
+        assert!(calls.is_empty());
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn any_channel_keeps_omitted_hashes_absent() {
+        let hashes = vec!["known".to_string(), "omitted".to_string()];
+
+        let found = resolve_hashes_any_channel(&hashes, |_| async {
+            Ok(HashMap::from([(
+                "known".to_string(),
+                bulk_version("known-version", "alpha", "2025-01-01"),
+            )]))
+        })
+        .await
+        .expect("lookup should succeed");
+
+        assert_eq!(found["known"].id, "known-version");
+        assert!(!found.contains_key("omitted"));
+    }
+
+    #[tokio::test]
+    async fn any_channel_splits_a_hash_set_above_the_request_guard() {
+        let hashes: Vec<String> = (0..MAX_HASHES_PER_UPDATE_REQUEST + 7)
+            .map(|index| format!("{index:040x}"))
+            .collect();
+        let mut request_sizes = Vec::new();
+
+        resolve_hashes_any_channel(&hashes, |chunk| {
+            request_sizes.push(chunk.len());
+            async { Ok(HashMap::new()) }
+        })
+        .await
+        .expect("lookup should succeed");
+
+        assert_eq!(
+            request_sizes,
+            vec![MAX_HASHES_PER_UPDATE_REQUEST, 7]
         );
     }
 
