@@ -77,16 +77,16 @@ pub(super) async fn resolve_and_install_content_packs(
             .collect();
 
         let instance_dir = instance_root.join(instance_subdir);
-        if instance_dir.exists() {
-            crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
-        }
+        // What we link this launch; the previous launch's list comes from the
+        // manifest, and only the difference is removed. Nothing else in the
+        // directory is touched.
+        let mut installed: Vec<String> = Vec::new();
+        let mut lookups_complete = true;
 
-        if active_entries.is_empty() {
-            continue;
+        if !active_entries.is_empty() {
+            std::fs::create_dir_all(&instance_dir)
+                .with_context(|| format!("failed to create {}", instance_dir.display()))?;
         }
-
-        std::fs::create_dir_all(&instance_dir)
-            .with_context(|| format!("failed to create {}", instance_dir.display()))?;
 
         for entry in &active_entries {
             if entry.source != "modrinth" {
@@ -129,6 +129,9 @@ pub(super) async fn resolve_and_install_content_packs(
                                         entry.id
                                     )
                                 })?;
+                            if !installed.iter().any(|name| name == &file.filename) {
+                                installed.push(file.filename.clone());
+                            }
                             let cache_label = if was_cached { " (cached)" } else { "" };
                             emit_log(
                                 app_handle,
@@ -151,6 +154,9 @@ pub(super) async fn resolve_and_install_content_packs(
                     }
                 }
                 Err(error) => {
+                    // Not an answer: we do not know which file this entry wants,
+                    // so nothing may be removed on this pass.
+                    lookups_complete = false;
                     emit_log(
                         app_handle,
                         ProcessLogStream::Stdout,
@@ -161,6 +167,21 @@ pub(super) async fn resolve_and_install_content_packs(
                     )?;
                 }
             }
+        }
+
+        let removed = crate::instance_content::sync_managed_content_dir(
+            instance_root,
+            instance_subdir,
+            &instance_dir,
+            &installed,
+            lookups_complete,
+        )?;
+        for name in removed {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!("[Content] Removed {} from {}", name, instance_subdir),
+            )?;
         }
     }
 
@@ -201,16 +222,13 @@ async fn install_datapacks(
         .collect();
 
     let instance_dir = instance_root.join("datapacks");
-    if instance_dir.exists() {
-        crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
-    }
+    let mut installed: Vec<String> = Vec::new();
+    let mut lookups_complete = true;
 
-    if active_entries.is_empty() {
-        return Ok(());
+    if !active_entries.is_empty() {
+        std::fs::create_dir_all(&instance_dir)
+            .with_context(|| format!("failed to create {}", instance_dir.display()))?;
     }
-
-    std::fs::create_dir_all(&instance_dir)
-        .with_context(|| format!("failed to create {}", instance_dir.display()))?;
 
     for entry in &active_entries {
         if entry.source != "modrinth" {
@@ -247,6 +265,9 @@ async fn install_datapacks(
                             .with_context(|| {
                                 format!("failed to link data pack '{}' into instance", entry.id)
                             })?;
+                        if !installed.iter().any(|name| name == &file.filename) {
+                            installed.push(file.filename.clone());
+                        }
                         let cache_label = if was_cached { " (cached)" } else { "" };
                         emit_log(
                             app_handle,
@@ -257,6 +278,9 @@ async fn install_datapacks(
                 }
             }
             Err(error) => {
+                // Not an answer: we do not know which file this entry wants, so
+                // nothing may be removed on this pass.
+                lookups_complete = false;
                 emit_log(
                     app_handle,
                     ProcessLogStream::Stdout,
@@ -267,6 +291,21 @@ async fn install_datapacks(
                 )?;
             }
         }
+    }
+
+    let removed = crate::instance_content::sync_managed_content_dir(
+        instance_root,
+        "datapacks",
+        &instance_dir,
+        &installed,
+        lookups_complete,
+    )?;
+    for name in removed {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!("[Content] Removed {name} from datapacks"),
+        )?;
     }
 
     Ok(())

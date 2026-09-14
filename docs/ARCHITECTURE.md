@@ -131,6 +131,7 @@ A modlist can contain:
 - `datapacks.json`
 - `shaders.json`
 - `instances/<minecraft-version>-<loader>/`
+  - `.cubic/managed-resourcepacks.json`, `.cubic/managed-shaderpacks.json`, `.cubic/managed-datapacks.json` — the content packs the launcher linked into that instance. The next launch removes only the entries it recorded and no longer wants; anything else in `resourcepacks/`, `shaderpacks/` and `datapacks/` is left untouched, and a missing or unreadable manifest removes nothing.
 
 ## Database
 
