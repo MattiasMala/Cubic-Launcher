@@ -49,10 +49,14 @@ pub struct PresentEntry {
 }
 
 /// Path of the manifest for `category` (`resourcepacks`, `shaderpacks`,
-/// `datapacks`). It lives in the instance root, hidden by the leading dot, so
-/// it never shows up as a bogus pack inside the pack folder itself.
+/// `datapacks`). It lives in the instance's own `.cubic/` directory (decision
+/// D39): hidden by the leading dot, outside the pack folders so it never shows
+/// up as a bogus pack, and in one place instead of three dotfiles in the
+/// instance root.
 pub fn manifest_path(instance_root: &Path, category: &str) -> PathBuf {
-    instance_root.join(format!(".cubic-managed-{category}.json"))
+    instance_root
+        .join(".cubic")
+        .join(format!("managed-{category}.json"))
 }
 
 /// Decide which files to remove, given the previous manifest, the set we just
@@ -119,6 +123,11 @@ fn write_manifest(manifest_path: &Path, category: &str, files: &[String]) -> Res
     };
     let body = serde_json::to_string_pretty(&manifest)
         .context("failed to serialize managed content manifest")?;
+
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
 
     fs::write(manifest_path, body).with_context(|| {
         format!(
@@ -393,8 +402,10 @@ mod tests {
         let instance_dir = fixture_instance(&root_dir, "shaderpacks");
         fs::write(instance_dir.join("shader.zip"), b"shader").expect("shader fixture should exist");
         fs::write(instance_dir.join("iris.txt"), b"config").expect("config fixture should exist");
-        fs::write(manifest_path(&root_dir, "shaderpacks"), b"{ not json")
-            .expect("corrupt manifest should be written");
+        let manifest = manifest_path(&root_dir, "shaderpacks");
+        fs::create_dir_all(manifest.parent().expect("manifest has a parent"))
+            .expect("manifest directory should be created");
+        fs::write(&manifest, b"{ not json").expect("corrupt manifest should be written");
 
         let removals = sync_managed_content_dir(&root_dir, "shaderpacks", &instance_dir, &[], true)
             .expect("sync should succeed despite the corrupt manifest");
