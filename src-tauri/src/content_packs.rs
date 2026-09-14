@@ -33,12 +33,41 @@ pub struct ContentGroup {
     pub entry_ids: Vec<String>,
 }
 
+/// One pack in a category list.
+///
+/// Every field added after the first release is `#[serde(default)]` and
+/// `skip_serializing_if`: a `resourcepacks.json` written before those fields
+/// existed keeps loading, and rewriting it does not grow null keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentEntry {
     pub id: String,
     pub source: String, // "modrinth" or "local"
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub version_rules: Vec<VersionRule>,
+    /// Display name for entries the launcher cannot look up remotely. Modrinth
+    /// entries leave it empty and keep taking their title from the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Name of the pack inside the mod-list category directory
+    /// (`mod-lists/<name>/resourcepacks/`, `datapacks/`, `shaders/`): the file
+    /// for a zipped pack, the directory for an unpacked one. This is what the
+    /// launcher links into the instance, and it is deliberately not `id`: the
+    /// id is identity, this is location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// Where the extracted `pack.png` lives, **relative to the mod-list
+    /// directory** (`.cubic/icons/<category>/<file_name>.png`). Absent when the
+    /// pack ships no `pack.png`, which is normal and not an error.
+    ///
+    /// The bytes are deliberately not stored here: this file is parsed on every
+    /// launch, and inlining base64 icons took the real mod list's
+    /// `resourcepacks.json` from 411 bytes to 372 KB for four packs. The
+    /// frontend still gets a ready `data:` URL — [`entry_snapshot`] builds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_path: Option<String>,
+    /// `pack.mcmeta`'s `pack.description`, but only when it is a plain string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 // ── File names ──────────────────────────────────────────────────────────────
@@ -149,6 +178,10 @@ pub struct ContentEntrySnapshot {
     pub id: String,
     pub source: String,
     pub version_rules: Vec<VersionRuleSnapshot>,
+    pub name: Option<String>,
+    pub file_name: Option<String>,
+    pub icon_image: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +194,39 @@ pub struct VersionRuleSnapshot {
 
 fn validate_content_modlist_name(name: &str) -> Result<(), String> {
     validate_path_component(name).map_err(|e| e.to_string())
+}
+
+/// The frontend-facing view of one entry. Shared by `load_content_list_command`
+/// and by the local-pack import, which returns the row it just created so the
+/// caller can insert it without reloading the whole list.
+///
+/// `icon_path` becomes `iconImage`, a `data:image/png;base64,…` the caller can
+/// put straight into an `<img>`: the icon is read here, off the launch path, and
+/// a missing or unreadable icon file simply yields no icon.
+pub fn entry_snapshot(entry: &ContentEntry, modlist_dir: &Path) -> ContentEntrySnapshot {
+    ContentEntrySnapshot {
+        id: entry.id.clone(),
+        source: entry.source.clone(),
+        version_rules: entry
+            .version_rules
+            .iter()
+            .map(|vr| VersionRuleSnapshot {
+                kind: match vr.kind {
+                    crate::rules::VersionRuleKind::Exclude => "exclude".to_string(),
+                    crate::rules::VersionRuleKind::Only => "only".to_string(),
+                },
+                mc_versions: vr.mc_versions.clone(),
+                loader: vr.loader.clone(),
+            })
+            .collect(),
+        name: entry.name.clone(),
+        file_name: entry.file_name.clone(),
+        icon_image: entry
+            .icon_path
+            .as_deref()
+            .and_then(|path| crate::local_content_packs::read_icon_data_url(modlist_dir, path)),
+        description: entry.description.clone(),
+    }
 }
 
 #[tauri::command]
@@ -176,25 +242,7 @@ pub fn load_content_list_command(
         entries: list
             .entries
             .iter()
-            .map(|e| ContentEntrySnapshot {
-                id: e.id.clone(),
-                source: e.source.clone(),
-                version_rules: e
-                    .version_rules
-                    .iter()
-                    .map(|vr| {
-                        let kind_str = match vr.kind {
-                            crate::rules::VersionRuleKind::Exclude => "exclude",
-                            crate::rules::VersionRuleKind::Only => "only",
-                        };
-                        VersionRuleSnapshot {
-                            kind: kind_str.to_string(),
-                            mc_versions: vr.mc_versions.clone(),
-                            loader: vr.loader.clone(),
-                        }
-                    })
-                    .collect(),
-            })
+            .map(|entry| entry_snapshot(entry, &dir))
             .collect(),
         groups: list
             .groups
@@ -226,6 +274,10 @@ pub fn add_content_command(
         id: input.id,
         source: input.source,
         version_rules: vec![],
+        name: None,
+        file_name: None,
+        icon_path: None,
+        description: None,
     });
     save_content_list(&dir, &list).map_err(|e| e.to_string())
 }
