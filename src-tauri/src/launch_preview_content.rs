@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::content_packs::{load_content_list, ContentEntry, ContentList};
 use crate::launcher_paths::LauncherPaths;
+use crate::local_content_packs::{link_local_pack, plan_local_pack_installs, PackLinkKind};
 use crate::modrinth::ModrinthClient;
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
@@ -36,6 +37,70 @@ fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str)
 
 pub(super) fn validate_content_filename(filename: &str) -> Result<()> {
     validate_path_component(filename)
+}
+
+/// Link the `source: "local"` entries of one category into the instance, and
+/// return the names that reached it.
+///
+/// Those names are the point of this function: they go into the set
+/// [`crate::instance_content::sync_managed_content_dir`] compares the previous
+/// manifest against. A pack that is linked but left out of that set is removed
+/// on the *next* launch — the wipe C1 closed, reappearing in a form that takes
+/// two launches to notice.
+///
+/// A missing file is an answer, not a failure: it is logged and does not freeze
+/// the category's removals, because we know exactly which pack is gone. Nothing
+/// here touches the network.
+fn install_local_content_packs(
+    app_handle: &tauri::AppHandle,
+    modlist_dir: &Path,
+    content_type: &str,
+    instance_subdir: &str,
+    instance_dir: &Path,
+    active_entries: &[&ContentEntry],
+) -> Result<Vec<String>> {
+    let mut installed = Vec::new();
+
+    for pack in plan_local_pack_installs(modlist_dir, content_type, active_entries) {
+        if !pack.present {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Content] Local pack '{}' is missing from {}",
+                    pack.file_name,
+                    pack.source_path.display()
+                ),
+            )?;
+            continue;
+        }
+
+        let target_path = instance_dir.join(&pack.file_name);
+        let kind = link_local_pack(&pack.source_path, &target_path).with_context(|| {
+            format!(
+                "failed to install local content pack '{}' into instance",
+                pack.file_name
+            )
+        })?;
+
+        if !installed.iter().any(|name| name == &pack.file_name) {
+            installed.push(pack.file_name.clone());
+        }
+
+        let how = match kind {
+            PackLinkKind::Linked => "",
+            // Not silent: a copied folder is a second set of bytes on disk, and
+            // whoever reads the log has to be able to tell why.
+            PackLinkKind::Copied => " (copied: this platform refused a directory link)",
+        };
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!("[Content] {} -> {}{}", pack.file_name, instance_subdir, how),
+        )?;
+    }
+
+    Ok(installed)
 }
 
 /// Resolve, download and install content packs into the instance.
@@ -88,8 +153,29 @@ pub(super) async fn resolve_and_install_content_packs(
                 .with_context(|| format!("failed to create {}", instance_dir.display()))?;
         }
 
+        installed.extend(install_local_content_packs(
+            app_handle,
+            &modlist_dir,
+            content_type,
+            instance_subdir,
+            &instance_dir,
+            &active_entries,
+        )?);
+
         for entry in &active_entries {
             if entry.source != "modrinth" {
+                if entry.source != "local" {
+                    // The old code skipped everything non-Modrinth without a
+                    // word, so a typo in `source` looked like an empty list.
+                    emit_log(
+                        app_handle,
+                        ProcessLogStream::Stdout,
+                        format!(
+                            "[Content] Skipping '{}': unknown source '{}'",
+                            entry.id, entry.source
+                        ),
+                    )?;
+                }
                 continue;
             }
 
@@ -230,8 +316,27 @@ async fn install_datapacks(
             .with_context(|| format!("failed to create {}", instance_dir.display()))?;
     }
 
+    installed.extend(install_local_content_packs(
+        app_handle,
+        modlist_dir,
+        "datapack",
+        "datapacks",
+        &instance_dir,
+        &active_entries,
+    )?);
+
     for entry in &active_entries {
         if entry.source != "modrinth" {
+            if entry.source != "local" {
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Content] Skipping '{}': unknown source '{}'",
+                        entry.id, entry.source
+                    ),
+                )?;
+            }
             continue;
         }
 

@@ -44,7 +44,8 @@ pub struct ManagedContentManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentEntry {
     pub name: String,
-    /// `true` for a real directory: never something we linked, so never ours.
+    /// `true` for a real directory, as opposed to a symlink pointing at one.
+    /// Removing the two takes different calls.
     pub is_real_dir: bool,
 }
 
@@ -59,13 +60,18 @@ pub fn manifest_path(instance_root: &Path, category: &str) -> PathBuf {
         .join(format!("managed-{category}.json"))
 }
 
-/// Decide which files to remove, given the previous manifest, the set we just
+/// Decide which names to remove, given the previous manifest, the set we just
 /// installed, and what is actually in the directory.
 ///
 /// A name is removed only when all three hold: it was in the previous manifest,
-/// it is not in the new set, and it is on disk as a file or symlink. Anything
-/// else — unknown files, entries the user already deleted, entries that are now
-/// real directories — is left alone.
+/// it is not in the new set, and it is on disk. Anything else — unknown files,
+/// unknown directories, entries the user already deleted — is left alone.
+///
+/// The manifest is the only thing that grants ownership, and that is what makes
+/// it safe to remove a **real directory**: local packs can be unpacked folders,
+/// and on a platform where a directory cannot be linked the launcher copies one
+/// in, so "it is a directory, therefore not mine" stopped being true. A
+/// directory the manifest does not name is still never touched.
 pub fn plan_stale_removals(
     previous: &[String],
     installed: &[String],
@@ -79,10 +85,7 @@ pub fn plan_stale_removals(
         if keep.contains(name.as_str()) || !planned.insert(name.as_str()) {
             continue;
         }
-        let removable = present
-            .iter()
-            .any(|entry| entry.name == *name && !entry.is_real_dir);
-        if removable {
+        if present.iter().any(|entry| entry.name == *name) {
             removals.push(name.clone());
         }
     }
@@ -228,13 +231,47 @@ pub fn sync_managed_content_dir(
 
     for name in &removals {
         let path = instance_dir.join(name);
-        fs::remove_file(&path)
+        remove_managed_entry(&path)
             .with_context(|| format!("failed to remove stale content pack {}", path.display()))?;
     }
 
     write_manifest(&manifest_path, category, installed)?;
 
     Ok(removals)
+}
+
+/// Remove one managed entry, whatever shape it has on disk.
+///
+/// Three shapes exist and they want three different calls: a symlink to a file,
+/// a symlink to a directory, and a real directory the launcher copied in
+/// because the platform refused to link one. Using the wrong call either fails
+/// outright or, worse, succeeds on the wrong thing.
+fn remove_managed_entry(path: &Path) -> std::io::Result<()> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if file_type.is_symlink() {
+        remove_symlink(path)
+    } else if file_type.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// On Windows a symlink to a directory is removed with `remove_dir`, not
+/// `remove_file`; `Path::is_dir` follows the link and tells the two apart.
+#[cfg(target_family = "windows")]
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// On unix `unlink` removes a symlink regardless of what it points at.
+#[cfg(target_family = "unix")]
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
 }
 
 #[cfg(test)]
@@ -337,8 +374,12 @@ mod tests {
         assert_eq!(removals, names(&["still-here.zip"]));
     }
 
+    /// C1 had the opposite assertion here — a real directory was "the user's",
+    /// because the launcher only ever linked files. Local packs can be unpacked
+    /// folders, so the rule moved to where it always belonged: ownership comes
+    /// from the manifest, and nothing else.
     #[test]
-    fn manifest_entry_that_is_now_a_real_directory_is_left_alone() {
+    fn manifest_entry_that_is_a_real_directory_is_removed() {
         let removals = plan_stale_removals(
             &names(&["pack"]),
             &[],
@@ -348,9 +389,34 @@ mod tests {
             }],
         );
 
-        assert!(
-            removals.is_empty(),
-            "we only ever link files, so a directory is the user's"
+        assert_eq!(
+            removals,
+            names(&["pack"]),
+            "a directory the manifest names is one we put there"
+        );
+    }
+
+    #[test]
+    fn a_real_directory_the_manifest_does_not_name_is_never_removed() {
+        let removals = plan_stale_removals(
+            &names(&["ours.zip"]),
+            &[],
+            &[
+                PresentEntry {
+                    name: "ours.zip".to_string(),
+                    is_real_dir: false,
+                },
+                PresentEntry {
+                    name: "user-unpacked-pack".to_string(),
+                    is_real_dir: true,
+                },
+            ],
+        );
+
+        assert_eq!(
+            removals,
+            names(&["ours.zip"]),
+            "the unlisted folder stays, the listed link goes"
         );
     }
 

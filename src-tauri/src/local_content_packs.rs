@@ -21,7 +21,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -334,6 +334,158 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Installing into an instance ─────────────────────────────────────────────
+
+/// One local pack that has to reach the instance on this launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPackInstall {
+    /// Name inside the mod-list category directory, and the name the pack gets
+    /// inside the instance. This is what goes into the manifest C1 compares
+    /// against on the next launch.
+    pub file_name: String,
+    /// Absolute path of the pack inside the mod list.
+    pub source_path: PathBuf,
+    /// `false` when the file or folder is not there any more.
+    pub present: bool,
+}
+
+/// Which `source: "local"` entries of an already-filtered list have to be
+/// installed, in list order.
+///
+/// Pure on purpose: the launch path needs the same decision that the two-pass
+/// test needs, and the decision must not depend on an `AppHandle` or on the
+/// network. Entries from any other source are skipped here, which is what keeps
+/// a local pack out of the Modrinth version lookup by construction.
+///
+/// A missing file is reported rather than dropped, so the caller can say so in
+/// the launch log instead of failing silently. An entry without `file_name`
+/// falls back to its `id`: the import writes both with the same value, and an
+/// entry written by hand would only have the id.
+pub fn plan_local_pack_installs(
+    modlist_dir: &Path,
+    content_type: &str,
+    entries: &[&ContentEntry],
+) -> Vec<LocalPackInstall> {
+    let Some(category_dir) = modlist_category_dir(content_type) else {
+        return Vec::new();
+    };
+    let category_path = modlist_dir.join(category_dir);
+
+    entries
+        .iter()
+        .filter(|entry| entry.source == "local")
+        .filter_map(|entry| {
+            let file_name = entry.file_name.as_deref().unwrap_or(entry.id.as_str());
+            validate_path_component(file_name).ok()?;
+            let source_path = category_path.join(file_name);
+            Some(LocalPackInstall {
+                file_name: file_name.to_string(),
+                present: source_path.symlink_metadata().is_ok(),
+                source_path,
+            })
+        })
+        .collect()
+}
+
+/// How a local pack reached the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackLinkKind {
+    /// A symlink, which is the normal case everywhere.
+    Linked,
+    /// A recursive copy, the fallback for an unpacked pack on a platform that
+    /// refuses to create a directory symlink.
+    Copied,
+}
+
+/// Put a local pack into the instance directory, replacing whatever the last
+/// launch left under that name.
+///
+/// A file is linked exactly the way a Modrinth pack is
+/// ([`crate::instance_mods::create_file_link`]): symlink, falling back to a hard
+/// link. A directory is linked with a directory symlink, and where that is
+/// refused — Windows without the privilege, which is the same condition the file
+/// path already handles — it is **copied**, because a junction would need a new
+/// dependency and zipping the pack would change the bytes the user chose and
+/// take away the point of keeping it unpacked.
+pub fn link_local_pack(source: &Path, target: &Path) -> Result<PackLinkKind> {
+    let source_is_dir = fs::metadata(source)
+        .with_context(|| format!("failed to read {}", source.display()))?
+        .is_dir();
+
+    remove_existing_target(target)?;
+
+    if !source_is_dir {
+        crate::instance_mods::create_file_link(source, target)?;
+        return Ok(PackLinkKind::Linked);
+    }
+
+    match create_directory_symlink(source, target) {
+        Ok(()) => Ok(PackLinkKind::Linked),
+        Err(_) => {
+            copy_directory_recursive(source, target)?;
+            Ok(PackLinkKind::Copied)
+        }
+    }
+}
+
+/// Clear the instance-side name before installing over it. Symmetric with
+/// `create_file_link`, which also removes an existing target; the directory
+/// cases are the ones it cannot handle.
+fn remove_existing_target(target: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+
+    let removed = if file_type.is_symlink() {
+        remove_symlink(target)
+    } else if file_type.is_dir() {
+        fs::remove_dir_all(target)
+    } else {
+        fs::remove_file(target)
+    };
+
+    removed.with_context(|| format!("failed to replace {}", target.display()))
+}
+
+#[cfg(target_family = "windows")]
+fn remove_symlink(target: &Path) -> std::io::Result<()> {
+    if target.is_dir() {
+        fs::remove_dir(target)
+    } else {
+        fs::remove_file(target)
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn remove_symlink(target: &Path) -> std::io::Result<()> {
+    fs::remove_file(target)
+}
+
+#[cfg(target_family = "unix")]
+fn create_directory_symlink(source: &Path, target: &Path) -> Result<()> {
+    // `symlink` does not care whether the target is a file or a directory, so
+    // unix needs no second branch and never reaches the copy fallback.
+    std::os::unix::fs::symlink(source, target).with_context(|| {
+        format!(
+            "failed to link {} to {}",
+            target.display(),
+            source.display()
+        )
+    })
+}
+
+#[cfg(target_family = "windows")]
+fn create_directory_symlink(source: &Path, target: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(source, target).with_context(|| {
+        format!(
+            "failed to link {} to {}",
+            target.display(),
+            source.display()
+        )
+    })
+}
+
 // ── Errors the UI has to tell apart ─────────────────────────────────────────
 
 /// Why an import failed, as a value instead of a sentence.
@@ -566,8 +718,8 @@ mod tests {
 
     use super::{
         build_local_entry, description_from_mcmeta, display_name_for, icon_relative_path,
-        import_local_content_pack_from_root, read_icon_data_url, ContentImportErrorCode,
-        ImportLocalContentPackInput,
+        import_local_content_pack_from_root, link_local_pack, plan_local_pack_installs,
+        read_icon_data_url, ContentImportErrorCode, ImportLocalContentPackInput, PackLinkKind,
     };
 
     /// The eight bytes every PNG starts with, plus a little payload.
@@ -1092,5 +1244,324 @@ mod tests {
         assert_eq!(entry.source, "local");
         assert_eq!(entry.file_name.as_deref(), Some("Pack.zip"));
         assert!(entry.version_rules.is_empty());
+    }
+
+    // ── Installing into an instance ──────────────────────────────────────────
+
+    /// One launch: link every local pack of the category and hand the names to
+    /// C1's differential sync, exactly as `launch_preview_content.rs` does.
+    fn simulate_launch(
+        modlist: &Path,
+        instance_root: &Path,
+        content_type: &str,
+        category: &str,
+        entries: &[&ContentEntry],
+        lookups_complete: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let instance_dir = instance_root.join(category);
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+
+        let mut installed = Vec::new();
+        for pack in plan_local_pack_installs(modlist, content_type, entries) {
+            if !pack.present {
+                continue;
+            }
+            link_local_pack(&pack.source_path, &instance_dir.join(&pack.file_name))
+                .expect("a present pack should install");
+            installed.push(pack.file_name.clone());
+        }
+
+        let removed = crate::instance_content::sync_managed_content_dir(
+            instance_root,
+            category,
+            &instance_dir,
+            &installed,
+            lookups_complete,
+        )
+        .expect("sync should succeed");
+
+        (installed, removed)
+    }
+
+    fn present_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("instance dir should be readable")
+            .map(|entry| {
+                entry
+                    .expect("entry should be readable")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8 name")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn only_local_entries_are_planned_so_modrinth_never_reaches_the_link_step() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let zip = root.join("Mine.zip");
+        write_zip_pack(&zip, &[("pack.png", PNG_BYTES)]);
+        import(&root, "Sky Pack", "resourcepack", &zip).expect("import should work");
+
+        let mut list = load_content_list(&modlist, "resourcepack").expect("list should load");
+        list.entries.insert(
+            0,
+            ContentEntry {
+                id: "fresh-animations".to_string(),
+                source: "modrinth".to_string(),
+                version_rules: vec![],
+                name: None,
+                file_name: None,
+                icon_path: None,
+                description: None,
+            },
+        );
+        let entries: Vec<&ContentEntry> = list.entries.iter().collect();
+
+        let planned = plan_local_pack_installs(&modlist, "resourcepack", &entries);
+        assert_eq!(
+            planned
+                .iter()
+                .map(|p| p.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Mine.zip"],
+            "a Modrinth entry has no local file and must not be planned"
+        );
+        assert!(planned[0].present);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_entry_whose_file_vanished_is_reported_not_installed() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let zip = root.join("Gone.zip");
+        write_zip_pack(&zip, &[("pack.png", PNG_BYTES)]);
+        import(&root, "Sky Pack", "resourcepack", &zip).expect("import should work");
+        fs::remove_file(modlist.join("resourcepacks").join("Gone.zip"))
+            .expect("the copied pack should be removable");
+
+        let list = load_content_list(&modlist, "resourcepack").expect("list should load");
+        let entries: Vec<&ContentEntry> = list.entries.iter().collect();
+        let planned = plan_local_pack_installs(&modlist, "resourcepack", &entries);
+
+        assert_eq!(planned.len(), 1);
+        assert!(
+            !planned[0].present,
+            "a missing file is reported, not silently dropped"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The two-pass test.** A pack linked without being put into the set C1
+    /// compares against is deleted on the *next* launch — the wipe C1 closed,
+    /// back in a form that takes two launches to see. Both shapes are covered,
+    /// because an unpacked pack is a directory and the removal rule had to
+    /// change for it.
+    #[test]
+    fn two_launches_in_a_row_leave_both_a_zip_and_a_folder_pack_in_place() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let instance_root = modlist.join("instances").join("1.20.1-forge");
+
+        let zip = root.join("Zipped Pack.zip");
+        write_zip_pack(&zip, &[("pack.png", PNG_BYTES)]);
+        let folder = root.join("Folder Pack");
+        write_dir_pack(&folder, &[("pack.png", PNG_BYTES), ("assets/a.txt", b"a")]);
+        import(&root, "Sky Pack", "resourcepack", &zip).expect("zip import should work");
+        import(&root, "Sky Pack", "resourcepack", &folder).expect("folder import should work");
+
+        let list = load_content_list(&modlist, "resourcepack").expect("list should load");
+        let entries: Vec<&ContentEntry> = list.entries.iter().collect();
+        let instance_dir = instance_root.join("resourcepacks");
+
+        // A file the user dropped in by hand: C1's invariant still holds.
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+        fs::write(instance_dir.join("user-hand-pack.zip"), b"mine")
+            .expect("hand-placed file should be written");
+
+        let (first, removed) = simulate_launch(
+            &modlist,
+            &instance_root,
+            "resourcepack",
+            "resourcepacks",
+            &entries,
+            true,
+        );
+        assert_eq!(
+            first,
+            vec!["Zipped Pack.zip".to_string(), "Folder Pack".to_string()]
+        );
+        assert!(removed.is_empty(), "nothing to remove on a first launch");
+        assert_eq!(
+            present_names(&instance_dir),
+            ["Folder Pack", "Zipped Pack.zip", "user-hand-pack.zip"]
+        );
+        // The names reached the manifest, which is the part that makes the
+        // second launch dangerous: C1 removes manifest names that are missing
+        // from the new installed set.
+        assert_eq!(
+            crate::instance_content::read_manifest_files(&crate::instance_content::manifest_path(
+                &instance_root,
+                "resourcepacks"
+            )),
+            first
+        );
+
+        let (second, removed) = simulate_launch(
+            &modlist,
+            &instance_root,
+            "resourcepack",
+            "resourcepacks",
+            &entries,
+            true,
+        );
+        assert_eq!(second, first, "the second launch installs the same set");
+        assert!(
+            removed.is_empty(),
+            "the second launch must not remove what it just installed"
+        );
+        assert_eq!(
+            present_names(&instance_dir),
+            ["Folder Pack", "Zipped Pack.zip", "user-hand-pack.zip"],
+            "both packs and the hand-placed file survive launch two"
+        );
+        assert!(
+            instance_dir
+                .join("Folder Pack")
+                .join("assets")
+                .join("a.txt")
+                .exists(),
+            "the folder pack is reachable through whatever link or copy was used"
+        );
+
+        // Third launch with the folder pack dropped from the list: only that
+        // one goes, whether it is a link or a copied directory.
+        let kept: Vec<&ContentEntry> = entries
+            .iter()
+            .copied()
+            .filter(|e| e.file_name.as_deref() != Some("Folder Pack"))
+            .collect();
+        let (third, removed) = simulate_launch(
+            &modlist,
+            &instance_root,
+            "resourcepack",
+            "resourcepacks",
+            &kept,
+            true,
+        );
+        assert_eq!(third, vec!["Zipped Pack.zip".to_string()]);
+        assert_eq!(removed, vec!["Folder Pack".to_string()]);
+        assert_eq!(
+            present_names(&instance_dir),
+            ["Zipped Pack.zip", "user-hand-pack.zip"]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A Modrinth lookup that failed freezes removals for the category. A local
+    /// pack has no lookup to fail, and must not be collateral damage: its link
+    /// stays and its name stays in the manifest.
+    #[test]
+    fn a_failed_modrinth_lookup_does_not_disturb_a_local_pack() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let instance_root = modlist.join("instances").join("1.20.1-forge");
+        let zip = root.join("Local Pack.zip");
+        write_zip_pack(&zip, &[("pack.png", PNG_BYTES)]);
+        import(&root, "Sky Pack", "resourcepack", &zip).expect("import should work");
+
+        let list = load_content_list(&modlist, "resourcepack").expect("list should load");
+        let entries: Vec<&ContentEntry> = list.entries.iter().collect();
+        let instance_dir = instance_root.join("resourcepacks");
+
+        simulate_launch(
+            &modlist,
+            &instance_root,
+            "resourcepack",
+            "resourcepacks",
+            &entries,
+            true,
+        );
+        // A Modrinth pack was linked last launch too.
+        fs::write(instance_dir.join("modrinth-pack.zip"), b"cached")
+            .expect("modrinth link should be written");
+        let manifest = crate::instance_content::manifest_path(&instance_root, "resourcepacks");
+        fs::write(
+            &manifest,
+            serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "category": "resourcepacks",
+                "files": ["Local Pack.zip", "modrinth-pack.zip"],
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest should be written");
+
+        // Next launch: the Modrinth request fails, so `installed` is incomplete.
+        let (_, removed) = simulate_launch(
+            &modlist,
+            &instance_root,
+            "resourcepack",
+            "resourcepacks",
+            &entries,
+            false,
+        );
+
+        assert!(removed.is_empty(), "a failed lookup removes nothing");
+        assert_eq!(
+            present_names(&instance_dir),
+            ["Local Pack.zip", "modrinth-pack.zip"]
+        );
+        assert_eq!(
+            crate::instance_content::read_manifest_files(&manifest),
+            vec![
+                "Local Pack.zip".to_string(),
+                "modrinth-pack.zip".to_string()
+            ],
+            "the frozen manifest keeps both names"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn installing_over_a_previous_link_replaces_it() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let folder = root.join("Folder Pack");
+        write_dir_pack(&folder, &[("pack.png", PNG_BYTES)]);
+        import(&root, "Sky Pack", "resourcepack", &folder).expect("import should work");
+        let source = modlist.join("resourcepacks").join("Folder Pack");
+
+        let instance_dir = root.join("instance").join("resourcepacks");
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+        let target = instance_dir.join("Folder Pack");
+
+        // A real directory left by an earlier copy fallback, and a stale file
+        // under the same name: both have to give way to the current pack.
+        fs::create_dir_all(target.join("stale")).expect("stale dir should be created");
+        assert_eq!(
+            link_local_pack(&source, &target).expect("install over a directory"),
+            PackLinkKind::Linked
+        );
+        assert!(
+            !target.join("stale").exists(),
+            "the stale directory is gone"
+        );
+        assert!(target.join("pack.png").exists());
+
+        fs::remove_file(&target).expect("the link should be removable");
+        fs::write(&target, b"stale file").expect("stale file should be written");
+        link_local_pack(&source, &target).expect("install over a file");
+        assert!(target.join("pack.png").exists());
+
+        fs::remove_dir_all(&root).ok();
     }
 }
