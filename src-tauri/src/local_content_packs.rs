@@ -387,18 +387,21 @@ pub fn plan_local_pack_installs(
         .collect()
 }
 
-/// How a local pack reached the instance.
+/// What happened when a local pack was installed into an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackLinkKind {
+pub enum PackLinkOutcome {
     /// A symlink, which is the normal case everywhere.
     Linked,
     /// A recursive copy, the fallback for an unpacked pack on a platform that
     /// refuses to create a directory symlink.
     Copied,
+    /// Nothing was done: a real directory already sits under that name and the
+    /// manifest does not claim it, so it is not ours to delete.
+    SkippedForeignDirectory,
 }
 
-/// Put a local pack into the instance directory, replacing whatever the last
-/// launch left under that name.
+/// Put a local pack into the instance directory, replacing what the last launch
+/// left under that name.
 ///
 /// A file is linked exactly the way a Modrinth pack is
 /// ([`crate::instance_mods::create_file_link`]): symlink, falling back to a hard
@@ -407,25 +410,52 @@ pub enum PackLinkKind {
 /// path already handles — it is **copied**, because a junction would need a new
 /// dependency and zipping the pack would change the bytes the user chose and
 /// take away the point of keeping it unpacked.
-pub fn link_local_pack(source: &Path, target: &Path) -> Result<PackLinkKind> {
+///
+/// `directory_is_ours` says whether the previous manifest lists this name, and
+/// it gates the one destructive case. A real directory already under that name
+/// is either the copy fallback from our own last launch or a folder the user
+/// unpacked there; `remove_dir_all` on the second is C1's wipe in a new costume.
+/// Without the manifest's word the install is skipped and nothing is touched —
+/// the same rule as removal, ownership comes from the manifest, applied on the
+/// way in.
+pub fn link_local_pack(
+    source: &Path,
+    target: &Path,
+    directory_is_ours: bool,
+) -> Result<PackLinkOutcome> {
     let source_is_dir = fs::metadata(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .is_dir();
+
+    if target_is_real_dir(target) && !directory_is_ours {
+        return Ok(PackLinkOutcome::SkippedForeignDirectory);
+    }
 
     remove_existing_target(target)?;
 
     if !source_is_dir {
         crate::instance_mods::create_file_link(source, target)?;
-        return Ok(PackLinkKind::Linked);
+        return Ok(PackLinkOutcome::Linked);
     }
 
     match create_directory_symlink(source, target) {
-        Ok(()) => Ok(PackLinkKind::Linked),
+        Ok(()) => Ok(PackLinkOutcome::Linked),
         Err(_) => {
             copy_directory_recursive(source, target)?;
-            Ok(PackLinkKind::Copied)
+            Ok(PackLinkOutcome::Copied)
         }
     }
+}
+
+/// A directory, and not a symlink pointing at one: the only shape whose removal
+/// can destroy something the launcher did not create.
+fn target_is_real_dir(target: &Path) -> bool {
+    fs::symlink_metadata(target)
+        .map(|metadata| {
+            let file_type = metadata.file_type();
+            file_type.is_dir() && !file_type.is_symlink()
+        })
+        .unwrap_or(false)
 }
 
 /// Clear the instance-side name before installing over it. Symmetric with
@@ -719,7 +749,7 @@ mod tests {
     use super::{
         build_local_entry, description_from_mcmeta, display_name_for, icon_relative_path,
         import_local_content_pack_from_root, link_local_pack, plan_local_pack_installs,
-        read_icon_data_url, ContentImportErrorCode, ImportLocalContentPackInput, PackLinkKind,
+        read_icon_data_url, ContentImportErrorCode, ImportLocalContentPackInput, PackLinkOutcome,
     };
 
     /// The eight bytes every PNG starts with, plus a little payload.
@@ -1261,13 +1291,21 @@ mod tests {
         let instance_dir = instance_root.join(category);
         fs::create_dir_all(&instance_dir).expect("instance dir should be created");
 
+        let previous = crate::instance_content::read_manifest_files(
+            &crate::instance_content::manifest_path(instance_root, category),
+        );
+
         let mut installed = Vec::new();
         for pack in plan_local_pack_installs(modlist, content_type, entries) {
             if !pack.present {
                 continue;
             }
-            link_local_pack(&pack.source_path, &instance_dir.join(&pack.file_name))
-                .expect("a present pack should install");
+            link_local_pack(
+                &pack.source_path,
+                &instance_dir.join(&pack.file_name),
+                previous.iter().any(|name| name == &pack.file_name),
+            )
+            .expect("a present pack should install");
             installed.push(pack.file_name.clone());
         }
 
@@ -1532,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn installing_over_a_previous_link_replaces_it() {
+    fn installing_over_our_own_directory_replaces_it_but_a_foreign_one_is_left_alone() {
         let root = unique_test_root();
         let modlist = modlist_dir(&root, "Sky Pack");
         let folder = root.join("Folder Pack");
@@ -1544,22 +1582,35 @@ mod tests {
         fs::create_dir_all(&instance_dir).expect("instance dir should be created");
         let target = instance_dir.join("Folder Pack");
 
-        // A real directory left by an earlier copy fallback, and a stale file
-        // under the same name: both have to give way to the current pack.
-        fs::create_dir_all(target.join("stale")).expect("stale dir should be created");
+        // A folder the user unpacked there themselves: the manifest does not
+        // name it, so it is not ours and nothing happens to it.
+        fs::create_dir_all(target.join("theirs")).expect("foreign dir should be created");
         assert_eq!(
-            link_local_pack(&source, &target).expect("install over a directory"),
-            PackLinkKind::Linked
+            link_local_pack(&source, &target, false).expect("a foreign directory is not an error"),
+            PackLinkOutcome::SkippedForeignDirectory
         );
         assert!(
-            !target.join("stale").exists(),
-            "the stale directory is gone"
+            target.join("theirs").exists(),
+            "deleting it would be C1's wipe in a new costume"
+        );
+
+        // The same directory, but the manifest says we put it there: it is the
+        // copy fallback from our own last launch and it gives way.
+        assert_eq!(
+            link_local_pack(&source, &target, true).expect("install over our own directory"),
+            PackLinkOutcome::Linked
+        );
+        assert!(
+            !target.join("theirs").exists(),
+            "our own stale copy is replaced"
         );
         assert!(target.join("pack.png").exists());
 
+        // A stale file under that name is replaced either way: that is what
+        // `create_file_link` already does for Modrinth packs.
         fs::remove_file(&target).expect("the link should be removable");
         fs::write(&target, b"stale file").expect("stale file should be written");
-        link_local_pack(&source, &target).expect("install over a file");
+        link_local_pack(&source, &target, false).expect("install over a file");
         assert!(target.join("pack.png").exists());
 
         fs::remove_dir_all(&root).ok();

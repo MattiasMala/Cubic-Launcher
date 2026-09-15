@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::content_packs::{load_content_list, ContentEntry, ContentList};
 use crate::launcher_paths::LauncherPaths;
-use crate::local_content_packs::{link_local_pack, plan_local_pack_installs, PackLinkKind};
+use crate::local_content_packs::{link_local_pack, plan_local_pack_installs, PackLinkOutcome};
 use crate::modrinth::ModrinthClient;
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
@@ -55,11 +55,19 @@ fn install_local_content_packs(
     app_handle: &tauri::AppHandle,
     modlist_dir: &Path,
     content_type: &str,
+    instance_root: &Path,
     instance_subdir: &str,
     instance_dir: &Path,
     active_entries: &[&ContentEntry],
 ) -> Result<Vec<String>> {
     let mut installed = Vec::new();
+
+    // What the last launch says it put here. It decides one thing only: whether
+    // a real directory already under a pack's name may be replaced. Without it
+    // the install would `remove_dir_all` a folder the user unpacked themselves.
+    let previous = crate::instance_content::read_manifest_files(
+        &crate::instance_content::manifest_path(instance_root, instance_subdir),
+    );
 
     for pack in plan_local_pack_installs(modlist_dir, content_type, active_entries) {
         if !pack.present {
@@ -76,23 +84,41 @@ fn install_local_content_packs(
         }
 
         let target_path = instance_dir.join(&pack.file_name);
-        let kind = link_local_pack(&pack.source_path, &target_path).with_context(|| {
-            format!(
-                "failed to install local content pack '{}' into instance",
-                pack.file_name
-            )
-        })?;
+        let directory_is_ours = previous.iter().any(|name| name == &pack.file_name);
+        let outcome = link_local_pack(&pack.source_path, &target_path, directory_is_ours)
+            .with_context(|| {
+                format!(
+                    "failed to install local content pack '{}' into instance",
+                    pack.file_name
+                )
+            })?;
+
+        let how = match outcome {
+            PackLinkOutcome::Linked => "",
+            // Not silent: a copied folder is a second set of bytes on disk, and
+            // whoever reads the log has to be able to tell why.
+            PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
+            PackLinkOutcome::SkippedForeignDirectory => {
+                // Left out of `installed` on purpose: the name is not in the
+                // manifest, so the sync will not remove it either, and the
+                // user's folder stays exactly as it is.
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Content] Skipped local pack '{}': {} is a directory the launcher did not create",
+                        pack.file_name,
+                        target_path.display()
+                    ),
+                )?;
+                continue;
+            }
+        };
 
         if !installed.iter().any(|name| name == &pack.file_name) {
             installed.push(pack.file_name.clone());
         }
 
-        let how = match kind {
-            PackLinkKind::Linked => "",
-            // Not silent: a copied folder is a second set of bytes on disk, and
-            // whoever reads the log has to be able to tell why.
-            PackLinkKind::Copied => " (copied: this platform refused a directory link)",
-        };
         emit_log(
             app_handle,
             ProcessLogStream::Stdout,
@@ -157,6 +183,7 @@ pub(super) async fn resolve_and_install_content_packs(
             app_handle,
             &modlist_dir,
             content_type,
+            instance_root,
             instance_subdir,
             &instance_dir,
             &active_entries,
@@ -320,6 +347,7 @@ async fn install_datapacks(
         app_handle,
         modlist_dir,
         "datapack",
+        instance_root,
         "datapacks",
         &instance_dir,
         &active_entries,
