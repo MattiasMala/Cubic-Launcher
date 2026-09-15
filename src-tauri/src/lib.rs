@@ -16,6 +16,7 @@ pub mod launch_command;
 pub mod launch_preview;
 mod launcher_paths;
 pub mod loader_metadata;
+pub mod local_content_packs;
 pub mod microsoft_auth;
 pub mod minecraft_downloader;
 pub mod mod_cache;
@@ -118,6 +119,7 @@ pub fn run() {
             content_packs::reorder_content_command,
             content_packs::save_content_groups_command,
             content_packs::save_content_version_rules_command,
+            local_content_packs::import_local_content_pack_command,
             launch_preview::start_launch_command,
             launch_preview::update_precheck_command,
             launch_preview::verify_launch_command,

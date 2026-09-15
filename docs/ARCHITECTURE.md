@@ -130,6 +130,9 @@ A modlist can contain:
 - `resourcepacks.json`
 - `datapacks.json`
 - `shaders.json`
+- `local-jars/` — JARs uploaded for local mod rules
+- `resourcepacks/`, `datapacks/`, `shaders/` — locally imported content packs, one copy per modlist rather than one per instance target. Each is either a `.zip` or an unpacked directory, and instances link from here.
+- `.cubic/icons/<category>/<pack>.png` — the `pack.png` extracted from each locally imported pack at import time, so rendering a list never reopens an archive. The entry in the category JSON stores this path, not the image bytes.
 - `instances/<minecraft-version>-<loader>/`
   - `.cubic/managed-resourcepacks.json`, `.cubic/managed-shaderpacks.json`, `.cubic/managed-datapacks.json` — the content packs the launcher linked into that instance. The next launch removes only the entries it recorded and no longer wants; anything else in `resourcepacks/`, `shaderpacks/` and `datapacks/` is left untouched, and a missing or unreadable manifest removes nothing.
 
