@@ -10,6 +10,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
 import { updateAltsDeep } from "./lib/dragUtils";
+import { CONTENT_TYPE_NOUN, describeContentImportError } from "./lib/contentImportErrors";
+import type { LocalImportFailure } from "./lib/contentImportErrors";
+import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod-dialog/shared";
 
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
@@ -452,28 +455,115 @@ export default function App() {
     }
   };
 
-  const handleUploadLocal = async () => {
-    if (!isTauri()) {
-      pushUiError({ title: "Desktop app required", message: "Local JAR upload requires the Cubic Launcher desktop app.", detail: "The file picker is only available when running inside Tauri.", severity: "warning", scope: "launch" });
-      return;
-    }
+  /**
+   * Copy a local pack into the mod list (`import_local_content_pack_command`).
+   *
+   * Returns the refusal instead of pushing a notice: the Add dialog covers the
+   * notice banner, so a message pushed there would be invisible exactly when
+   * it matters. The dialog shows what comes back.
+   */
+  const importLocalContentPack = async (
+    sourcePath: string,
+    contentType: LocalUploadContentType,
+  ): Promise<LocalImportFailure | null> => {
+    const modlistName = selectedModListName();
+    if (!modlistName) return null;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({ title: "Select a mod JAR", filters: [{ name: "JAR files", extensions: ["jar"] }], multiple: false, directory: false });
-      if (!selected || !selectedModListName()) return;
+      await invoke("import_local_content_pack_command", {
+        input: { modlistName, contentType, sourcePath },
+      });
+      setAddModModalOpen(false);
+      // The command hands back the row it created, but reloading the list is
+      // the existing "the content list changed" path and also picks up groups
+      // and order. One command, one reload.
+      bumpContentVersion();
+      logger.debug("App", "importLocalContentPack completed", { contentType, sourcePath });
+      return null;
+    } catch (err) {
+      logger.error("App", "importLocalContentPack failed", err);
+      return describeContentImportError(err, { modlistName, contentType, sourcePath });
+    }
+  };
+
+  /**
+   * The Browse buttons of the Upload tab.
+   *
+   * A mod is a `.jar` and keeps the local-JAR command. A pack is a `.zip` or a
+   * folder, and since a Tauri dialog opens files or directories but not both,
+   * `pick` says which of the two buttons was pressed.
+   */
+  const handleUploadLocal = async (
+    contentType: LocalUploadContentType,
+    pick: LocalPickMode,
+  ): Promise<LocalImportFailure | null> => {
+    if (!isTauri()) {
+      pushUiError({
+        title: "Desktop app required",
+        message: contentType === "mod"
+          ? "Local JAR upload requires the Cubic Launcher desktop app."
+          : "Importing a local pack requires the Cubic Launcher desktop app.",
+        detail: "The file picker is only available when running inside Tauri.",
+        severity: "warning",
+        scope: "launch",
+      });
+      return null;
+    }
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    if (contentType === "mod") {
+      try {
+        const selected = await open({ title: "Select a mod JAR", filters: [{ name: "JAR files", extensions: ["jar"] }], multiple: false, directory: false });
+        if (!selected || !selectedModListName()) return null;
+        await invoke("copy_local_jar_command", {
+          input: {
+            sourcePath: selected as string,
+            ruleName: localJarRuleName().trim(),
+            modlistName: selectedModListName(),
+          },
+        });
+        setLocalJarRuleName("");
+        setAddModModalOpen(false);
+        await loadEditorSnapshot(selectedModListName());
+      } catch (err) {
+        pushUiError({ title: "Failed to upload JAR", message: "The file could not be copied to the mod cache.", detail: String(err), severity: "error", scope: "launch" });
+      }
+      return null;
+    }
+
+    const noun = CONTENT_TYPE_NOUN[contentType] ?? "pack";
+    try {
+      const selected = pick === "directory"
+        ? await open({ title: `Select an unpacked ${noun} folder`, multiple: false, directory: true })
+        : await open({ title: `Select a ${noun} ZIP`, filters: [{ name: "ZIP archives", extensions: ["zip"] }], multiple: false, directory: false });
+      if (!selected) return null;
+      return await importLocalContentPack(selected as string, contentType);
+    } catch (err) {
+      logger.error("App", "handleUploadLocal picker failed", err);
+      return { title: `The ${noun} picker could not be opened`, message: "The file dialog did not open, so nothing was imported.", detail: String(err) };
+    }
+  };
+
+  /**
+   * The drop zone of the Upload tab. A dropped `.jar` is a mod; for a pack the
+   * dropped path is a `.zip` or the folder of an unpacked pack, and the
+   * backend is the side that tells those apart from a stray file.
+   */
+  const handleDropLocal = async (
+    path: string,
+    contentType: LocalUploadContentType,
+  ): Promise<LocalImportFailure | null> => {
+    if (!selectedModListName()) return null;
+    if (contentType !== "mod") return await importLocalContentPack(path, contentType);
+    try {
       await invoke("copy_local_jar_command", {
-        input: {
-          sourcePath: selected as string,
-          ruleName: localJarRuleName().trim(),
-          modlistName: selectedModListName(),
-        },
+        input: { sourcePath: path, ruleName: localJarRuleName().trim(), modlistName: selectedModListName() },
       });
       setLocalJarRuleName("");
       setAddModModalOpen(false);
       await loadEditorSnapshot(selectedModListName());
     } catch (err) {
-      pushUiError({ title: "Failed to upload JAR", message: "The file could not be copied to the mod cache.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Failed to upload JAR", message: "The dropped file could not be added.", detail: String(err), severity: "error", scope: "launch" });
     }
+    return null;
   };
 
   const handleDeleteSelected = async () => {
@@ -938,19 +1028,7 @@ export default function App() {
         } catch (err) {
           pushUiError({ title: "Failed to add content", message: `Could not add '${id}'.`, detail: String(err), severity: "error", scope: "launch" });
         }
-      }} onUploadLocal={handleUploadLocal} onDropJar={async (path) => {
-        if (!selectedModListName()) return;
-        try {
-          await invoke("copy_local_jar_command", {
-            input: { sourcePath: path, ruleName: localJarRuleName().trim(), modlistName: selectedModListName() },
-          });
-          setLocalJarRuleName("");
-          setAddModModalOpen(false);
-          await loadEditorSnapshot(selectedModListName());
-        } catch (err) {
-          pushUiError({ title: "Failed to upload JAR", message: "The dropped file could not be added.", detail: String(err), severity: "error", scope: "launch" });
-        }
-      }} />
+      }} onUploadLocal={handleUploadLocal} onDropLocal={handleDropLocal} />
       <CreateModlistModal onCreate={handleCreateModlist} />
       <SettingsModal onSave={handleSaveSettings} />
       <AccountsModal onSwitchAccount={handleSwitchAccount} />

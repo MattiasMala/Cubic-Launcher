@@ -7,6 +7,7 @@ import type {
   ContentEntry,
   ContentGroupData,
   ContentMeta,
+  ContentSnapshotPayload,
   ContentTabViewProps,
   ContentTopLevelItem,
 } from "./content-types";
@@ -59,32 +60,45 @@ export function useContentTabState(props: ContentTabViewProps) {
   const load = async () => {
     if (!props.modlistName) return;
     try {
-      const snap: any = await invoke("load_content_list_command", {
+      const snap = await invoke<ContentSnapshotPayload>("load_content_list_command", {
         input: { modlistName: props.modlistName, contentType: props.type },
       });
-      const list: ContentEntry[] = (snap.entries ?? []).map((entry: any) => ({
+      const list: ContentEntry[] = (snap.entries ?? []).map(entry => ({
         id: entry.id,
         source: entry.source,
-        versionRules: (entry.versionRules ?? []).map((rule: any) => ({
+        versionRules: (entry.versionRules ?? []).map(rule => ({
           kind: rule.kind,
           mcVersions: rule.mcVersions,
           loader: rule.loader,
         })),
+        name: entry.name ?? undefined,
+        iconImage: entry.iconImage ?? undefined,
       }));
       const nextGroups: ContentGroupData[] = snap.groups ?? [];
       setEntries(list);
       setGroups(nextGroups);
 
+      const nextMeta = new Map<string, ContentMeta>();
+      // A local pack answers for itself: the snapshot already carries the name
+      // and the icon, so nothing here asks Modrinth about it. A pack with no
+      // pack.png simply has no icon, which is the normal case and not an error
+      // — the row falls back to the generic icon.
+      for (const entry of list) {
+        if (entry.source !== "local") continue;
+        nextMeta.set(entry.id, { name: entry.name ?? entry.id, iconUrl: entry.iconImage });
+      }
+
       const modrinthIds = list.filter(entry => entry.source === "modrinth").map(entry => entry.id);
       // Show already-known readable names immediately; the fetch below only
       // refines them (icons, corrected titles). If it fails, cached names keep
       // cards from falling back to raw project IDs.
-      const nextMeta = new Map<string, ContentMeta>();
       for (const id of modrinthIds) {
         const cached = contentNameCache.get(id);
         if (cached) nextMeta.set(id, { name: cached });
       }
       setMeta(nextMeta);
+      // Only the Modrinth half needs the API; a list of local packs only is
+      // already complete here.
       if (modrinthIds.length === 0) return;
 
       try {

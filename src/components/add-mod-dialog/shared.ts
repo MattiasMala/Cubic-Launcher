@@ -1,11 +1,26 @@
 import { MOCK_MODRINTH } from "../../store";
 import type { ModrinthResult } from "../../lib/types";
+import type { LocalImportFailure } from "../../lib/contentImportErrors";
+
+/**
+ * What the Upload tab is uploading. `mod` keeps the local-JAR path; the other
+ * three are content packs and go through the pack import command.
+ */
+export type LocalUploadContentType = "mod" | "resourcepack" | "datapack" | "shader";
+
+/**
+ * Which picker to open. A pack can be a `.zip` **or** a folder, and a Tauri
+ * dialog opens files or directories, never both at once, so the choice is the
+ * user's and it is explicit.
+ */
+export type LocalPickMode = "file" | "directory";
 
 export interface AddModDialogProps {
   onAddModrinth: (id: string, name: string) => Promise<void>;
   onAddContent?: (contentType: string, id: string, name: string) => Promise<void>;
-  onUploadLocal: () => Promise<void>;
-  onDropJar?: (path: string) => Promise<void>;
+  /** Resolves to the refusal to show in the panel, or `null` when it worked. */
+  onUploadLocal: (contentType: LocalUploadContentType, pick: LocalPickMode) => Promise<LocalImportFailure | null>;
+  onDropLocal?: (path: string, contentType: LocalUploadContentType) => Promise<LocalImportFailure | null>;
 }
 
 interface ModrinthHit {
