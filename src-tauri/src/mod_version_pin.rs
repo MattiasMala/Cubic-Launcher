@@ -260,6 +260,19 @@ fn plan_pin(modlist: &ModList, input: &ApplyPinInput) -> Result<PinPlan> {
         );
     }
 
+    // `delete_rules_from_root` drops the rule with `retain` (`editor_data.rs:248`),
+    // and a rule carries its alternatives: removing a dynamic entry that is the
+    // head of a fallback chain would delete mods nobody named. D5 says the
+    // dynamic entry disappears, not the chain under it, so this is refused
+    // instead of decided here.
+    if input.remove_dynamic && !modlist.rules[position].alternatives.is_empty() {
+        bail!(
+            "'{}' has {} alternative(s): removing it would delete them too — keep the dynamic entry, or remove its alternatives first",
+            input.dynamic_mod_id,
+            modlist.rules[position].alternatives.len()
+        );
+    }
+
     let mut top_level_order: Vec<String> = modlist
         .rules
         .iter()
@@ -602,6 +615,35 @@ mod tests {
             resolved_id(&modlist, &target("1.21.1", ModLoader::Forge), PINNED_ID),
             Some("modernfix".to_string()),
             "another Minecraft version must fall back to the dynamic entry"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removing_a_dynamic_entry_that_carries_alternatives_is_refused() {
+        let root = unique_test_root();
+        let mut dynamic = modrinth_rule("modernfix");
+        dynamic.alternatives = vec![modrinth_rule("embeddium")];
+        let modlist_dir = seed_modlist(&root, vec![dynamic]);
+        let before = fs::read(modlist_dir.join("rules.json")).unwrap();
+
+        let error = apply_pin_from_root(&root, &pin_input(&root, true))
+            .expect_err("deleting the dynamic entry would delete its fallback chain");
+        assert!(
+            error.to_string().contains("would delete them too"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(modlist_dir.join("rules.json")).unwrap(), before);
+
+        // Keeping the dynamic entry preserves the chain under it.
+        apply_pin_from_root(&root, &pin_input(&root, false)).unwrap();
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        assert_eq!(modlist.rules[0].mod_id, PINNED_ID);
+        assert_eq!(modlist.rules[0].alternatives[0].mod_id, "modernfix");
+        assert_eq!(
+            modlist.rules[0].alternatives[0].alternatives[0].mod_id,
+            "embeddium"
         );
 
         fs::remove_dir_all(&root).unwrap();
