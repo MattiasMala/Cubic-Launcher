@@ -1042,11 +1042,14 @@ pub(super) async fn resolve_selected_remote_artifacts(
     Ok(artifacts)
 }
 
-/// What a target actually loads, once the availability pass has had its say.
+/// What a target actually loads, once the availability pass has had its say —
+/// and what it stopped loading with nothing in its place, which no later stage
+/// can still see (A5).
 #[derive(Debug, Clone)]
 pub(super) struct TargetSelection {
     pub(super) resolution: ResolutionResult,
     pub(super) selected_mods: Vec<SelectedMod>,
+    pub(super) dropped: DroppedMods,
 }
 
 /// The Modrinth mods resolution selected and for which no artifact is
@@ -1088,6 +1091,201 @@ pub(super) fn reresolve_without_unavailable(
     }
 
     resolve_modlist(&patched, target)
+}
+
+/// Why the availability pass had nothing to install a mod with.
+///
+/// One value per selection path, because "available" means a different thing
+/// on each of them (`CacheBacking`): a notice that names the wrong reason is
+/// worse than the reason being generic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DropReason {
+    /// The resolving path: no version came back from Modrinth for this target
+    /// and no jar for it is on disk.
+    NoVersionAndNoCachedJar,
+    /// The pre-checked path: no version was chosen for it before the launch
+    /// and the cache cannot produce a jar either.
+    NoChosenVersionAndNothingCached,
+}
+
+/// The mods the availability pass took out of the launch with nothing in their
+/// place, and why. Empty in the normal case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DroppedMods {
+    pub(super) mod_ids: Vec<String>,
+    pub(super) reason: DropReason,
+}
+
+/// Of the mods the availability pass disabled, the ones the user actually
+/// loses: not in the game, and nothing took their place.
+///
+/// Reporting `unavailable` as it comes would be wrong three ways out of four,
+/// and a banner that cries wolf teaches people to ignore banners — the
+/// failure the dependency notices already cost this repository:
+///
+/// - **an alternative took over**: the group did its job, and saying "X was
+///   left out" while Y is loaded is false. Told apart by the slot — the
+///   top-level rule that resolved to the mod before the pass is `Resolved` to
+///   something else after it.
+/// - **the rules excluded it** (`exclude_if`, `requires`, `version_rules`):
+///   that is `resolve_modlist`'s decision, taken before this pass ever runs,
+///   so the mod is already `Unresolved`, never reaches `collect_selected_mods`
+///   and therefore never reaches `unavailable`. Nothing to filter here.
+/// - **a real loss**: no slot that carried it found anything, and the mod is
+///   nowhere in the final active set. This is the one the launch has to say
+///   out loud.
+///
+/// The two resolutions are compared by slot index, which is sound because both
+/// ran over the same top-level rule vector: `reresolve_without_unavailable`
+/// clones the mod-list and only flips `enabled`, and `resolve_modlist` pushes
+/// one `resolved_rules` entry per top-level rule, in order.
+pub(super) fn mods_dropped_without_replacement(
+    before: &ResolutionResult,
+    after: &ResolutionResult,
+    unavailable: &[String],
+) -> Vec<String> {
+    let mut dropped = Vec::new();
+
+    for mod_id in unavailable {
+        // Still loaded — another rule of the tree resolved to it — so there is
+        // nothing missing to report.
+        if after.active_mods.contains(mod_id.as_str()) {
+            continue;
+        }
+
+        let replaced = before
+            .resolved_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| {
+                matches!(&rule.outcome, RuleOutcome::Resolved { resolved_id } if resolved_id == mod_id)
+            })
+            .any(|(index, _)| {
+                matches!(
+                    after.resolved_rules.get(index).map(|rule| &rule.outcome),
+                    Some(RuleOutcome::Resolved { .. })
+                )
+            });
+
+        if !replaced {
+            dropped.push(mod_id.clone());
+        }
+    }
+
+    dropped
+}
+
+/// The reason in the words of someone reading it, singular or plural.
+///
+/// "no version for this Minecraft version" is useful; "unresolved" is the
+/// resolver talking to itself.
+fn dropped_reason_clause(reason: DropReason, target: &ResolutionTarget, many: bool) -> String {
+    let pronoun = if many { "them" } else { "it" };
+
+    match reason {
+        DropReason::NoVersionAndNoCachedJar => format!(
+            "there is no version of {pronoun} for Minecraft {} / {} and no jar for {pronoun} in your cache",
+            target.minecraft_version,
+            target.mod_loader.as_modrinth_loader()
+        ),
+        DropReason::NoChosenVersionAndNothingCached => format!(
+            "this launch had no version chosen for {pronoun} and your cache has no jar for Minecraft {} / {}",
+            target.minecraft_version,
+            target.mod_loader.as_modrinth_loader()
+        ),
+    }
+}
+
+/// At most six names on the banner, all of them in the log.
+fn dropped_mod_names(mod_ids: &[String]) -> String {
+    const SHOWN: usize = 6;
+
+    let shown = mod_ids
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match mod_ids.len().saturating_sub(SHOWN) {
+        0 => shown,
+        hidden => format!("{shown} and {hidden} more"),
+    }
+}
+
+/// The one notice the pass emits, or `None` when nothing was lost.
+///
+/// A notice per mod is what `report_unusable_probe` does, and it is the wrong
+/// shape here: this pass decides about the whole selection at once, so a
+/// Modrinth that does not answer drops every mod with no jar on disk — 24 of
+/// them on this repository's own mod-list — and the banner shows three at a
+/// time (`NoticeBanner.tsx:19`). One notice that names the mods is the
+/// aggregation A3 already chose for the cache fallback, and the title is
+/// `report_unusable_probe`'s so that the two stages say the same thing the
+/// same way.
+fn dropped_mods_notice(
+    dropped: &DroppedMods,
+    target: &ResolutionTarget,
+) -> Option<(&'static str, String, String)> {
+    let many = dropped.mod_ids.len() > 1;
+    let clause = dropped_reason_clause(dropped.reason, target, many);
+    let (it, its) = if many { ("them", "their") } else { ("it", "its") };
+
+    let (title, message) = match dropped.mod_ids.as_slice() {
+        [] => return None,
+        [mod_id] => (
+            "Mod left out of the launch",
+            format!("'{mod_id}' is not in this launch: {clause}."),
+        ),
+        mod_ids => (
+            "Mods left out of the launch",
+            format!(
+                "{} mods are not in this launch ({}): {clause}.",
+                mod_ids.len(),
+                dropped_mod_names(mod_ids)
+            ),
+        ),
+    };
+
+    let cause = match dropped.reason {
+        DropReason::NoVersionAndNoCachedJar => {
+            "Modrinth returned no compatible version for this Minecraft version and loader — there may be none, or it may not have answered — and the cache has no jar to install instead.".to_string()
+        }
+        DropReason::NoChosenVersionAndNothingCached => format!(
+            "The versions chosen before this launch do not cover {it}, and the cache has no jar for this Minecraft version and loader."
+        ),
+    };
+
+    Some((
+        title,
+        message,
+        format!("{cause} Nothing took {its} place, so the game starts without {it}."),
+    ))
+}
+
+/// The mods lost to the availability pass, said in both channels: one log line
+/// each, one banner notice for the pass (D28).
+pub(super) fn report_dropped_mods(
+    app_handle: &tauri::AppHandle,
+    dropped: &DroppedMods,
+    target: &ResolutionTarget,
+) {
+    let Some((title, message, detail)) = dropped_mods_notice(dropped, target) else {
+        return;
+    };
+
+    let one = dropped_reason_clause(dropped.reason, target, false);
+    for mod_id in &dropped.mod_ids {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Resolver] '{mod_id}' is not in this launch: {one}, and no alternative took its place"
+            ),
+        );
+    }
+
+    let _ = emit_launcher_issue(app_handle, title, &message, &detail, "warning", "launch");
 }
 
 /// Selected Modrinth mods split by whether the pre-check already chose a
@@ -1285,10 +1483,23 @@ pub(super) async fn resolve_online_selection(
             || cache_backed.contains(mod_id)
             || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
     });
+    // Taken before the pass disables anything: telling a lost mod from a
+    // replaced one needs both resolutions. The clone only happens when
+    // something is actually unavailable, the same path that then re-runs the
+    // whole resolver.
+    let before = (!unavailable.is_empty()).then(|| resolution.clone());
     let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
     let selected_mods = collect_selected_mods(modlist, &resolution, target);
 
     Ok(TargetSelection {
+        dropped: DroppedMods {
+            mod_ids: before
+                .map(|before| {
+                    mods_dropped_without_replacement(&before, &resolution, &unavailable)
+                })
+                .unwrap_or_default(),
+            reason: DropReason::NoVersionAndNoCachedJar,
+        },
         resolution,
         selected_mods,
     })
@@ -1323,10 +1534,19 @@ pub(super) fn resolve_offline_selection(
         cache_backed.contains(mod_id)
             || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
     });
+    let before = (!unavailable.is_empty()).then(|| resolution.clone());
     let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
     let selected_mods = collect_selected_mods(modlist, &resolution, target);
 
     Ok(TargetSelection {
+        dropped: DroppedMods {
+            mod_ids: before
+                .map(|before| {
+                    mods_dropped_without_replacement(&before, &resolution, &unavailable)
+                })
+                .unwrap_or_default(),
+            reason: DropReason::NoChosenVersionAndNothingCached,
+        },
         resolution,
         selected_mods,
     })
@@ -1411,6 +1631,7 @@ pub(super) fn collect_top_level_version_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{VersionRule, VersionRuleKind};
 
     fn test_version(id: &str, date_published: &str) -> ModrinthVersion {
         test_version_with_channel(id, date_published, "release")
@@ -1946,5 +2167,195 @@ mod tests {
             vec!["sodium"]
         );
         assert!(matches!(&fallback[0].1, RemoteArtifact::Cached(record) if record == &sodium));
+    }
+
+    // ── A5: which disabled mods deserve a notice ─────────────────────────
+    //
+    // The availability pass disables three different things and only one of
+    // them is a loss, so these tests run the real pair — `resolve_modlist`
+    // then `reresolve_without_unavailable` — and check the decision against
+    // it. No network: the availability verdict is the `unavailable` list,
+    // which is what the network would have produced.
+
+    fn a5_target() -> ResolutionTarget {
+        ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Forge,
+        }
+    }
+
+    fn a5_rule(mod_id: &str, alternatives: Vec<Rule>) -> Rule {
+        Rule {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives,
+        }
+    }
+
+    fn a5_modlist(rules: Vec<Rule>) -> ModList {
+        ModList {
+            modlist_name: "A5 Pack".into(),
+            author: "Author".into(),
+            description: "Test".into(),
+            rules,
+        }
+    }
+
+    /// The pass as the launch runs it: resolve, disable what is unavailable,
+    /// re-resolve, decide who deserves a notice.
+    fn a5_pass(modlist: &ModList, unavailable: &[&str]) -> (Vec<String>, Vec<String>) {
+        let target = a5_target();
+        let unavailable = unavailable
+            .iter()
+            .map(|mod_id| (*mod_id).to_string())
+            .collect::<Vec<_>>();
+        let before = resolve_modlist(modlist, &target).expect("first resolution");
+        let after = reresolve_without_unavailable(modlist, before.clone(), &unavailable, &target)
+            .expect("re-resolution");
+        let dropped = mods_dropped_without_replacement(&before, &after, &unavailable);
+        let loaded = collect_selected_mods(modlist, &after, &target)
+            .into_iter()
+            .map(|selected| selected.mod_id)
+            .collect::<Vec<_>>();
+
+        (dropped, loaded)
+    }
+
+    #[test]
+    fn a_mod_nothing_can_install_and_nothing_replaces_is_named() {
+        let modlist = a5_modlist(vec![a5_rule("modernfix", vec![]), a5_rule("sodium", vec![])]);
+
+        let (dropped, loaded) = a5_pass(&modlist, &["modernfix"]);
+
+        assert_eq!(dropped, vec!["modernfix".to_string()]);
+        // And it really is out of the game, which is what makes it a loss.
+        assert_eq!(loaded, vec!["sodium".to_string()]);
+    }
+
+    #[test]
+    fn a_mod_an_alternative_replaces_is_not_a_notice() {
+        // The group did its job: saying "embeddium was left out" while its
+        // alternative is loaded is false and worries the user for nothing.
+        let modlist = a5_modlist(vec![a5_rule("embeddium", vec![a5_rule("sodium", vec![])])]);
+
+        let (dropped, loaded) = a5_pass(&modlist, &["embeddium"]);
+
+        assert!(dropped.is_empty());
+        assert_eq!(loaded, vec!["sodium".to_string()]);
+    }
+
+    #[test]
+    fn a_mod_the_rules_excluded_never_reaches_the_availability_pass() {
+        // `version_rules` is the user's own decision, taken by the resolver
+        // before this pass: the mod is not in the selection the pass looks at,
+        // so nothing here can turn it into a notice — even with a machine that
+        // can install nothing at all.
+        let mut forge_only = a5_rule("embeddium", vec![]);
+        forge_only.version_rules = vec![VersionRule {
+            kind: VersionRuleKind::Only,
+            mc_versions: vec!["1.20.1".into()],
+            loader: "fabric".into(),
+        }];
+        let modlist = a5_modlist(vec![forge_only, a5_rule("sodium", vec![])]);
+
+        let target = a5_target();
+        let before = resolve_modlist(&modlist, &target).expect("first resolution");
+        let selected = collect_selected_mods(&modlist, &before, &target);
+        let unavailable = unavailable_selected_mods(&selected, |_| false);
+
+        assert_eq!(unavailable, vec!["sodium".to_string()]);
+        let (dropped, _) = a5_pass(&modlist, &["sodium"]);
+        assert_eq!(dropped, vec!["sodium".to_string()]);
+    }
+
+    #[test]
+    fn every_mod_lost_in_the_same_pass_is_named_once() {
+        let modlist = a5_modlist(vec![
+            a5_rule("modernfix", vec![]),
+            a5_rule("embeddium", vec![a5_rule("sodium", vec![])]),
+            a5_rule("iris", vec![]),
+            a5_rule("cull-leaves", vec![]),
+        ]);
+
+        // Three unavailable; `embeddium` has somewhere to fall back to, the
+        // other two do not.
+        let (dropped, loaded) = a5_pass(&modlist, &["modernfix", "embeddium", "iris"]);
+
+        assert_eq!(
+            dropped,
+            vec!["modernfix".to_string(), "iris".to_string()]
+        );
+        assert_eq!(
+            loaded,
+            vec!["sodium".to_string(), "cull-leaves".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_launch_that_loses_nothing_says_nothing() {
+        let modlist = a5_modlist(vec![a5_rule("sodium", vec![]), a5_rule("iris", vec![])]);
+
+        let (dropped, loaded) = a5_pass(&modlist, &[]);
+
+        assert!(dropped.is_empty());
+        assert_eq!(loaded, vec!["sodium".to_string(), "iris".to_string()]);
+        assert_eq!(
+            dropped_mods_notice(
+                &DroppedMods {
+                    mod_ids: dropped,
+                    reason: DropReason::NoVersionAndNoCachedJar,
+                },
+                &a5_target()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_mod_and_the_reason_in_the_words_of_whoever_reads_it() {
+        let (title, message, detail) = dropped_mods_notice(
+            &DroppedMods {
+                mod_ids: vec!["modernfix".to_string()],
+                reason: DropReason::NoVersionAndNoCachedJar,
+            },
+            &a5_target(),
+        )
+        .expect("a lost mod must produce a notice");
+
+        // Same title as the artifact stage: two channels saying the same thing
+        // in two ways is a way of confusing people.
+        assert_eq!(title, "Mod left out of the launch");
+        assert_eq!(
+            message,
+            "'modernfix' is not in this launch: there is no version of it for Minecraft 1.20.1 / forge and no jar for it in your cache."
+        );
+        assert!(detail.ends_with("Nothing took its place, so the game starts without it."));
+    }
+
+    #[test]
+    fn many_lost_mods_produce_one_notice_that_caps_the_names_it_lists() {
+        let mod_ids = (1..=8)
+            .map(|index| format!("mod-{index}"))
+            .collect::<Vec<_>>();
+
+        let (title, message, _) = dropped_mods_notice(
+            &DroppedMods {
+                mod_ids,
+                reason: DropReason::NoChosenVersionAndNothingCached,
+            },
+            &a5_target(),
+        )
+        .expect("lost mods must produce a notice");
+
+        assert_eq!(title, "Mods left out of the launch");
+        assert_eq!(
+            message,
+            "8 mods are not in this launch (mod-1, mod-2, mod-3, mod-4, mod-5, mod-6 and 2 more): this launch had no version chosen for them and your cache has no jar for Minecraft 1.20.1 / forge."
+        );
     }
 }
