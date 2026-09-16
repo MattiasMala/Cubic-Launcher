@@ -20,6 +20,7 @@ pub mod local_content_packs;
 pub mod microsoft_auth;
 pub mod minecraft_downloader;
 pub mod mod_cache;
+pub mod mod_version_pin;
 pub mod modlist_assets;
 pub mod modlist_manager;
 pub mod modrinth;
@@ -102,6 +103,7 @@ pub fn run() {
             modlist_manager::delete_modlist_command,
             modlist_manager::copy_local_jar_command,
             modlist_manager::import_modlist_command,
+            mod_version_pin::pin_mod_version_command,
             modlist_assets::load_modlist_presentation_command,
             modlist_assets::save_modlist_presentation_command,
             modlist_assets::load_modlist_groups_command,
