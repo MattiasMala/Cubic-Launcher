@@ -139,3 +139,5 @@ export const [resolvedModIds, setResolvedModIds] = createSignal<Set<string> | nu
 export const [versionRules, setVersionRules] = createSignal<VersionRule[]>([]);
 export const [customConfigs, setCustomConfigs] = createSignal<CustomConfig[]>([]);
 export const [advancedPanelModId, setAdvancedPanelModId] = createSignal<string | null>(null);
+/** Row whose "pinned version" modal is open (task B / D3). */
+export const [pinModalRowId, setPinModalRowId] = createSignal<string | null>(null);

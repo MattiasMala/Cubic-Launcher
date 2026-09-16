@@ -94,6 +94,7 @@ import {
   UpdatePopup,
 } from "./components/Modals";
 import { AdvancedModPanel } from "./components/AdvancedModPanel";
+import { PinVersionDialog } from "./components/PinVersionDialog";
 
 export default function App() {
   const {
@@ -1036,6 +1037,7 @@ export default function App() {
       <LinkModal />
       <LinksOverviewModal />
       <AdvancedModPanel onDelete={id => { setSelectedIds([id]); void handleDeleteSelected(); }} />
+      <PinVersionDialog />
       <InstancePresentationModal onSave={handleSavePresentation} onDelete={handleDeleteModList} />
       <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />

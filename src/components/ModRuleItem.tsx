@@ -14,7 +14,8 @@ import {
   removeFunctionalGroupMember,
   tagFilter, functionalGroups, tagFilterForcedExpanded,
   linksByModId, removeLink, cycleLinkDirection, removeIncompatibility,
-  setAdvancedPanelModId, selectedCount, resolvedModIds, resolvedTarget,
+  setAdvancedPanelModId, setPinModalRowId, pinnedRowIds, topLevelRowIds, parentIdByChildId,
+  selectedCount, resolvedModIds, resolvedTarget,
   selectedModListName, selectedMcVersion, selectedModLoader, onToggleEnabled,
 } from "../store";
 import {
@@ -61,6 +62,28 @@ export function ModRuleItem(props: ModRuleItemProps) {
   };
 
   const stopDragPropagation = (event: MouseEvent | PointerEvent) => event.stopPropagation();
+
+  const isPinned = () => pinnedRowIds().has(props.row.id);
+
+  /**
+   * Why the pin button is disabled, or `null` when it works.
+   *
+   * A version can be pinned on a top-level Modrinth entry, on the dynamic
+   * entry parked under a pin (D48: that replaces the pin), and the button also
+   * opens on the pin itself to change or remove it. Anything else is a
+   * fallback of another mod: pinning it would pull it out of that chain.
+   */
+  const pinReason = (): string | null => {
+    if (isPinned()) return null;
+    if (props.row.kind === "local") return "A local jar has no Modrinth release to pin";
+    if (topLevelRowIds().has(props.row.id)) return null;
+
+    const parentId = parentIdByChildId().get(props.row.id);
+    const parent = parentId ? rowMap().get(parentId) : undefined;
+    if (parent && pinnedRowIds().has(parent.id)) return null;
+
+    return "Only a top-level mod can have a pinned version";
+  };
 
   // Returns true if alt (or any of its descendants) matches the active tag filter.
   const altMatchesFilter = (alt: ModRow): boolean => {
@@ -340,6 +363,20 @@ export function ModRuleItem(props: ModRuleItemProps) {
               Ungroup
             </button>
           </Show>
+
+          {/* Pinned version (D3). Only mods have this: content packs use
+              ContentEntryRow, which D10 leaves alone. */}
+          <button
+            onClick={e => { e.stopPropagation(); setPinModalRowId(props.row.id); }}
+            onPointerDown={stopDragPropagation}
+            onMouseDown={stopDragPropagation}
+            disabled={pinReason() !== null}
+            class="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
+            title={pinReason() ?? (isPinned() ? "Change or remove the pinned version" : "Pin this mod to one release")}
+          >
+            <MaterialIcon name="push_pin" size="sm" />
+            {isPinned() ? "Pinned" : "Pin"}
+          </button>
 
           <button
             onClick={e => { e.stopPropagation(); setAdvancedPanelModId(props.row.id); }}
