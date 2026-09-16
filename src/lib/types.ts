@@ -5,6 +5,8 @@ export type ModRow = {
   name: string;
   /** Modrinth project slug — present for Modrinth mods, absent for local mods. Used for icon fetching. */
   modrinth_id?: string;
+  /** `data:image/png;base64,…` extracted from a local mod's jar, absent for Modrinth mods and for jars without an icon. */
+  iconImage?: string;
   /** First mod ID in the rule (used as stable link target identifier). */
   primaryModId?: string;
   kind: "modrinth" | "local";

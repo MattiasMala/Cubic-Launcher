@@ -47,6 +47,7 @@ export function smartSetModRows(current: ModRow[], next: ModRow[]): ModRow[] {
       currentRow.enabled === nextRow.enabled &&
       currentRow.area === nextRow.area &&
       currentRow.modrinth_id === nextRow.modrinth_id &&
+      currentRow.iconImage === nextRow.iconImage &&
       currentRow.note === nextRow.note &&
       currentRow.tags.length === nextRow.tags.length &&
       currentRow.tags.every((tag, index) => tag === nextRow.tags[index]) &&

@@ -152,6 +152,7 @@ function mapEditorRow(row: any, ruleIndex: number, path: string): ModRow {
     id,
     name: row.name as string,
     modrinth_id: row.source === "modrinth" ? (row.modId as string) : undefined,
+    iconImage: (row.iconImage as string | null | undefined) ?? undefined,
     primaryModId: row.modId as string,
     kind: row.source as "modrinth" | "local",
     enabled: row.enabled !== false,

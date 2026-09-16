@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { For, Show } from "solid-js";
 import {
   commitGroupRename,
   editingGroupId,
@@ -8,12 +8,21 @@ import {
   startGroupRename,
   toggleGroupCollapsed,
 } from "../../store";
-import { ChevronDownIcon, ChevronRightIcon, FolderOpenIcon, XIcon } from "../icons";
+import { ChevronDownIcon, ChevronRightIcon, PackageIcon, XIcon } from "../icons";
+
+/** Where each tile crops its own icon (decision D52): tile n shows quadrant n. */
+const QUADRANTS = ["left top", "right top", "left bottom", "right bottom"] as const;
 
 interface ModListEditorGroupHeaderProps {
   groupId: string;
   name: string;
   blockCount: number;
+  /**
+   * Icons of the first four mods in the group, in order; an entry is absent
+   * when that mod has no icon. Resolved by the caller, which is the only place
+   * that holds the group's rows.
+   */
+  iconUrls: Array<string | undefined>;
   collapsed: boolean;
   onStartDrag: (event: PointerEvent) => void;
   enabled: boolean;
@@ -46,8 +55,29 @@ export function ModListEditorGroupHeader(props: ModListEditorGroupHeaderProps) {
           <ChevronRightIcon class="h-4 w-4" />
         </Show>
       </button>
+      {/* Drag handle: a 2x2 mosaic of the group's first four mod icons (D51: 24 px,
+          12 px tiles, which leaves the header height unchanged), each tile cropped
+          to its own quadrant. An empty group keeps a glyph — there is nothing to
+          show. */}
       <div class="cursor-grab touch-none" onPointerDown={props.onStartDrag} title="Drag to reorder group">
-        <FolderOpenIcon class="h-4 w-4 text-primary" />
+        <Show when={props.blockCount > 0} fallback={<PackageIcon class="h-6 w-6 text-muted-foreground" />}>
+          <div class="grid h-6 w-6 grid-cols-2 grid-rows-2 overflow-hidden rounded-sm">
+            <For each={[0, 1, 2, 3]}>
+              {index => (
+                <div
+                  class="bg-muted bg-no-repeat"
+                  style={props.iconUrls[index]
+                    ? {
+                        "background-image": `url("${props.iconUrls[index]}")`,
+                        "background-size": "200%",
+                        "background-position": QUADRANTS[index],
+                      }
+                    : undefined}
+                />
+              )}
+            </For>
+          </div>
+        </Show>
       </div>
       <Show
         when={editing()}

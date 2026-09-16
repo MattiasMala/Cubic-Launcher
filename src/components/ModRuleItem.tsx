@@ -43,7 +43,10 @@ export function ModRuleItem(props: ModRuleItemProps) {
   const hasConflict   = () => conflictModIds().has(props.row.id);
   const conflictPairs = () => conflictPairsForId().get(props.row.id) ?? [];
   const fGroups       = () => functionalGroupsByBlockId().get(props.row.id) ?? [];
-  const iconUrl    = () => props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined;
+  // A Modrinth row draws the CDN icon; a local row draws the icon extracted from
+  // its jar (mod_icons.rs). A local jar without an icon keeps the PackageIcon.
+  const iconUrl    = () =>
+    (props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row.iconImage;
   const containingGroup = () =>
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
   const isResolved = () => {
