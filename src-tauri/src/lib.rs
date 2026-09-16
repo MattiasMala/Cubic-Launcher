@@ -20,6 +20,7 @@ pub mod local_content_packs;
 pub mod microsoft_auth;
 pub mod minecraft_downloader;
 pub mod mod_cache;
+pub mod mod_icons;
 pub mod mod_version_pin;
 pub mod modlist_assets;
 pub mod modlist_manager;

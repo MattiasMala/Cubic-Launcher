@@ -36,7 +36,7 @@ use crate::path_safety::{contained_join, validate_path_component};
 
 /// Upper bound on the `pack.png` we are willing to copy out. Real pack icons on
 /// this machine run 6 KB to 149 KB; anything past this is not an icon.
-const MAX_PACK_ICON_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_PACK_ICON_BYTES: u64 = 1024 * 1024;
 
 /// Upper bound on `pack.mcmeta`, which is a few hundred bytes of JSON.
 const MAX_PACK_MCMETA_BYTES: u64 = 256 * 1024;
@@ -192,8 +192,11 @@ pub fn read_icon_data_url(modlist_dir: &Path, relative_path: &str) -> Option<Str
     Some(format!("data:image/png;base64,{}", BASE64.encode(&bytes)))
 }
 
-/// Write the extracted `pack.png` and return its mod-list-relative path.
-fn write_icon(
+/// Write an extracted icon and return its mod-list-relative path.
+///
+/// Shared with [`crate::mod_icons`], which caches the icon of a locally
+/// imported mod jar under the same `.cubic/icons/<category>/` convention.
+pub(crate) fn write_icon(
     modlist_dir: &Path,
     category_dir: &str,
     file_name: &str,

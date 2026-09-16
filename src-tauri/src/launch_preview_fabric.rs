@@ -287,7 +287,14 @@ fn read_embedded_fabric_mod_metadata_from_archive<R: Read + Seek>(
     Ok(entries)
 }
 
-fn read_embedded_fabric_metadata<R: Read + Seek>(
+/// The root `fabric.mod.json` of an already-open archive, if it has one.
+///
+/// `pub(crate)` for [`crate::mod_icons`]: the icon of a local mod jar comes
+/// from the **root** entry, so the nested-jar recursion in
+/// [`read_embedded_fabric_mod_metadata_from_archive`] would answer with a
+/// bundled mod's icon. Taking the archive by reference is what lets the caller
+/// read `fabric.mod.json` and `META-INF/*.mods.toml` from one open handle.
+pub(crate) fn read_embedded_fabric_metadata<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     source: &str,
 ) -> Result<Option<serde_json::Value>> {
