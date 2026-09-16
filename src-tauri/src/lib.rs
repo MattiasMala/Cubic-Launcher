@@ -104,6 +104,7 @@ pub fn run() {
             modlist_manager::copy_local_jar_command,
             modlist_manager::import_modlist_command,
             mod_version_pin::pin_mod_version_command,
+            mod_version_pin::remove_pin_command,
             modlist_assets::load_modlist_presentation_command,
             modlist_assets::save_modlist_presentation_command,
             modlist_assets::load_modlist_groups_command,
