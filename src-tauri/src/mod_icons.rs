@@ -48,19 +48,40 @@ pub fn icon_cache_relative_path(mod_id: &str) -> String {
 /// The icon of a local rule as a `data:image/png;base64,…`, extracting it from
 /// the jar the first time and reading the cached PNG afterwards.
 ///
+/// The cache is invalidated by **mtime**: the jar being newer than the PNG next
+/// to it means the jar was replaced. That happens with the same `mod_id`,
+/// because deleting a rule leaves `local-jars/<mod_id>.jar` on disk, so
+/// re-importing a different jar under the same name overwrites the bytes and
+/// would otherwise keep showing the previous mod's icon. One `stat` per local
+/// row buys not having to remember anything.
+///
 /// Every failure is `None`, which the frontend draws as the same placeholder a
 /// jar without an icon gets: a jar with no icon is normal, not an error, so
 /// nothing is logged and nothing is surfaced.
 pub fn local_mod_icon_data_url(modlist_dir: &Path, mod_id: &str) -> Option<String> {
     let relative = icon_cache_relative_path(mod_id);
-    if let Some(url) = read_icon_data_url(modlist_dir, &relative) {
-        return Some(url);
+    let jar = local_jar_path(modlist_dir, mod_id);
+    if !jar_is_newer_than_cache(&jar, &modlist_dir.join(&relative)) {
+        if let Some(url) = read_icon_data_url(modlist_dir, &relative) {
+            return Some(url);
+        }
     }
 
-    let jar = local_jar_path(modlist_dir, mod_id);
     let bytes = read_icon_from_jar(&jar).ok().flatten()?;
     write_icon(modlist_dir, LOCAL_JARS_DIR, &format!("{mod_id}.jar"), &bytes).ok()?;
     read_icon_data_url(modlist_dir, &relative)
+}
+
+/// Whether the cached icon is stale. A missing jar is never "newer": the cache
+/// is then the only thing left that can answer.
+fn jar_is_newer_than_cache(jar: &Path, cache: &Path) -> bool {
+    let (Ok(jar), Ok(cache)) = (
+        std::fs::metadata(jar).and_then(|meta| meta.modified()),
+        std::fs::metadata(cache).and_then(|meta| meta.modified()),
+    ) else {
+        return false;
+    };
+    jar > cache
 }
 
 /// The icon bytes declared by a jar, when it has a usable one.
@@ -422,6 +443,44 @@ mod tests {
         assert!(cached_exists, "the icon should have been cached on first read");
         assert!(first.as_deref().unwrap().starts_with("data:image/png;base64,"));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_jar_replaced_under_the_same_name_gets_its_new_icon() {
+        let replacement = b"\x89PNG\r\n\x1a\nreplacement" as &[u8];
+        let modlist = temp_dir("replaced");
+        let jar = local_jar_path(&modlist, "my-mod");
+        write_jar(
+            &jar,
+            &[
+                ("fabric.mod.json", br#"{"id":"m","icon":"icon.png"}"#),
+                ("icon.png", PNG),
+            ],
+        );
+        let first = local_mod_icon_data_url(&modlist, "my-mod");
+
+        // Same path, different mod: this is what deleting a rule (which leaves the
+        // jar behind) and re-importing another jar under the same mod_id does.
+        write_jar(
+            &jar,
+            &[
+                ("fabric.mod.json", br#"{"id":"m","icon":"icon.png"}"#),
+                ("icon.png", replacement),
+            ],
+        );
+        let cache = modlist.join(icon_cache_relative_path("my-mod"));
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(&cache)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+
+        let second = local_mod_icon_data_url(&modlist, "my-mod");
+        let cached_bytes = fs::read(&cache).unwrap();
+        fs::remove_dir_all(&modlist).ok();
+
+        assert_ne!(first, second, "a replaced jar must not keep the old icon");
+        assert_eq!(cached_bytes, replacement);
     }
 
     #[test]
