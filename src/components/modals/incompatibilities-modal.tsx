@@ -106,7 +106,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                     />
                     <Show
                       when={enabled()}
-                      fallback={<span class="flex items-center gap-1.5 text-sm text-muted-foreground"><ModIcon modrinthId={other.modrinth_id} name={other.name} />{other.name}</span>}
+                      fallback={<span class="flex items-center gap-1.5 text-sm text-muted-foreground"><ModIcon row={other} />{other.name}</span>}
                     >
                       <div class="flex flex-1 flex-wrap items-center gap-2">
                         <button
@@ -114,7 +114,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                           title={focusWins() ? "Currently wins - click to make it lose" : "Currently loses - click to make it win"}
                           class={`rounded-md px-2.5 py-0.5 text-sm font-medium transition-colors ${focusWins() ? "bg-green-500/15 text-green-500 ring-1 ring-green-500/30" : "bg-red-500/15 text-red-500 ring-1 ring-red-500/30"}`}
                         >
-                          <span class="inline-flex items-center gap-1"><ModIcon modrinthId={focusedIncompatibilityMod()?.modrinth_id} name={focusedIncompatibilityMod()?.name} />{focusedIncompatibilityMod()?.name}</span>
+                          <span class="inline-flex items-center gap-1"><ModIcon row={focusedIncompatibilityMod() ?? undefined} />{focusedIncompatibilityMod()?.name}</span>
                         </button>
 
                         <span class="text-xs text-muted-foreground">vs</span>
@@ -124,7 +124,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                           title={!focusWins() ? "Currently wins - click to make it lose" : "Currently loses - click to make it win"}
                           class={`rounded-md px-2.5 py-0.5 text-sm font-medium transition-colors ${!focusWins() ? "bg-green-500/15 text-green-500 ring-1 ring-green-500/30" : "bg-red-500/15 text-red-500 ring-1 ring-red-500/30"}`}
                         >
-                          <span class="inline-flex items-center gap-1"><ModIcon modrinthId={other.modrinth_id} name={other.name} />{other.name}</span>
+                          <span class="inline-flex items-center gap-1"><ModIcon row={other} />{other.name}</span>
                         </button>
                       </div>
                     </Show>

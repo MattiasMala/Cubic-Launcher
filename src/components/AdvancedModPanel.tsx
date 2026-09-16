@@ -23,7 +23,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
           <div class="flex items-center justify-between border-b border-border px-6 py-4 shrink-0">
             <div>
               <h2 class="text-lg font-semibold text-foreground">Advanced</h2>
-              <p class="flex items-center gap-1.5 text-sm text-muted-foreground truncate max-w-md"><ModIcon modrinthId={row()!.modrinth_id} name={row()!.name} />{row()!.name}</p>
+              <p class="flex items-center gap-1.5 text-sm text-muted-foreground truncate max-w-md"><ModIcon row={row()!} />{row()!.name}</p>
             </div>
             <button
               onClick={() => setAdvancedPanelModId(null)}

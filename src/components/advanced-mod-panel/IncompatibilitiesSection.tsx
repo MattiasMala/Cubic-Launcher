@@ -60,7 +60,7 @@ export function IncompatibilitiesSection(props: { modId: string; row: ModRow }) 
             const otherName = () => rowMap().get(item.otherId)?.name ?? item.otherId;
             return (
               <div class="flex items-center gap-2 rounded-md border border-border bg-background p-2">
-                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon modrinthId={props.row.modrinth_id} name={props.row.name} />{props.row.name}</span>
+                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon row={props.row} />{props.row.name}</span>
                 <button
                   onClick={() => swapIncompat(item.otherId)}
                   class="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold text-primary hover:bg-primary/20 transition-colors"
@@ -68,7 +68,7 @@ export function IncompatibilitiesSection(props: { modId: string; row: ModRow }) 
                 >
                   {item.meWins ? ">" : "<"}
                 </button>
-                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon modrinthId={rowMap().get(item.otherId)?.modrinth_id} name={otherName()} />{otherName()}</span>
+                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon row={rowMap().get(item.otherId)} name={otherName()} />{otherName()}</span>
                 <button
                   onClick={() => removeIncompat(item.otherId)}
                   class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
@@ -105,7 +105,7 @@ export function IncompatibilitiesSection(props: { modId: string; row: ModRow }) 
                     <input type="text" placeholder="Search mod..." value={incompatSearch()} onInput={e => { setIncompatSearch(e.currentTarget.value); setNewIncompatPartnerId(""); }} class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground outline-none" />
                     <Show when={incompatSearch().trim() && filtered().length > 0}>
                       <div class="absolute left-0 right-0 top-full mt-1 z-20 max-h-32 overflow-y-auto rounded border border-border bg-card shadow-lg">
-                        <For each={filtered()}>{partner => <button onClick={() => { setNewIncompatPartnerId(partner.id); setIncompatSearch(partner.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon modrinthId={rowMap().get(partner.id)?.modrinth_id} name={partner.name} />{partner.name}</button>}</For>
+                        <For each={filtered()}>{partner => <button onClick={() => { setNewIncompatPartnerId(partner.id); setIncompatSearch(partner.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon row={rowMap().get(partner.id)} name={partner.name} />{partner.name}</button>}</For>
                       </div>
                     </Show>
                   </div>

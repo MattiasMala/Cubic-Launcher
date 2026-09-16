@@ -69,13 +69,13 @@ export function LinksSection(props: { modId: string; row: ModRow }) {
             const dir = () => currentLinkDir(link.partnerId);
             return (
               <div class="flex items-center gap-2 rounded-md border border-border bg-background p-2">
-                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon modrinthId={props.row.modrinth_id} name={props.row.name} />{props.row.name}</span>
+                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon row={props.row} />{props.row.name}</span>
                 <div class="flex shrink-0 items-center gap-0.5">
                   <button onClick={() => toggleLinkDir(link.partnerId, "a-to-b")} class={dirBtnClass(dir() === "a-to-b")} title={`${props.row.name} requires ${partnerName()}`}>→</button>
                   <button onClick={() => toggleLinkDir(link.partnerId, "mutual")} class={dirBtnClass(dir() === "mutual")} title="Mutual dependency">↔</button>
                   <button onClick={() => toggleLinkDir(link.partnerId, "b-to-a")} class={dirBtnClass(dir() === "b-to-a")} title={`${partnerName()} requires ${props.row.name}`}>←</button>
                 </div>
-                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon modrinthId={rowMap().get(link.partnerId)?.modrinth_id} name={partnerName()} />{partnerName()}</span>
+                <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon row={rowMap().get(link.partnerId)} name={partnerName()} />{partnerName()}</span>
                 <button
                   onClick={() => setLinkDirection(link.partnerId, "none")}
                   class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
@@ -110,7 +110,7 @@ export function LinksSection(props: { modId: string; row: ModRow }) {
                     <input type="text" placeholder="Search mod..." value={linkSearch()} onInput={e => { setLinkSearch(e.currentTarget.value); setNewLinkPartnerId(""); }} class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground outline-none" />
                     <Show when={linkSearch().trim() && filtered().length > 0}>
                       <div class="absolute left-0 right-0 top-full mt-1 z-20 max-h-32 overflow-y-auto rounded border border-border bg-card shadow-lg">
-                        <For each={filtered()}>{partner => <button onClick={() => { setNewLinkPartnerId(partner.id); setLinkSearch(partner.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon modrinthId={rowMap().get(partner.id)?.modrinth_id} name={partner.name} />{partner.name}</button>}</For>
+                        <For each={filtered()}>{partner => <button onClick={() => { setNewLinkPartnerId(partner.id); setLinkSearch(partner.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon row={rowMap().get(partner.id)} name={partner.name} />{partner.name}</button>}</For>
                       </div>
                     </Show>
                   </div>

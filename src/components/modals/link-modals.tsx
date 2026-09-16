@@ -173,7 +173,7 @@ export function LinksOverviewModal() {
                 <div class="flex items-center gap-3 rounded-md border border-border bg-background p-3">
                   <span class="min-w-0 flex-1 truncate text-right text-sm font-medium text-foreground">
                     <span class="inline-flex items-center justify-end gap-1">
-                      <ModIcon modrinthId={rowMap().get(a)?.modrinth_id} name={nameOf(a)} />
+                      <ModIcon row={rowMap().get(a)} name={nameOf(a)} />
                       {nameOf(a)}
                     </span>
                   </span>
@@ -202,7 +202,7 @@ export function LinksOverviewModal() {
                   </div>
                   <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-1">
-                      <ModIcon modrinthId={rowMap().get(b)?.modrinth_id} name={nameOf(b)} />
+                      <ModIcon row={rowMap().get(b)} name={nameOf(b)} />
                       {nameOf(b)}
                     </span>
                   </span>

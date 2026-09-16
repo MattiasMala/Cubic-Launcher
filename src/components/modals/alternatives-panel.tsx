@@ -57,7 +57,7 @@ function DraggableAltRow(props: {
         class="h-4 w-4 shrink-0 rounded text-primary"
       />
 
-      <ModIcon modrinthId={props.alt.modrinth_id} name={props.alt.name} />
+      <ModIcon row={props.alt} />
       <div class="min-w-0 flex-1">
         <p class="truncate text-sm font-medium text-foreground">{props.alt.name}</p>
         <Show when={props.alt.kind === "local"}>
@@ -280,7 +280,7 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
             <div class="flex items-center gap-3 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
               <div class="h-4 w-4 shrink-0" />
               <span class="w-5 shrink-0 text-center text-sm font-semibold text-primary">1</span>
-              <ModIcon modrinthId={parent().modrinth_id} name={parent().name} />
+              <ModIcon row={parent()} />
               <span class="flex-1 text-sm font-medium text-foreground">{parent().name}</span>
               <span class="text-xs text-muted-foreground">Primary</span>
             </div>
@@ -395,7 +395,7 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
                       <For each={filteredAlts()}>
                         {row => (
                           <div class="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
-                            <ModIcon modrinthId={row.modrinth_id} name={row.name} />
+                            <ModIcon row={row} />
                             <span class="flex-1 truncate text-sm text-foreground">{row.name}</span>
                             <Show when={row.kind === "local"}>
                               <span class="text-[10px] text-warning">Local</span>
