@@ -112,8 +112,10 @@ pub fn read_icon_from_jar(jar_path: &Path) -> Result<Option<Vec<u8>>> {
 ///
 /// Fabric first, because `fabric.mod.json` is the only one of the three that is
 /// also a dependency manifest the launch path already reads; then NeoForge's
-/// own file, then the Forge one. A jar carrying both a Fabric and a Forge
-/// manifest (a Sinytra-style multi-loader jar) answers with the Fabric icon.
+/// own file, then the Forge one. A multi-loader jar (Sinytra-style, both
+/// manifests) answers with the Fabric icon **when the Fabric side declares
+/// one** and falls through to the toml otherwise: the point is to find an
+/// icon, and one manifest staying silent is not a reason to ignore the other.
 fn declared_icon_path<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     source: &str,
@@ -121,7 +123,9 @@ fn declared_icon_path<R: Read + Seek>(
     if let Some(metadata) =
         crate::launch_preview::fabric::read_embedded_fabric_metadata(archive, source)?
     {
-        return Ok(fabric_icon_path(&metadata));
+        if let Some(path) = fabric_icon_path(&metadata) {
+            return Ok(Some(path));
+        }
     }
 
     for member in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
@@ -338,6 +342,20 @@ mod tests {
         );
 
         assert_eq!(icon.as_deref(), Some(neo));
+    }
+
+    #[test]
+    fn a_multi_loader_jar_falls_through_to_the_toml_when_fabric_declares_no_icon() {
+        let icon = jar_icon(
+            "multi-loader",
+            &[
+                ("fabric.mod.json", br#"{"id":"m","version":"1.0"}"#),
+                ("META-INF/mods.toml", b"[[mods]]\nlogoFile = \"icon.png\"\n"),
+                ("icon.png", PNG),
+            ],
+        );
+
+        assert_eq!(icon.as_deref(), Some(PNG));
     }
 
     #[test]
