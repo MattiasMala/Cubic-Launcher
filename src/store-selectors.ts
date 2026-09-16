@@ -30,6 +30,7 @@ import {
   sortOrder,
   tagFilter,
   advancedPanelModId,
+  versionRules,
 } from "./store-state";
 
 function collectRowsRecursive(rows: ModRow[], map: Map<string, ModRow>) {
@@ -169,6 +170,23 @@ export const advancedPanelMod = createMemo(() => {
   const id = advancedPanelModId();
   return id ? (rowMap().get(id) ?? null) : null;
 });
+
+/**
+ * Rows that are a pinned version: a local entry carrying an `only` version
+ * rule. That rule is what the pin writes, and it is what tells a pin apart
+ * from a jar the user uploaded by hand — whose jar must never be deleted.
+ */
+export const pinnedRowIds = createMemo(() => {
+  const rows = rowMap();
+  return new Set(
+    versionRules()
+      .filter(rule => rule.kind === "only" && rows.get(rule.modId)?.kind === "local")
+      .map(rule => rule.modId)
+  );
+});
+
+/** Top-level rows, the only ones a version can be pinned on (plus the dynamic entry of a pin). */
+export const topLevelRowIds = createMemo(() => new Set(modRowsState().map(row => row.id)));
 
 export const parentIdByChildId = createMemo(() => {
   const map = new Map<string, string>();

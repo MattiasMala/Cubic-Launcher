@@ -290,15 +290,13 @@ pub fn copy_local_jar_command(
     copy_local_jar_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
-pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> Result<()> {
-    validate_path_component(&input.modlist_name)?;
-    let source_path = Path::new(&input.source_path);
-
-    let file_name = source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("source path '{}' has no valid filename", input.source_path))?;
-
+/// The `mod_id` a locally copied jar gets: its filename without the `.jar`
+/// extension.
+///
+/// Shared with the version pin (`mod_version_pin.rs`), which has to know the
+/// id before it writes anything — two copies of this derivation would let the
+/// pin plan and the copy disagree about which rule was just created.
+pub fn local_mod_id_from_jar_filename(file_name: &str) -> Result<String> {
     if !file_name.to_ascii_lowercase().ends_with(".jar") {
         bail!(
             "only .jar files are accepted for local mod upload, got '{}'",
@@ -306,7 +304,6 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
         );
     }
 
-    // Derive mod_id from the filename stem (without .jar)
     let mod_id = file_name
         .trim_end_matches(".jar")
         .trim_end_matches(".JAR")
@@ -316,6 +313,20 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
         bail!("JAR filename has no stem: '{}'", file_name);
     }
     validate_path_component(&mod_id)?;
+
+    Ok(mod_id)
+}
+
+pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> Result<()> {
+    validate_path_component(&input.modlist_name)?;
+    let source_path = Path::new(&input.source_path);
+
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("source path '{}' has no valid filename", input.source_path))?;
+
+    let mod_id = local_mod_id_from_jar_filename(file_name)?;
 
     // Check if a rule with this mod_id already exists
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());

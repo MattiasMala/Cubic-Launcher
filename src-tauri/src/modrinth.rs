@@ -196,7 +196,7 @@ const MAX_HASHES_PER_UPDATE_REQUEST: usize = 1_000;
 /// never splits a real modlist either.
 const MAX_IDS_PER_VERSIONS_REQUEST: usize = 1_000;
 
-fn build_http_client() -> reqwest::Client {
+pub(crate) fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("cubic-launcher/0.1.0 (https://github.com/arius-c/Cubic-Launcher)")
         .timeout(REQUEST_TIMEOUT)

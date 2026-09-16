@@ -317,7 +317,7 @@ fn find_rule_by_id<'a>(rule: &'a Rule, mod_id: &str) -> Option<&'a Rule> {
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
-fn parse_mod_loader(value: &str) -> Result<ModLoader> {
+pub(crate) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
     match value.trim().to_ascii_lowercase().as_str() {
         "fabric" => Ok(ModLoader::Fabric),
         "forge" => Ok(ModLoader::Forge),
