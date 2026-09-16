@@ -1093,13 +1093,13 @@ pub(super) fn reresolve_without_unavailable(
     resolve_modlist(&patched, target)
 }
 
-/// Why a mod is not in the launch, in the only three shapes the availability
-/// pass can produce.
+/// Why a mod is not in the launch.
 ///
-/// The first two are the pass itself, and they are two values and not one
-/// because "available" means a different thing on each path
-/// (`CacheBacking`): a notice that names the wrong reason is worse than a
-/// reason that is generic.
+/// The first two are the availability pass itself, and they are two values and
+/// not one because "available" means a different thing on each path
+/// (`CacheBacking`). The others are collateral: the mod was installable, and
+/// the re-resolution left it out anyway. A notice that names the wrong reason
+/// is worse than one that is generic, so each shape gets its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DropReason {
     /// The resolving path: no version came back from Modrinth for this target
@@ -1108,11 +1108,19 @@ pub(super) enum DropReason {
     /// The pre-checked path: no version was chosen for it before the launch
     /// and the cache cannot produce a jar either.
     NoChosenVersionAndNothingCached,
-    /// Collateral: the mod itself was installable, but a mod it `requires`
-    /// was not, so the re-resolution left it out too
-    /// (`FailureReason::RequiredModMissing`). Leaving this one silent would
-    /// reopen the hole one rule further down.
+    /// A mod it `requires` was the one nothing could install
+    /// (`FailureReason::RequiredModMissing` after the pass). Leaving this one
+    /// silent would reopen the hole one rule further down.
     RequiredModLeftOut,
+    /// An alternative that entered in place of an unusable mod trips this
+    /// rule's `exclude_if` (`FailureReason::ExcludedByActiveMod` after the
+    /// pass, on a rule that is still enabled). A real loss with a cause of its
+    /// own: calling it a dependency would be false.
+    ExcludedByReplacement,
+    /// Everything else the re-resolution can file: the rules stopped keeping
+    /// the mod once the unusable ones were out. Deliberately vague, because it
+    /// is the branch whose cause this code cannot name.
+    RulesLeftItOut,
 }
 
 /// One mod the launch lost, with the reason to say about it.
@@ -1148,11 +1156,18 @@ pub(super) struct DroppedMod {
 ///   (`resolver.rs:231-233`) — and it is *not* in `unavailable`, which is why
 ///   iterating that list would let a genuine silent loss through. The diff
 ///   catches it and `RequiredModLeftOut` says the truth about it.
+/// - **a mod excluded by the alternative that replaced another one**: the
+///   substitute is now active and trips this rule's `exclude_if`
+///   (`resolver.rs:221-228`). Also not in `unavailable`, and *not* a
+///   dependency problem, so it gets `ExcludedByReplacement` and its own
+///   sentence.
 ///
-/// The same diff is also the only honest source for the reason: an
-/// availability-disabled rule takes the `!rule.enabled` branch and comes back
-/// as `ExcludedByActiveMod` (`resolver.rs:210-218`), indistinguishable from a
-/// real `exclude_if`, so `FailureReason` cannot be trusted to carry the why.
+/// The reason is read off the mod's own slot in `after`, except for the mods
+/// in `unavailable`: those took the `!rule.enabled` branch and come back as
+/// `ExcludedByActiveMod` (`resolver.rs:210-218`), indistinguishable from a
+/// real `exclude_if`, so for them `FailureReason` is worthless and the path's
+/// own reason is used. For every other lost mod the rule is still enabled, so
+/// the failure reason is the resolver's honest answer.
 ///
 /// Comparing by slot index is sound because both resolutions ran over the same
 /// top-level rule vector: `reresolve_without_unavailable` clones the mod-list
@@ -1185,12 +1200,24 @@ pub(super) fn mods_dropped_without_replacement(
             continue;
         }
 
+        let after_reason = after
+            .resolved_rules
+            .get(index)
+            .and_then(|rule| match rule.outcome {
+                RuleOutcome::Unresolved { reason } => Some(reason),
+                RuleOutcome::Resolved { .. } => None,
+            });
+
         dropped.push(DroppedMod {
             mod_id: resolved_id.clone(),
             reason: if unavailable.iter().any(|mod_id| mod_id == resolved_id) {
                 unavailable_reason
             } else {
-                DropReason::RequiredModLeftOut
+                match after_reason {
+                    Some(FailureReason::RequiredModMissing) => DropReason::RequiredModLeftOut,
+                    Some(FailureReason::ExcludedByActiveMod) => DropReason::ExcludedByReplacement,
+                    _ => DropReason::RulesLeftItOut,
+                }
             },
         });
     }
@@ -1202,23 +1229,34 @@ pub(super) fn mods_dropped_without_replacement(
 ///
 /// "no version for this Minecraft version" is useful; "unresolved" is the
 /// resolver talking to itself.
+///
+/// Two pronouns, not one: some reasons need the mods as the object ("no
+/// version of them"), others as the subject ("a mod they need"), and reusing
+/// the object form for both produces "a mod them need".
 fn dropped_reason_clause(reason: DropReason, target: &ResolutionTarget, many: bool) -> String {
-    let pronoun = if many { "them" } else { "it" };
+    let object = if many { "them" } else { "it" };
+    let subject = if many { "they" } else { "it" };
+    let verb_s = if many { "" } else { "s" };
 
     match reason {
         DropReason::NoVersionAndNoCachedJar => format!(
-            "there is no version of {pronoun} for Minecraft {} / {} and no jar for {pronoun} in your cache",
+            "there is no version of {object} for Minecraft {} / {} and no jar for {object} in your cache",
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ),
         DropReason::NoChosenVersionAndNothingCached => format!(
-            "this launch had no version chosen for {pronoun} and your cache has no jar for Minecraft {} / {}",
+            "this launch had no version chosen for {object} and your cache has no jar for Minecraft {} / {}",
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ),
-        DropReason::RequiredModLeftOut => format!(
-            "a mod {pronoun} need{} is not in this launch either",
-            if many { "" } else { "s" }
+        DropReason::RequiredModLeftOut => {
+            format!("a mod {subject} need{verb_s} is not in this launch either")
+        }
+        DropReason::ExcludedByReplacement => format!(
+            "your mod-list does not let {object} load next to the mod that came in for one this launch could not install"
+        ),
+        DropReason::RulesLeftItOut => format!(
+            "your rules stop keeping {object} once the mods this launch cannot install are out"
         ),
     }
 }
@@ -1236,6 +1274,12 @@ fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
         ),
         DropReason::RequiredModLeftOut => format!(
             "The mod-list makes {it} require a mod this launch could not install, so the resolver left {it} out too."
+        ),
+        DropReason::ExcludedByReplacement => format!(
+            "A mod this launch could not install was replaced by one of its alternatives, and an exclusion rule in your mod-list keeps that substitute and {it} from loading together."
+        ),
+        DropReason::RulesLeftItOut => format!(
+            "With the mods this launch could not install out of the way, the mod-list rules no longer select {it}."
         ),
     };
 
@@ -1284,6 +1328,8 @@ fn dropped_mods_notices(
         DropReason::NoVersionAndNoCachedJar,
         DropReason::NoChosenVersionAndNothingCached,
         DropReason::RequiredModLeftOut,
+        DropReason::ExcludedByReplacement,
+        DropReason::RulesLeftItOut,
     ] {
         let mod_ids = dropped
             .iter()
@@ -2371,6 +2417,28 @@ mod tests {
     }
 
     #[test]
+    fn a_mod_the_replacement_excludes_is_named_with_its_own_reason() {
+        // `embeddium` is unavailable, so its alternative `sodium` comes in —
+        // and `rubidium-extra` excludes `sodium`. Nobody is missing a
+        // dependency here: calling this a dependency problem would be false,
+        // and staying silent would lose a mod the user has in the list.
+        let mut extra = a5_rule("rubidium-extra", vec![]);
+        extra.exclude_if = vec!["sodium".into()];
+        let modlist = a5_modlist(vec![
+            a5_rule("embeddium", vec![a5_rule("sodium", vec![])]),
+            extra,
+        ]);
+
+        let (dropped, loaded) = a5_pass(&modlist, &["embeddium"]);
+
+        assert_eq!(
+            a5_lost(&dropped),
+            vec![("rubidium-extra", DropReason::ExcludedByReplacement)]
+        );
+        assert_eq!(loaded, vec!["sodium".to_string()]);
+    }
+
+    #[test]
     fn every_mod_lost_in_the_same_pass_is_named_once() {
         let modlist = a5_modlist(vec![
             a5_rule("modernfix", vec![]),
@@ -2480,6 +2548,43 @@ mod tests {
                 "'entitytexturefeatures' is not in this launch: there is no version of it for Minecraft 1.20.1 / forge and no jar for it in your cache.",
                 "'entity-model-features' is not in this launch: a mod it needs is not in this launch either.",
             ]
+        );
+    }
+
+    #[test]
+    fn the_plural_of_every_reason_is_a_sentence() {
+        // The object pronoun reads wrong as a subject ("a mod them need"), so
+        // the plural of each reason is pinned, not just the singular.
+        let plural = |reason| {
+            dropped_mods_notices(
+                &["one", "two"]
+                    .iter()
+                    .map(|mod_id| DroppedMod {
+                        mod_id: (*mod_id).into(),
+                        reason,
+                    })
+                    .collect::<Vec<_>>(),
+                &a5_target(),
+            )
+            .remove(0)
+            .1
+        };
+
+        assert_eq!(
+            plural(DropReason::RequiredModLeftOut),
+            "2 mods are not in this launch (one, two): a mod they need is not in this launch either."
+        );
+        assert_eq!(
+            plural(DropReason::ExcludedByReplacement),
+            "2 mods are not in this launch (one, two): your mod-list does not let them load next to the mod that came in for one this launch could not install."
+        );
+        assert_eq!(
+            plural(DropReason::RulesLeftItOut),
+            "2 mods are not in this launch (one, two): your rules stop keeping them once the mods this launch cannot install are out."
+        );
+        assert_eq!(
+            plural(DropReason::NoVersionAndNoCachedJar),
+            "2 mods are not in this launch (one, two): there is no version of them for Minecraft 1.20.1 / forge and no jar for them in your cache."
         );
     }
 }
