@@ -24,7 +24,7 @@ use crate::rules::ModSource;
 use std::sync::Mutex;
 
 #[path = "launch_preview_fabric.rs"]
-mod fabric;
+pub(crate) mod fabric;
 use fabric::*;
 
 #[path = "launch_preview_fabric_versions.rs"]

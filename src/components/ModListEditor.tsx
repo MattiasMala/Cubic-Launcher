@@ -4,6 +4,7 @@ import {
   activeAccount,
   activeContentTab,
   instancePresentation,
+  modIcons,
   modListCards,
   modRowsState,
   onToggleEnabled,
@@ -310,6 +311,9 @@ export function ModListEditor(props: Props) {
                                 groupId={group.id}
                                 name={group.name}
                                 blockCount={group.blocks.length}
+                                iconUrls={group.blocks.slice(0, 4).map(row =>
+                                  (row.modrinth_id ? modIcons().get(row.modrinth_id) : undefined) ?? row.iconImage
+                                )}
                                 collapsed={group.collapsed}
                                 onStartDrag={(event) => handleStartDrag(group.id, "group", event)}
                                 enabled={group.blocks.every((row) => row.enabled)}

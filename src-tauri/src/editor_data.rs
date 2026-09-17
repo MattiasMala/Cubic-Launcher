@@ -177,7 +177,14 @@ pub fn load_editor_snapshot_from_root(
 ) -> Result<EditorSnapshot> {
     let modlist = load_modlist(root_dir, modlist_name)?;
 
-    let rows: Vec<EditorRow> = modlist.rules.iter().map(build_editor_row).collect();
+    let modlist_dir = LauncherPaths::new(root_dir.to_path_buf())
+        .modlists_dir()
+        .join(modlist_name);
+    let rows: Vec<EditorRow> = modlist
+        .rules
+        .iter()
+        .map(|rule| build_editor_row(rule, &modlist_dir))
+        .collect();
     let incompatibilities = derive_incompatibilities(&modlist.rules);
 
     Ok(EditorSnapshot {
@@ -650,13 +657,24 @@ pub fn save_advanced_batch_from_root(
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
 
-fn build_editor_row(rule: &Rule) -> EditorRow {
+/// One row of the editor snapshot.
+///
+/// `modlist_dir` is only there for the icon of a local mod: it is read from the
+/// jar the first time and from `.cubic/icons/local-jars/` afterwards
+/// ([`crate::mod_icons`]), which is why building a row can touch the disk.
+fn build_editor_row(rule: &Rule, modlist_dir: &Path) -> EditorRow {
     EditorRow {
         mod_id: rule.mod_id.clone(),
         name: rule.mod_id.clone(),
         source: match &rule.source {
             ModSource::Modrinth => "modrinth".into(),
             ModSource::Local => "local".into(),
+        },
+        icon_image: match rule.source {
+            ModSource::Local => {
+                crate::mod_icons::local_mod_icon_data_url(modlist_dir, &rule.mod_id)
+            }
+            ModSource::Modrinth => None,
         },
         enabled: rule.enabled,
         exclude_if: rule.exclude_if.clone(),
@@ -683,7 +701,11 @@ fn build_editor_row(rule: &Rule) -> EditorRow {
                 files: cc.files.clone(),
             })
             .collect(),
-        alternatives: rule.alternatives.iter().map(build_editor_row).collect(),
+        alternatives: rule
+            .alternatives
+            .iter()
+            .map(|alt| build_editor_row(alt, modlist_dir))
+            .collect(),
     }
 }
 

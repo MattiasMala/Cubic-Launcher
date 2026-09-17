@@ -24,7 +24,7 @@ export function RelationshipsSection(props: { modId: string; row: ModRow }) {
               onClick={() => setAdvancedPanelModId(parentId()!)}
               class="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline truncate"
             >
-              <ModIcon modrinthId={parentRow()!.modrinth_id} name={parentRow()!.name} />{parentRow()!.name}
+              <ModIcon row={parentRow()!} />{parentRow()!.name}
             </button>
           </div>
         </Show>
@@ -37,7 +37,7 @@ export function RelationshipsSection(props: { modId: string; row: ModRow }) {
                   onClick={() => setAdvancedPanelModId(child.id)}
                   class="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
                 >
-                  <ModIcon modrinthId={child.modrinth_id} name={child.name} />{child.name}
+                  <ModIcon row={child} />{child.name}
                 </button>
               )}
             </For>

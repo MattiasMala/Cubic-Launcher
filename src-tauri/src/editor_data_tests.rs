@@ -86,6 +86,51 @@ fn load_editor_snapshot_returns_rows_and_incompatibilities() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+/// A local rule **and** a local alternative both get the icon of their jar: the
+/// snapshot builds alternatives by recursion, and losing that recursion would
+/// leave every fallback option with a placeholder while its parent shows an icon.
+#[test]
+fn local_rules_and_local_alternatives_both_get_their_jar_icon() {
+    use std::io::Write;
+
+    let root = unique_test_root();
+    let mut top = simple_rule("top-local");
+    top.source = ModSource::Local;
+    let mut alt = simple_rule("alt-local");
+    alt.source = ModSource::Local;
+    top.alternatives = vec![alt];
+    setup_modlist(&root, "Pack", vec![top]);
+
+    let jars = root.join("mod-lists").join("Pack").join("local-jars");
+    fs::create_dir_all(&jars).unwrap();
+    for mod_id in ["top-local", "alt-local"] {
+        let file = fs::File::create(jars.join(format!("{mod_id}.jar"))).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("fabric.mod.json", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(br#"{"id":"m","icon":"icon.png"}"#).unwrap();
+        zip.start_file("icon.png", zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(b"\x89PNG\r\n\x1a\nbytes").unwrap();
+        zip.finish().unwrap();
+    }
+
+    let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
+    let top_icon = snapshot.rows[0].icon_image.clone();
+    let alt_icon = snapshot.rows[0].alternatives[0].icon_image.clone();
+
+    fs::remove_dir_all(&root).unwrap();
+    assert!(top_icon
+        .unwrap_or_default()
+        .starts_with("data:image/png;base64,"));
+    assert!(
+        alt_icon
+            .unwrap_or_default()
+            .starts_with("data:image/png;base64,"),
+        "an alternative's icon is what the recursion is for"
+    );
+}
+
 #[test]
 fn load_modlist_rejects_traversal_name() {
     let root = unique_test_root();

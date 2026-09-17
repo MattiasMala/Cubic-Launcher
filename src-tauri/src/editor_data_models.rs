@@ -19,6 +19,10 @@ pub struct EditorRow {
     pub requires: Vec<String>,
     pub version_rules: Vec<EditorVersionRule>,
     pub custom_configs: Vec<EditorCustomConfig>,
+    /// `data:image/png;base64,…` for a local mod whose jar carries an icon,
+    /// `None` for every other row: Modrinth rows get their icon from the
+    /// Modrinth CDN in the frontend. Filled by [`crate::mod_icons`].
+    pub icon_image: Option<String>,
     pub alternatives: Vec<EditorRow>,
 }
 

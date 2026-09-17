@@ -43,7 +43,10 @@ export function ModRuleItem(props: ModRuleItemProps) {
   const hasConflict   = () => conflictModIds().has(props.row.id);
   const conflictPairs = () => conflictPairsForId().get(props.row.id) ?? [];
   const fGroups       = () => functionalGroupsByBlockId().get(props.row.id) ?? [];
-  const iconUrl    = () => props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined;
+  // A Modrinth row draws the CDN icon; a local row draws the icon extracted from
+  // its jar (mod_icons.rs). A local jar without an icon keeps the PackageIcon.
+  const iconUrl    = () =>
+    (props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row.iconImage;
   const containingGroup = () =>
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
   const isResolved = () => {
@@ -285,7 +288,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
                               : "\u2190";
                             return (
                               <div class="flex items-center gap-1.5 px-3 py-1.5 text-xs hover:bg-muted/30">
-                                <ModIcon modrinthId={props.row.modrinth_id} name={props.row.name} />
+                                <ModIcon row={props.row} />
                                 <span class="truncate text-foreground">{props.row.name}</span>
                                 <button
                                   onClick={e => { e.stopPropagation(); cycleLinkDirection(props.row.id, link.partnerId); }}
@@ -294,7 +297,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
                                 >
                                   {arrow()}
                                 </button>
-                                <ModIcon modrinthId={rowMap().get(link.partnerId)?.modrinth_id} name={partnerName()} />
+                                <ModIcon row={rowMap().get(link.partnerId)} name={partnerName()} />
                                 <span class="truncate text-foreground flex-1">{partnerName()}</span>
                                 <button
                                   onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}
