@@ -10,8 +10,45 @@ import {
 } from "../../store";
 import { ChevronDownIcon, ChevronRightIcon, PackageIcon, XIcon } from "../icons";
 
-/** Where each tile crops its own icon (decision D52): tile n shows quadrant n. */
-const QUADRANTS = ["left top", "right top", "left bottom", "right bottom"] as const;
+/**
+ * The mosaic always fills the 24 px square; how it is cut up depends on how many
+ * mods the group has (decision D59): 1 → the whole icon, 2 → two full-height
+ * halves, 3 → two quarters over a full-width band, 4 (and more: the first four)
+ * → the four quadrants.
+ *
+ * Each region shows *its own* icon's matching region (D52 generalized): the icon
+ * is scaled so that its width spans the whole 24 px mosaic — that is what `size`
+ * says, as a percentage of the region's own width — and `position` anchors the
+ * region's share of it. A square icon therefore fills its region exactly;
+ * the icon is cropped, never shrunk into the region (D53).
+ */
+interface MosaicRegion {
+  /** grid placement inside the shared 2x2 grid */
+  span: string;
+  /** `background-size`: 24 px over the region's width */
+  size: string;
+  /** `background-position`: which part of the scaled icon this region shows */
+  position: string;
+}
+
+const MOSAIC_LAYOUTS: Record<number, MosaicRegion[]> = {
+  1: [{ span: "col-span-2 row-span-2", size: "100%", position: "center" }],
+  2: [
+    { span: "row-span-2", size: "200%", position: "left center" },
+    { span: "row-span-2", size: "200%", position: "right center" },
+  ],
+  3: [
+    { span: "", size: "200%", position: "left top" },
+    { span: "", size: "200%", position: "right top" },
+    { span: "col-span-2", size: "100%", position: "center bottom" },
+  ],
+  4: [
+    { span: "", size: "200%", position: "left top" },
+    { span: "", size: "200%", position: "right top" },
+    { span: "", size: "200%", position: "left bottom" },
+    { span: "", size: "200%", position: "right bottom" },
+  ],
+};
 
 interface ModListEditorGroupHeaderProps {
   groupId: string;
@@ -31,6 +68,7 @@ interface ModListEditorGroupHeaderProps {
 
 export function ModListEditorGroupHeader(props: ModListEditorGroupHeaderProps) {
   const editing = () => editingGroupId() === props.groupId;
+  const regions = () => MOSAIC_LAYOUTS[Math.min(props.blockCount, 4)];
 
   return (
     <div class="flex flex-1 items-center gap-2 min-w-0">
@@ -55,22 +93,24 @@ export function ModListEditorGroupHeader(props: ModListEditorGroupHeaderProps) {
           <ChevronRightIcon class="h-4 w-4" />
         </Show>
       </button>
-      {/* Drag handle: a 2x2 mosaic of the group's first four mod icons (D51: 24 px,
-          12 px tiles, which leaves the header height unchanged), each tile cropped
-          to its own quadrant. An empty group keeps a glyph — there is nothing to
-          show. */}
+      {/* Drag handle: the mosaic of the group's first four mod icons, 24 px like
+          the glyph it replaces (D51) so the header height does not move. The
+          regions come from MOSAIC_LAYOUTS: they always cover the whole square,
+          and a mod without an icon leaves its own region — not the rest of the
+          mosaic — on `bg-muted`. An empty group keeps the glyph: there is
+          nothing to show. */}
       <div class="cursor-grab touch-none" onPointerDown={props.onStartDrag} title="Drag to reorder group">
         <Show when={props.blockCount > 0} fallback={<PackageIcon class="h-6 w-6 text-muted-foreground" />}>
           <div class="grid h-6 w-6 grid-cols-2 grid-rows-2 overflow-hidden rounded-sm">
-            <For each={[0, 1, 2, 3]}>
-              {index => (
+            <For each={regions()}>
+              {(region, index) => (
                 <div
-                  class="bg-muted bg-no-repeat"
-                  style={props.iconUrls[index]
+                  class={`bg-muted bg-no-repeat ${region.span}`}
+                  style={props.iconUrls[index()]
                     ? {
-                        "background-image": `url("${props.iconUrls[index]}")`,
-                        "background-size": "200%",
-                        "background-position": QUADRANTS[index],
+                        "background-image": `url("${props.iconUrls[index()]}")`,
+                        "background-size": region.size,
+                        "background-position": region.position,
                       }
                     : undefined}
                 />
