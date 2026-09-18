@@ -98,8 +98,23 @@ pub fn clear_instance_mods_directory(instance_mods_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace `target_path` with a link to `source_path`.
+///
+/// The existence check is `symlink_metadata`, not `exists`, because `exists`
+/// **follows** the link: on a symlink whose source is gone it answers "nothing
+/// here", the removal is skipped, and then both `symlink` and the hard-link
+/// fallback fail with `File exists` — a launch that refuses to start with an
+/// error naming neither the stale link nor the way out. A link left pointing
+/// at a deleted cache entry is not a corner case: it is what any cleanup of
+/// the cache produces, the one C5's layout change invites.
+///
+/// Only a file (or a link) is removed here. A real directory under that name
+/// fails, as it did before, and that is deliberate: `link_local_pack` is the
+/// caller that knows whether a directory is the launcher's to delete
+/// (`local_content_packs.rs:433-437`), and it clears the target itself before
+/// calling in.
 pub fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
-    if target_path.exists() {
+    if fs::symlink_metadata(target_path).is_ok() {
         fs::remove_file(target_path).with_context(|| {
             format!("failed to remove existing target {}", target_path.display())
         })?;
@@ -145,7 +160,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{clear_instance_mods_directory, prepare_instance_mods_directory, CachedModJar};
+    use super::{
+        clear_instance_mods_directory, create_file_link, prepare_instance_mods_directory,
+        CachedModJar,
+    };
 
     fn unique_test_root() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -282,6 +300,72 @@ mod tests {
         assert!(
             !escaped_path.exists(),
             "rejected filename must not create a link outside the mods directory"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// A link whose source is gone is the state C5 creates on purpose: the
+    /// pack cache moved to `<version_id>/<filename>`, the files of the old flat
+    /// layout are orphans, and deleting them is the obvious thing to do. The
+    /// instance keeps a link pointing at what was deleted, and the next launch
+    /// has to relink over it instead of refusing to start.
+    ///
+    /// `exists()` follows the link, so on a broken one it answers "nothing
+    /// here" and the removal is skipped — after which both `symlink` and the
+    /// hard-link fallback fail with `File exists`. The jar path has the same
+    /// shape and the same bug.
+    #[test]
+    fn a_dangling_link_at_the_target_is_replaced_instead_of_failing() {
+        let root_dir = unique_test_root();
+        let cache_dir = root_dir.join("cache");
+        let instance_dir = root_dir.join("instance");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+
+        let removed_source = cache_dir.join("old.zip");
+        fs::write(&removed_source, b"old").expect("the first cache entry should exist");
+        let target_path = instance_dir.join("pack.zip");
+        create_file_link(&removed_source, &target_path).expect("the first link should be created");
+        fs::remove_file(&removed_source).expect("the orphaned cache entry should be removable");
+
+        let fresh_source = cache_dir.join("new.zip");
+        fs::write(&fresh_source, b"new").expect("the new cache entry should exist");
+
+        create_file_link(&fresh_source, &target_path)
+            .expect("a dangling link must not stop the relink");
+
+        assert_eq!(
+            fs::read(&target_path).expect("the relinked target should be readable"),
+            b"new",
+            "the target must resolve to the new source"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// The widened check must not widen what is *deleted*: `symlink_metadata`
+    /// also succeeds on a real directory, and `remove_dir_all` there would
+    /// destroy whatever the user keeps under that name. The refusal is the
+    /// behaviour, unchanged from before the fix.
+    #[test]
+    fn a_real_directory_at_the_target_is_refused_and_left_alone() {
+        let root_dir = unique_test_root();
+        let cache_dir = root_dir.join("cache");
+        let instance_dir = root_dir.join("instance");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        let occupied = instance_dir.join("pack.zip");
+        fs::create_dir_all(&occupied).expect("the directory in the way should exist");
+        fs::write(occupied.join("inside.txt"), b"mine").expect("its content should exist");
+        let source_path = cache_dir.join("new.zip");
+        fs::write(&source_path, b"new").expect("the cache entry should exist");
+
+        let result = create_file_link(&source_path, &occupied);
+
+        assert!(result.is_err(), "a directory must not be replaced by a link");
+        assert_eq!(
+            fs::read(occupied.join("inside.txt")).expect("the directory should be intact"),
+            b"mine"
         );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
