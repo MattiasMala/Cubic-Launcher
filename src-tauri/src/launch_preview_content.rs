@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -37,6 +37,64 @@ fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str)
 
 pub(super) fn validate_content_filename(filename: &str) -> Result<()> {
     validate_path_component(filename)
+}
+
+/// Where the cache keeps one downloaded Modrinth content-pack file: one
+/// directory per **version id**, with the file inside it under its own name
+/// (D54) — the same shape the mod cache has had all along
+/// (`mod_cache::cached_remote_artifact_path`).
+///
+/// Keyed by filename alone, as this was, three things went wrong at once and
+/// all of them in silence, because the launch only logs `(cached)`. Resource
+/// pack authors reuse a filename across versions, so an update was never
+/// downloaded (`visual-effects-plus` ships every version as
+/// `Visual Effects+.zip`); they also reuse it across game-version lines, so a
+/// launch on another target linked the wrong bytes (`enhanced-boss-bars` 1.6
+/// exists five times under `[1.6] Enhanced Boss Bars.zip`, byte-different per
+/// line); and the cache is shared by every mod list, so two lists using two
+/// projects with one filename overwrote each other.
+///
+/// The version id comes from the network, so it is validated like the filename
+/// already was: it becomes a directory name.
+pub(super) fn content_pack_cache_path(
+    cache_dir: &Path,
+    version_id: &str,
+    filename: &str,
+) -> Result<PathBuf> {
+    validate_path_component(version_id)
+        .with_context(|| format!("unsafe Modrinth version id '{version_id}'"))?;
+    validate_content_filename(filename)?;
+    Ok(cache_dir.join(version_id).join(filename))
+}
+
+/// Put the file of one Modrinth content-pack version in the cache if it is not
+/// there yet, and say which of the two happened.
+///
+/// The pair is the whole point of the function: `was_cached` decides the
+/// download *and* the `(cached)` label in the launch log, so the decision and
+/// the path it was taken on come from one place instead of being restated at
+/// every call site. That is also what makes the skip testable without a
+/// `tauri::AppHandle`: the two callers below are inside the launch pipeline.
+///
+/// `before_download` runs only when the file has to be fetched, and before the
+/// request, so the log line still precedes a download that can take a while.
+pub(super) async fn ensure_content_pack_cached(
+    http_client: &reqwest::Client,
+    cache_dir: &Path,
+    version_id: &str,
+    filename: &str,
+    url: &str,
+    before_download: impl FnOnce() -> Result<()>,
+) -> Result<(PathBuf, bool)> {
+    let cached_path = content_pack_cache_path(cache_dir, version_id, filename)?;
+    if cached_path.exists() {
+        return Ok((cached_path, true));
+    }
+
+    before_download()?;
+    download_file(http_client, url, &cached_path).await?;
+
+    Ok((cached_path, false))
 }
 
 /// Link the `source: "local"` entries of one category into the instance, and
@@ -216,24 +274,27 @@ pub(super) async fn resolve_and_install_content_packs(
                         .max_by(|a, b| a.date_published.cmp(&b.date_published));
                     if let Some(version) = best {
                         if let Some(file) = version.primary_file() {
-                            validate_content_filename(&file.filename)?;
-                            let cached_path = cache_dir.join(&file.filename);
-                            let was_cached = cached_path.exists();
-                            if !was_cached {
-                                emit_log(
-                                    app_handle,
-                                    ProcessLogStream::Stdout,
-                                    format!(
-                                        "[Content] Downloading {} ({})",
-                                        entry.id, file.filename
-                                    ),
-                                )?;
-                                download_file(http_client, &file.url, &cached_path)
-                                    .await
-                                    .with_context(|| {
-                                        format!("failed to download content pack '{}'", entry.id)
-                                    })?;
-                            }
+                            let (cached_path, was_cached) = ensure_content_pack_cached(
+                                http_client,
+                                cache_dir,
+                                &version.id,
+                                &file.filename,
+                                &file.url,
+                                || {
+                                    emit_log(
+                                        app_handle,
+                                        ProcessLogStream::Stdout,
+                                        format!(
+                                            "[Content] Downloading {} ({})",
+                                            entry.id, file.filename
+                                        ),
+                                    )
+                                },
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("failed to download content pack '{}'", entry.id)
+                            })?;
                             let target_path = instance_dir.join(&file.filename);
                             crate::instance_mods::create_file_link(&cached_path, &target_path)
                                 .with_context(|| {
@@ -378,21 +439,25 @@ async fn install_datapacks(
                     .max_by(|a, b| a.date_published.cmp(&b.date_published));
                 if let Some(version) = best {
                     if let Some(file) = version.primary_file() {
-                        validate_content_filename(&file.filename)?;
-                        let cached_path = cache_dir.join(&file.filename);
-                        let was_cached = cached_path.exists();
-                        if !was_cached {
-                            emit_log(
-                                app_handle,
-                                ProcessLogStream::Stdout,
-                                format!("[Content] Downloading {} ({})", entry.id, file.filename),
-                            )?;
-                            download_file(http_client, &file.url, &cached_path)
-                                .await
-                                .with_context(|| {
-                                    format!("failed to download data pack '{}'", entry.id)
-                                })?;
-                        }
+                        let (cached_path, was_cached) = ensure_content_pack_cached(
+                            http_client,
+                            cache_dir,
+                            &version.id,
+                            &file.filename,
+                            &file.url,
+                            || {
+                                emit_log(
+                                    app_handle,
+                                    ProcessLogStream::Stdout,
+                                    format!(
+                                        "[Content] Downloading {} ({})",
+                                        entry.id, file.filename
+                                    ),
+                                )
+                            },
+                        )
+                        .await
+                        .with_context(|| format!("failed to download data pack '{}'", entry.id))?;
                         let target_path = instance_dir.join(&file.filename);
                         crate::instance_mods::create_file_link(&cached_path, &target_path)
                             .with_context(|| {
@@ -442,4 +507,192 @@ async fn install_datapacks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// One root per test: the async tests run on different threads, and two
+    /// calls in the same nanosecond would otherwise share a directory that one
+    /// of them removes at the end.
+    fn unique_test_root(label: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+
+        env::temp_dir().join(format!("cubic-launcher-content-cache-test-{label}-{timestamp}"))
+    }
+
+    /// A server that answers one fixed body and counts what it was asked for,
+    /// so a test can tell "downloaded" from "served from the cache" by
+    /// observing the requests instead of the file.
+    fn counting_server(body: &'static [u8]) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("test server has an address").port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut scratch = [0u8; 2048];
+                let _ = stream.read(&mut scratch);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}/pack.zip"), requests)
+    }
+
+    /// The difference between the two layouts, measured on the behaviour and
+    /// not on the path: a file sitting in the cache **root** under the wanted
+    /// name must not make a version count as downloaded. That file is what the
+    /// filename-keyed layout left behind, and it is also what every launch
+    /// before this change produced.
+    #[tokio::test]
+    async fn a_file_in_the_old_flat_layout_does_not_pass_for_a_version() {
+        let cache_dir = unique_test_root("flat-leftover");
+        let filename = "Visual Effects+.zip";
+        let (url, requests) = counting_server(b"1.3.1");
+
+        fs::create_dir_all(&cache_dir).expect("cache root should exist");
+        fs::write(cache_dir.join(filename), b"1.3.0").expect("the flat leftover is on disk");
+        let previous = content_pack_cache_path(&cache_dir, "rNnjlJrG", filename).expect("path");
+        fs::create_dir_all(previous.parent().expect("parent")).expect("mkdir");
+        fs::write(&previous, b"1.3.0").expect("the previous version is on disk too");
+
+        let (path, was_cached) = ensure_content_pack_cached(
+            &reqwest::Client::new(),
+            &cache_dir,
+            "MgC4Oa2v",
+            filename,
+            &url,
+            || Ok(()),
+        )
+        .await
+        .expect("the newer version should be fetched");
+
+        assert!(!was_cached, "the newer version was never downloaded before");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "exactly one download must have been issued"
+        );
+        assert_eq!(
+            fs::read(&path).expect("the fetched file is readable"),
+            b"1.3.1",
+            "the bytes on disk must be the newer version's"
+        );
+        assert_eq!(
+            fs::read(&previous).expect("the previous version is readable"),
+            b"1.3.0",
+            "and the previous version must still be there, untouched"
+        );
+
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    /// The other direction, so the fix cannot become "download every launch":
+    /// the same version asked twice costs one request.
+    #[tokio::test]
+    async fn the_same_version_asked_twice_is_served_from_the_cache() {
+        let cache_dir = unique_test_root("cache-hit");
+        let (url, requests) = counting_server(b"1.3.1");
+        let client = reqwest::Client::new();
+
+        let first = ensure_content_pack_cached(
+            &client,
+            &cache_dir,
+            "MgC4Oa2v",
+            "Visual Effects+.zip",
+            &url,
+            || Ok(()),
+        )
+        .await
+        .expect("first call downloads");
+        let second = ensure_content_pack_cached(
+            &client,
+            &cache_dir,
+            "MgC4Oa2v",
+            "Visual Effects+.zip",
+            &url,
+            || panic!("a cached version must not announce a download"),
+        )
+        .await
+        .expect("second call is a cache hit");
+
+        assert_eq!((first.1, second.1), (false, true));
+        assert_eq!(first.0, second.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    /// Real shape from `visual-effects-plus`: every one of its versions ships a
+    /// file called `Visual Effects+.zip`, with different bytes each time
+    /// (measured 2026-09-17: 1.3.0 for 1.21.1 is sha1 `134990cd3846`, 1.3.1 for
+    /// the same target is `20365db0e8ee`). Keyed by filename, the second
+    /// version reads as already cached and is never downloaded, so the update
+    /// never lands and the launch says `(cached)`.
+    #[test]
+    fn two_versions_sharing_a_filename_get_separate_cache_entries() {
+        let cache_dir = unique_test_root("separate-entries");
+        let filename = "Visual Effects+.zip";
+
+        let installed = content_pack_cache_path(&cache_dir, "5DrQdfaM", filename)
+            .expect("the installed version has a cache path");
+        let update = content_pack_cache_path(&cache_dir, "BsMkkGrN", filename)
+            .expect("the newer version has a cache path");
+
+        assert_ne!(
+            installed, update,
+            "two Modrinth versions must not share one cache entry"
+        );
+
+        fs::create_dir_all(installed.parent().expect("cache entry has a parent"))
+            .expect("cache directory should be created");
+        fs::write(&installed, b"1.3.0").expect("the installed pack should be on disk");
+
+        assert!(
+            !update.exists(),
+            "a version that was never downloaded must not count as cached"
+        );
+
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    /// The version id reaches the path from the network, so it is checked like
+    /// the filename already was.
+    #[test]
+    fn refuses_a_version_id_that_would_escape_the_cache() {
+        let cache_dir = unique_test_root("escaping-id");
+
+        let error = content_pack_cache_path(&cache_dir, "../../etc", "pack.zip")
+            .expect_err("a traversing version id must be refused");
+
+        assert!(
+            format!("{error:#}").contains("../../etc"),
+            "the refusal names the offending id, got: {error:#}"
+        );
+    }
+
+
+
 }
