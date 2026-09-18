@@ -767,6 +767,10 @@ fn automation_env_does_not_silently_drop_fields() {
         minecraft_version: "1.20.1".into(),
         mod_loader: "neoforge".into(),
         resolved_versions: Some(HashMap::from([("sodium".to_string(), "abc123".to_string())])),
+        resolved_content: Some(HashMap::from([(
+            "resourcepack".to_string(),
+            HashMap::from([("fresh-animations".to_string(), "xN57JJts".to_string())]),
+        )])),
         timeout_seconds: 30,
         success_after_seconds: 10,
         terminate_on_success: true,
@@ -777,11 +781,21 @@ fn automation_env_does_not_silently_drop_fields() {
     assert_eq!(back, request);
     assert_eq!(back.success_after_seconds, 10);
     assert!(!back.terminate_on_timeout);
-    // The version map has to survive `into_launch_request` too, or an automated
-    // run could never exercise the pre-resolved path.
+    // The two maps have to survive `into_launch_request` too, or an automated
+    // run could never exercise the pre-resolved path — for the mods or for the
+    // packs, whose map is the only way a popup answer reaches the install
+    // (D58).
+    let launch_request = back.into_launch_request();
     assert_eq!(
-        back.into_launch_request().resolved_versions,
+        launch_request.resolved_versions,
         Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
+    );
+    assert_eq!(
+        launch_request.resolved_content,
+        Some(HashMap::from([(
+            "resourcepack".to_string(),
+            HashMap::from([("fresh-animations".to_string(), "xN57JJts".to_string())]),
+        )]))
     );
 }
 

@@ -43,16 +43,38 @@ pub(super) enum RemoteArtifact {
     /// version without asking Modrinth anything.
     MissingJar(ModCacheRecord),
 }
-/// Pick the preferred candidate by channel first, then by `date_published`
+/// Index of the preferred candidate: channel first, then `date_published`
 /// (RFC3339 UTC, so lexicographic comparison is chronological). Candidates are
 /// already filtered to the exact/wildcard-compatible set by
 /// `fetch_project_versions`.
-fn select_preferred_version(versions: Vec<ModrinthVersion>) -> Option<ModrinthVersion> {
-    versions.into_iter().max_by(|left, right| {
-        left.channel_rank()
-            .cmp(&right.channel_rank())
-            .then_with(|| left.date_published.cmp(&right.date_published))
-    })
+///
+/// The index is the shared form because the content packs pick from a list
+/// they keep — the pre-check needs the other versions of the same entry to
+/// recognise the installed one — while the mods move the winner out of a list
+/// they throw away. One comparator, two accessors, so the two cannot drift
+/// (D56).
+fn preferred_version_index(versions: &[ModrinthVersion]) -> Option<usize> {
+    versions
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.channel_rank()
+                .cmp(&right.channel_rank())
+                .then_with(|| left.date_published.cmp(&right.date_published))
+        })
+        .map(|(index, _)| index)
+}
+
+/// The preferred candidate, borrowed from the list it stays in.
+pub(super) fn preferred_version(versions: &[ModrinthVersion]) -> Option<&ModrinthVersion> {
+    preferred_version_index(versions).map(|index| &versions[index])
+}
+
+/// The preferred candidate, taken out of a list the caller is done with.
+pub(super) fn select_preferred_version(
+    mut versions: Vec<ModrinthVersion>,
+) -> Option<ModrinthVersion> {
+    preferred_version_index(&versions).map(|index| versions.swap_remove(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
