@@ -68,6 +68,22 @@ pub struct ContentEntryWithoutVersions {
     pub entry_id: String,
 }
 
+/// A selected entry the pre-check could not read the versions of (D63).
+///
+/// Deliberately a **different** list from
+/// [`ContentEntryWithoutVersions`]: "Modrinth has no version for this target"
+/// is a fact about the pack, "I could not ask" is a fact about the network,
+/// and telling the user the first when the second happened is the silence A5
+/// closed for the mods, dressed up as an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentLookupFailure {
+    pub category: String,
+    pub entry_id: String,
+    /// The error as it was logged, for the detail line of a UI notice.
+    pub error: String,
+}
+
 /// What one category contributed to the payload.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct CategoryPrecheck {
@@ -85,6 +101,7 @@ pub(super) struct ContentPrecheck {
     pub(super) updates: Vec<ContentUpdateRow>,
     pub(super) resolved: ResolvedContentVersions,
     pub(super) without_versions: Vec<ContentEntryWithoutVersions>,
+    pub(super) lookup_failures: Vec<ContentLookupFailure>,
 }
 
 /// The Modrinth version id of every pack this launcher linked into one
@@ -258,17 +275,26 @@ pub(super) async fn run_content_precheck(
                     versions_by_entry.insert(entry.id.as_str(), versions);
                 }
                 Err(error) => {
-                    // Left out of everything: a failed lookup is not "no
-                    // versions", and promising a version we could not read
-                    // would be worse than letting the launch resolve it.
+                    // Left out of the rows and of the map — promising a
+                    // version we could not read would be worse than letting
+                    // the launch resolve it — but **not** left out of the
+                    // payload: D63. The list it lands in is not the D60 one,
+                    // because "no version exists" and "I could not ask" are
+                    // different sentences to the user.
+                    let error = format!("{error:#}");
                     let _ = emit_log(
                         app_handle,
                         ProcessLogStream::Stderr,
                         format!(
-                            "[Precheck] could not read the versions of '{}' ({category}); the launch will resolve it ({error:#})",
+                            "[Precheck] could not read the versions of '{}' ({category}); the launch will resolve it ({error})",
                             entry.id
                         ),
                     );
+                    precheck.lookup_failures.push(ContentLookupFailure {
+                        category: category.to_string(),
+                        entry_id: entry.id.clone(),
+                        error,
+                    });
                 }
             }
         }

@@ -212,7 +212,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     </div>
                     <Show when={notificationsAdvancedOpen()}>
                       <div class="ml-7 mt-1 space-y-1.5">
-                        <p class="text-xs text-muted-foreground">Mods are always included. These are the other categories to report on.</p>
+                        <p class="text-xs text-muted-foreground">Mods are always included. These are the other categories to report on. A category that is off keeps the version you already have; a pack you have never installed is still installed.</p>
                         <label class="flex items-center gap-3 text-sm">
                           <input type="checkbox" checked={globalDraft().updateNotificationsResourcePacks} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsResourcePacks: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                           <span class="text-foreground">Resource packs</span>

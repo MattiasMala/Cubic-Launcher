@@ -47,7 +47,7 @@ pub use precheck::{ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
 #[path = "launch_preview_precheck_content.rs"]
 mod precheck_content;
 use precheck_content::*;
-pub use precheck_content::{ContentEntryWithoutVersions, ContentUpdateRow};
+pub use precheck_content::{ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow};
 
 
 #[path = "launch_preview_models.rs"]

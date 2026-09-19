@@ -195,13 +195,51 @@ export type ModUpdateRow = {
   candidateVersionNumber: string;
 };
 
-/** `update_precheck_command`'s payload (`launch_preview_precheck.rs:62-83`). */
+/**
+ * One row of `contentUpdates` (`launch_preview_precheck_content.rs:43-57`).
+ *
+ * `currentVersionNumber` is not nullable, unlike the mod row's: a pack's
+ * installed version is recognised inside the entry's own version list, so the
+ * number comes from the same response as the candidate and has no separate
+ * lookup to fail.
+ */
+export type ContentUpdateRow = {
+  /** `resourcepack`, `shader` or `datapack`: the grouping, and half of the row's identity. */
+  category: string;
+  /** The Modrinth slug as written in the category's JSON file. */
+  entryId: string;
+  projectId: string;
+  currentVersionId: string;
+  currentVersionNumber: string;
+  candidateVersionId: string;
+  candidateVersionNumber: string;
+};
+
+/** An entry Modrinth has no version of for this target (D60). */
+export type ContentEntryWithoutVersions = {
+  category: string;
+  entryId: string;
+};
+
+/** An entry whose version lookup failed — not the same thing as having none (D63). */
+export type ContentLookupFailure = {
+  category: string;
+  entryId: string;
+  error: string;
+};
+
+/** `update_precheck_command`'s payload (`launch_preview_precheck.rs:70-108`). */
 export type UpdatePrecheckResult = {
   updates: ModUpdateRow[];
   /** `mod_id → version_id` for every selected Modrinth mod, updated or not (D16, D17). */
   resolved: Record<string, string>;
   /** Set when the version-number lookup failed; costs the "from" labels and nothing else. */
   versionNumberLookupError: string | null;
+  contentUpdates: ContentUpdateRow[];
+  /** `category → (entry id → version id)` for every selected Modrinth pack (D16, D17, D58). */
+  resolvedContent: Record<string, Record<string, string>>;
+  contentWithoutVersions: ContentEntryWithoutVersions[];
+  contentLookupFailures: ContentLookupFailure[];
 };
 
 // ── Static constants ──────────────────────────────────────────────────────────

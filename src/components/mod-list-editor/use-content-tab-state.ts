@@ -12,6 +12,7 @@ import type {
   ContentTopLevelItem,
 } from "./content-types";
 import { CONTENT_TAB_LABELS } from "./content-types";
+import { contentProjects, fetchContentProjects, mcVersionMatches } from "../../lib/content-meta";
 
 const [contentVersion, setContentVersion] = createSignal(0);
 
@@ -19,33 +20,29 @@ export function bumpContentVersion() {
   setContentVersion(v => v + 1);
 }
 
-// Readable titles for Modrinth content ids/slugs. Filled from the add dialog
-// (seedContentName) and from successful metadata fetches so cards keep showing
-// titles instead of raw project IDs when a later fetch is unavailable.
-const contentNameCache = new Map<string, string>();
-
-export function seedContentName(id: string, name: string) {
-  if (id && name && name !== id) contentNameCache.set(id, name);
-}
+export { seedContentName } from "../../lib/content-meta";
 
 const ctlId = (item: ContentTopLevelItem) => item.kind === "entry" ? item.entry.id : `group:${item.id}`;
 
 const removeFromArr = (arr: string[], id: string) => arr.filter(x => x !== id);
-
-const mcVersionMatches = (pattern: string, concrete: string): boolean => {
-  if (pattern === concrete) return true;
-  const lower = pattern.toLowerCase();
-  if (!lower.endsWith(".x")) return false;
-  const prefix = pattern.slice(0, -2);
-  return concrete.startsWith(prefix) && concrete[prefix.length] === ".";
-};
 
 export function useContentTabState(props: ContentTabViewProps) {
   let listContainerRef: HTMLDivElement | undefined;
 
   const [entries, setEntries] = createSignal<ContentEntry[]>([]);
   const [groups, setGroups] = createSignal<ContentGroupData[]>([]);
-  const [meta, setMeta] = createSignal<Map<string, ContentMeta>>(new Map());
+  // Only the local entries: their name and icon come from the snapshot and
+  // from nowhere else. The Modrinth half lives in the shared cache, so the
+  // update popup reads the same titles the rows show.
+  const [localMeta, setLocalMeta] = createSignal<Map<string, ContentMeta>>(new Map());
+  const meta = createMemo(() => {
+    const merged = new Map(localMeta());
+    for (const [id, project] of contentProjects()) {
+      if (merged.has(id)) continue;
+      merged.set(id, { name: project.name ?? id, iconUrl: project.iconUrl });
+    }
+    return merged;
+  });
   const [selectedIds, setSelectedIds] = createSignal<Set<string>>(new Set());
   const [editingGroupId, setEditingGroupId] = createSignal<string | null>(null);
   const [groupNameDraft, setGroupNameDraft] = createSignal("");
@@ -78,49 +75,23 @@ export function useContentTabState(props: ContentTabViewProps) {
       setEntries(list);
       setGroups(nextGroups);
 
-      const nextMeta = new Map<string, ContentMeta>();
+      const nextLocalMeta = new Map<string, ContentMeta>();
       // A local pack answers for itself: the snapshot already carries the name
       // and the icon, so nothing here asks Modrinth about it. A pack with no
       // pack.png simply has no icon, which is the normal case and not an error
       // — the row falls back to the generic icon.
       for (const entry of list) {
         if (entry.source !== "local") continue;
-        nextMeta.set(entry.id, { name: entry.name ?? entry.id, iconUrl: entry.iconImage });
+        nextLocalMeta.set(entry.id, { name: entry.name ?? entry.id, iconUrl: entry.iconImage });
       }
+      setLocalMeta(nextLocalMeta);
 
+      // One request for the whole Modrinth half, and the only one this tab
+      // makes: names, icons and — since D62 — the game versions the badge
+      // reads. A list of local packs only is already complete here.
       const modrinthIds = list.filter(entry => entry.source === "modrinth").map(entry => entry.id);
-      // Show already-known readable names immediately; the fetch below only
-      // refines them (icons, corrected titles). If it fails, cached names keep
-      // cards from falling back to raw project IDs.
-      for (const id of modrinthIds) {
-        const cached = contentNameCache.get(id);
-        if (cached) nextMeta.set(id, { name: cached });
-      }
-      setMeta(nextMeta);
-      // Only the Modrinth half needs the API; a list of local packs only is
-      // already complete here.
       if (modrinthIds.length === 0) return;
-
-      try {
-        const param = encodeURIComponent(JSON.stringify(modrinthIds));
-        const response = await fetch(`https://api.modrinth.com/v2/projects?ids=${param}`, {
-          headers: { "User-Agent": "CubicLauncher/0.1.0" },
-        });
-        if (!response.ok) return;
-        const projects: Array<{ id: string; slug: string; title: string; icon_url?: string | null }> = await response.json();
-        for (const project of projects) {
-          const data = { name: project.title, iconUrl: project.icon_url ?? undefined };
-          if (project.slug) nextMeta.set(project.slug, data);
-          if (project.id) nextMeta.set(project.id, data);
-          if (project.title) {
-            if (project.slug) contentNameCache.set(project.slug, project.title);
-            if (project.id) contentNameCache.set(project.id, project.title);
-          }
-        }
-        setMeta(new Map(nextMeta));
-      } catch {
-        // best effort
-      }
+      await fetchContentProjects(modrinthIds);
     } catch {
       setEntries([]);
       setGroups([]);

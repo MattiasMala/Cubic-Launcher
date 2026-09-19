@@ -23,7 +23,8 @@ use crate::rules::ModSource;
 use super::{
     emit_log, load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
     resolve_compatible_versions_hybrid, resolve_online_selection, run_content_precheck,
-    ContentEntryWithoutVersions, ContentUpdateRow, ResolvedContentVersions, SelectedMod,
+    ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow, ResolvedContentVersions,
+    SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -101,6 +102,10 @@ pub struct UpdatePrecheckResult {
     /// and not a row: today only `launcher.log` knows, and only during a
     /// launch.
     pub content_without_versions: Vec<ContentEntryWithoutVersions>,
+    /// Entries whose version lookup failed (D63). Not the same list as the one
+    /// above and not the same sentence: the launch will resolve these the
+    /// usual way, and until it does nothing is known about them.
+    pub content_lookup_failures: Vec<ContentLookupFailure>,
 }
 
 /// A vanilla target loads no mods: an empty payload, not an error, and no
@@ -326,6 +331,7 @@ pub(super) async fn run_update_precheck(
     result.content_updates = content.updates;
     result.resolved_content = content.resolved;
     result.content_without_versions = content.without_versions;
+    result.content_lookup_failures = content.lookup_failures;
 
     Ok(result)
 }
@@ -716,6 +722,11 @@ mod tests {
                 category: "resourcepack".into(),
                 entry_id: "visual-effects-plus".into(),
             }],
+            content_lookup_failures: vec![ContentLookupFailure {
+                category: "shader".into(),
+                entry_id: "complementary-reimagined".into(),
+                error: "Modrinth returned an error".into(),
+            }],
         };
 
         assert_eq!(
@@ -746,6 +757,11 @@ mod tests {
                 "contentWithoutVersions": [{
                     "category": "resourcepack",
                     "entryId": "visual-effects-plus",
+                }],
+                "contentLookupFailures": [{
+                    "category": "shader",
+                    "entryId": "complementary-reimagined",
+                    "error": "Modrinth returned an error",
                 }],
             })
         );
