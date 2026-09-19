@@ -16,6 +16,7 @@ import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod
 
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
+  activeRailView,
   modRowsState, setModRowsState, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
   setLaunchLogs,
@@ -77,6 +78,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { NoticeBanner } from "./components/NoticeBanner";
 import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
+import { ScreenshotsView } from "./components/ScreenshotsView";
 import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
 import { LaunchPanel } from "./components/LaunchPanel";
 import { AddModDialog } from "./components/AddModDialog";
@@ -1059,21 +1061,23 @@ export default function App() {
 
       {/* Main content area - Sidebar + Content + BottomBar */}
       <div class="flex flex-1 overflow-hidden relative">
-        <Sidebar
-          onSelectModList={handleSelectModList}
-          onSwitchAccount={handleSwitchAccount}
-        />
+        <Sidebar onSelectModList={handleSelectModList} />
 
         {/* Content + BottomBar column */}
-        <div class="flex flex-col flex-1 min-w-0">
-          <ModListEditor
-            onAddMod={() => setAddModModalOpen(true)}
-            onDeleteSelected={handleDeleteSelected}
-            onReorder={orderedIds => void handleReorderRules(orderedIds)}
-            onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
-          />
-          <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} onVersionChange={handleVersionChange} onLoaderChange={handleLoaderChange} />
-        </div>
+        <Show
+          when={activeRailView() === "home"}
+          fallback={<ScreenshotsView />}
+        >
+          <div class="flex flex-col flex-1 min-w-0">
+            <ModListEditor
+              onAddMod={() => setAddModModalOpen(true)}
+              onDeleteSelected={handleDeleteSelected}
+              onReorder={orderedIds => void handleReorderRules(orderedIds)}
+              onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
+            />
+            <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} onVersionChange={handleVersionChange} onLoaderChange={handleLoaderChange} />
+          </div>
+        </Show>
       </div>
 
       {/* Modals */}

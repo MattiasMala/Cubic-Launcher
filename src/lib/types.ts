@@ -242,6 +242,23 @@ export type UpdatePrecheckResult = {
   contentLookupFailures: ContentLookupFailure[];
 };
 
+/** One screenshot found under an instance's `screenshots/` folder. */
+export type ScreenshotEntry = {
+  path: string;
+  fileName: string;
+  modlistName: string;
+  instanceName: string;
+  /** Filesystem mtime, not the date in the filename. */
+  modifiedMs: number;
+  sizeBytes: number;
+};
+
+export type ScreenshotListing = {
+  entries: ScreenshotEntry[];
+  /** Whether this platform has a system trash at all; the attempt can still fail. */
+  trashSupported: boolean;
+};
+
 // ── Static constants ──────────────────────────────────────────────────────────
 
 export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Vanilla"] as const;

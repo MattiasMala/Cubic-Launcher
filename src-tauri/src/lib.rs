@@ -30,6 +30,7 @@ pub mod offline_account;
 pub mod process_streaming;
 pub mod resolver;
 pub mod rules;
+pub mod screenshots;
 pub mod token_storage;
 mod updater;
 
@@ -128,6 +129,9 @@ pub fn run() {
             launch_preview::update_precheck_command,
             launch_preview::verify_launch_command,
             launch_preview::stop_minecraft_command,
+            screenshots::list_screenshots_command,
+            screenshots::delete_screenshot_command,
+            screenshots::open_screenshot_folder_command,
             updater::check_for_updates,
             updater::install_update
         ])

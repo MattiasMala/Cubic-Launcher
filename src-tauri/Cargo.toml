@@ -38,6 +38,9 @@ semver = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
+# System trash for the screenshot deletion (D64): the hand-rolled freedesktop
+# implementation only covered Linux, and Windows is a shipped target.
+trash = "5"
 uuid = { version = "1", features = ["v5"] }
 zip = "0.6"
 flate2 = "1"
