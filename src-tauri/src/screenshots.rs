@@ -24,6 +24,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
+use crate::path_safety::validate_path_component;
 
 const INSTANCES_DIR_NAME: &str = "instances";
 const SCREENSHOTS_DIR_NAME: &str = "screenshots";
@@ -213,66 +214,59 @@ fn modified_ms(metadata: &fs::Metadata) -> i64 {
     }
 }
 
-// ── The path a deletion is allowed to touch ──────────────────────────────────
+// ── The screenshot a deletion is allowed to touch ────────────────────────────
 
-/// Resolve `path` to the screenshot it names, or refuse.
+/// Rebuild one screenshot's path from the three names the listing handed out,
+/// or refuse.
 ///
-/// Accepted only when all of this holds: the path is absolute, spells no `.`
-/// or `..`, names a regular file (a symlink is not one), carries a screenshot
-/// extension, and its **canonicalised** parent is exactly
-/// `<root>/mod-lists/<modlist>/instances/<instance>/screenshots`.
+/// The caller never passes a path. It passes `(modlist, instance, file_name)`,
+/// and each one MUST be a single path component — `validate_path_component`,
+/// the primitive `launch_preview_content::validate_content_filename` already
+/// uses for the same reason (`launch_preview_content.rs:68-70`). A traversal
+/// cannot even be spelled this way: `".."` is rejected outright and
+/// `"../../options.txt"` carries separators.
 ///
-/// Canonicalising the parent is what makes the check hold against links: a
-/// `screenshots` directory that is a symlink to somewhere else resolves to its
-/// real location, which then fails the prefix test. Same shape as
-/// `launch_preview_content::content_pack_cache_path` refusing `..`
-/// (`launch_preview_content.rs:89-98` via `path_safety::validate_path_component`),
-/// one level up: there a filename, here a whole directory position.
-fn resolve_screenshot_path(root_dir: &Path, path: &str) -> Result<PathBuf> {
-    let candidate = Path::new(path);
-    if !candidate.is_absolute() {
-        bail!("screenshot path must be absolute: '{path}'");
-    }
-    if candidate
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-    {
-        bail!("screenshot path must not contain '.' or '..': '{path}'");
-    }
-    if !has_screenshot_extension(candidate) {
-        bail!("'{path}' is not a screenshot file");
-    }
+/// That leaves the filesystem, which the names cannot speak for: the join is
+/// canonicalised and compared against `<root>/mod-lists`, so a `screenshots`
+/// directory that is a symlink elsewhere resolves to its real location and
+/// fails the prefix test.
+fn resolve_screenshot(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
+) -> Result<PathBuf> {
+    validate_path_component(modlist_name)
+        .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
+    validate_path_component(instance_name)
+        .with_context(|| format!("invalid instance name '{instance_name}'"))?;
+    validate_path_component(file_name)
+        .with_context(|| format!("invalid screenshot name '{file_name}'"))?;
 
-    let file_name = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("screenshot path has no filename: '{path}'"))?;
-
-    // `symlink_metadata` does not follow: a symlink is refused here rather
-    // than resolved, so the delete only ever touches a real file that sits in
-    // the folder it claims to sit in.
-    let metadata = fs::symlink_metadata(candidate)
-        .with_context(|| format!("no screenshot at '{path}'"))?;
-    if !metadata.is_file() {
-        bail!("'{path}' is not a regular file");
+    if !has_screenshot_extension(Path::new(file_name)) {
+        bail!("'{file_name}' is not a screenshot file");
     }
-
-    let parent = candidate
-        .parent()
-        .with_context(|| format!("screenshot path has no parent: '{path}'"))?;
-    let parent = fs::canonicalize(parent)
-        .with_context(|| format!("failed to resolve the folder of '{path}'"))?;
 
     let modlists_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
         .to_path_buf();
+    let screenshots_dir = modlists_dir
+        .join(modlist_name)
+        .join(INSTANCES_DIR_NAME)
+        .join(instance_name)
+        .join(SCREENSHOTS_DIR_NAME);
+
+    let resolved_dir = fs::canonicalize(&screenshots_dir)
+        .with_context(|| format!("no screenshots folder at {}", screenshots_dir.display()))?;
     let modlists_dir = fs::canonicalize(&modlists_dir)
         .with_context(|| format!("failed to resolve {}", modlists_dir.display()))?;
 
-    let relative = parent
-        .strip_prefix(&modlists_dir)
-        .map_err(|_| anyhow::anyhow!("'{path}' is outside the mod lists directory"))?;
-
+    let relative = resolved_dir.strip_prefix(&modlists_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "the screenshots folder of '{modlist_name}/{instance_name}' is outside the \
+             mod lists directory"
+        )
+    })?;
     let segments: Vec<&std::ffi::OsStr> = relative
         .components()
         .filter_map(|component| match component {
@@ -280,43 +274,67 @@ fn resolve_screenshot_path(root_dir: &Path, path: &str) -> Result<PathBuf> {
             _ => None,
         })
         .collect();
-
     let shaped_like_a_screenshots_folder = segments.len() == 4
         && segments[1] == INSTANCES_DIR_NAME
         && segments[3] == SCREENSHOTS_DIR_NAME;
     if !shaped_like_a_screenshots_folder {
-        bail!("'{path}' is not inside an instance's screenshots folder");
+        bail!(
+            "the screenshots folder of '{modlist_name}/{instance_name}' is outside the \
+             mod lists directory"
+        );
     }
 
-    Ok(parent.join(file_name))
+    let file_path = resolved_dir.join(file_name);
+    // `symlink_metadata` does not follow: a symlink is refused here rather
+    // than resolved, so the delete only ever touches a real file sitting in
+    // the folder it claims to sit in.
+    let metadata = fs::symlink_metadata(&file_path)
+        .with_context(|| format!("no screenshot at {}", file_path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", file_path.display());
+    }
+
+    Ok(file_path)
 }
 
 // ── Deleting ─────────────────────────────────────────────────────────────────
 
 pub fn delete_screenshot(
     root_dir: &Path,
-    path: &str,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
     allow_permanent: bool,
 ) -> Result<DeleteScreenshotOutcome> {
-    delete_screenshot_into_trash(root_dir, path, allow_permanent, home_trash_dir().as_deref())
+    delete_screenshot_into_trash(
+        root_dir,
+        modlist_name,
+        instance_name,
+        file_name,
+        allow_permanent,
+        home_trash_dir().as_deref(),
+    )
 }
 
 /// The deletion with its trash directory injected, so the tests can exercise
 /// all three outcomes without touching the real one.
 fn delete_screenshot_into_trash(
     root_dir: &Path,
-    path: &str,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
     allow_permanent: bool,
     trash_dir: Option<&Path>,
 ) -> Result<DeleteScreenshotOutcome> {
-    let resolved = resolve_screenshot_path(root_dir, path)?;
+    let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
+    let resolved_text = resolved.display().to_string();
 
     if let Some(trash_dir) = trash_dir {
         match trash_into(trash_dir, &resolved) {
             Ok(_) => {
                 return Ok(DeleteScreenshotOutcome {
                     disposal: ScreenshotDisposal::Trashed,
-                    path: path.to_string(),
+                    path: resolved_text,
                 })
             }
             Err(error) if !allow_permanent => {
@@ -340,7 +358,7 @@ fn delete_screenshot_into_trash(
         .with_context(|| format!("failed to delete {}", resolved.display()))?;
     Ok(DeleteScreenshotOutcome {
         disposal: ScreenshotDisposal::Deleted,
-        path: path.to_string(),
+        path: resolved_text,
     })
 }
 
@@ -589,23 +607,38 @@ pub fn list_screenshots_command(
 #[tauri::command]
 pub fn delete_screenshot_command(
     launcher_paths: State<'_, LauncherPaths>,
-    path: String,
+    modlist_name: String,
+    instance_name: String,
+    file_name: String,
     allow_permanent: bool,
 ) -> Result<DeleteScreenshotOutcome, String> {
-    delete_screenshot(launcher_paths.root_dir(), &path, allow_permanent)
-        .map_err(|error| format!("{error:#}"))
+    delete_screenshot(
+        launcher_paths.root_dir(),
+        &modlist_name,
+        &instance_name,
+        &file_name,
+        allow_permanent,
+    )
+    .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
 pub fn open_screenshot_folder_command(
     launcher_paths: State<'_, LauncherPaths>,
-    path: String,
+    modlist_name: String,
+    instance_name: String,
+    file_name: String,
 ) -> Result<(), String> {
-    let resolved = resolve_screenshot_path(launcher_paths.root_dir(), &path)
-        .map_err(|error| format!("{error:#}"))?;
+    let resolved = resolve_screenshot(
+        launcher_paths.root_dir(),
+        &modlist_name,
+        &instance_name,
+        &file_name,
+    )
+    .map_err(|error| format!("{error:#}"))?;
     let folder = resolved
         .parent()
-        .ok_or_else(|| format!("'{path}' has no folder"))?
+        .ok_or_else(|| format!("'{file_name}' has no folder"))?
         .to_path_buf();
     open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
 }
@@ -722,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_every_path_that_leaves_the_screenshots_folder() {
+    fn refuses_every_name_that_leaves_the_screenshots_folder() {
         let root = unique_root("refusal");
         let screenshot = write_screenshot(&root, "pack", "instance", "shot.png", 1_000);
         let instance_dir = screenshot
@@ -734,19 +767,6 @@ mod tests {
         let options_txt = instance_dir.join("options.txt.png");
         fs::write(&options_txt, b"a file that is not in screenshots/")
             .expect("failed to write the decoy");
-        let outside = env::temp_dir().join(format!(
-            "cubic-screenshots-outside-{}.png",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before unix epoch")
-                .as_nanos()
-        ));
-        fs::write(&outside, b"a file outside the launcher root").expect("failed to write the decoy");
-
-        let traversal = format!(
-            "{}/../../options.txt.png",
-            screenshot.parent().expect("parent").display()
-        );
         let subfolder = screenshot
             .parent()
             .expect("parent")
@@ -755,30 +775,40 @@ mod tests {
         fs::create_dir_all(subfolder.parent().expect("parent")).expect("failed to nest");
         fs::write(&subfolder, b"one level too deep").expect("failed to write the nested decoy");
 
-        for rejected in [
-            traversal,
-            options_txt.display().to_string(),
-            outside.display().to_string(),
-            subfolder.display().to_string(),
-            screenshot.parent().expect("parent").display().to_string(),
-            "mod-lists/pack/instances/instance/screenshots/shot.png".to_string(),
+        // Every shape that tries to name something other than one file inside
+        // one known instance's screenshots folder.
+        for (modlist, instance, file_name) in [
+            // Climbing out of the folder, the directory, and the root.
+            ("pack", "instance", "../options.txt.png"),
+            ("pack", "instance", "../../../../../../etc/passwd.png"),
+            ("pack", "instance", ".."),
+            ("pack", "..", "shot.png"),
+            ("..", "instance", "shot.png"),
+            // An absolute path is not a component either.
+            ("pack", "instance", "/etc/passwd.png"),
+            // A subfolder of screenshots/ is one level too deep.
+            ("pack", "instance", "nested/shot.png"),
+            // Empty names, and a file that is not an image.
+            ("pack", "instance", ""),
+            ("", "instance", "shot.png"),
+            ("pack", "instance", "shot.txt"),
+            // A folder that does not exist at all.
+            ("pack", "ghost", "shot.png"),
         ] {
-            let error = delete_screenshot_into_trash(&root, &rejected, true, None)
-                .expect_err(&format!("'{rejected}' must be refused"));
+            let error =
+                delete_screenshot_into_trash(&root, modlist, instance, file_name, true, None)
+                    .expect_err(&format!("'{modlist}/{instance}/{file_name}' must be refused"));
             assert!(
-                error.to_string().contains("screenshot")
-                    || error.to_string().contains("mod lists")
-                    || error.to_string().contains("regular file"),
-                "unexpected refusal for '{rejected}': {error}"
+                screenshot.exists() && options_txt.exists(),
+                "the refusal of '{modlist}/{instance}/{file_name}' deleted something: {error}"
             );
         }
 
         // Nothing was deleted by any of the refusals.
         assert!(screenshot.exists());
         assert!(options_txt.exists());
-        assert!(outside.exists());
+        assert!(subfolder.exists());
 
-        let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -800,13 +830,9 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, instance_dir.join(SCREENSHOTS_DIR_NAME))
             .expect("failed to link");
 
-        let through_the_link = instance_dir
-            .join(SCREENSHOTS_DIR_NAME)
-            .join("secret.png")
-            .display()
-            .to_string();
-        let error = delete_screenshot_into_trash(&root, &through_the_link, true, None)
-            .expect_err("a linked screenshots folder must be refused");
+        let error =
+            delete_screenshot_into_trash(&root, "pack", "instance", "secret.png", true, None)
+                .expect_err("a linked screenshots folder must be refused");
         assert!(
             error.to_string().contains("outside the mod lists directory"),
             "unexpected refusal: {error}"
@@ -825,7 +851,9 @@ mod tests {
 
         let outcome = delete_screenshot_into_trash(
             &root,
-            &screenshot.display().to_string(),
+            "pack",
+            "instance",
+            "2026-09-19_22.47.09.png",
             false,
             Some(&trash),
         )
@@ -864,10 +892,24 @@ mod tests {
         let second = write_screenshot(&root, "pack", "two", "2026-09-19_22.47.09.png", 2_000);
         fs::write(&second, b"the second one").expect("failed to rewrite the second screenshot");
 
-        delete_screenshot_into_trash(&root, &first.display().to_string(), false, Some(&trash))
-            .expect("the first deletion must succeed");
-        delete_screenshot_into_trash(&root, &second.display().to_string(), false, Some(&trash))
-            .expect("the second deletion must succeed");
+        delete_screenshot_into_trash(
+            &root,
+            "pack",
+            "one",
+            "2026-09-19_22.47.09.png",
+            false,
+            Some(&trash),
+        )
+        .expect("the first deletion must succeed");
+        delete_screenshot_into_trash(
+            &root,
+            "pack",
+            "two",
+            "2026-09-19_22.47.09.png",
+            false,
+            Some(&trash),
+        )
+        .expect("the second deletion must succeed");
 
         let files_dir = trash.join("files");
         assert_eq!(
@@ -887,18 +929,19 @@ mod tests {
     fn without_a_trash_the_deletion_needs_the_permanent_confirmation() {
         let root = unique_root("permanent");
         let screenshot = write_screenshot(&root, "pack", "instance", "shot.png", 1_000);
-        let path = screenshot.display().to_string();
 
-        let error = delete_screenshot_into_trash(&root, &path, false, None)
-            .expect_err("a deletion with no trash and no confirmation must be refused");
+        let error =
+            delete_screenshot_into_trash(&root, "pack", "instance", "shot.png", false, None)
+                .expect_err("a deletion with no trash and no confirmation must be refused");
         assert!(
             error.to_string().contains("not confirmed as permanent"),
             "unexpected refusal: {error}"
         );
         assert!(screenshot.exists(), "the refused deletion must not delete");
 
-        let outcome = delete_screenshot_into_trash(&root, &path, true, None)
-            .expect("a confirmed permanent deletion must go through");
+        let outcome =
+            delete_screenshot_into_trash(&root, "pack", "instance", "shot.png", true, None)
+                .expect("a confirmed permanent deletion must go through");
         assert_eq!(outcome.disposal, ScreenshotDisposal::Deleted);
         assert!(!screenshot.exists());
 

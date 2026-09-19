@@ -83,7 +83,13 @@ export function ScreenshotsView() {
 
   const openFolder = async (entry: ScreenshotEntry) => {
     try {
-      await invoke("open_screenshot_folder_command", { path: entry.path });
+      // The backend takes the three names, never a path: it rebuilds the
+      // location itself, so nothing the frontend sends can point elsewhere.
+      await invoke("open_screenshot_folder_command", {
+        modlistName: entry.modlistName,
+        instanceName: entry.instanceName,
+        fileName: entry.fileName,
+      });
     } catch (error) {
       pushUiError({
         title: "Could not open the folder",
@@ -105,7 +111,9 @@ export function ScreenshotsView() {
       // is available the backend must refuse to delete outright instead of
       // quietly turning a "move to trash" into an unlink.
       await invoke("delete_screenshot_command", {
-        path: entry.path,
+        modlistName: entry.modlistName,
+        instanceName: entry.instanceName,
+        fileName: entry.fileName,
         allowPermanent: !trashAvailable(),
       });
       setPendingDelete(null);
