@@ -38,6 +38,7 @@ import {
   launchState, selectedModList,
   setUpdateInfo,
   updateCheckRunning, setUpdateCheckRunning, pendingUpdatePrecheck, setPendingUpdatePrecheck,
+  setContentLookupFailures,
   LAUNCH_STAGES, wait,
 } from "./store";
 import { normalizeModLoader, type ModRow, type UpdatePrecheckResult } from "./lib/types";
@@ -986,6 +987,14 @@ export default function App() {
       // caches: mods by project id, packs by entry id.
       void fetchMetadataForIds(precheck.updates.map(update => update.projectId));
       void fetchContentProjects(precheck.contentUpdates.map(update => update.entryId));
+
+      // D63 reaches the editor row from here, not from a second request: the
+      // popup only opens when there is an update, and a pack nobody could ask
+      // about may well produce none. Rewritten every pre-check, so a failure
+      // that goes away stops being reported.
+      setContentLookupFailures(
+        new Map(precheck.contentLookupFailures.map(failure => [`${failure.category}/${failure.entryId}`, failure.error])),
+      );
 
       // The three Advanced checkboxes, finally read. A category that is off
       // keeps its rows out of the popup **and** out of the accepted set, so

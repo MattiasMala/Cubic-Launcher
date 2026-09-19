@@ -154,6 +154,7 @@ export function ContentTabView(props: ContentTabViewProps) {
                       >
                         <ContentEntryRow
                           entry={item.entry}
+                          contentType={props.type}
                           info={state.meta().get(item.entry.id)}
                           isResolved={state.isEntryResolved(item.entry)}
                           isSelected={state.selectedIds().has(item.entry.id)}
@@ -262,6 +263,7 @@ export function ContentTabView(props: ContentTabViewProps) {
                                   >
                                     <ContentEntryRow
                                       entry={entry}
+                                      contentType={props.type}
                                       info={state.meta().get(entry.id)}
                                       isResolved={state.isEntryResolved(entry)}
                                       isSelected={state.selectedIds().has(entry.id)}

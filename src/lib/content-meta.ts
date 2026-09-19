@@ -110,13 +110,22 @@ export type ContentCompatibility = "compatible" | "no-version" | "unknown" | "pe
 
 /**
  * Whether Modrinth publishes anything for this target, from the project's own
- * `game_versions` — the union over its versions, which is exactly the question
- * D60 asks, and the same comparison the backend runs per version
- * (`mc_version_matches`, `modrinth.rs:16-31`).
+ * `game_versions` — the union over its versions, which is the question D60
+ * asks.
+ *
+ * It is **not** the same code path the backend takes, and the difference is
+ * worth knowing: `fetch_content_pack_versions` sends
+ * `game_versions=["1.20.1"]` and Modrinth filters server-side by exact
+ * string, while this reads the union the project object already carries. The
+ * two agreed on all five of the real list's packs (measured 2026-09-19,
+ * `visual-effects-plus` false on both sides, the other four true). The `.x`
+ * branch of `mcVersionMatches` never fires here, since Modrinth returns
+ * concrete versions; it is there because the same helper reads the mod-list's
+ * own version rules, which do use wildcards.
  *
  * Loader is not part of it, on purpose: content packs are `loaders:
- * ["minecraft"]` and `fetch_content_pack_versions` filters by game version
- * alone, so a loader here would make the badge stricter than the launch.
+ * ["minecraft"]` and the backend's pack lookup filters by game version alone,
+ * so a loader here would make the badge stricter than the launch.
  *
  * `pending` is the state before anyone has asked, and it shows nothing: a
  * badge that appears for half a second on every row and then goes away is

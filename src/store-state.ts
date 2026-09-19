@@ -128,6 +128,16 @@ export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
 /** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */
 export const [modNames, setModNames] = createSignal<Map<string, string>>(new Map());
+/**
+ * `category/entryId → error` for the packs the **last pre-check** could not
+ * read the versions of (D63).
+ *
+ * It lives here and not only in the popup payload because the popup opens
+ * only when there is at least one update, and this is precisely a case where
+ * there may be none: without it the failure would be invisible exactly when
+ * it matters. The editor row reads it; nothing fetches anything for it.
+ */
+export const [contentLookupFailures, setContentLookupFailures] = createSignal<Map<string, string>>(new Map());
 export const [savedLinks, setSavedLinks] = createSignal<LinkRule[]>([]);
 export const [draftLinks, setDraftLinks] = createSignal<LinkRule[]>([]);
 export const [linkModalOpen, setLinkModalOpen] = createSignal(false);
