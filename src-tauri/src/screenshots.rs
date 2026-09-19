@@ -776,31 +776,43 @@ mod tests {
         fs::write(&subfolder, b"one level too deep").expect("failed to write the nested decoy");
 
         // Every shape that tries to name something other than one file inside
-        // one known instance's screenshots folder.
-        for (modlist, instance, file_name) in [
+        // one known instance's screenshots folder, with the reason it must be
+        // refused for: a refusal that happens for the wrong reason is a test
+        // that stops protecting anything the day the reason changes.
+        for (modlist, instance, file_name, reason) in [
             // Climbing out of the folder, the directory, and the root.
-            ("pack", "instance", "../options.txt.png"),
-            ("pack", "instance", "../../../../../../etc/passwd.png"),
-            ("pack", "instance", ".."),
-            ("pack", "..", "shot.png"),
-            ("..", "instance", "shot.png"),
+            ("pack", "instance", "../options.txt.png", "must not contain a path separator"),
+            (
+                "pack",
+                "instance",
+                "../../../../../../etc/passwd.png",
+                "must not contain a path separator",
+            ),
+            ("pack", "instance", "..", "is not allowed"),
+            ("pack", "..", "shot.png", "invalid instance name"),
+            ("..", "instance", "shot.png", "invalid mod list name"),
             // An absolute path is not a component either.
-            ("pack", "instance", "/etc/passwd.png"),
+            ("pack", "instance", "/etc/passwd.png", "must not contain a path separator"),
             // A subfolder of screenshots/ is one level too deep.
-            ("pack", "instance", "nested/shot.png"),
+            ("pack", "instance", "nested/shot.png", "must not contain a path separator"),
             // Empty names, and a file that is not an image.
-            ("pack", "instance", ""),
-            ("", "instance", "shot.png"),
-            ("pack", "instance", "shot.txt"),
+            ("pack", "instance", "", "cannot be empty"),
+            ("", "instance", "shot.png", "cannot be empty"),
+            ("pack", "instance", "shot.txt", "is not a screenshot file"),
             // A folder that does not exist at all.
-            ("pack", "ghost", "shot.png"),
+            ("pack", "ghost", "shot.png", "no screenshots folder at"),
         ] {
             let error =
                 delete_screenshot_into_trash(&root, modlist, instance, file_name, true, None)
                     .expect_err(&format!("'{modlist}/{instance}/{file_name}' must be refused"));
+            let reported = format!("{error:#}");
+            assert!(
+                reported.contains(reason),
+                "'{modlist}/{instance}/{file_name}' was refused for the wrong reason: {reported}"
+            );
             assert!(
                 screenshot.exists() && options_txt.exists(),
-                "the refusal of '{modlist}/{instance}/{file_name}' deleted something: {error}"
+                "the refusal of '{modlist}/{instance}/{file_name}' deleted something"
             );
         }
 
