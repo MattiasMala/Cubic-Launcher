@@ -228,7 +228,13 @@ export function ScreenshotsView() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => setPendingDelete(entry)}
+                          onClick={() => {
+                            // A refusal belongs to the deletion that hit it:
+                            // left set, the next dialog would open straight
+                            // in permanent mode and never retry the trash.
+                            setTrashRefusal(null);
+                            setPendingDelete(entry);
+                          }}
                           class="w-8 h-8 rounded-md text-textMuted hover:text-destructive hover:bg-bgHover flex items-center justify-center cursor-pointer"
                           aria-label={`Delete ${entry.fileName}`}
                         >
