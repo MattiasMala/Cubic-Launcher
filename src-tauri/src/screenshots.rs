@@ -17,7 +17,7 @@
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -52,10 +52,11 @@ pub struct ScreenshotEntry {
 #[serde(rename_all = "camelCase")]
 pub struct ScreenshotListing {
     pub entries: Vec<ScreenshotEntry>,
-    /// Whether a deletion would reach the system trash. The confirmation text
-    /// depends on this: when it is false the dialog must say the deletion is
-    /// permanent instead of pretending there is a safety net.
-    pub trash_available: bool,
+    /// Whether this platform has a system trash at all. The confirmation
+    /// opens with the "moves to the trash" wording when it is true and with
+    /// the permanent one when it is false; a trash that turns out not to work
+    /// is caught by the deletion itself, which refuses instead of unlinking.
+    pub trash_supported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -299,6 +300,11 @@ fn resolve_screenshot(
 
 // ── Deleting ─────────────────────────────────────────────────────────────────
 
+/// Prefix of the error a refused deletion carries when the trash is the thing
+/// that failed. The frontend matches on it to re-ask with the permanent
+/// wording instead of showing a bare failure.
+pub const TRASH_UNAVAILABLE: &str = "trash-unavailable:";
+
 pub fn delete_screenshot(
     root_dir: &Path,
     modlist_name: &str,
@@ -306,52 +312,55 @@ pub fn delete_screenshot(
     file_name: &str,
     allow_permanent: bool,
 ) -> Result<DeleteScreenshotOutcome> {
-    delete_screenshot_into_trash(
+    let send_to_trash = |path: &Path| trash::delete(path).map_err(anyhow::Error::from);
+    let send_to_trash: Option<&dyn Fn(&Path) -> Result<()>> = if trash_supported() {
+        Some(&send_to_trash)
+    } else {
+        None
+    };
+    delete_screenshot_with(
         root_dir,
         modlist_name,
         instance_name,
         file_name,
         allow_permanent,
-        home_trash_dir().as_deref(),
+        send_to_trash,
     )
 }
 
-/// The deletion with its trash directory injected, so the tests can exercise
-/// all three outcomes without touching the real one.
-fn delete_screenshot_into_trash(
+/// The deletion with the "put this in the trash" step injected; `None` is a
+/// platform with no trash at all. The seam exists so the tests can exercise
+/// the contract — moved, refused, or deleted on an explicit confirmation —
+/// without ever touching the trash of whoever runs them.
+fn delete_screenshot_with(
     root_dir: &Path,
     modlist_name: &str,
     instance_name: &str,
     file_name: &str,
     allow_permanent: bool,
-    trash_dir: Option<&Path>,
+    send_to_trash: Option<&dyn Fn(&Path) -> Result<()>>,
 ) -> Result<DeleteScreenshotOutcome> {
     let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
     let resolved_text = resolved.display().to_string();
 
-    if let Some(trash_dir) = trash_dir {
-        match trash_into(trash_dir, &resolved) {
-            Ok(_) => {
+    let trash_error = match send_to_trash {
+        Some(send_to_trash) => match send_to_trash(&resolved) {
+            Ok(()) => {
                 return Ok(DeleteScreenshotOutcome {
                     disposal: ScreenshotDisposal::Trashed,
                     path: resolved_text,
                 })
             }
-            Err(error) if !allow_permanent => {
-                return Err(error.context(
-                    "the system trash is unavailable and this deletion was not \
-                     confirmed as permanent",
-                ))
-            }
-            // Falls through to the permanent deletion the caller already
-            // confirmed: the dialog said "permanently" and meant it.
-            Err(_) => {}
-        }
-    } else if !allow_permanent {
-        bail!(
-            "the system trash is unavailable and this deletion was not confirmed \
-             as permanent"
-        );
+            Err(error) => format!("{error:#}"),
+        },
+        None => "this platform has no system trash".to_string(),
+    };
+
+    // The pact: `allow_permanent` is what the dialog promised. A trash that
+    // did not work does not quietly become an unlink — the caller is told,
+    // and has to come back having said "permanently".
+    if !allow_permanent {
+        bail!("{TRASH_UNAVAILABLE} {trash_error}");
     }
 
     fs::remove_file(&resolved)
@@ -362,228 +371,24 @@ fn delete_screenshot_into_trash(
     })
 }
 
-/// Whether a deletion can reach the system trash right now.
+/// Whether this build has a system trash to aim at **at all**.
 ///
-/// Trash support is the freedesktop home trash, so: Linux, an
-/// `XDG_DATA_HOME`/`HOME` to put it under, and the launcher root on the same
-/// filesystem as that trash — a trash on another device cannot receive a
-/// `rename`, and copying a user's file across a disk behind their back is not
-/// what "delete" means.
-pub fn trash_available(root_dir: &Path) -> bool {
-    let Some(trash_dir) = home_trash_dir() else {
-        return false;
-    };
-    // The trash directory itself may not exist yet on a fresh account; the
-    // device that decides the question is the one holding it.
-    let probe = if trash_dir.exists() {
-        trash_dir
-    } else {
-        match trash_dir.parent() {
-            Some(parent) if parent.exists() => parent.to_path_buf(),
-            _ => return false,
-        }
-    };
-    same_device(&probe, root_dir).unwrap_or(false)
-}
-
-#[cfg(target_os = "linux")]
-fn home_trash_dir() -> Option<PathBuf> {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        if !data_home.is_empty() {
-            return Some(PathBuf::from(data_home).join("Trash"));
-        }
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".local/share/Trash"))
-}
-
-/// No home trash outside Linux: the freedesktop layout is not what macOS and
-/// Windows use, and guessing at their shells from here would be worse than
-/// telling the user plainly that the deletion is permanent.
-#[cfg(not(target_os = "linux"))]
-fn home_trash_dir() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(unix)]
-fn same_device(left: &Path, right: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let left_dev = fs::metadata(left)
-        .with_context(|| format!("failed to stat {}", left.display()))?
-        .dev();
-    let right_dev = fs::metadata(right)
-        .with_context(|| format!("failed to stat {}", right.display()))?
-        .dev();
-    Ok(left_dev == right_dev)
-}
-
-#[cfg(not(unix))]
-fn same_device(_left: &Path, _right: &Path) -> Result<bool> {
-    Ok(false)
-}
-
-/// Move `file` into the freedesktop trash at `trash_dir`
-/// (<https://specifications.freedesktop.org/trash-spec/trashspec-1.0.html>):
-/// the file goes to `files/<name>`, and `info/<name>.trashinfo` records where
-/// it came from so the file manager can put it back.
-///
-/// The info file is created with `create_new`, which is what reserves the
-/// name: another trashing process racing for the same name loses the create
-/// and picks the next one instead of overwriting.
-fn trash_into(trash_dir: &Path, file: &Path) -> Result<PathBuf> {
-    let files_dir = trash_dir.join("files");
-    let info_dir = trash_dir.join("info");
-    fs::create_dir_all(&files_dir)
-        .with_context(|| format!("failed to create {}", files_dir.display()))?;
-    fs::create_dir_all(&info_dir)
-        .with_context(|| format!("failed to create {}", info_dir.display()))?;
-
-    let source_dir = file
-        .parent()
-        .with_context(|| format!("{} has no parent directory", file.display()))?;
-    if !same_device(&files_dir, source_dir)? {
-        bail!(
-            "{} is on another filesystem than the trash at {}",
-            file.display(),
-            trash_dir.display()
-        );
-    }
-
-    let file_name = file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("{} has no usable filename", file.display()))?;
-    let (trashed_name, mut info_file) = reserve_trash_name(&files_dir, &info_dir, file_name)?;
-
-    let write_info = {
-        use std::io::Write;
-        write!(
-            info_file,
-            "[Trash Info]\nPath={}\nDeletionDate={}\n",
-            percent_encode_path(file),
-            deletion_date_now()
-        )
-    };
-    let info_path = info_dir.join(format!("{trashed_name}.trashinfo"));
-    if let Err(error) = write_info {
-        let _ = fs::remove_file(&info_path);
-        return Err(error).with_context(|| format!("failed to write {}", info_path.display()));
-    }
-    drop(info_file);
-
-    let destination = files_dir.join(&trashed_name);
-    if let Err(error) = fs::rename(file, &destination) {
-        // Nothing moved, so the record must not survive: a `.trashinfo` with
-        // no file behind it is rubbish the file manager will show forever.
-        let _ = fs::remove_file(&info_path);
-        return Err(error).with_context(|| {
-            format!(
-                "failed to move {} into {}",
-                file.display(),
-                files_dir.display()
-            )
-        });
-    }
-
-    Ok(destination)
-}
-
-/// Claim a free `<name>` in the trash, returning it with the opened (and
-/// exclusively created) info file.
-fn reserve_trash_name(
-    files_dir: &Path,
-    info_dir: &Path,
-    file_name: &str,
-) -> Result<(String, fs::File)> {
-    for attempt in 0..1_000u32 {
-        let candidate = if attempt == 0 {
-            file_name.to_string()
-        } else {
-            suffixed_name(file_name, attempt)
-        };
-        if files_dir.join(&candidate).symlink_metadata().is_ok() {
-            continue;
-        }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(info_dir.join(format!("{candidate}.trashinfo")))
-        {
-            Ok(info_file) => return Ok((candidate, info_file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to write into {}", info_dir.display()))
-            }
-        }
-    }
-    bail!("no free name left in the trash for '{file_name}'")
-}
-
-fn suffixed_name(file_name: &str, attempt: u32) -> String {
-    match file_name.rsplit_once('.') {
-        Some((stem, extension)) if !stem.is_empty() => format!("{stem}.{attempt}.{extension}"),
-        _ => format!("{file_name}.{attempt}"),
-    }
-}
-
-/// Percent-encode an absolute path for the `Path=` field, per the spec's
-/// reference to RFC 2396: unreserved characters and the separator stay, every
-/// other byte becomes `%XX`. Bytes, not chars — a filename is not required to
-/// be UTF-8.
-fn percent_encode_path(path: &Path) -> String {
-    #[cfg(unix)]
-    let bytes: Vec<u8> = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(not(unix))]
-    let bytes: Vec<u8> = path.to_string_lossy().into_owned().into_bytes();
-
-    let mut encoded = String::with_capacity(bytes.len());
-    for byte in bytes {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-/// `DeletionDate` in the spec's format: local time, no zone suffix.
-#[cfg(unix)]
-fn deletion_date_now() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since_epoch| since_epoch.as_secs() as libc::time_t)
-        .unwrap_or(0);
-
-    let mut broken_down: libc::tm = unsafe { std::mem::zeroed() };
-    let resolved = unsafe { libc::localtime_r(&seconds, &mut broken_down) };
-    if resolved.is_null() {
-        // Cannot happen short of a broken libc; the trash entry is still
-        // valid, the restore date just reads as the epoch.
-        return "1970-01-01T00:00:00".to_string();
-    }
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        broken_down.tm_year + 1900,
-        broken_down.tm_mon + 1,
-        broken_down.tm_mday,
-        broken_down.tm_hour,
-        broken_down.tm_min,
-        broken_down.tm_sec
-    )
-}
-
-#[cfg(not(unix))]
-fn deletion_date_now() -> String {
-    "1970-01-01T00:00:00".to_string()
+/// Deliberately not "will the next deletion reach the trash": with the crate
+/// doing the work that question has no honest answer short of trying, and
+/// probing by trashing a throwaway file would leave litter in the user's bin.
+/// So this answers the platform question — the one that can be answered
+/// without guessing — and the runtime answer comes from the attempt itself,
+/// which refuses rather than deletes when it fails (`TRASH_UNAVAILABLE`).
+pub fn trash_supported() -> bool {
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -596,7 +401,7 @@ pub fn list_screenshots_command(
     let entries = list_screenshots(root_dir).map_err(|error| error.to_string())?;
     Ok(ScreenshotListing {
         entries,
-        trash_available: trash_available(root_dir),
+        trash_supported: trash_supported(),
     })
 }
 
@@ -646,7 +451,7 @@ pub fn open_screenshot_folder_command(
 #[cfg(test)]
 mod tests {
     use std::env;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
 
@@ -803,7 +608,7 @@ mod tests {
             ("pack", "ghost", "shot.png", "no screenshots folder at"),
         ] {
             let error =
-                delete_screenshot_into_trash(&root, modlist, instance, file_name, true, None)
+                delete_screenshot_with(&root, modlist, instance, file_name, true, None)
                     .expect_err(&format!("'{modlist}/{instance}/{file_name}' must be refused"));
             let reported = format!("{error:#}");
             assert!(
@@ -843,7 +648,7 @@ mod tests {
             .expect("failed to link");
 
         let error =
-            delete_screenshot_into_trash(&root, "pack", "instance", "secret.png", true, None)
+            delete_screenshot_with(&root, "pack", "instance", "secret.png", true, None)
                 .expect_err("a linked screenshots folder must be refused");
         assert!(
             error.to_string().contains("outside the mod lists directory"),
@@ -855,86 +660,79 @@ mod tests {
         let _ = fs::remove_dir_all(&elsewhere);
     }
 
-    #[test]
-    fn deletion_moves_the_file_into_the_trash_and_records_where_it_came_from() {
-        let root = unique_root("trash");
-        let trash = unique_root("trash-dir");
-        let screenshot = write_screenshot(&root, "pack", "instance", "2026-09-19_22.47.09.png", 1_000);
+    /// A stand-in for `trash::delete`: moves the file into `bin` instead of
+    /// into whoever runs the tests' real trash.
+    fn bin_into(bin: &Path) -> impl Fn(&Path) -> Result<()> + '_ {
+        move |path: &Path| {
+            fs::create_dir_all(bin)?;
+            let name = path.file_name().context("no file name")?;
+            fs::rename(path, bin.join(name))?;
+            Ok(())
+        }
+    }
 
-        let outcome = delete_screenshot_into_trash(
+    #[test]
+    fn a_trashed_screenshot_leaves_its_folder_and_says_so() {
+        let root = unique_root("trashed");
+        let bin = unique_root("trashed-bin");
+        let screenshot = write_screenshot(&root, "pack", "instance", "shot.png", 1_000);
+        let send_to_trash = bin_into(&bin);
+
+        let outcome = delete_screenshot_with(
             &root,
             "pack",
             "instance",
-            "2026-09-19_22.47.09.png",
+            "shot.png",
             false,
-            Some(&trash),
+            Some(&send_to_trash),
         )
         .expect("the deletion must succeed");
 
         assert_eq!(outcome.disposal, ScreenshotDisposal::Trashed);
         assert!(!screenshot.exists(), "the screenshot must leave its folder");
-        let trashed = trash.join("files").join("2026-09-19_22.47.09.png");
-        assert_eq!(
-            fs::read(&trashed).expect("the file must be in the trash"),
-            b"not really a png"
-        );
-        let info = fs::read_to_string(
-            trash
-                .join("info")
-                .join("2026-09-19_22.47.09.png.trashinfo"),
-        )
-        .expect("the trash record must exist");
-        assert!(info.starts_with("[Trash Info]\n"), "unexpected record: {info}");
-        assert!(
-            info.contains(&format!("Path={}\n", percent_encode_path(&screenshot))),
-            "the record must point back at the original path: {info}"
-        );
-        assert!(info.contains("DeletionDate=20"), "unexpected record: {info}");
+        assert!(bin.join("shot.png").exists(), "the trash must have received it");
 
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&trash);
+        let _ = fs::remove_dir_all(&bin);
     }
 
     #[test]
-    fn a_name_already_in_the_trash_does_not_overwrite_the_earlier_file() {
-        let root = unique_root("trash-collision");
-        let trash = unique_root("trash-collision-dir");
-        let first = write_screenshot(&root, "pack", "one", "2026-09-19_22.47.09.png", 1_000);
-        fs::write(&first, b"the first one").expect("failed to rewrite the first screenshot");
-        let second = write_screenshot(&root, "pack", "two", "2026-09-19_22.47.09.png", 2_000);
-        fs::write(&second, b"the second one").expect("failed to rewrite the second screenshot");
+    fn a_trash_that_fails_refuses_instead_of_deleting() {
+        let root = unique_root("trash-fails");
+        let screenshot = write_screenshot(&root, "pack", "instance", "shot.png", 1_000);
+        let broken_trash = |_: &Path| bail!("no trash on this machine");
 
-        delete_screenshot_into_trash(
+        let error = delete_screenshot_with(
             &root,
             "pack",
-            "one",
-            "2026-09-19_22.47.09.png",
+            "instance",
+            "shot.png",
             false,
-            Some(&trash),
+            Some(&broken_trash),
         )
-        .expect("the first deletion must succeed");
-        delete_screenshot_into_trash(
+        .expect_err("a failed trashing must not become a deletion");
+        let reported = format!("{error:#}");
+        assert!(reported.contains(TRASH_UNAVAILABLE), "unexpected refusal: {reported}");
+        assert!(
+            reported.contains("no trash on this machine"),
+            "the refusal must carry why the trash failed: {reported}"
+        );
+        assert!(screenshot.exists(), "the refused deletion must not delete");
+
+        // Only the explicit confirmation turns it into an unlink.
+        let outcome = delete_screenshot_with(
             &root,
             "pack",
-            "two",
-            "2026-09-19_22.47.09.png",
-            false,
-            Some(&trash),
+            "instance",
+            "shot.png",
+            true,
+            Some(&broken_trash),
         )
-        .expect("the second deletion must succeed");
-
-        let files_dir = trash.join("files");
-        assert_eq!(
-            fs::read(files_dir.join("2026-09-19_22.47.09.png")).expect("the first file"),
-            b"the first one"
-        );
-        assert_eq!(
-            fs::read(files_dir.join("2026-09-19_22.47.09.1.png")).expect("the second file"),
-            b"the second one"
-        );
+        .expect("a confirmed permanent deletion must go through");
+        assert_eq!(outcome.disposal, ScreenshotDisposal::Deleted);
+        assert!(!screenshot.exists());
 
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&trash);
     }
 
     #[test]
@@ -942,18 +740,18 @@ mod tests {
         let root = unique_root("permanent");
         let screenshot = write_screenshot(&root, "pack", "instance", "shot.png", 1_000);
 
-        let error =
-            delete_screenshot_into_trash(&root, "pack", "instance", "shot.png", false, None)
-                .expect_err("a deletion with no trash and no confirmation must be refused");
+        let error = delete_screenshot_with(&root, "pack", "instance", "shot.png", false, None)
+            .expect_err("a deletion with no trash and no confirmation must be refused");
+        let reported = format!("{error:#}");
+        assert!(reported.contains(TRASH_UNAVAILABLE), "unexpected refusal: {reported}");
         assert!(
-            error.to_string().contains("not confirmed as permanent"),
-            "unexpected refusal: {error}"
+            reported.contains("no system trash"),
+            "unexpected refusal: {reported}"
         );
         assert!(screenshot.exists(), "the refused deletion must not delete");
 
-        let outcome =
-            delete_screenshot_into_trash(&root, "pack", "instance", "shot.png", true, None)
-                .expect("a confirmed permanent deletion must go through");
+        let outcome = delete_screenshot_with(&root, "pack", "instance", "shot.png", true, None)
+            .expect("a confirmed permanent deletion must go through");
         assert_eq!(outcome.disposal, ScreenshotDisposal::Deleted);
         assert!(!screenshot.exists());
 

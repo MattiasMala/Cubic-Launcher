@@ -43,8 +43,14 @@ export function ScreenshotsView() {
   const [viewing, setViewing] = createSignal<ScreenshotEntry | null>(null);
   const [pendingDelete, setPendingDelete] = createSignal<ScreenshotEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = createSignal(false);
+  /**
+   * Set when a trashing attempt came back refused: the dialog stays open and
+   * switches to the permanent wording, carrying why the trash did not work.
+   * Nothing has been deleted at that point — that is the whole pact.
+   */
+  const [trashRefusal, setTrashRefusal] = createSignal<string | null>(null);
 
-  const trashAvailable = () => listing()?.trashAvailable ?? false;
+  const trashSupported = () => listing()?.trashSupported ?? false;
 
   /**
    * Consecutive runs of the (already newest-first) listing: the current
@@ -107,26 +113,34 @@ export function ScreenshotsView() {
 
     setDeleteBusy(true);
     try {
-      // `allowPermanent` is exactly what the dialog promised: when the trash
-      // is available the backend must refuse to delete outright instead of
-      // quietly turning a "move to trash" into an unlink.
+      // `allowPermanent` is exactly what the dialog promised. On a platform
+      // with a trash the first attempt promises the trash; if the backend
+      // comes back with `trash-unavailable:` nothing was deleted, and the
+      // dialog asks again saying "permanently" before we set the flag.
+      const permanentPromised = !trashSupported() || trashRefusal() !== null;
       await invoke("delete_screenshot_command", {
         modlistName: entry.modlistName,
         instanceName: entry.instanceName,
         fileName: entry.fileName,
-        allowPermanent: !trashAvailable(),
+        allowPermanent: permanentPromised,
       });
       setPendingDelete(null);
+      setTrashRefusal(null);
       if (viewing()?.path === entry.path) setViewing(null);
       await refetch();
     } catch (error) {
-      pushUiError({
-        title: "Could not delete the screenshot",
-        message: `'${entry.fileName}' is still on disk.`,
-        detail: String(error),
-        severity: "error",
-        scope: "launch",
-      });
+      const reported = String(error);
+      if (reported.includes("trash-unavailable:")) {
+        setTrashRefusal(reported.split("trash-unavailable:").pop()?.trim() || reported);
+      } else {
+        pushUiError({
+          title: "Could not delete the screenshot",
+          message: `'${entry.fileName}' is still on disk.`,
+          detail: reported,
+          severity: "error",
+          scope: "launch",
+        });
+      }
     } finally {
       setDeleteBusy(false);
     }
@@ -137,6 +151,7 @@ export function ScreenshotsView() {
       if (event.key !== "Escape") return;
       if (pendingDelete()) {
         setPendingDelete(null);
+        setTrashRefusal(null);
         return;
       }
       setViewing(null);
@@ -252,21 +267,32 @@ export function ScreenshotsView() {
           <div class="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-6">
             <div class="w-[420px] max-w-full rounded-lg border border-borderColor bg-bgPanel p-5">
               <h2 class="text-base font-semibold text-white mb-2">
-                {trashAvailable() ? "Move this screenshot to the trash?" : "Delete this screenshot?"}
+                {trashSupported() && !trashRefusal()
+                  ? "Move this screenshot to the trash?"
+                  : "Delete this screenshot?"}
               </h2>
               <p class="text-sm text-textMuted mb-1 break-all">{entry().fileName}</p>
               <p class="text-xs text-textMuted mb-4">
                 {modlistLabel(entry())} / {entry().instanceName}
               </p>
-              <p class={`text-sm mb-5 ${trashAvailable() ? "text-textMuted" : "text-destructive"}`}>
-                {trashAvailable()
-                  ? "It goes to the system trash, where your file manager can put it back."
-                  : "The system trash is not available here, so this deletes the file for good."}
+              <p
+                class={`text-sm mb-5 ${
+                  trashSupported() && !trashRefusal() ? "text-textMuted" : "text-destructive"
+                }`}
+              >
+                {trashRefusal()
+                  ? `The system trash could not take it (${trashRefusal()}). Nothing has been deleted yet: going on deletes the file for good.`
+                  : trashSupported()
+                    ? "It goes to the system trash, where your file manager can put it back."
+                    : "The system trash is not available here, so this deletes the file for good."}
               </p>
               <div class="flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setPendingDelete(null)}
+                  onClick={() => {
+                    setPendingDelete(null);
+                    setTrashRefusal(null);
+                  }}
                   class="px-3 py-1.5 rounded-md text-sm text-textMuted hover:text-white hover:bg-bgHover cursor-pointer"
                 >
                   Cancel
@@ -277,7 +303,7 @@ export function ScreenshotsView() {
                   onClick={() => void confirmDelete()}
                   class="px-3 py-1.5 rounded-md text-sm bg-destructive text-white hover:opacity-90 disabled:opacity-60 cursor-pointer"
                 >
-                  {trashAvailable() ? "Move to trash" : "Delete permanently"}
+                  {trashSupported() && !trashRefusal() ? "Move to trash" : "Delete permanently"}
                 </button>
               </div>
             </div>

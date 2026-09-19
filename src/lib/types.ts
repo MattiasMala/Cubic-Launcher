@@ -255,8 +255,8 @@ export type ScreenshotEntry = {
 
 export type ScreenshotListing = {
   entries: ScreenshotEntry[];
-  /** False means a deletion cannot reach the system trash and is permanent. */
-  trashAvailable: boolean;
+  /** Whether this platform has a system trash at all; the attempt can still fail. */
+  trashSupported: boolean;
 };
 
 // ── Static constants ──────────────────────────────────────────────────────────
