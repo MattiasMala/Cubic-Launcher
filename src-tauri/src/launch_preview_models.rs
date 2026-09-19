@@ -7,6 +7,8 @@ use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
+use super::ResolvedContentVersions;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRequest {
@@ -23,6 +25,14 @@ pub struct LaunchRequest {
     /// this feature exists to close (D16).
     #[serde(default)]
     pub resolved_versions: Option<HashMap<String, String>>,
+    /// `category → (entry id → version id)` for the content packs, decided by
+    /// the same pre-check and optional for the same reason (D58).
+    ///
+    /// Separate from `resolved_versions` because the keys are not the same
+    /// kind of name: a mod id is unique on its own, a pack entry id only
+    /// inside its category.
+    #[serde(default)]
+    pub resolved_content: Option<ResolvedContentVersions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -35,6 +45,10 @@ pub struct LaunchVerificationRequest {
     /// pre-resolved path end to end.
     #[serde(default)]
     pub resolved_versions: Option<HashMap<String, String>>,
+    /// Forwarded untouched as well, or an automated run could never exercise
+    /// the pre-resolved pack path.
+    #[serde(default)]
+    pub resolved_content: Option<ResolvedContentVersions>,
     #[serde(default = "default_verification_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_success_after_seconds")]
@@ -187,6 +201,7 @@ impl LaunchVerificationRequest {
             minecraft_version: self.minecraft_version,
             mod_loader: self.mod_loader,
             resolved_versions: self.resolved_versions,
+            resolved_content: self.resolved_content,
         }
     }
 }

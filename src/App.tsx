@@ -38,10 +38,12 @@ import {
   launchState, selectedModList,
   setUpdateInfo,
   updateCheckRunning, setUpdateCheckRunning, pendingUpdatePrecheck, setPendingUpdatePrecheck,
+  setContentLookupFailures,
   LAUNCH_STAGES, wait,
 } from "./store";
 import { normalizeModLoader, type ModRow, type UpdatePrecheckResult } from "./lib/types";
-import { buildResolvedVersions } from "./lib/update-selection";
+import { buildResolvedContent, buildResolvedVersions } from "./lib/update-selection";
+import { fetchContentProjects } from "./lib/content-meta";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
 import {
   buildIdRemap,
@@ -95,6 +97,25 @@ import {
 } from "./components/Modals";
 import { AdvancedModPanel } from "./components/AdvancedModPanel";
 import { PinVersionDialog } from "./components/PinVersionDialog";
+
+/**
+ * The Advanced checkbox that governs one pre-check category.
+ *
+ * The three settings were written and read by nobody until now
+ * (`app_shell.rs:59` said so in a comment); this table is the whole of
+ * "reading" them. A category with no entry here — there is none today — is
+ * treated as on, because silence must not hide an update.
+ */
+const CONTENT_CATEGORY_SETTINGS: Record<string, "updateNotificationsResourcePacks" | "updateNotificationsDataPacks" | "updateNotificationsShaders"> = {
+  resourcepack: "updateNotificationsResourcePacks",
+  datapack: "updateNotificationsDataPacks",
+  shader: "updateNotificationsShaders",
+};
+
+function contentCategoryNotificationsEnabled(category: string): boolean {
+  const setting = CONTENT_CATEGORY_SETTINGS[category];
+  return setting ? globalSettings()[setting] : true;
+}
 
 export default function App() {
   const {
@@ -906,7 +927,10 @@ export default function App() {
     }
   };
 
-  const startLaunch = async (resolvedVersions?: Record<string, string>) => {
+  const startLaunch = async (
+    resolvedVersions?: Record<string, string>,
+    resolvedContent?: Record<string, Record<string, string>>,
+  ) => {
     try {
       await invoke("start_launch_command", {
         request: {
@@ -916,6 +940,7 @@ export default function App() {
           // Omitted, not `undefined`: a request without the field is the
           // pre-feature request, and the backend reads its absence (D19).
           ...(resolvedVersions ? { resolvedVersions } : {}),
+          ...(resolvedContent ? { resolvedContent } : {}),
         },
       });
     } catch (err) {
@@ -958,8 +983,28 @@ export default function App() {
       }
 
       // Icons and names are best-effort and reactive: the popup opens now and
-      // fills in when the single request lands.
+      // fills in when the single request lands. The two halves have two
+      // caches: mods by project id, packs by entry id.
       void fetchMetadataForIds(precheck.updates.map(update => update.projectId));
+      void fetchContentProjects(precheck.contentUpdates.map(update => update.entryId));
+
+      // D63 reaches the editor row from here, not from a second request: the
+      // popup only opens when there is an update, and a pack nobody could ask
+      // about may well produce none. Rewritten every pre-check, so a failure
+      // that goes away stops being reported.
+      setContentLookupFailures(
+        new Map(precheck.contentLookupFailures.map(failure => [`${failure.category}/${failure.entryId}`, failure.error])),
+      );
+
+      // The three Advanced checkboxes, finally read. A category that is off
+      // keeps its rows out of the popup **and** out of the accepted set, so
+      // its entries stay at the version on disk — D30's rule, per category
+      // instead of globally. An entry that was never installed has no row, so
+      // it keeps its candidate and is installed anyway: switching a category
+      // off means "do not update", never "do not install" (D17).
+      const shownContentUpdates = precheck.contentUpdates.filter(row =>
+        contentCategoryNotificationsEnabled(row.category),
+      );
 
       // D30: with notifications off the pre-check still ran — a mod that was
       // never downloaded has to be resolved or it would never be installed —
@@ -969,13 +1014,25 @@ export default function App() {
       // notifications off asks for. An empty accepted set is the same code
       // path as the popup's "Skip".
       if (!globalSettings().updateNotificationsEnabled) {
-        await startLaunch(buildResolvedVersions(precheck.resolved, precheck.updates, new Set()));
+        await startLaunch(
+          buildResolvedVersions(precheck.resolved, precheck.updates, new Set()),
+          buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
+        );
         return;
       }
-      if (precheck.updates.length === 0) {
-        await startLaunch(precheck.resolved);
+      if (precheck.updates.length === 0 && shownContentUpdates.length === 0) {
+        // Not `precheck.resolvedContent` as it stands: the rows of a category
+        // that is switched off are updates nobody accepted, and handing over
+        // their candidates would install them behind the checkbox's back.
+        await startLaunch(
+          precheck.resolved,
+          buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
+        );
         return;
       }
+      // The **whole** payload is kept: the popup shows the categories that are
+      // on, and the rows of the ones that are off still have to reach
+      // `buildResolvedContent` to be refused there.
       setPendingUpdatePrecheck(precheck);
       return; // the popup decides, then launches
     }
@@ -1048,10 +1105,19 @@ export default function App() {
         {precheck => (
           <UpdatePopup
             updates={precheck.updates}
+            contentUpdates={precheck.contentUpdates.filter(row => contentCategoryNotificationsEnabled(row.category))}
+            contentWithoutVersions={precheck.contentWithoutVersions}
+            contentLookupFailures={precheck.contentLookupFailures}
             versionNumberLookupError={precheck.versionNumberLookupError}
-            onChoose={accepted => {
+            onChoose={(accepted, acceptedContent) => {
               setPendingUpdatePrecheck(null);
-              void startLaunch(buildResolvedVersions(precheck.resolved, precheck.updates, accepted));
+              void startLaunch(
+                buildResolvedVersions(precheck.resolved, precheck.updates, accepted),
+                // Every row, not only the ones on screen: a category whose
+                // checkbox is off was filtered out of `contentUpdates` before
+                // the popup, and those rows have to be refused, not dropped.
+                buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, acceptedContent),
+              );
             }}
             // D26: the X and the backdrop cancel the launch. "Skip" means
             // "launch without updating"; closing means "I have not decided".

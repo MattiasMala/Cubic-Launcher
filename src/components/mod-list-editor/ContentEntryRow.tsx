@@ -1,11 +1,15 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { MaterialIcon, PackageIcon } from "../icons";
+import { contentLookupFailures, selectedMcVersion } from "../../store";
+import { contentCompatibility, contentProjects } from "../../lib/content-meta";
 import type { ContentEntry, ContentMeta } from "./content-types";
 
 const DRAG_THRESHOLD = 5;
 
 interface ContentEntryRowProps {
   entry: ContentEntry;
+  /** The category this row belongs to: half of the key the pre-check reports failures under. */
+  contentType: string;
   info?: ContentMeta;
   isResolved: boolean | null;
   isSelected: boolean;
@@ -18,6 +22,24 @@ export function ContentEntryRow(props: ContentEntryRowProps) {
   const [pendingClickPos, setPendingClickPos] = createSignal<{ x: number; y: number } | null>(null);
 
   const isLocal = () => props.entry.source === "local";
+
+  // D62: the entry sits in the list and the launch installs nothing for it,
+  // and until now only `launcher.log` said so, once, during a launch. The
+  // answer comes from the project metadata the tab already fetches — the same
+  // single `GET /v2/projects` — so the badge costs no request of its own.
+  //
+  // A local pack has no Modrinth versions to have or lack, so it is never
+  // asked about.
+  const compatibility = () =>
+    isLocal()
+      ? "compatible"
+      : contentCompatibility(contentProjects().get(props.entry.id), selectedMcVersion());
+
+  // D63, and the reason it is here and not only in the popup: the popup opens
+  // only when there is at least one update, so a pack the pre-check could not
+  // ask about would stay invisible in exactly the case that matters. The row
+  // reads what the last pre-check reported and fetches nothing.
+  const precheckError = () => contentLookupFailures().get(`${props.contentType}/${props.entry.id}`);
 
   const handlePointerDown = (event: PointerEvent) => {
     if (event.button !== 0) return;
@@ -76,6 +98,32 @@ export function ContentEntryRow(props: ContentEntryRowProps) {
           }`}>
             {isLocal() ? "Local" : "Modrinth"}
           </span>
+          {/* D60: no version for this target. D63: nobody could ask — two
+              different sentences, deliberately not one. */}
+          <Show when={compatibility() === "no-version"}>
+            <span
+              class="inline-flex items-center gap-1 rounded-md border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning"
+              title={`Modrinth publishes no version of this pack for Minecraft ${selectedMcVersion()}. A launch on this target installs nothing for it.`}
+            >
+              No {selectedMcVersion()} version
+            </span>
+          </Show>
+          <Show when={compatibility() === "unknown"}>
+            <span
+              class="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              title="Modrinth could not be reached for this pack, so whether it has a version for this target is unknown."
+            >
+              Compatibility unknown
+            </span>
+          </Show>
+          <Show when={precheckError()}>
+            <span
+              class="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              title={`The last update check could not read this pack's versions from Modrinth (${precheckError()}). Whether it has an update is unknown; the launch keeps what you have.`}
+            >
+              Update check failed
+            </span>
+          </Show>
         </div>
       </div>
       <div class="flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">

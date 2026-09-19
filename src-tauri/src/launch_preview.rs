@@ -44,6 +44,11 @@ mod precheck;
 use precheck::*;
 pub use precheck::{ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
 
+#[path = "launch_preview_precheck_content.rs"]
+mod precheck_content;
+use precheck_content::*;
+pub use precheck_content::{ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow};
+
 
 #[path = "launch_preview_models.rs"]
 mod models;
@@ -597,7 +602,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &Vec::<CachedConfigPlacement>::new(),
     )?;
 
-    // Download and install content packs (resource packs, data packs, shaders)
+    // Download and install content packs (resource packs, data packs, shaders),
+    // at the versions the pre-check named when it named any (D58).
     resolve_and_install_content_packs(
         &app_handle,
         &launcher_paths,
@@ -606,6 +612,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &modlist_name,
         &target,
         &instance_root,
+        request.resolved_content.as_ref(),
     )
     .await?;
 

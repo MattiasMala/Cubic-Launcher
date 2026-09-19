@@ -22,7 +22,9 @@ use crate::rules::ModSource;
 
 use super::{
     emit_log, load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
-    resolve_compatible_versions_hybrid, resolve_online_selection, SelectedMod,
+    resolve_compatible_versions_hybrid, resolve_online_selection, run_content_precheck,
+    ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow, ResolvedContentVersions,
+    SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -57,8 +59,16 @@ pub struct ModUpdateRow {
     pub candidate_version_number: String,
 }
 
-/// The two sets the popup and the launch need, and the distinction between them
-/// is the whole point: `updates` is what to show, `resolved` is what to install.
+/// The sets the popup and the launch need, and the distinction between them
+/// is the whole point: `updates` is what to show, `resolved` is what to
+/// install.
+///
+/// The content packs travel here and not in a second command (D57): a second
+/// call would widen the double-click window the frontend guards, and the
+/// launch starts once. They get their own fields rather than a `kind` on the
+/// mod rows because the two halves are keyed differently — a mod by `mod_id`,
+/// a pack by category *and* entry id — so one list would force a composite key
+/// on both sides and a category that is meaningless for half the rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePrecheckResult {
@@ -80,10 +90,31 @@ pub struct UpdatePrecheckResult {
     /// the pre-check. One malformed version id would otherwise `400` the whole
     /// request and take the launch's version map down with it.
     pub version_number_lookup_error: Option<String>,
+    /// The pack rows, all three categories in one list, each carrying its
+    /// category so the popup can group them.
+    pub content_updates: Vec<ContentUpdateRow>,
+    /// `category → (entry id → version id)` for **every** selected Modrinth
+    /// pack, same rule as `resolved` above: the unchanged and the
+    /// never-installed included (D16, D17). Without it the launch re-resolves
+    /// and the answer to the popup is lost in silence (D58).
+    pub resolved_content: ResolvedContentVersions,
+    /// Entries Modrinth has no version of for this target (D60). Not an error
+    /// and not a row: today only `launcher.log` knows, and only during a
+    /// launch.
+    pub content_without_versions: Vec<ContentEntryWithoutVersions>,
+    /// Entries whose version lookup failed (D63). Not the same list as the one
+    /// above and not the same sentence: the launch will resolve these the
+    /// usual way, and until it does nothing is known about them.
+    pub content_lookup_failures: Vec<ContentLookupFailure>,
 }
 
 /// A vanilla target loads no mods: an empty payload, not an error, and no
 /// mod-list read at all. `None` means the target needs the full selection.
+///
+/// Empty covers the packs too, and that is not an omission: the vanilla
+/// pipeline installs none (`launch_preview_vanilla.rs:31-35`, "skipping mod
+/// resolution, mod downloads and content packs"), so a pack row would promise
+/// something no launch would do.
 pub(super) fn empty_precheck_for_loaderless_target(
     target: &ResolutionTarget,
 ) -> Option<UpdatePrecheckResult> {
@@ -279,12 +310,30 @@ pub(super) async fn run_update_precheck(
         );
     }
 
-    Ok(build_precheck_result(
+    let mut result = build_precheck_result(
         &selection.selected_mods,
         &candidates,
         &cached_version_ids,
         &cached_version_numbers,
-    ))
+    );
+
+    // The packs last, and in the same payload: they need no mod-list read and
+    // no database, so nothing above depends on them, and a pack lookup that
+    // fails costs its own entry only.
+    let content = run_content_precheck(
+        app_handle,
+        launcher_paths,
+        &modrinth_client,
+        &modlist_name,
+        &target,
+    )
+    .await?;
+    result.content_updates = content.updates;
+    result.resolved_content = content.resolved;
+    result.content_without_versions = content.without_versions;
+    result.content_lookup_failures = content.lookup_failures;
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -656,6 +705,28 @@ mod tests {
             }],
             resolved: string_map(&[("sodium", "sodium-v2")]),
             version_number_lookup_error: Some("boom".into()),
+            content_updates: vec![ContentUpdateRow {
+                category: "resourcepack".into(),
+                entry_id: "enhanced-boss-bars".into(),
+                project_id: "U5SedJ9S".into(),
+                current_version_id: "older".into(),
+                current_version_number: "1.5".into(),
+                candidate_version_id: "fzlnlUF3".into(),
+                candidate_version_number: "1.6".into(),
+            }],
+            resolved_content: ResolvedContentVersions::from([(
+                "resourcepack".to_string(),
+                string_map(&[("enhanced-boss-bars", "fzlnlUF3")]),
+            )]),
+            content_without_versions: vec![ContentEntryWithoutVersions {
+                category: "resourcepack".into(),
+                entry_id: "visual-effects-plus".into(),
+            }],
+            content_lookup_failures: vec![ContentLookupFailure {
+                category: "shader".into(),
+                entry_id: "complementary-reimagined".into(),
+                error: "Modrinth returned an error".into(),
+            }],
         };
 
         assert_eq!(
@@ -671,6 +742,27 @@ mod tests {
                 }],
                 "resolved": { "sodium": "sodium-v2" },
                 "versionNumberLookupError": "boom",
+                "contentUpdates": [{
+                    "category": "resourcepack",
+                    "entryId": "enhanced-boss-bars",
+                    "projectId": "U5SedJ9S",
+                    "currentVersionId": "older",
+                    "currentVersionNumber": "1.5",
+                    "candidateVersionId": "fzlnlUF3",
+                    "candidateVersionNumber": "1.6",
+                }],
+                "resolvedContent": {
+                    "resourcepack": { "enhanced-boss-bars": "fzlnlUF3" },
+                },
+                "contentWithoutVersions": [{
+                    "category": "resourcepack",
+                    "entryId": "visual-effects-plus",
+                }],
+                "contentLookupFailures": [{
+                    "category": "shader",
+                    "entryId": "complementary-reimagined",
+                    "error": "Modrinth returned an error",
+                }],
             })
         );
     }
