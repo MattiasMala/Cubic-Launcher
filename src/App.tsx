@@ -5,7 +5,7 @@
 // `src/app/`, `src/store-*`, or colocated component folders instead of growing
 // this file again.
 
-import { Show, batch, onMount } from "solid-js";
+import { Match, Show, Switch, batch, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
@@ -16,7 +16,7 @@ import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod
 
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
-  activeRailView,
+  activeRailView, setActiveRailView, setQuickPlayWorldFolder, quickPlayWorldFolder,
   modRowsState, setModRowsState, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
   setLaunchLogs,
@@ -42,7 +42,7 @@ import {
   setContentLookupFailures,
   LAUNCH_STAGES, wait,
 } from "./store";
-import { normalizeModLoader, type ModRow, type UpdatePrecheckResult } from "./lib/types";
+import { normalizeModLoader, parseInstanceName, type ModRow, type UpdatePrecheckResult, type WorldEntry } from "./lib/types";
 import { buildResolvedContent, buildResolvedVersions } from "./lib/update-selection";
 import { fetchContentProjects } from "./lib/content-meta";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
@@ -79,6 +79,7 @@ import { NoticeBanner } from "./components/NoticeBanner";
 import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
 import { ScreenshotsView } from "./components/ScreenshotsView";
+import { HomeView } from "./components/HomeView";
 import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
 import { LaunchPanel } from "./components/LaunchPanel";
 import { AddModDialog } from "./components/AddModDialog";
@@ -933,6 +934,7 @@ export default function App() {
     resolvedVersions?: Record<string, string>,
     resolvedContent?: Record<string, Record<string, string>>,
   ) => {
+    const quickPlayFolder = quickPlayWorldFolder();
     try {
       await invoke("start_launch_command", {
         request: {
@@ -943,15 +945,30 @@ export default function App() {
           // pre-feature request, and the backend reads its absence (D19).
           ...(resolvedVersions ? { resolvedVersions } : {}),
           ...(resolvedContent ? { resolvedContent } : {}),
+          // Same rule for the world a "Jump in" Play asked for: absent means
+          // the ordinary launch, which stops at the menu.
+          ...(quickPlayFolder ? { quickPlaySingleplayer: quickPlayFolder } : {}),
         },
       });
     } catch (err) {
       pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch" });
+    } finally {
+      // One launch, one world: a second Play from the panel must not inherit
+      // the world the card asked for.
+      setQuickPlayWorldFolder(null);
     }
   };
 
-  const handleLaunch = async () => {
+  /**
+   * `worldFolder` is the world this launch should open, and defaults to none:
+   * every launch says what it wants instead of inheriting what the last one
+   * asked for. It matters with real data — both instances hold a folder
+   * called `New World`, so a stale value would not fail, it would jump into
+   * the wrong world.
+   */
+  const handleLaunch = async (worldFolder: string | null = null) => {
     if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
+    setQuickPlayWorldFolder(worldFolder);
     if (!selectedModList()) {
       pushUiError({ title: "No mod list selected", message: "Select a mod list from the sidebar before launching.", detail: "", severity: "warning", scope: "launch" });
       return;
@@ -1051,6 +1068,47 @@ export default function App() {
     setLaunchState("ready");
   };
 
+  /**
+   * The Play of a world card, and the "play the mod list" of its ⋮ menu.
+   *
+   * Both go through the ordinary launch — same pre-check, same popup, same
+   * panel — after pointing the app at the mod list and the target the world
+   * belongs to. The only difference is the world folder: with it the client
+   * opens the world, without it the menu.
+   *
+   * It also switches to the mod list view, because the launch progress and
+   * every question the launch can ask live there; leaving the user on the
+   * home would look like nothing happened.
+   */
+  const handlePlayWorld = async (world: WorldEntry, openTheWorld: boolean) => {
+    if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
+
+    const target = parseInstanceName(world.instanceName);
+    if (!target) {
+      pushUiError({
+        title: "Unknown instance",
+        message: `'${world.instanceName}' is not a target this launcher built.`,
+        detail: "An instance directory is named '<minecraft version>-<loader>'.",
+        severity: "warning",
+        scope: "launch",
+      });
+      return;
+    }
+
+    await handleSelectModList(world.modlistName);
+    // After the mod list's own saved target: the world lives in one specific
+    // instance and that is the one to launch.
+    setSelectedMcVersion(target.minecraftVersion);
+    setSelectedModLoader(target.modLoader);
+    setActiveRailView("modlist");
+    await handleLaunch(openTheWorld ? world.folderName : null);
+  };
+
+  const handleOpenModlist = async (modlistName: string) => {
+    setActiveRailView("modlist");
+    await handleSelectModList(modlistName);
+  };
+
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div class="flex flex-col h-screen w-screen overflow-hidden text-textMain bg-bgDark font-sans">
@@ -1063,21 +1121,37 @@ export default function App() {
       <div class="flex flex-1 overflow-hidden relative">
         <Sidebar onSelectModList={handleSelectModList} />
 
-        {/* Content + BottomBar column */}
-        <Show
-          when={activeRailView() === "home"}
-          fallback={<ScreenshotsView />}
-        >
-          <div class="flex flex-col flex-1 min-w-0">
-            <ModListEditor
-              onAddMod={() => setAddModModalOpen(true)}
-              onDeleteSelected={handleDeleteSelected}
-              onReorder={orderedIds => void handleReorderRules(orderedIds)}
-              onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
+        {/* One of three destinations: the home, a mod list, the gallery. */}
+        <Switch>
+          <Match when={activeRailView() === "home"}>
+            <HomeView
+              onPlayWorld={world => void handlePlayWorld(world, true)}
+              onPlayModlistOf={world => void handlePlayWorld(world, false)}
+              onOpenModlist={name => void handleOpenModlist(name)}
             />
-            <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} onVersionChange={handleVersionChange} onLoaderChange={handleLoaderChange} />
-          </div>
-        </Show>
+          </Match>
+          <Match when={activeRailView() === "screenshots"}>
+            <ScreenshotsView />
+          </Match>
+          <Match when={activeRailView() === "modlist"}>
+            <div class="flex flex-col flex-1 min-w-0">
+              <ModListEditor
+                onAddMod={() => setAddModModalOpen(true)}
+                onDeleteSelected={handleDeleteSelected}
+                onReorder={orderedIds => void handleReorderRules(orderedIds)}
+                onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
+              />
+              <LaunchPanel
+                // The panel's own Play is the ordinary one: it must not
+                // inherit the world a card asked for a moment ago.
+                onLaunch={() => void handleLaunch()}
+                onSwitchAccount={handleSwitchAccount}
+                onVersionChange={handleVersionChange}
+                onLoaderChange={handleLoaderChange}
+              />
+            </div>
+          </Match>
+        </Switch>
       </div>
 
       {/* Modals */}
@@ -1125,7 +1199,9 @@ export default function App() {
             }}
             // D26: the X and the backdrop cancel the launch. "Skip" means
             // "launch without updating"; closing means "I have not decided".
-            onCancel={() => setPendingUpdatePrecheck(null)}
+            // A cancelled launch also drops the world it was going to open,
+            // which would otherwise sit there until the next Play took it.
+            onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
           />
         )}
       </Show>

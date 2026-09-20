@@ -259,6 +259,31 @@ export type ScreenshotListing = {
   trashSupported: boolean;
 };
 
+/** How `GameType` in `level.dat` reads; `unknown` is a mode this build does not know. */
+export type WorldGameMode = "survival" | "creative" | "adventure" | "spectator" | "unknown";
+
+/**
+ * One singleplayer world found under an instance's `saves/`.
+ *
+ * The identity is the triple, never the name: two worlds can be called
+ * `New World` and live in a folder called `New World` in two different
+ * instances, which is exactly the case on this machine.
+ */
+export type WorldEntry = {
+  modlistName: string;
+  instanceName: string;
+  /** The `saves/` directory name, which is what Quick Play takes. */
+  folderName: string;
+  /** `LevelName`: what the player sees in game, and not the folder name. */
+  levelName: string;
+  gameMode: WorldGameMode;
+  lastPlayedMs: number;
+  /** Absolute path of `icon.png`, when the world has one. Usually it has not. */
+  iconPath: string | null;
+  /** Hidden from "Jump in" right now (D65); playing it again brings it back. */
+  hidden: boolean;
+};
+
 // ── Static constants ──────────────────────────────────────────────────────────
 
 export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Vanilla"] as const;
@@ -268,6 +293,29 @@ export function normalizeModLoader(loader?: string | null): string {
   return MOD_LOADERS.includes(loader as typeof MOD_LOADERS[number])
     ? loader!
     : DEFAULT_MOD_LOADER;
+}
+
+/**
+ * Split an instance directory name back into the pair it was built from.
+ *
+ * The backend names an instance `<minecraft version>-<loader>`
+ * (`launch_preview_runtime.rs:build_instance_root`), and a Minecraft version
+ * can itself contain a dash — `1.20.1-pre1-fabric` — so the split is on the
+ * **last** one. An unknown loader suffix means this directory was not built
+ * by us: the caller gets `null` and refuses rather than launching something
+ * it guessed.
+ */
+export function parseInstanceName(
+  instanceName: string,
+): { minecraftVersion: string; modLoader: string } | null {
+  const separator = instanceName.lastIndexOf("-");
+  if (separator <= 0 || separator === instanceName.length - 1) return null;
+
+  const suffix = instanceName.slice(separator + 1).toLowerCase();
+  const modLoader = MOD_LOADERS.find(loader => loader.toLowerCase() === suffix);
+  if (!modLoader) return null;
+
+  return { minecraftVersion: instanceName.slice(0, separator), modLoader };
 }
 
 export const LAUNCH_STAGES: LaunchResolutionStage[] = [

@@ -33,6 +33,7 @@ pub mod rules;
 pub mod screenshots;
 pub mod token_storage;
 mod updater;
+pub mod worlds;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -132,6 +133,9 @@ pub fn run() {
             screenshots::list_screenshots_command,
             screenshots::delete_screenshot_command,
             screenshots::open_screenshot_folder_command,
+            worlds::list_worlds_command,
+            worlds::set_world_hidden_command,
+            worlds::open_world_folder_command,
             updater::check_for_updates,
             updater::install_update
         ])

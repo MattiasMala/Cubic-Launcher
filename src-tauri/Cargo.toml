@@ -44,4 +44,7 @@ trash = "5"
 uuid = { version = "1", features = ["v5"] }
 zip = "0.6"
 flate2 = "1"
+# The world list (E10) reads three fields out of `level.dat`, which is gzipped
+# NBT. `flate2` above handles the gzip; this handles the NBT.
+fastnbt = "2"
 tar = "0.4"

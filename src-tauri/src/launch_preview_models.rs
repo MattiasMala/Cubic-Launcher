@@ -33,6 +33,16 @@ pub struct LaunchRequest {
     /// inside its category.
     #[serde(default)]
     pub resolved_content: Option<ResolvedContentVersions>,
+    /// The `saves/` folder name of the world this launch should open
+    /// directly, when the Play button was the one on a world card (E10).
+    ///
+    /// Optional for the same reason as the two fields above: a request
+    /// without it is the ordinary Play and must behave exactly as before.
+    /// The folder name and not the world name, because that is what
+    /// `--quickPlaySingleplayer` takes, and not the triple, because the mod
+    /// list and the instance are already in this request.
+    #[serde(default)]
+    pub quick_play_singleplayer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -202,6 +212,9 @@ impl LaunchVerificationRequest {
             mod_loader: self.mod_loader,
             resolved_versions: self.resolved_versions,
             resolved_content: self.resolved_content,
+            // The automation verifier checks that the game starts, so it
+            // launches the way the ordinary Play does: to the menu.
+            quick_play_singleplayer: None,
         }
     }
 }

@@ -402,8 +402,9 @@ fn load_global_settings(connection: &Connection) -> Result<ShellGlobalSettings> 
         profiler_enabled: parse_bool_setting(&values, "profiler_enabled").unwrap_or(false),
         // D12: no migration. The keys are new, the rows are not there, and the
         // default is what a fresh install gets: notifications on, every
-        // category included. The orphaned `cache_only_mode` row is ignored
-        // until the first save rewrites the table.
+        // category included. The orphaned `cache_only_mode` row is ignored,
+        // and now stays: since E10 a save writes only its own keys
+        // (`upsert_global_settings`) instead of rewriting the whole table.
         update_notifications_enabled: parse_bool_setting(&values, "update_notifications_enabled")
             .unwrap_or(true),
         update_notifications_resource_packs: parse_bool_setting(
@@ -483,7 +484,7 @@ pub fn save_global_settings(
         ("java_path_override", settings.java_path_override.clone()),
     ];
 
-    replace_global_settings(connection, &values)
+    upsert_global_settings(connection, &values)
 }
 
 pub fn save_modlist_overrides(
@@ -576,13 +577,20 @@ fn bool_setting(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-fn replace_global_settings(connection: &Connection, values: &[(&str, String)]) -> Result<()> {
+/// Write the settings form's own keys, leaving every other row alone.
+///
+/// It used to `DELETE FROM global_settings` first, which made the form the
+/// owner of the whole table: any key written by something else — the hidden
+/// worlds list of E10 (`worlds::HIDDEN_WORLDS_KEY`) — disappeared the next
+/// time the user pressed Save. The upsert keeps the table what its schema
+/// says it is, a key/value store with more than one writer.
+fn upsert_global_settings(connection: &Connection, values: &[(&str, String)]) -> Result<()> {
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute("DELETE FROM global_settings", [])?;
 
     for (key, value) in values {
         transaction.execute(
-            "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
+            "INSERT INTO global_settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [*key, value.as_str()],
         )?;
     }
