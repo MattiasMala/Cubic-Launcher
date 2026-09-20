@@ -14,8 +14,10 @@ import {
   createModlistDescription, setCreateModlistDescription,
   createModlistBusy,
   selectedModListName,
+  modListCards,
 } from "../../store";
 import { Modal, ModalHeader } from "./modal-base";
+import { GameOptionsPanel } from "./game-options-panel";
 import { ChevronDownIcon, ChevronRightIcon } from "../icons";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
@@ -352,11 +354,13 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
   const [saving, setSaving] = createSignal(false);
   const [confirmDelete, setConfirmDelete] = createSignal(false);
   const [deleting, setDeleting] = createSignal(false);
+  const [tab, setTab] = createSignal<"identity" | "game">("identity");
 
   createEffect(() => {
     if (instancePresentationOpen()) {
       setDraft({ ...instancePresentation() });
       setConfirmDelete(false);
+      setTab("identity");
     }
   });
 
@@ -407,8 +411,38 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
 
   return (
     <Show when={instancePresentationOpen()}>
-      <Modal onClose={close}>
+      <Modal onClose={close} maxWidth="max-w-4xl">
         <ModalHeader title="Settings" description="Customize the mod-list card identity and save private notes for this pack." onClose={close} />
+        <div class="flex gap-1 border-b border-border px-6">
+          <For each={[
+            { id: "identity" as const, label: "Identity" },
+            { id: "game" as const, label: "Game settings" },
+          ]}>
+            {entry => (
+              <button
+                onClick={() => setTab(entry.id)}
+                class={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+                  tab() === entry.id
+                    ? "border-primary text-primary"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {entry.label}
+              </button>
+            )}
+          </For>
+        </div>
+        <Show when={tab() === "game"}>
+          <div class="overflow-y-auto p-6">
+            <GameOptionsPanel
+              modlist={selectedModListName() ?? ""}
+              otherModlists={modListCards()
+                .map(card => card.name)
+                .filter(name => name !== selectedModListName())}
+            />
+          </div>
+        </Show>
+        <Show when={tab() === "identity"}>
         <div class="grid gap-6 p-6 md:grid-cols-[220px,1fr]">
           <div class="rounded-lg border border-border bg-background p-4">
             <p class="mb-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">Preview</p>
@@ -472,6 +506,13 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
             </div>
           </div>
         </div>
+        </Show>
+        <Show when={tab() === "game"}>
+          <div class="flex justify-end border-t border-border px-6 py-4">
+            <button onClick={close} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Close</button>
+          </div>
+        </Show>
+        <Show when={tab() === "identity"}>
         <div class="flex items-center justify-between gap-2 border-t border-border px-6 py-4">
           <Show when={confirmDelete()} fallback={
             <button
@@ -503,6 +544,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
             <button onClick={() => void handleSave()} disabled={saving()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving() ? "Saving..." : "Save Settings"}</button>
           </div>
         </div>
+        </Show>
       </Modal>
     </Show>
   );

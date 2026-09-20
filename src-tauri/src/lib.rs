@@ -120,7 +120,7 @@ pub fn run() {
             modlist_assets::read_image_as_data_url_command,
             options_share::load_shared_options_command,
             options_share::save_shared_options_command,
-            options_share::promote_options_command,
+            options_share::apply_options_command,
             options_share::derive_option_keys_command,
             resolver::resolve_modlist_command,
             resolver::backfill_availability_command,

@@ -17,6 +17,7 @@
 //!   preset, e quella tabella il gioco ce l'ha già. La nostra sarebbe una copia
 //!   sempre indietro.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,9 @@ pub enum BlockReason {
     /// È vanilla, ma è la lista dei resource pack, che per questo salto è
     /// spenta di default (D67).
     ResourcePacksOff,
+    /// La spunta di quella riga è tolta per questo salto (D67): non decide
+    /// "cosa è condiviso per sempre", decide cosa viene copiato adesso.
+    Unchecked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -230,19 +234,27 @@ impl SeedStatus {
 /// sono. Per questo il default cambia con il salto (D67): **spenta** su
 /// globale → modlist, **accesa** su modlist → istanza, perché le istanze della
 /// stessa modlist hanno naturalmente gli stessi pack. Qui c'è solo il default:
-/// la spunta per ribaltarlo è roba della fase 2.
+/// la spunta per ribaltarlo la mette la GUI, passando `include_resource_packs`.
 pub const RESOURCE_PACK_KEYS: [&str; 2] = ["resourcePacks", "incompatibleResourcePacks"];
 
 pub fn filter_for_seed(
     source: &OptionsFile,
     source_keys: &VanillaOptionKeys,
     include_resource_packs: bool,
+    unchecked: &BTreeSet<String>,
 ) -> (OptionsFile, Vec<BlockedKey>) {
     let mut seeded = OptionsFile::new();
     let mut blocked: Vec<BlockedKey> = Vec::new();
 
     for (key, value) in source.iter() {
         if key == VERSION_KEY {
+            continue;
+        }
+        if unchecked.contains(key) {
+            blocked.push(BlockedKey {
+                key: key.to_string(),
+                reason: BlockReason::Unchecked,
+            });
             continue;
         }
         if is_internal_state(key) {
@@ -290,6 +302,7 @@ fn seed_into(
     target_path: &Path,
     overwrite: bool,
     include_resource_packs: bool,
+    unchecked: &BTreeSet<String>,
 ) -> SeedStatus {
     if !overwrite && target_path.exists() {
         return SeedStatus::SkippedTargetExists {
@@ -347,7 +360,8 @@ fn seed_into(
         }
     };
 
-    let (seeded, blocked) = filter_for_seed(&source, &source_keys, include_resource_packs);
+    let (seeded, blocked) =
+        filter_for_seed(&source, &source_keys, include_resource_packs, unchecked);
     if let Err(error) = seeded.write(target_path) {
         return SeedStatus::Refused {
             reason: error.to_string(),
@@ -385,6 +399,8 @@ pub fn seed_modlist_from_global(launcher_paths: &LauncherPaths, modlist_name: &s
         // globale → modlist: i pack elencati altrove quasi certamente non
         // stanno in questa modlist (D67).
         false,
+        // la semina automatica non ha spunte: nessuno è lì a toglierle.
+        &BTreeSet::new(),
     )
 }
 
@@ -412,6 +428,7 @@ pub fn seed_instance_from_modlist(
         // modlist → istanza: le istanze della stessa modlist hanno gli stessi
         // pack (D67).
         true,
+        &BTreeSet::new(),
     )
 }
 
@@ -603,23 +620,34 @@ fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<(
     guarded.write(path)
 }
 
-/// Promozione all'insù (istanza → modlist, modlist → globale) e copia fra
-/// modlist: sono lo stesso gesto della semina, in un'altra direzione, e
-/// sovrascrivono perché è l'utente a chiederlo.
+/// Applicare un file su un altro, in qualunque direzione, con le spunte di
+/// questo salto.
+///
+/// Copre i tre gesti della GUI: ri-applicare verso il basso (modlist → istanza:
+/// è l'unico modo di sovrascrivere un'istanza, e infatti la GUI chiede
+/// conferma dicendo cosa sta per coprire), promuovere all'insù (istanza →
+/// modlist, modlist → globale), copiare da un'altra modlist. Sovrascrive
+/// sempre, perché qui è l'utente a chiederlo: la regola del "una volta sola"
+/// vale per la semina automatica, non per un gesto esplicito.
 #[tauri::command]
-pub fn promote_options_command(
+pub fn apply_options_command(
     launcher_paths: State<'_, LauncherPaths>,
     from: OptionsScope,
     to: OptionsScope,
+    unchecked: Vec<String>,
+    include_resource_packs: bool,
 ) -> Result<SeedStatus, String> {
-    if !to.is_writable() {
-        return Err("non si promuove dentro un'istanza".to_string());
-    }
-
     let source = from.path(&launcher_paths).map_err(|e| e.to_string())?;
     let target = to.path(&launcher_paths).map_err(|e| e.to_string())?;
 
-    Ok(seed_into(&launcher_paths, &source, &target, true, true))
+    Ok(seed_into(
+        &launcher_paths,
+        &source,
+        &target,
+        true,
+        include_resource_packs,
+        &unchecked.into_iter().collect(),
+    ))
 }
 
 #[tauri::command]
@@ -661,7 +689,7 @@ mod tests {
         ));
         let keys = keys_for(3465, &["fov"], &["key.attack"]);
 
-        let (seeded, blocked) = filter_for_seed(&source, &keys, true);
+        let (seeded, blocked) = filter_for_seed(&source, &keys, true, &BTreeSet::new());
 
         assert_eq!(seeded.get("fov"), Some("0.5"));
         assert_eq!(seeded.get("key_key.attack"), Some("key.mouse.left"));
@@ -680,6 +708,20 @@ mod tests {
     }
 
     #[test]
+    fn an_unchecked_row_stays_behind_and_says_why() {
+        let source = OptionsFile::parse("version:3465\nfov:0.5\nguiScale:2\n");
+        let keys = keys_for(3465, &["fov", "guiScale"], &[]);
+        let unchecked: BTreeSet<String> = ["guiScale".to_string()].into_iter().collect();
+
+        let (seeded, blocked) = filter_for_seed(&source, &keys, true, &unchecked);
+
+        assert_eq!(seeded.render(), "version:3465\nfov:0.5\n");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].key, "guiScale");
+        assert_eq!(blocked[0].reason, BlockReason::Unchecked);
+    }
+
+    #[test]
     fn internal_state_is_blocked_even_though_it_is_vanilla() {
         let source = OptionsFile::parse(concat!(
             "version:3465\n",
@@ -689,7 +731,7 @@ mod tests {
         ));
         let keys = keys_for(3465, &["fov", "lastServer", "tutorialStep"], &[]);
 
-        let (seeded, blocked) = filter_for_seed(&source, &keys, true);
+        let (seeded, blocked) = filter_for_seed(&source, &keys, true, &BTreeSet::new());
 
         assert_eq!(seeded.get("lastServer"), None);
         assert_eq!(seeded.get("tutorialStep"), None);
@@ -703,7 +745,7 @@ mod tests {
         let source = OptionsFile::parse("version:3465\nfov:0.5\n");
         let keys = keys_for(3465, &["fov"], &[]);
 
-        let (seeded, _) = filter_for_seed(&source, &keys, true);
+        let (seeded, _) = filter_for_seed(&source, &keys, true, &BTreeSet::new());
 
         assert_eq!(seeded.render(), "version:3465\nfov:0.5\n");
     }
@@ -715,7 +757,7 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "fov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true);
+        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true, &BTreeSet::new());
 
         match status {
             SeedStatus::Refused { reason } => assert!(
@@ -735,7 +777,7 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "version:999999\nfov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true);
+        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true, &BTreeSet::new());
 
         match status {
             SeedStatus::Refused { reason } => {
@@ -755,7 +797,7 @@ mod tests {
         std::fs::write(&source, "version:3465\nfov:0.5\n").unwrap();
         std::fs::write(&target, "fov:0.9\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &target, false, true);
+        let status = seed_into(&launcher_paths, &source, &target, false, true, &BTreeSet::new());
 
         assert!(matches!(status, SeedStatus::SkippedTargetExists { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fov:0.9\n");
