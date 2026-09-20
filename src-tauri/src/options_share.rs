@@ -568,7 +568,39 @@ pub fn save_shared_options_command(
     for entry in entries {
         file.set(&entry.key, &entry.value);
     }
-    file.write(&path).map_err(|error| error.to_string())
+    write_with_version_guard(&file, &path).map_err(|error| error.to_string())
+}
+
+/// Nessuno scrive uno di questi file senza `version:`, nemmeno la GUI.
+///
+/// Se chi salva non rimanda quella riga — ed è facile che non lo faccia, non è
+/// un'impostazione e in una lista di spunte non ci sta — il file finirebbe a
+/// DataVersion 0, e a zero il gioco applica tutti i datafixer delle opzioni,
+/// `OptionsKeyLwjgl3Fix` (1344) compreso. Quindi: si riusa quella del file che
+/// c'è già, e se non c'è nemmeno quella si rifiuta di scrivere.
+fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<()> {
+    if file.data_version().is_some() {
+        return file.write(path);
+    }
+
+    let existing = path
+        .is_file()
+        .then(|| OptionsFile::read(path).ok())
+        .flatten()
+        .and_then(|existing| existing.data_version());
+
+    let Some(data_version) = existing else {
+        anyhow::bail!(
+            "{} non può essere scritto senza una riga `{VERSION_KEY}:`: un file senza \
+             vale DataVersion 0 per il gioco, e a zero si applicano tutti i datafixer \
+             delle opzioni",
+            path.display()
+        );
+    };
+
+    let mut guarded = file.clone();
+    guarded.set_first(VERSION_KEY, &data_version.to_string());
+    guarded.write(path)
 }
 
 /// Promozione all'insù (istanza → modlist, modlist → globale) e copia fra
@@ -896,6 +928,53 @@ mod tests {
             "modlist → istanza: i pack passano (D67)"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_without_a_version_line_reuses_the_one_already_on_disk() {
+        let root = temp_root("version-guard-reuse");
+        let path = root.join("options.txt");
+        std::fs::write(&path, "version:3465\nfov:0.5\n").unwrap();
+
+        let edited = OptionsFile::parse("fov:0.9\nguiScale:3\n");
+        write_with_version_guard(&edited, &path).expect("the guard must fill the version in");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version:3465\nfov:0.9\nguiScale:3\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_without_any_version_anywhere_is_refused() {
+        let root = temp_root("version-guard-refuse");
+        let path = root.join("options.txt");
+
+        let error = write_with_version_guard(&OptionsFile::parse("fov:0.9\n"), &path)
+            .expect_err("a file without a DataVersion must not be written");
+
+        assert!(
+            error.to_string().contains("DataVersion 0"),
+            "unexpected error: {error}"
+        );
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_with_a_version_line_writes_it_as_given() {
+        let root = temp_root("version-guard-given");
+        let path = root.join("options.txt");
+        std::fs::write(&path, "version:3465\nfov:0.5\n").unwrap();
+
+        write_with_version_guard(&OptionsFile::parse("version:5023\nfov:0.9\n"), &path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version:5023\nfov:0.9\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

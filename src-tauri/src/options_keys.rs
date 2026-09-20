@@ -862,6 +862,177 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Un constant pool costruito a mano. Serve per il percorso **positivo**:
+    /// i jar veri non ci sono su tutte le macchine, e l'ancora più il
+    /// camminatore di `ldc` sono la parte fragile — se restassero coperti solo
+    /// dai jar in cache, altrove non li proverebbe niente.
+    struct Pool {
+        bytes: Vec<u8>,
+        next: u16,
+    }
+
+    impl Pool {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                next: 1,
+            }
+        }
+
+        fn utf8(&mut self, text: &str) -> u16 {
+            self.bytes.push(1);
+            self.bytes
+                .extend_from_slice(&(text.len() as u16).to_be_bytes());
+            self.bytes.extend_from_slice(text.as_bytes());
+            let index = self.next;
+            self.next += 1;
+            index
+        }
+
+        fn string(&mut self, text: &str) -> u16 {
+            let utf8 = self.utf8(text);
+            self.bytes.push(8);
+            self.bytes.extend_from_slice(&utf8.to_be_bytes());
+            let index = self.next;
+            self.next += 1;
+            index
+        }
+    }
+
+    /// `ldc_w` + `pop` per ogni letterale, poi `return`. Non deve essere
+    /// bytecode eseguibile: deve essere bytecode **percorribile**.
+    fn code_body(indices: &[u16]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for index in indices {
+            code.push(0x13);
+            code.extend_from_slice(&index.to_be_bytes());
+            code.push(0x57);
+        }
+        code.push(0xb1);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+        body.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+        body.extend_from_slice(&(code.len() as u32).to_be_bytes());
+        body.extend_from_slice(&code);
+        body.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        body.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+        body
+    }
+
+    fn well_formed_options_class(plain: &[String], keybinds: &[String]) -> Vec<u8> {
+        let mut pool = Pool::new();
+        pool.utf8(ANCHOR_LITERAL);
+        let code_name = pool.utf8("Code");
+        let process_name = pool.utf8("processOptions");
+        let process_descriptor = pool.utf8("(Lstub/Options$FieldAccess;)V");
+        let load_name = pool.utf8("load");
+        let init_name = pool.utf8("<init>");
+        let void_descriptor = pool.utf8("()V");
+
+        let mut process_literals: Vec<u16> = plain.iter().map(|key| pool.string(key)).collect();
+        // un formato di log fra i letterali: la forma deve scartarlo
+        process_literals.push(pool.string("Invalid keyMapping {} = {}, unbinding"));
+
+        let load_literals = vec![
+            pool.string("fullscreenResolution"),
+            pool.string(LOAD_METHOD_LITERAL),
+        ];
+
+        let mut init_literals: Vec<u16> = keybinds.iter().map(|key| pool.string(key)).collect();
+        // una categoria: ha la stessa forma ma non è una chiave del file
+        init_literals.push(pool.string("key.categories.misc"));
+
+        let methods = [
+            (process_name, process_descriptor, process_literals),
+            (load_name, void_descriptor, load_literals),
+            (init_name, void_descriptor, init_literals),
+        ];
+
+        let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x34];
+        bytes.extend_from_slice(&pool.next.to_be_bytes());
+        bytes.extend_from_slice(&pool.bytes);
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // this_class
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // super_class
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // interfaces_count
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // fields_count
+        bytes.extend_from_slice(&(methods.len() as u16).to_be_bytes());
+        for (name, descriptor, literals) in &methods {
+            let body = code_body(literals);
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // access_flags
+            bytes.extend_from_slice(&name.to_be_bytes());
+            bytes.extend_from_slice(&descriptor.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+            bytes.extend_from_slice(&code_name.to_be_bytes());
+            bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&body);
+        }
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // class attributes_count
+        bytes
+    }
+
+    #[test]
+    fn derives_plain_keybinds_and_lang_from_a_synthetic_jar() {
+        let mut plain: Vec<String> = HISTORIC_CORE.iter().map(|key| key.to_string()).collect();
+        plain.extend((0..MIN_PLAIN_KEYS).map(|index| format!("setting{index}")));
+        let keybinds: Vec<String> = (0..MIN_KEYBINDS + 1)
+            .map(|index| format!("key.binding{index}"))
+            .collect();
+
+        let directory = temp_dir("synthetic");
+        let jar = directory.join("client.jar");
+        let file = std::fs::File::create(&jar).expect("stub jar");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("version.json", options).unwrap();
+        std::io::Write::write_all(
+            &mut archive,
+            br#"{"id":"stub","name":"stub","world_version":4242}"#,
+        )
+        .unwrap();
+        archive.start_file(LANG_ENTRY, options).unwrap();
+        std::io::Write::write_all(
+            &mut archive,
+            br#"{"soundCategory.master":"Master","soundCategory.music":"Music","options.modelPart.cape":"Cape"}"#,
+        )
+        .unwrap();
+        archive.start_file("stub/Options.class", options).unwrap();
+        std::io::Write::write_all(
+            &mut archive,
+            &well_formed_options_class(&plain, &keybinds),
+        )
+        .unwrap();
+        archive.finish().unwrap();
+
+        let derived = derive_from_client_jar(&jar).expect("a well-formed jar must derive");
+
+        assert_eq!(derived.version_id, "stub");
+        assert_eq!(derived.data_version, 4242);
+        assert_eq!(derived.options_class, "stub/Options.class");
+        // le chiavi del metodo scrittore, più `fullscreenResolution` da load()
+        // e `version`, che non passa da nessuno dei due
+        assert_eq!(derived.plain.len(), plain.len() + 2);
+        assert!(derived.plain.contains("fullscreenResolution"));
+        assert!(derived.plain.contains(VERSION_KEY));
+        assert!(!derived
+            .plain
+            .iter()
+            .any(|key| key.contains(' ')), "il formato di log non è una chiave");
+        assert_eq!(derived.keybinds.len(), keybinds.len());
+        assert!(!derived.keybinds.contains("key.categories.misc"));
+        assert_eq!(derived.sound_categories.len(), 2);
+        assert_eq!(derived.model_parts.len(), 1);
+
+        assert!(derived.accepts("key_key.binding0"));
+        assert!(derived.accepts("soundCategory_music"));
+        assert!(derived.accepts("modelPart_cape"));
+        assert!(!derived.accepts("key_key.epicfight.dodge"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn derivation_fails_when_the_anchor_is_missing() {
         let directory = temp_dir("anchorless");
