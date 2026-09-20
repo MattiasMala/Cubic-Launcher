@@ -402,8 +402,9 @@ fn load_global_settings(connection: &Connection) -> Result<ShellGlobalSettings> 
         profiler_enabled: parse_bool_setting(&values, "profiler_enabled").unwrap_or(false),
         // D12: no migration. The keys are new, the rows are not there, and the
         // default is what a fresh install gets: notifications on, every
-        // category included. The orphaned `cache_only_mode` row is ignored
-        // until the first save rewrites the table.
+        // category included. The orphaned `cache_only_mode` row is ignored,
+        // and now stays: since E10 a save writes only its own keys
+        // (`upsert_global_settings`) instead of rewriting the whole table.
         update_notifications_enabled: parse_bool_setting(&values, "update_notifications_enabled")
             .unwrap_or(true),
         update_notifications_resource_packs: parse_bool_setting(
