@@ -27,6 +27,9 @@ pub mod modlist_manager;
 pub mod modrinth;
 pub mod path_safety;
 pub mod offline_account;
+pub mod options_file;
+pub mod options_keys;
+pub mod options_share;
 pub mod process_streaming;
 pub mod resolver;
 pub mod rules;
@@ -115,6 +118,10 @@ pub fn run() {
             modlist_assets::export_modlist_command,
             modlist_assets::list_instance_files_command,
             modlist_assets::read_image_as_data_url_command,
+            options_share::load_shared_options_command,
+            options_share::save_shared_options_command,
+            options_share::promote_options_command,
+            options_share::derive_option_keys_command,
             resolver::resolve_modlist_command,
             resolver::backfill_availability_command,
             minecraft_downloader::fetch_minecraft_versions_command,

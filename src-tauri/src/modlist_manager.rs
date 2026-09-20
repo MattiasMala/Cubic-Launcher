@@ -93,6 +93,15 @@ pub fn create_modlist_from_root(
         )
     })?;
 
+    // Il globale è il modello per una modlist nuova (D66). Se non c'è, o se
+    // non si può filtrare in sicurezza, la modlist nasce senza `options.txt` e
+    // nessuno se ne accorge finché non la apre: la creazione non fallisce per
+    // questo, ma la ragione resta scritta nel log.
+    let seed = crate::options_share::seed_modlist_from_global(&launcher_paths, &name);
+    if let crate::options_share::SeedStatus::Refused { .. } = &seed {
+        eprintln!("[options] {}", seed.describe());
+    }
+
     Ok(CreateModlistResult {
         name,
         author,

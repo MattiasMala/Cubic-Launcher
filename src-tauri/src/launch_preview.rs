@@ -582,6 +582,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     std::fs::create_dir_all(&instance_natives_dir)
         .with_context(|| format!("failed to create {}", instance_natives_dir.display()))?;
 
+    // Primo avvio di questa istanza: si semina da `options.txt` della modlist,
+    // e mai più (D66). Il "mai più" non ha bisogno di uno stato nostro — dal
+    // secondo avvio il file c'è, perché l'abbiamo scritto noi o perché il
+    // gioco l'ha riscritto — e la semina lascia comunque una riga nel log,
+    // anche quando non fa niente.
+    let options_seed = crate::options_share::seed_instance_from_modlist(
+        &launcher_paths,
+        &modlist_name,
+        &instance_root,
+    );
+    let _ = emit_log(
+        &app_handle,
+        ProcessLogStream::Stdout,
+        format!("[options] {}", options_seed.describe()),
+    );
+
     let cached_mod_jars = build_cached_mod_jars(
         &app_handle,
         &selected_mods,
