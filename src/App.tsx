@@ -959,8 +959,16 @@ export default function App() {
     }
   };
 
-  const handleLaunch = async () => {
+  /**
+   * `worldFolder` is the world this launch should open, and defaults to none:
+   * every launch says what it wants instead of inheriting what the last one
+   * asked for. It matters with real data — both instances hold a folder
+   * called `New World`, so a stale value would not fail, it would jump into
+   * the wrong world.
+   */
+  const handleLaunch = async (worldFolder: string | null = null) => {
     if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
+    setQuickPlayWorldFolder(worldFolder);
     if (!selectedModList()) {
       pushUiError({ title: "No mod list selected", message: "Select a mod list from the sidebar before launching.", detail: "", severity: "warning", scope: "launch" });
       return;
@@ -1092,9 +1100,8 @@ export default function App() {
     // instance and that is the one to launch.
     setSelectedMcVersion(target.minecraftVersion);
     setSelectedModLoader(target.modLoader);
-    setQuickPlayWorldFolder(openTheWorld ? world.folderName : null);
     setActiveRailView("modlist");
-    await handleLaunch();
+    await handleLaunch(openTheWorld ? world.folderName : null);
   };
 
   const handleOpenModlist = async (modlistName: string) => {
@@ -1137,7 +1144,7 @@ export default function App() {
               <LaunchPanel
                 // The panel's own Play is the ordinary one: it must not
                 // inherit the world a card asked for a moment ago.
-                onLaunch={() => { setQuickPlayWorldFolder(null); void handleLaunch(); }}
+                onLaunch={() => void handleLaunch()}
                 onSwitchAccount={handleSwitchAccount}
                 onVersionChange={handleVersionChange}
                 onLoaderChange={handleLoaderChange}
@@ -1192,7 +1199,9 @@ export default function App() {
             }}
             // D26: the X and the backdrop cancel the launch. "Skip" means
             // "launch without updating"; closing means "I have not decided".
-            onCancel={() => setPendingUpdatePrecheck(null)}
+            // A cancelled launch also drops the world it was going to open,
+            // which would otherwise sit there until the next Play took it.
+            onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
           />
         )}
       </Show>

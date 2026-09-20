@@ -143,25 +143,13 @@ function WorldCard(props: {
   onOpenModlist: () => void;
   onOpenFolder: () => void;
   onHide: () => void;
+  /** Whether this card's ⋮ menu is the open one; at most one ever is. */
+  menuOpen: boolean;
+  onToggleMenu: () => void;
+  onCloseMenu: () => void;
 }) {
-  const [menuOpen, setMenuOpen] = createSignal(false);
-
-  const closeOnOutside = (event: MouseEvent) => {
-    const target = event.target as HTMLElement | null;
-    if (!target?.closest("[data-world-menu]")) setMenuOpen(false);
-  };
-  const closeOnEscape = (event: KeyboardEvent) => {
-    if (event.key === "Escape") setMenuOpen(false);
-  };
-  document.addEventListener("click", closeOnOutside);
-  document.addEventListener("keydown", closeOnEscape);
-  onCleanup(() => {
-    document.removeEventListener("click", closeOnOutside);
-    document.removeEventListener("keydown", closeOnEscape);
-  });
-
   const run = (action: () => void) => {
-    setMenuOpen(false);
+    props.onCloseMenu();
     action();
   };
 
@@ -189,10 +177,6 @@ function WorldCard(props: {
       <button
         class="px-4 h-9 rounded-lg bg-primary hover:bg-brandPurpleHover text-white text-sm font-medium flex items-center gap-1.5 shrink-0"
         onClick={props.onPlay}
-        // The card must not promise what the instance may not do: the
-        // backend passes `--quickPlaySingleplayer` only when that client's
-        // own manifest declares it, and otherwise the game opens at the menu.
-        title="Play — opens this world directly on Minecraft 1.20 and newer; older versions open at the menu"
       >
         <MaterialIcon name="play_arrow" size="sm" />
         Play
@@ -202,12 +186,12 @@ function WorldCard(props: {
         <button
           class="w-9 h-9 rounded-lg border border-borderColor text-textMuted hover:text-textMain hover:bg-bgHover flex items-center justify-center"
           aria-label={`More actions for ${props.world.levelName}`}
-          onClick={() => setMenuOpen(open => !open)}
+          onClick={props.onToggleMenu}
         >
           <MaterialIcon name="more_vert" size="sm" />
         </button>
 
-        <Show when={menuOpen()}>
+        <Show when={props.menuOpen}>
           <div class="absolute right-0 top-full mt-1 w-56 rounded-lg border border-borderColor bg-popover shadow-xl py-1 z-30">
             <button
               class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
@@ -256,6 +240,30 @@ export function HomeView(props: HomeViewProps) {
       });
       return [] as WorldEntry[];
     }
+  });
+
+  /**
+   * The triple of the world whose ⋮ menu is open, or `null`.
+   *
+   * One signal for every card, because two dropdowns open at once is what a
+   * per-card one produced: his two worlds have the same name, so the second
+   * menu opening while the first stayed up was genuinely confusing.
+   */
+  const [openMenuKey, setOpenMenuKey] = createSignal<string | null>(null);
+  const menuKey = (world: WorldEntry) =>
+    `${world.modlistName}/${world.instanceName}/${world.folderName}`;
+
+  const closeOnOutside = (event: MouseEvent) => {
+    if (!(event.target as HTMLElement | null)?.closest("[data-world-menu]")) setOpenMenuKey(null);
+  };
+  const closeOnEscape = (event: KeyboardEvent) => {
+    if (event.key === "Escape") setOpenMenuKey(null);
+  };
+  document.addEventListener("click", closeOnOutside);
+  document.addEventListener("keydown", closeOnEscape);
+  onCleanup(() => {
+    document.removeEventListener("click", closeOnOutside);
+    document.removeEventListener("keydown", closeOnEscape);
   });
 
   /** Hidden worlds are not shown at all: the un-hiding is playing them (D65). */
@@ -315,7 +323,8 @@ export function HomeView(props: HomeViewProps) {
         <section>
           <h2 class="text-lg font-semibold text-textMain mb-1">Jump in</h2>
           <p class="text-sm text-textMuted mb-4">
-            Your most recent worlds. Play opens the world itself, without going through the menu.
+            Your most recent worlds. Play opens the world itself on Minecraft 1.20 and newer;
+            an older instance cannot skip the menu, and lands there instead.
           </p>
 
           <Show
@@ -342,6 +351,11 @@ export function HomeView(props: HomeViewProps) {
                     onOpenModlist={() => props.onOpenModlist(world.modlistName)}
                     onOpenFolder={() => void openWorldFolder(world)}
                     onHide={() => void hideWorld(world)}
+                    menuOpen={openMenuKey() === menuKey(world)}
+                    onToggleMenu={() =>
+                      setOpenMenuKey(current => (current === menuKey(world) ? null : menuKey(world)))
+                    }
+                    onCloseMenu={() => setOpenMenuKey(null)}
                   />
                 )}
               </For>
