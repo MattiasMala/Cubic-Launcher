@@ -20,6 +20,7 @@ use crate::modrinth::ModrinthClient;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
+use crate::worlds::quick_play_arguments;
 
 use std::sync::Mutex;
 
@@ -260,6 +261,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             launch_log_session,
             effective_settings,
             http_client,
+            request.quick_play_singleplayer.clone(),
         )
         .await;
     }
@@ -768,7 +770,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             profiler: None,
             wrapper_command: effective_settings.wrapper_command.clone(),
         },
-        additional_game_arguments: Vec::new(),
+        additional_game_arguments: quick_play_arguments(
+            &instance_root,
+            request.quick_play_singleplayer.as_deref(),
+            mc_data.supports_quick_play_singleplayer,
+        ),
         config_attribution: None,
     })?;
 

@@ -11,6 +11,7 @@ use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::ModAcquisitionPlan;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{ModLoader, ResolutionTarget};
+use crate::worlds::quick_play_arguments;
 
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
@@ -27,6 +28,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
     launch_log_session: Arc<LaunchLogSession>,
     effective_settings: EffectiveLaunchSettings,
     http_client: reqwest::Client,
+    quick_play_singleplayer: Option<String>,
 ) -> Result<StartedLaunch> {
     emit_log(
         &app_handle,
@@ -185,7 +187,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
     classpath_entries.push(mc_data.client_jar_path.clone());
     let prepared_command = build_launch_command(&JavaLaunchRequest {
         java_binary_path: java_binary_path.clone(),
-        working_directory: instance_root,
+        working_directory: instance_root.clone(),
         classpath_entries,
         loader_metadata,
         launch_settings: JavaLaunchSettings {
@@ -195,7 +197,11 @@ pub(super) async fn run_vanilla_launch_pipeline(
             profiler: None,
             wrapper_command: effective_settings.wrapper_command.clone(),
         },
-        additional_game_arguments: Vec::new(),
+        additional_game_arguments: quick_play_arguments(
+            &instance_root,
+            quick_play_singleplayer.as_deref(),
+            mc_data.supports_quick_play_singleplayer,
+        ),
         config_attribution: None,
     })?;
 

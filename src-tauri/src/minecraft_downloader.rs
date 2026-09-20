@@ -39,6 +39,16 @@ pub struct MinecraftVersionData {
     pub game_arguments: Vec<String>,
     /// JVM arguments (filtered by the current OS), with `${placeholder}` tokens.
     pub jvm_arguments: Vec<String>,
+    /// Whether this client's own manifest declares the Quick Play
+    /// singleplayer option, i.e. whether `arguments.game` carries the
+    /// `--quickPlaySingleplayer` entry behind its feature rule.
+    ///
+    /// This is the support criterion for the "jump into the world" Play
+    /// (E10): the client about to run says what its own argument parser
+    /// accepts, which no comparison of `1.20.1`, `26.3` and `23w14a` can do.
+    /// Pre-1.13 versions, which carry a flat `minecraft_arguments` string,
+    /// come out `false` — Quick Play arrived in 1.20.
+    pub supports_quick_play_singleplayer: bool,
 }
 
 // ── Mojang API serde structs ──────────────────────────────────────────────────
@@ -519,8 +529,11 @@ pub async fn ensure_minecraft_version(
     )
     .await?;
 
-    // 6. Extract arguments.
+    // 6. Extract arguments. `game_arguments` is unfiltered on purpose (the
+    //    launch strips the feature-gated entries later), which is also what
+    //    makes it the honest place to read Quick Play support from.
     let (game_arguments, jvm_arguments) = extract_arguments(&version_json);
+    let supports_quick_play_singleplayer = declares_quick_play_singleplayer(&game_arguments);
 
     Ok(MinecraftVersionData {
         main_class: version_json.main_class,
@@ -532,6 +545,7 @@ pub async fn ensure_minecraft_version(
         is_virtual_assets,
         game_arguments,
         jvm_arguments,
+        supports_quick_play_singleplayer,
     })
 }
 
@@ -798,6 +812,19 @@ fn extract_arguments(version_json: &VersionJson) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// Whether the version's game arguments declare `--quickPlaySingleplayer`.
+///
+/// The entry lives behind a `is_quick_play_singleplayer` feature rule, which
+/// `flatten_args` keeps (features are not OS rules and are not filtered
+/// here), so its presence in the flattened list is exactly "this client
+/// understands the option". Verified against the five version manifests in
+/// the shared cache: 1.20.1, 1.20.2, 1.21.1, 26.1 and 26.3 all declare it.
+fn declares_quick_play_singleplayer(game_arguments: &[String]) -> bool {
+    game_arguments
+        .iter()
+        .any(|argument| argument == "--quickPlaySingleplayer")
+}
+
 /// Flatten `ArgEntry` list into plain strings, filtering by OS rules.
 fn flatten_args(entries: &[ArgEntry], filter_by_os: bool) -> Vec<String> {
     let mut result = Vec::new();
@@ -943,5 +970,44 @@ mod tests {
             // The conditional windows arg is filtered out; only the simple one remains.
             assert_eq!(result, vec!["-Xss1M"]);
         }
+    }
+
+    #[test]
+    fn quick_play_support_is_read_from_the_version_json() {
+        // The shape Mojang ships: the option is an argument entry behind a
+        // feature rule, not an OS rule.
+        let modern = r#"{
+          "mainClass": "net.minecraft.client.main.Main",
+          "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "0123456789abcdef0123456789abcdef01234567" } },
+          "libraries": [],
+          "assetIndex": { "id": "17", "url": "https://example.invalid/17.json", "sha1": "0123456789abcdef0123456789abcdef01234567" },
+          "assets": "17",
+          "arguments": {
+            "game": [
+              "--username", "${auth_player_name}",
+              { "rules": [{ "action": "allow", "features": { "is_quick_play_singleplayer": true } }],
+                "value": ["--quickPlaySingleplayer", "${quickPlaySingleplayer}"] }
+            ],
+            "jvm": []
+          }
+        }"#;
+        let modern: VersionJson =
+            serde_json::from_str(modern).expect("the version json should deserialize");
+        let (game_arguments, _) = extract_arguments(&modern);
+        assert!(declares_quick_play_singleplayer(&game_arguments));
+
+        // A pre-1.13 version: one flat argument string, and no Quick Play.
+        let legacy = r#"{
+          "mainClass": "net.minecraft.client.main.Main",
+          "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "0123456789abcdef0123456789abcdef01234567" } },
+          "libraries": [],
+          "assetIndex": { "id": "legacy", "url": "https://example.invalid/legacy.json", "sha1": "0123456789abcdef0123456789abcdef01234567" },
+          "assets": "legacy",
+          "minecraftArguments": "--username ${auth_player_name} --gameDir ${game_directory}"
+        }"#;
+        let legacy: VersionJson =
+            serde_json::from_str(legacy).expect("the version json should deserialize");
+        let (game_arguments, _) = extract_arguments(&legacy);
+        assert!(!declares_quick_play_singleplayer(&game_arguments));
     }
 }
