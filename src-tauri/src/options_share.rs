@@ -17,7 +17,7 @@
 //!   preset, e quella tabella il gioco ce l'ha già. La nostra sarebbe una copia
 //!   sempre indietro.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use tauri::State;
 use crate::launcher_paths::LauncherPaths;
 use crate::options_file::{OptionsFile, VERSION_KEY};
 use crate::options_keys::{
-    find_version_for_data_version, load_or_derive, VanillaOptionKeys,
+    borrowed_groups, find_version_for_data_version, load_or_derive, VanillaOptionKeys,
 };
 use crate::path_safety::validate_path_component;
 
@@ -481,6 +481,10 @@ pub struct SharedOptionsView {
     /// Perché non sappiamo dire cosa è vanilla, quando non lo sappiamo.
     pub derivation_error: Option<String>,
     pub entries: Vec<OptionEntryView>,
+    /// La versione che ha prestato i nomi dei gruppi, quando quella del file
+    /// non ne ha (jar offuscato). Riguarda **solo** i gruppi: cosa è vanilla lo
+    /// decide sempre il jar della versione del file.
+    pub groups_from: Option<String>,
 }
 
 pub fn load_shared_options(
@@ -521,6 +525,24 @@ pub fn load_shared_options(
         derivation_error = Some(format!("{} non ha una riga `{VERSION_KEY}:`", path.display()));
     }
 
+    // Due dati, due sorgenti, e si deve vedere: `keys` dice cosa è vanilla e
+    // viene dal jar di *questa* versione; `groups` dice solo in che gruppo
+    // mettere una riga, e può venire da un'altra versione se questa è
+    // offuscata e la sua mappa è vuota.
+    let mut groups_from = None;
+    let mut groups: BTreeMap<String, String> = keys
+        .as_ref()
+        .map(|keys| keys.groups.clone())
+        .unwrap_or_default();
+    if groups.is_empty() {
+        if let Some(target) = keys.as_ref() {
+            if let Some((lender, borrowed)) = borrowed_groups(launcher_paths, target) {
+                groups_from = Some(lender);
+                groups = borrowed;
+            }
+        }
+    }
+
     let entries = file
         .iter()
         .map(|(key, value)| OptionEntryView {
@@ -529,10 +551,7 @@ pub fn load_shared_options(
             kind: kind_of(key),
             vanilla: keys.as_ref().is_some_and(|keys| keys.accepts(key)),
             internal_state: is_internal_state(key),
-            group: keys
-                .as_ref()
-                .and_then(|keys| keys.groups.get(key))
-                .cloned(),
+            group: groups.get(key).cloned(),
         })
         .collect();
 
@@ -544,6 +563,7 @@ pub fn load_shared_options(
         version_id,
         derivation_error,
         entries,
+        groups_from,
     })
 }
 
@@ -637,16 +657,49 @@ pub fn apply_options_command(
     unchecked: Vec<String>,
     include_resource_packs: bool,
 ) -> Result<SeedStatus, String> {
-    let source = from.path(&launcher_paths).map_err(|e| e.to_string())?;
-    let target = to.path(&launcher_paths).map_err(|e| e.to_string())?;
+    apply_options(
+        &launcher_paths,
+        &from,
+        &to,
+        &unchecked.into_iter().collect(),
+        include_resource_packs,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn apply_options(
+    launcher_paths: &LauncherPaths,
+    from: &OptionsScope,
+    to: &OptionsScope,
+    unchecked: &BTreeSet<String>,
+    include_resource_packs: bool,
+) -> anyhow::Result<SeedStatus> {
+    let source = from.path(launcher_paths)?;
+    let target = to.path(launcher_paths)?;
+
+    // Difesa in profondità su un percorso che oggi la GUI non raggiunge: la
+    // modlist corrente non compare fra le sorgenti, "porta qui" esiste solo
+    // mentre se ne guarda un'altra, "ri-applica" va sempre a un'istanza e
+    // "promuovi" sempre al globale. Sta qui perché il danno, se un domani un
+    // chiamante nuovo ci arrivasse, è perdita di dati: applicare un file su sé
+    // stesso lo rileggerebbe e lo riscriverebbe **filtrato**, cioè
+    // cancellerebbe da un `options.txt` di istanza tutti i keybind dei mod.
+    if source == target {
+        return Ok(SeedStatus::Refused {
+            reason: format!(
+                "sorgente e destinazione sono lo stesso file ({}): non si applica un file su sé stesso",
+                source.display()
+            ),
+        });
+    }
 
     Ok(seed_into(
-        &launcher_paths,
+        launcher_paths,
         &source,
         &target,
         true,
         include_resource_packs,
-        &unchecked.into_iter().collect(),
+        unchecked,
     ))
 }
 
@@ -1017,6 +1070,74 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "version:5023\nfov:0.9\n"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// La mappa prestata raggruppa una chiave che le due versioni hanno in
+    /// comune, **e non allarga l'insieme vanilla**: `graphicsPreset` esiste
+    /// solo da 26.1 in poi, e in un file 1.20.1 deve restare "non vanilla"
+    /// anche se la mappa prestata viene da 26.3.
+    #[test]
+    fn borrowed_groups_name_shared_keys_without_widening_what_is_vanilla() {
+        let root = temp_root("borrowed-groups");
+        if !copy_real_jar(&root, "1.20.1") || !copy_real_jar(&root, "26.3") {
+            eprintln!("skipping: client.jar 1.20.1/26.3 not in the local cache");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let launcher_paths = LauncherPaths::new(root.clone());
+        let scope = OptionsScope::Modlist {
+            modlist: "Drehmal".into(),
+        };
+        OptionsFile::parse("version:3465\nguiScale:2\ngraphicsPreset:\"fancy\"\n")
+            .write(&modlist_options_path(&launcher_paths, "Drehmal").unwrap())
+            .unwrap();
+
+        let view = load_shared_options(&launcher_paths, &scope).unwrap();
+
+        assert_eq!(view.version_id.as_deref(), Some("1.20.1"));
+        assert_eq!(view.groups_from.as_deref(), Some("26.3"));
+
+        let gui_scale = view.entries.iter().find(|e| e.key == "guiScale").unwrap();
+        assert!(gui_scale.vanilla);
+        assert_eq!(gui_scale.group.as_deref(), Some("VideoSettingsScreen"));
+
+        let preset = view
+            .entries
+            .iter()
+            .find(|e| e.key == "graphicsPreset")
+            .unwrap();
+        assert!(
+            !preset.vanilla,
+            "la mappa prestata non deve rendere vanilla una chiave che 1.20.1 non conosce"
+        );
+        assert_eq!(preset.group, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn applying_a_file_onto_itself_is_refused_without_touching_it() {
+        let root = temp_root("self-apply");
+        let launcher_paths = LauncherPaths::new(root.clone());
+        let scope = OptionsScope::Modlist {
+            modlist: "Drehmal".into(),
+        };
+        let path = modlist_options_path(&launcher_paths, "Drehmal").unwrap();
+        let original = "version:3465\nfov:0.5\nkey_key.epicfight.dodge:key.keyboard.left.alt\n";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+
+        let status =
+            apply_options(&launcher_paths, &scope, &scope, &BTreeSet::new(), true).unwrap();
+
+        match status {
+            SeedStatus::Refused { reason } => {
+                assert!(reason.contains("stesso file"), "unexpected refusal: {reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

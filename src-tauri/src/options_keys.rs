@@ -513,6 +513,71 @@ pub fn find_version_for_data_version(
     Ok(None)
 }
 
+/// I gruppi presi in prestito da un'altra versione, quando quella bersaglio
+/// non ne ha.
+///
+/// Sui jar offuscati — 1.20.1 e tutti quelli fino a 1.21.1 — i nomi delle
+/// classi delle schermate non sopravvivono, quindi [`derive_from_client_jar`]
+/// restituisce `groups` vuota e ogni impostazione semplice finisce in un
+/// secchio solo. Le versioni condividono però quasi tutti i nomi (81 chiavi su
+/// 86 fra 1.20.1 e 26.3, misurate), quindi la mappa di un jar con i nomi veri
+/// copre quasi tutta la lista anche di una versione vecchia.
+///
+/// **Il confine, che non va attraversato**: questa mappa decide solo *in che
+/// gruppo* finisce una chiave, **mai se quella chiave è vanilla**.
+/// L'appartenenza al vanilla resta quella derivata dal jar della versione
+/// bersaglio (D68), e per renderlo vero e non solo dichiarato la mappa viene
+/// **ristretta alle chiavi semplici del bersaglio** prima di uscire da qui:
+/// una chiave che esiste solo nella versione prestatrice non può passare di
+/// qua e finire in un `options.txt` che non la conosce.
+///
+/// Fra più candidate si prende quella con la `DataVersion` più alta: è quella
+/// che conosce più chiavi, e i nomi nuovi non fanno danno perché il filtro
+/// sopra li toglie. Se non c'è nessuna candidata resta il secchio unico.
+pub fn borrowed_groups(
+    launcher_paths: &LauncherPaths,
+    target: &VanillaOptionKeys,
+) -> Option<(String, BTreeMap<String, String>)> {
+    let entries = std::fs::read_dir(launcher_paths.mc_cache_dir()).ok()?;
+
+    let mut best: Option<VanillaOptionKeys> = None;
+    for entry in entries.flatten() {
+        if !entry.path().join(CLIENT_JAR_FILENAME).is_file() {
+            continue;
+        }
+        let Some(version_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if version_id == target.version_id {
+            continue;
+        }
+        let Ok(candidate) = load_or_derive(launcher_paths, &version_id) else {
+            continue;
+        };
+        if candidate.groups.is_empty() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.data_version > current.data_version)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    let lender = best?;
+    let groups: BTreeMap<String, String> = lender
+        .groups
+        .into_iter()
+        .filter(|(key, _)| target.plain.contains(key))
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+
+    Some((lender.version_id, groups))
+}
+
 // ---------------------------------------------------------------------------
 // Class file, il minimo indispensabile
 // ---------------------------------------------------------------------------
