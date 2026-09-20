@@ -162,6 +162,9 @@ pub enum BlockReason {
     NotVanilla,
     /// È vanilla ma descrive lo stato di quella installazione.
     InternalState,
+    /// È vanilla, ma è la lista dei resource pack, che per questo salto è
+    /// spenta di default (D67).
+    ResourcePacksOff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -222,9 +225,18 @@ impl SeedStatus {
 // Il filtro
 // ---------------------------------------------------------------------------
 
+/// `resourcePacks` è l'unica riga che litiga con le task C (i pack locali):
+/// una lista scritta altrove può nominare pack che in quella cartella non ci
+/// sono. Per questo il default cambia con il salto (D67): **spenta** su
+/// globale → modlist, **accesa** su modlist → istanza, perché le istanze della
+/// stessa modlist hanno naturalmente gli stessi pack. Qui c'è solo il default:
+/// la spunta per ribaltarlo è roba della fase 2.
+pub const RESOURCE_PACK_KEYS: [&str; 2] = ["resourcePacks", "incompatibleResourcePacks"];
+
 pub fn filter_for_seed(
     source: &OptionsFile,
     source_keys: &VanillaOptionKeys,
+    include_resource_packs: bool,
 ) -> (OptionsFile, Vec<BlockedKey>) {
     let mut seeded = OptionsFile::new();
     let mut blocked: Vec<BlockedKey> = Vec::new();
@@ -237,6 +249,13 @@ pub fn filter_for_seed(
             blocked.push(BlockedKey {
                 key: key.to_string(),
                 reason: BlockReason::InternalState,
+            });
+            continue;
+        }
+        if !include_resource_packs && RESOURCE_PACK_KEYS.contains(&key) {
+            blocked.push(BlockedKey {
+                key: key.to_string(),
+                reason: BlockReason::ResourcePacksOff,
             });
             continue;
         }
@@ -270,6 +289,7 @@ fn seed_into(
     source_path: &Path,
     target_path: &Path,
     overwrite: bool,
+    include_resource_packs: bool,
 ) -> SeedStatus {
     if !overwrite && target_path.exists() {
         return SeedStatus::SkippedTargetExists {
@@ -327,7 +347,7 @@ fn seed_into(
         }
     };
 
-    let (seeded, blocked) = filter_for_seed(&source, &source_keys);
+    let (seeded, blocked) = filter_for_seed(&source, &source_keys, include_resource_packs);
     if let Err(error) = seeded.write(target_path) {
         return SeedStatus::Refused {
             reason: error.to_string(),
@@ -362,6 +382,9 @@ pub fn seed_modlist_from_global(launcher_paths: &LauncherPaths, modlist_name: &s
         &global_options_path(launcher_paths),
         &target,
         false,
+        // globale → modlist: i pack elencati altrove quasi certamente non
+        // stanno in questa modlist (D67).
+        false,
     )
 }
 
@@ -386,6 +409,9 @@ pub fn seed_instance_from_modlist(
         &source,
         &instance_options_path(instance_root),
         false,
+        // modlist → istanza: le istanze della stessa modlist hanno gli stessi
+        // pack (D67).
+        true,
     )
 }
 
@@ -561,7 +587,7 @@ pub fn promote_options_command(
     let source = from.path(&launcher_paths).map_err(|e| e.to_string())?;
     let target = to.path(&launcher_paths).map_err(|e| e.to_string())?;
 
-    Ok(seed_into(&launcher_paths, &source, &target, true))
+    Ok(seed_into(&launcher_paths, &source, &target, true, true))
 }
 
 #[tauri::command]
@@ -603,7 +629,7 @@ mod tests {
         ));
         let keys = keys_for(3465, &["fov"], &["key.attack"]);
 
-        let (seeded, blocked) = filter_for_seed(&source, &keys);
+        let (seeded, blocked) = filter_for_seed(&source, &keys, true);
 
         assert_eq!(seeded.get("fov"), Some("0.5"));
         assert_eq!(seeded.get("key_key.attack"), Some("key.mouse.left"));
@@ -631,7 +657,7 @@ mod tests {
         ));
         let keys = keys_for(3465, &["fov", "lastServer", "tutorialStep"], &[]);
 
-        let (seeded, blocked) = filter_for_seed(&source, &keys);
+        let (seeded, blocked) = filter_for_seed(&source, &keys, true);
 
         assert_eq!(seeded.get("lastServer"), None);
         assert_eq!(seeded.get("tutorialStep"), None);
@@ -645,7 +671,7 @@ mod tests {
         let source = OptionsFile::parse("version:3465\nfov:0.5\n");
         let keys = keys_for(3465, &["fov"], &[]);
 
-        let (seeded, _) = filter_for_seed(&source, &keys);
+        let (seeded, _) = filter_for_seed(&source, &keys, true);
 
         assert_eq!(seeded.render(), "version:3465\nfov:0.5\n");
     }
@@ -657,7 +683,7 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "fov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false);
+        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true);
 
         match status {
             SeedStatus::Refused { reason } => assert!(
@@ -677,7 +703,7 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "version:999999\nfov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false);
+        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true);
 
         match status {
             SeedStatus::Refused { reason } => {
@@ -697,7 +723,7 @@ mod tests {
         std::fs::write(&source, "version:3465\nfov:0.5\n").unwrap();
         std::fs::write(&target, "fov:0.9\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &target, false);
+        let status = seed_into(&launcher_paths, &source, &target, false, true);
 
         assert!(matches!(status, SeedStatus::SkippedTargetExists { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fov:0.9\n");
@@ -827,6 +853,47 @@ mod tests {
             std::fs::read_to_string(modlist_options_path(&launcher_paths, "Nuova").unwrap())
                 .unwrap(),
             "version:3465\nguiScale:2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resource_packs_stop_at_the_modlist_but_reach_the_instance() {
+        let root = temp_root("resource-packs");
+        if !copy_real_jar(&root, "1.20.1") {
+            eprintln!("skipping: 1.20.1/client.jar not in the local cache");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let launcher_paths = LauncherPaths::new(root.clone());
+        let packs = "version:3465\nfov:0.5\nresourcePacks:[\"vanilla\"]\nincompatibleResourcePacks:[]\n";
+
+        OptionsFile::parse(packs)
+            .write(&global_options_path(&launcher_paths))
+            .unwrap();
+        assert!(matches!(
+            seed_modlist_from_global(&launcher_paths, "Nuova"),
+            SeedStatus::Seeded { .. }
+        ));
+        let at_modlist = modlist_options_path(&launcher_paths, "Nuova").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&at_modlist).unwrap(),
+            "version:3465\nfov:0.5\n",
+            "globale → modlist: la lista dei pack resta indietro (D67)"
+        );
+
+        OptionsFile::parse(packs).write(&at_modlist).unwrap();
+        let instance_root = root.join("mod-lists/Nuova/instances/1.20.1-fabric");
+        std::fs::create_dir_all(&instance_root).unwrap();
+        assert!(matches!(
+            seed_instance_from_modlist(&launcher_paths, "Nuova", &instance_root),
+            SeedStatus::Seeded { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(instance_options_path(&instance_root)).unwrap(),
+            packs,
+            "modlist → istanza: i pack passano (D67)"
         );
 
         let _ = std::fs::remove_dir_all(&root);
