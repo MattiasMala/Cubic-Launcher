@@ -326,6 +326,9 @@ export function GameOptionsPanel(props: Props) {
   };
 
   const onSourceChange = (value: string) => {
+    // Il Select in-DOM lascia cliccare la voce già scelta: ricaricare lì
+    // butterebbe via modifiche e spunte senza che sia cambiato niente.
+    if (value === source()) return;
     setSource(value);
     setCheckedOverride({});
     // In anteprima l'unico gesto è "porta qui", cioè un salto verso questa
