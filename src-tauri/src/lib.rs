@@ -135,6 +135,7 @@ pub fn run() {
             screenshots::open_screenshot_folder_command,
             worlds::list_worlds_command,
             worlds::set_world_hidden_command,
+            worlds::open_world_folder_command,
             updater::check_for_updates,
             updater::install_update
         ])

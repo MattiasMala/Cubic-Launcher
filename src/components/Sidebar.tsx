@@ -125,14 +125,14 @@ export function Sidebar(props: SidebarProps) {
         <For each={modListCards()}>
           {(modList) => {
             const isActive = () =>
-              activeRailView() === "home" && selectedModListName() === modList.name;
+              activeRailView() === "modlist" && selectedModListName() === modList.name;
 
             return (
               <RailItem
                 tooltip={modList.displayName || modList.name}
                 active={isActive()}
                 onClick={() => {
-                  setActiveRailView("home");
+                  setActiveRailView("modlist");
                   void props.onSelectModList(modList.name);
                 }}
               >

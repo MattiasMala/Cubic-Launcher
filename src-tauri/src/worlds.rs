@@ -25,9 +25,9 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -41,9 +41,9 @@ const SAVES_DIR_NAME: &str = "saves";
 const LEVEL_DAT_FILE_NAME: &str = "level.dat";
 const WORLD_ICON_FILE_NAME: &str = "icon.png";
 
-/// The `global_settings` key the hidden list lives under. One row, a JSON
-/// array of triples: the table is already key/value and has no migrations,
-/// and a list of hidden worlds does not deserve a schema of its own.
+/// The `global_settings` key the hidden list lives under. One row holds a JSON
+/// array of world triples and their `LastPlayed` baselines: the table is
+/// already key/value and this list does not deserve a schema of its own.
 pub const HIDDEN_WORLDS_KEY: &str = "hidden_worlds";
 
 /// Ceiling on the decompressed `level.dat` a read is willing to hold in
@@ -59,6 +59,21 @@ pub struct WorldId {
     pub modlist_name: String,
     pub instance_name: String,
     pub folder_name: String,
+}
+
+/// A hidden world and the `LastPlayed` value observed when it was hidden.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiddenWorld {
+    #[serde(flatten)]
+    pub id: WorldId,
+    /// Rows written before the baseline existed have no timestamp. They are
+    /// hidden when read, and the first listing gives them the world's current
+    /// `LastPlayed` as their baseline — see
+    /// [`list_worlds_with_baseline_backfill`] — so the old data ends up with
+    /// the new meaning: hidden until it is played again, never forever.
+    #[serde(default)]
+    pub hidden_at_last_played_ms: Option<i64>,
 }
 
 /// `GameType` in `level.dat`, as the frontend will read it.
@@ -102,8 +117,8 @@ pub struct WorldEntry {
     /// writes it when the player leaves the world through the menu, so its
     /// absence is ordinary — both real worlds are missing it.
     pub icon_path: Option<String>,
-    /// Whether the triple is in the hidden list. The entry is still returned:
-    /// the menu that un-hides a world needs to be able to name it.
+    /// Whether this world is hidden right now. Playing it after it was hidden
+    /// makes it visible again without changing the stored hidden list.
     pub hidden: bool,
 }
 
@@ -134,9 +149,11 @@ struct LevelDatData {
 /// Every world under `mod-lists/<modlist>/instances/<instance>/saves/`,
 /// newest first.
 ///
-/// `hidden` decides only the `hidden` flag on each entry; nothing is filtered
-/// out here.
-pub fn list_worlds(root_dir: &Path, hidden: &[WorldId]) -> Result<Vec<WorldEntry>> {
+/// `hidden` decides only the current `hidden` flag on each entry; nothing is
+/// filtered out here. An entry with no baseline counts as hidden: it is the
+/// state the backfill repairs, and until it does the world stays where the
+/// user put it.
+pub fn list_worlds(root_dir: &Path, hidden: &[HiddenWorld]) -> Result<Vec<WorldEntry>> {
     let modlists_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
         .to_path_buf();
@@ -163,13 +180,20 @@ pub fn list_worlds(root_dir: &Path, hidden: &[WorldId]) -> Result<Vec<WorldEntry
                     instance_name: instance_name.clone(),
                     folder_name,
                 };
-                let hidden = hidden.contains(&id);
+                let last_played_ms = level.last_played.unwrap_or(0);
+                let is_hidden = hidden.iter().any(|stored| {
+                    &stored.id == &id
+                        && match stored.hidden_at_last_played_ms {
+                            Some(hidden_at) => last_played_ms <= hidden_at,
+                            None => true,
+                        }
+                });
                 entries.push(WorldEntry {
                     level_name: level.level_name.unwrap_or_else(|| id.folder_name.clone()),
                     game_mode: WorldGameMode::from_game_type(level.game_type),
-                    last_played_ms: level.last_played.unwrap_or(0),
+                    last_played_ms,
                     icon_path: world_icon_path(&world_dir),
-                    hidden,
+                    hidden: is_hidden,
                     id,
                 });
             }
@@ -186,6 +210,46 @@ pub fn list_worlds(root_dir: &Path, hidden: &[WorldId]) -> Result<Vec<WorldEntry
             .then_with(|| left.id.instance_name.cmp(&right.id.instance_name))
             .then_with(|| left.id.folder_name.cmp(&right.id.folder_name))
     });
+
+    Ok(entries)
+}
+
+/// The listing the command serves: the worlds, plus the one repair the
+/// hidden list can need.
+///
+/// Hiding means "not now", never "never again" (D65), and the rule that
+/// brings a world back is its `LastPlayed` moving past the value it had when
+/// it was hidden. A row written before that baseline existed has no such
+/// value, and reading it as "hidden forever" would turn hiding into the
+/// one-way door it was never meant to be — there is no "show hidden" switch
+/// anywhere in the app to escape through.
+///
+/// So the first listing adopts the world's current `LastPlayed` as the
+/// missing baseline and writes the row back: the world stays hidden today,
+/// exactly where the user left it, and comes back the next time it is
+/// played. An entry whose world is no longer on disk keeps its empty
+/// baseline, because there is nothing to adopt.
+pub fn list_worlds_with_baseline_backfill(
+    root_dir: &Path,
+    connection: &Connection,
+) -> Result<Vec<WorldEntry>> {
+    let mut hidden = load_hidden_worlds(connection)?;
+    let entries = list_worlds(root_dir, &hidden)?;
+
+    let mut backfilled = false;
+    for stored in hidden.iter_mut() {
+        if stored.hidden_at_last_played_ms.is_some() {
+            continue;
+        }
+        let Some(world) = entries.iter().find(|entry| entry.id == stored.id) else {
+            continue;
+        };
+        stored.hidden_at_last_played_ms = Some(world.last_played_ms);
+        backfilled = true;
+    }
+    if backfilled {
+        write_hidden_worlds(connection, &hidden)?;
+    }
 
     Ok(entries)
 }
@@ -248,10 +312,10 @@ fn utf8_file_name(path: &Path) -> Option<String> {
 
 // ── The hidden list ──────────────────────────────────────────────────────────
 
-/// The hidden triples. A missing row is an empty list, and so is a row this
-/// build cannot parse: a corrupted value must not stop the home from opening,
-/// and the next hide rewrites it.
-pub fn load_hidden_worlds(connection: &Connection) -> Result<Vec<WorldId>> {
+/// The hidden worlds and their `LastPlayed` baselines. A missing row is an
+/// empty list, and so is a row this build cannot parse: a corrupted value must
+/// not stop the home from opening, and the next hide rewrites it.
+pub fn load_hidden_worlds(connection: &Connection) -> Result<Vec<HiddenWorld>> {
     let stored: Option<String> = connection
         .query_row(
             "SELECT value FROM global_settings WHERE key = ?1",
@@ -265,29 +329,47 @@ pub fn load_hidden_worlds(connection: &Connection) -> Result<Vec<WorldId>> {
         .context("failed to read the hidden worlds setting")?;
 
     Ok(stored
-        .and_then(|value| serde_json::from_str::<Vec<WorldId>>(&value).ok())
+        .and_then(|value| serde_json::from_str::<Vec<HiddenWorld>>(&value).ok())
         .unwrap_or_default())
 }
 
-/// Add or remove one triple, and return the list as it now stands.
+/// Add, update, or remove one hidden world, and return the list as it now
+/// stands. Re-hiding updates the baseline so the next play can reveal it
+/// again.
 ///
-/// Writes a single `global_settings` row and nothing else — no new file, no
-/// format to migrate.
+/// Writes a single `global_settings` row and nothing else — no new file and
+/// no database migration.
 pub fn set_world_hidden(
     connection: &Connection,
     world: &WorldId,
     hidden: bool,
-) -> Result<Vec<WorldId>> {
+    hidden_at_last_played_ms: Option<i64>,
+) -> Result<Vec<HiddenWorld>> {
     let mut worlds = load_hidden_worlds(connection)?;
-    let already_hidden = worlds.iter().any(|stored| stored == world);
 
-    if hidden && !already_hidden {
-        worlds.push(world.clone());
-    } else if !hidden {
-        worlds.retain(|stored| stored != world);
+    if hidden {
+        if let Some(stored) = worlds.iter_mut().find(|stored| &stored.id == world) {
+            stored.hidden_at_last_played_ms = hidden_at_last_played_ms;
+        } else {
+            worlds.push(HiddenWorld {
+                id: world.clone(),
+                hidden_at_last_played_ms,
+            });
+        }
+    } else {
+        worlds.retain(|stored| &stored.id != world);
     }
 
-    let value = serde_json::to_string(&worlds).context("failed to serialize the hidden worlds")?;
+    write_hidden_worlds(connection, &worlds)?;
+
+    Ok(worlds)
+}
+
+/// The one row the hidden list lives in, rewritten whole. It is a single
+/// JSON value: there is nothing to merge, and an upsert keeps the other
+/// `global_settings` keys — the launch settings — untouched.
+fn write_hidden_worlds(connection: &Connection, worlds: &[HiddenWorld]) -> Result<()> {
+    let value = serde_json::to_string(worlds).context("failed to serialize the hidden worlds")?;
     connection
         .execute(
             "INSERT INTO global_settings (key, value) VALUES (?1, ?2) \
@@ -295,8 +377,7 @@ pub fn set_world_hidden(
             [HIDDEN_WORLDS_KEY, value.as_str()],
         )
         .context("failed to write the hidden worlds setting")?;
-
-    Ok(worlds)
+    Ok(())
 }
 
 // ── Quick Play ───────────────────────────────────────────────────────────────
@@ -345,6 +426,67 @@ pub fn quick_play_arguments(
     ]
 }
 
+// ── The folder a world lives in ──────────────────────────────────────────────
+
+/// Rebuild one world's directory from the triple the listing handed out, or
+/// refuse.
+///
+/// Same pact as `screenshots::resolve_screenshot`: the caller never passes a
+/// path, each name MUST be a single path component, and the join is
+/// canonicalised and checked against `<root>/mod-lists` so a `saves`
+/// directory that is a symlink elsewhere resolves to its real location and
+/// fails the test.
+fn resolve_world_directory(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    folder_name: &str,
+) -> Result<PathBuf> {
+    validate_path_component(modlist_name)
+        .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
+    validate_path_component(instance_name)
+        .with_context(|| format!("invalid instance name '{instance_name}'"))?;
+    validate_path_component(folder_name)
+        .with_context(|| format!("invalid world folder name '{folder_name}'"))?;
+
+    let modlists_dir = LauncherPaths::new(root_dir.to_path_buf())
+        .modlists_dir()
+        .to_path_buf();
+    let world_dir = modlists_dir
+        .join(modlist_name)
+        .join(INSTANCES_DIR_NAME)
+        .join(instance_name)
+        .join(SAVES_DIR_NAME)
+        .join(folder_name);
+
+    let resolved = fs::canonicalize(&world_dir)
+        .with_context(|| format!("no world folder at {}", world_dir.display()))?;
+    let resolved_modlists_dir = fs::canonicalize(&modlists_dir)
+        .with_context(|| format!("failed to resolve {}", modlists_dir.display()))?;
+
+    let relative = resolved.strip_prefix(&resolved_modlists_dir).map_err(|_| {
+        anyhow::anyhow!("the world folder of '{modlist_name}/{instance_name}' is outside the mod lists directory")
+    })?;
+    let segments: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => Some(segment),
+            _ => None,
+        })
+        .collect();
+    let shaped_like_a_world = segments.len() == 5
+        && segments[1] == INSTANCES_DIR_NAME
+        && segments[3] == SAVES_DIR_NAME;
+    if !shaped_like_a_world {
+        bail!("the world folder of '{modlist_name}/{instance_name}' is outside the mod lists directory");
+    }
+    if !resolved.is_dir() {
+        bail!("{} is not a directory", resolved.display());
+    }
+
+    Ok(resolved)
+}
+
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -353,9 +495,9 @@ pub fn list_worlds_command(
 ) -> Result<Vec<WorldEntry>, String> {
     let connection =
         Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
-    let hidden = load_hidden_worlds(&connection).map_err(|error| error.to_string())?;
 
-    list_worlds(launcher_paths.root_dir(), &hidden).map_err(|error| error.to_string())
+    list_worlds_with_baseline_backfill(launcher_paths.root_dir(), &connection)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -366,6 +508,22 @@ pub fn set_world_hidden_command(
     folder_name: String,
     hidden: bool,
 ) -> Result<Vec<WorldId>, String> {
+    validate_path_component(&modlist_name).map_err(|error| error.to_string())?;
+    validate_path_component(&instance_name).map_err(|error| error.to_string())?;
+    validate_path_component(&folder_name).map_err(|error| error.to_string())?;
+    let hidden_at_last_played_ms = if hidden {
+        let level_dat_path = launcher_paths
+            .modlists_dir()
+            .join(&modlist_name)
+            .join(INSTANCES_DIR_NAME)
+            .join(&instance_name)
+            .join(SAVES_DIR_NAME)
+            .join(&folder_name)
+            .join(LEVEL_DAT_FILE_NAME);
+        read_level_dat(&level_dat_path).and_then(|level| level.last_played)
+    } else {
+        None
+    };
     let connection =
         Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
     let world = WorldId {
@@ -374,7 +532,37 @@ pub fn set_world_hidden_command(
         folder_name,
     };
 
-    set_world_hidden(&connection, &world, hidden).map_err(|error| error.to_string())
+    set_world_hidden(
+        &connection,
+        &world,
+        hidden,
+        hidden_at_last_played_ms,
+    )
+    .map(|worlds| worlds.into_iter().map(|stored| stored.id).collect())
+    .map_err(|error| error.to_string())
+}
+
+/// Open the world's folder in the system file manager.
+///
+/// The ⋮ menu of a world card offers it, and the card only ever holds the
+/// triple: the path is rebuilt here, refused rather than guessed, exactly
+/// like `screenshots::open_screenshot_folder_command` does for a screenshot.
+#[tauri::command]
+pub fn open_world_folder_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    instance_name: String,
+    folder_name: String,
+) -> Result<(), String> {
+    let folder = resolve_world_directory(
+        launcher_paths.root_dir(),
+        &modlist_name,
+        &instance_name,
+        &folder_name,
+    )
+    .map_err(|error| format!("{error:#}"))?;
+
+    open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
 }
 
 #[cfg(test)]

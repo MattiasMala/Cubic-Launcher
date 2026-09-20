@@ -58,12 +58,23 @@ export const MOCK_MODRINTH: ModrinthResult[] = [
 export const [modListCards, setModListCards] = createSignal<ModListCard[]>([]);
 export const [selectedModListName, setSelectedModListName] = createSignal<string>("");
 /**
- * Which destination of the icon rail is showing. "home" is the view that
- * picks and launches a mod list; "screenshots" is the global gallery. The
- * Skin icon is a placeholder and has no view (E7).
+ * Which destination of the icon rail is showing. "home" is the Modrinth-style
+ * landing page — the worlds to jump into, then the mod list library;
+ * "modlist" is the editor plus its launch panel, which is where picking a mod
+ * list lands; "screenshots" is the global gallery. The Skin icon is a
+ * placeholder and has no view (E7).
  */
-export type RailView = "home" | "screenshots";
+export type RailView = "home" | "modlist" | "screenshots";
 export const [activeRailView, setActiveRailView] = createSignal<RailView>("home");
+/**
+ * The world folder the next launch should open directly, or `null` for the
+ * ordinary Play that stops at the menu. Set by the Play button of a world
+ * card and read by the launch request; it is a signal and not an argument
+ * because the update popup can sit between the click and the launch.
+ */
+export const [quickPlayWorldFolder, setQuickPlayWorldFolder] = createSignal<string | null>(null);
+/** The Library search box on the home: filters the mod list grid by name. */
+export const [librarySearch, setLibrarySearch] = createSignal("");
 export const [search, setSearch] = createSignal("");
 export const [minecraftVersions, setMinecraftVersions] = createSignal<string[]>(["1.21.1", "1.20.6", "1.20.4", "1.19.4"]);
 export const [mcWithSnapshots, setMcWithSnapshots] = createSignal<string[]>([]);

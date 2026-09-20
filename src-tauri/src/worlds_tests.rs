@@ -244,10 +244,13 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
     );
     write_world(&root, "test2", "26.3-fabric", "New World", "New World", 1, 2_000);
 
-    let hidden = vec![WorldId {
-        modlist_name: "test2".into(),
-        instance_name: "26.3-fabric".into(),
-        folder_name: "New World".into(),
+    let hidden = vec![HiddenWorld {
+        id: WorldId {
+            modlist_name: "test2".into(),
+            instance_name: "26.3-fabric".into(),
+            folder_name: "New World".into(),
+        },
+        hidden_at_last_played_ms: Some(2_000),
     }];
 
     let entries = list_worlds(&root, &hidden).expect("listing must not fail");
@@ -268,7 +271,149 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
 }
 
 #[test]
-fn hiding_a_world_persists_the_triple_and_unhiding_removes_it() {
+fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
+    // A row written before D65: the triple, no baseline. It must not mean
+    // "hidden forever" — there is no show-hidden switch to escape through —
+    // so the first listing adopts the world's current `LastPlayed` and the
+    // world behaves like anything hidden today.
+    let root = unique_root("old-hidden-row");
+    let directory = write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_000);
+    let connection = open_test_database(&root);
+    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
+    connection
+        .execute(
+            "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
+            [HIDDEN_WORLDS_KEY, old_value],
+        )
+        .expect("the old-format row should write");
+
+    assert_eq!(
+        load_hidden_worlds(&connection).expect("the old-format row should deserialize"),
+        vec![HiddenWorld {
+            id: WorldId {
+                modlist_name: "pack".into(),
+                instance_name: "1.20.1-forge".into(),
+                folder_name: "Old World".into(),
+            },
+            hidden_at_last_played_ms: None,
+        }]
+    );
+
+    let entries = list_worlds_with_baseline_backfill(&root, &connection)
+        .expect("listing must not fail");
+    assert!(entries[0].hidden, "the world stays where the user left it");
+    assert_eq!(
+        load_hidden_worlds(&connection).expect("the row must read back"),
+        vec![HiddenWorld {
+            id: WorldId {
+                modlist_name: "pack".into(),
+                instance_name: "1.20.1-forge".into(),
+                folder_name: "Old World".into(),
+            },
+            hidden_at_last_played_ms: Some(9_000),
+        }],
+        "the missing baseline is adopted from the world itself"
+    );
+
+    // He plays it again: it comes back on its own.
+    drop(directory);
+    write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_500);
+    let after_play = list_worlds_with_baseline_backfill(&root, &connection)
+        .expect("listing must not fail");
+    assert!(!after_play[0].hidden);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_backfill_leaves_a_hidden_world_that_is_no_longer_on_disk_alone() {
+    // Nothing to adopt: the row keeps its empty baseline instead of being
+    // dropped or given a made-up one.
+    let root = unique_root("old-hidden-gone");
+    fs::create_dir_all(&root).expect("failed to create the root");
+    let connection = open_test_database(&root);
+    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Deleted"}]"#;
+    connection
+        .execute(
+            "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
+            [HIDDEN_WORLDS_KEY, old_value],
+        )
+        .expect("the old-format row should write");
+
+    let entries = list_worlds_with_baseline_backfill(&root, &connection)
+        .expect("listing must not fail");
+    assert!(entries.is_empty());
+    assert_eq!(
+        load_hidden_worlds(&connection).expect("the row must read back")[0].hidden_at_last_played_ms,
+        None
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_world_becomes_visible_when_last_played_advances_past_the_hide_baseline() {
+    let root = unique_root("hidden-until-played");
+    write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_000);
+    let hidden = vec![HiddenWorld {
+        id: WorldId {
+            modlist_name: "pack".into(),
+            instance_name: "1.20.1-forge".into(),
+            folder_name: "World".into(),
+        },
+        hidden_at_last_played_ms: Some(1_000),
+    }];
+
+    let at_baseline = list_worlds(&root, &hidden).expect("listing must not fail");
+    assert!(at_baseline[0].hidden);
+
+    write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_250);
+    let after_play = list_worlds(&root, &hidden).expect("listing must not fail");
+    assert!(!after_play[0].hidden);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rehiding_after_a_later_play_updates_the_stored_baseline() {
+    let root = unique_root("rehide-baseline");
+    let directory = write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_000);
+    let connection = open_test_database(&root);
+    let world = WorldId {
+        modlist_name: "pack".into(),
+        instance_name: "1.20.1-forge".into(),
+        folder_name: "World".into(),
+    };
+    let level_dat_path = directory.join(LEVEL_DAT_FILE_NAME);
+
+    let first_baseline = read_level_dat(&level_dat_path).and_then(|level| level.last_played);
+    set_world_hidden(&connection, &world, true, first_baseline)
+        .expect("the first hide must persist");
+    assert_eq!(
+        load_hidden_worlds(&connection).expect("the first baseline must read back"),
+        vec![HiddenWorld {
+            id: world.clone(),
+            hidden_at_last_played_ms: Some(1_000),
+        }]
+    );
+
+    write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_250);
+    let later_baseline = read_level_dat(&level_dat_path).and_then(|level| level.last_played);
+    set_world_hidden(&connection, &world, true, later_baseline)
+        .expect("re-hiding must persist the later baseline");
+    assert_eq!(
+        load_hidden_worlds(&connection).expect("the later baseline must read back"),
+        vec![HiddenWorld {
+            id: world,
+            hidden_at_last_played_ms: Some(1_250),
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hiding_a_world_persists_one_entry_and_unhiding_removes_it() {
     let root = unique_root("hidden-db");
     fs::create_dir_all(&root).expect("failed to create the root");
     let connection = open_test_database(&root);
@@ -288,23 +433,31 @@ fn hiding_a_world_persists_the_triple_and_unhiding_removes_it() {
         .expect("a missing row is an empty list")
         .is_empty());
 
-    set_world_hidden(&connection, &world, true).expect("hiding must persist");
-    // Hiding twice must not duplicate the entry.
-    set_world_hidden(&connection, &world, true).expect("hiding twice must be idempotent");
+    set_world_hidden(&connection, &world, true, Some(2_000)).expect("hiding must persist");
+    // Hiding twice must update the same entry rather than duplicate it.
+    set_world_hidden(&connection, &world, true, Some(2_000))
+        .expect("hiding twice must remain one entry");
     assert_eq!(
         load_hidden_worlds(&connection).expect("the row must read back"),
-        vec![world.clone()]
+        vec![HiddenWorld {
+            id: world.clone(),
+            hidden_at_last_played_ms: Some(2_000),
+        }]
     );
 
     // The other `New World` is a different world: un-hiding it must not
     // touch this one.
-    set_world_hidden(&connection, &other, false).expect("unhiding an absent world is a no-op");
+    set_world_hidden(&connection, &other, false, None)
+        .expect("unhiding an absent world is a no-op");
     assert_eq!(
         load_hidden_worlds(&connection).expect("the row must read back"),
-        vec![world.clone()]
+        vec![HiddenWorld {
+            id: world.clone(),
+            hidden_at_last_played_ms: Some(2_000),
+        }]
     );
 
-    set_world_hidden(&connection, &world, false).expect("unhiding must persist");
+    set_world_hidden(&connection, &world, false, None).expect("unhiding must persist");
     assert!(load_hidden_worlds(&connection)
         .expect("the row must read back")
         .is_empty());
@@ -323,7 +476,7 @@ fn saving_the_settings_form_leaves_the_hidden_worlds_alone() {
         instance_name: "26.3-fabric".into(),
         folder_name: "New World".into(),
     };
-    set_world_hidden(&connection, &world, true).expect("hiding must persist");
+    set_world_hidden(&connection, &world, true, Some(1_000)).expect("hiding must persist");
 
     save_global_settings(
         &connection,
@@ -344,7 +497,10 @@ fn saving_the_settings_form_leaves_the_hidden_worlds_alone() {
 
     assert_eq!(
         load_hidden_worlds(&connection).expect("the hidden list must survive a settings save"),
-        vec![world]
+        vec![HiddenWorld {
+            id: world,
+            hidden_at_last_played_ms: Some(1_000),
+        }]
     );
 
     let _ = fs::remove_dir_all(&root);
