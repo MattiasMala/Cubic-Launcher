@@ -494,23 +494,48 @@ pub fn find_version_for_data_version(
     };
 
     for entry in entries.flatten() {
-        let jar_path = entry.path().join(CLIENT_JAR_FILENAME);
+        let version_dir = entry.path();
+        let jar_path = version_dir.join(CLIENT_JAR_FILENAME);
         if !jar_path.is_file() {
-            continue;
-        }
-        let Ok(found) = read_jar_data_version(&jar_path) else {
-            continue;
-        };
-        if found != data_version {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        let found = match cached_data_version(&version_dir, &name) {
+            Some(cached) => cached,
+            None => match read_jar_data_version(&jar_path) {
+                Ok(found) => found,
+                Err(_) => continue,
+            },
+        };
+        if found != data_version {
+            continue;
+        }
         return Ok(Some(name));
     }
 
     Ok(None)
+}
+
+/// La `DataVersion` di una versione senza aprire il suo `client.jar`.
+///
+/// Misurato: aprire un jar costa **226 ms** (1.20.1, 20 953 voci) e **375 ms**
+/// (26.3, 34 227 voci) in debug, perché `ZipArchive::new` legge tutta la
+/// directory centrale; e questa funzione li apriva **tutti** finché non
+/// trovava la versione giusta — 1447 ms su cinque jar, cioè l'intero blocco
+/// che si vedeva aprendo il pannello.
+///
+/// Lo stesso numero sta già in `options-keys.json`, 3 KiB accanto al jar, che
+/// viene proprio da `version.json` di quel jar. Fidarsene non allarga la
+/// fiducia che il codice già dà a quel file: [`load_or_derive`] ne prende
+/// l'insieme delle chiavi vanilla senza riaprire il jar. Se il file manca, è
+/// di un formato vecchio o non è di questa versione, si torna al jar.
+fn cached_data_version(version_dir: &Path, version_id: &str) -> Option<i64> {
+    let text = std::fs::read_to_string(version_dir.join(CACHE_FILENAME)).ok()?;
+    let cached: VanillaOptionKeys = serde_json::from_str(&text).ok()?;
+    (cached.format_version == DERIVATION_FORMAT_VERSION && cached.version_id == version_id)
+        .then_some(cached.data_version)
 }
 
 /// I gruppi presi in prestito da un'altra versione, quando quella bersaglio

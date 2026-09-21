@@ -14,6 +14,12 @@ export interface SelectProps {
   class?: string;
   /** Classes applied to the popup panel in addition to the base ones. */
   panelClass?: string;
+  /**
+   * Which edge the popup is anchored to. Inside a modal a left-anchored panel
+   * whose options are wider than the trigger runs past the right border and
+   * gets clipped; anchoring it right makes it grow inwards instead.
+   */
+  align?: "left" | "right";
   /** Open the panel above the trigger (for controls near the bottom edge). */
   direction?: "up" | "down";
   disabled?: boolean;
@@ -61,20 +67,22 @@ export function Select(props: SelectProps) {
       </button>
       <Show when={open()}>
         <div
-          class={`absolute left-0 z-50 min-w-full max-h-64 overflow-y-auto rounded-lg border border-borderColor bg-bgPanel py-1 shadow-lg ${
-            props.direction === "up" ? "bottom-full mb-1" : "top-full mt-1"
-          } ${props.panelClass ?? ""}`}
+          class={`absolute z-50 min-w-full max-h-64 overflow-y-auto rounded-lg border border-borderColor bg-bgPanel py-1 shadow-lg ${
+            props.align === "right" ? "right-0" : "left-0"
+          } ${props.direction === "up" ? "bottom-full mb-1" : "top-full mt-1"} ${
+            props.panelClass ?? ""
+          }`}
         >
           <For each={props.options}>
             {option => (
               <button
                 type="button"
                 onClick={() => { props.onChange(option.value); setOpen(false); }}
-                class={`flex w-full items-center px-3 py-1.5 text-left text-xs transition-colors hover:bg-bgHover whitespace-nowrap ${
+                class={`flex w-full items-center px-3 py-1.5 text-left text-xs transition-colors hover:bg-bgHover ${
                   option.value === props.value ? "text-accentColor font-medium" : "text-textMain"
                 }`}
               >
-                {option.label}
+                <span class="truncate">{option.label}</span>
               </button>
             )}
           </For>

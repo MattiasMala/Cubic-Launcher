@@ -60,9 +60,9 @@ export type Invoke = (command: string, args?: Record<string, unknown>) => Promis
 const RESOURCE_PACK_KEYS = ["resourcePacks", "incompatibleResourcePacks"];
 
 const PREFIX_GROUP_LABELS: Record<Exclude<OptionKind, "plain">, string> = {
-  keybind: "Comandi",
-  soundCategory: "Volumi",
-  modelPart: "Aspetto del personaggio",
+  keybind: "Controls",
+  soundCategory: "Music & Sounds",
+  modelPart: "Skin Customization",
 };
 
 /**
@@ -71,20 +71,24 @@ const PREFIX_GROUP_LABELS: Record<Exclude<OptionKind, "plain">, string> = {
  * quindi deve reggere da solo 86 righe: per questo la casella di ricerca sopra
  * l'elenco filtra su tutti i gruppi e questo resta ordinato per nome.
  */
-const FALLBACK_GROUP = "Altre impostazioni";
+const FALLBACK_GROUP = "Other settings";
 
 const REASON_LABELS: Record<BlockReason, string> = {
-  notVanilla: "non è una chiave vanilla (quasi sempre di un mod)",
-  internalState: "è stato di quella installazione, non una preferenza",
-  resourcePacksOff: "la lista dei resource pack, spenta per questo salto",
-  unchecked: "spunta tolta",
+  notVanilla: "not a vanilla key (almost always from a mod)",
+  internalState: "state of that installation, not a preference",
+  resourcePacksOff: "the resource pack list, off for this hop",
+  unchecked: "unchecked",
 };
 
 
+/**
+ * Il livello che il pannello apre. Le istanze non sono qui: si guardano dal
+ * menu «From» di una modlist e non si modificano (D73).
+ */
+export type PanelScope = { level: "global" } | { level: "modlist"; modlist: string };
+
 interface Props {
-  modlist: string;
-  /** Le altre modlist, per il dropdown che copia le loro impostazioni. */
-  otherModlists: string[];
+  scope: PanelScope;
   /** Iniettabile per poter mostrare il pannello fuori da Tauri. */
   invoke?: Invoke;
   /** Vista iniziale, quando il chiamante l'ha già caricata. */
@@ -130,28 +134,32 @@ export function GameOptionsPanel(props: Props) {
     const current = view();
     return Boolean(current?.exists) && (current?.dataVersion ?? null) === null;
   };
-  const scope = (): OptionsScope => ({ level: "modlist", modlist: props.modlist });
+  /** Il nome della modlist, quando il pannello ne sta aprendo una. */
+  const modlistName = () => (props.scope.level === "modlist" ? props.scope.modlist : null);
 
   /**
-   * Quale file si sta guardando. `default` è la modlist corrente; le altre
-   * voci — le altre modlist e le istanze di questa — **non copiano niente**,
-   * aprono quel file in lettura. Così le spunte e il contatore descrivono la
-   * sorgente vera di quel salto, che è quello che chiede D67, e per portarsela
-   * qui serve il bottone apposta, che chiede conferma.
+   * Quale file si sta guardando. `default` è il file di questo livello; le
+   * altre voci — le istanze di questa modlist, e solo quelle (D74) — **non
+   * copiano niente**, aprono quel file in lettura. Così le spunte e il
+   * contatore descrivono la sorgente vera di quel salto, che è quello che
+   * chiede D67, e per portarsela qui serve il bottone apposta, che chiede
+   * conferma.
+   *
+   * Le altre modlist non compaiono: copiare da una modlist all'altra è fuori
+   * dalla feature, e la voce è stata tolta, non nascosta.
    */
   const previewing = () => source() !== "default";
   const sourceScope = (): OptionsScope => {
     const selected = source();
-    if (selected.startsWith("i:")) {
-      return { level: "instance", modlist: props.modlist, instance: selected.slice(2) };
+    const modlist = modlistName();
+    if (selected.startsWith("i:") && modlist !== null) {
+      return { level: "instance", modlist, instance: selected.slice(2) };
     }
-    if (selected.startsWith("m:")) return { level: "modlist", modlist: selected.slice(2) };
-    return scope();
+    return props.scope;
   };
   const sourceLabel = () => {
     const selected = source();
-    if (selected.startsWith("i:")) return `istanza ${selected.slice(2)}`;
-    if (selected.startsWith("m:")) return `modlist ${selected.slice(2)}`;
+    if (selected.startsWith("i:")) return `instance ${selected.slice(2)}`;
     return "default";
   };
 
@@ -164,8 +172,14 @@ export function GameOptionsPanel(props: Props) {
       })) as SharedOptionsView;
       setView(loaded);
       setEdits({});
+      // Il globale non ha istanze: niente da elencare, e nessun menu «From».
+      const modlist = modlistName();
+      if (modlist === null) {
+        setInstances([]);
+        return;
+      }
       const listed = (await call()("list_instance_files_command", {
-        modlistName: props.modlist,
+        modlistName: modlist,
       })) as Array<{ name: string; isDir: boolean }>;
       setInstances(listed.filter(node => node.isDir).map(node => node.name));
     } catch (loadError) {
@@ -278,11 +292,11 @@ export function GameOptionsPanel(props: Props) {
 
   const describe = (status: SeedStatus): string => {
     if (status.status === "seeded") {
-      return `${status.report.seeded} impostazioni scritte in ${status.report.target}; ${status.report.blocked.length} non passate.`;
+      return `${status.report.seeded} settings written to ${status.report.target}; ${status.report.blocked.length} did not pass.`;
     }
-    if (status.status === "refused") return `Rifiutato: ${status.reason}`;
-    if (status.status === "skippedNoSource") return `Niente da copiare: ${status.source} non esiste.`;
-    return `Niente da fare: ${status.target} esiste già.`;
+    if (status.status === "refused") return `Refused: ${status.reason}`;
+    if (status.status === "skippedNoSource") return `Nothing to copy: ${status.source} does not exist.`;
+    return `Nothing to do: ${status.target} already exists.`;
   };
 
   const apply = async (from: OptionsScope, to: OptionsScope, toInstance: boolean) => {
@@ -317,8 +331,8 @@ export function GameOptionsPanel(props: Props) {
       value: edits()[entry.key] ?? entry.value,
     }));
     try {
-      await call()("save_shared_options_command", { scope: scope(), entries });
-      setNotice("Salvato.");
+      await call()("save_shared_options_command", { scope: props.scope, entries });
+      setNotice("Saved.");
       await load();
     } catch (saveError) {
       setError(String(saveError));
@@ -331,15 +345,13 @@ export function GameOptionsPanel(props: Props) {
     if (value === source()) return;
     setSource(value);
     setCheckedOverride({});
-    // In anteprima l'unico gesto è "porta qui", cioè un salto verso questa
-    // modlist; tornando a «default» il gesto disponibile è di nuovo la
+    // In anteprima l'unico gesto è "porta qui", cioè un salto verso questo
+    // livello; tornando a «default» il gesto disponibile è di nuovo la
     // ri-applicazione a un'istanza. Il selettore del contatore segue, se no
     // le spunte mostrano un default e il bottone ne usa un altro.
     setJump(value === "default" ? "instance" : "modlist");
     setNotice(
-      value === "default"
-        ? null
-        : `Stai guardando ${sourceLabel()}. Non è stato copiato niente.`,
+      value === "default" ? null : `Viewing ${sourceLabel()}. Nothing has been copied.`,
     );
     void load();
   };
@@ -347,10 +359,10 @@ export function GameOptionsPanel(props: Props) {
   const copyFromSource = () => {
     if (!previewing()) return;
     setConfirm({
-      title: `Portare qui le impostazioni di ${sourceLabel()}?`,
-      detail: `Sovrascrive mod-lists/${props.modlist}/options.txt, che è il default da cui nascono le istanze nuove. Le istanze già avviate non cambiano.`,
+      title: `Bring the settings from ${sourceLabel()} here?`,
+      detail: `Overwrites mod-lists/${modlistName()}/options.txt, the default that new instances are born from. Instances that already exist do not change.`,
       run: async () => {
-        await apply(sourceScope(), scope(), false);
+        await apply(sourceScope(), props.scope, false);
         setSource("default");
         setCheckedOverride({});
         await load();
@@ -360,19 +372,20 @@ export function GameOptionsPanel(props: Props) {
 
   const reapply = () => {
     const target = instance();
-    if (!target) return;
+    const modlist = modlistName();
+    if (!target || modlist === null) return;
     setConfirm({
-      title: `Ri-applicare a «${target}»?`,
-      detail: `Sovrascrive mod-lists/${props.modlist}/instances/${target}/options.txt, che da quando esiste è del gioco: quello che hai cambiato in gioco in quell'istanza va perso.`,
-      run: () => apply(scope(), { level: "instance", modlist: props.modlist, instance: target }, true),
+      title: `Re-apply to “${target}”?`,
+      detail: `Overwrites mod-lists/${modlist}/instances/${target}/options.txt, which has belonged to the game since it was created: whatever you changed in-game in that instance is lost.`,
+      run: () => apply(props.scope, { level: "instance", modlist, instance: target }, true),
     });
   };
 
   const promoteToGlobal = () => {
     setConfirm({
-      title: "Promuovere a default globale?",
-      detail: "Sovrascrive options.txt globale, che è il modello per le modlist nuove. Le modlist che esistono già non cambiano.",
-      run: () => apply(scope(), { level: "global" }, false),
+      title: "Promote to the global default?",
+      detail: "Overwrites the global options.txt, the template for new mod-lists. Mod-lists that already exist do not change.",
+      run: () => apply(props.scope, { level: "global" }, false),
     });
   };
 
@@ -386,26 +399,47 @@ export function GameOptionsPanel(props: Props) {
             version:{view()!.dataVersion} · {view()!.versionId}
           </span>
         </Show>
-        <div class="ml-auto flex items-center gap-2">
-          <span class="text-muted-foreground">Da</span>
-          <Select
-            value={source()}
-            onChange={onSourceChange}
-            class="rounded-md border border-input bg-input px-2 py-1 text-xs text-foreground"
-            options={[
-              { value: "default", label: "default" },
-              ...props.otherModlists.map(name => ({ value: `m:${name}`, label: `modlist ${name}` })),
-              ...instances().map(name => ({ value: `i:${name}`, label: `istanza ${name}` })),
-            ]}
-            title="Guarda le impostazioni di un'altra modlist o di un'istanza, senza copiarle"
-          />
-        </div>
+        {/*
+          Il menu vive solo dove ha senso: il globale non ha istanze sotto di
+          sé, e le altre modlist non sono una sorgente (D74).
+        */}
+        <Show when={modlistName() !== null}>
+          <div class="ml-auto flex min-w-0 items-center gap-2">
+            <span class="text-muted-foreground">From</span>
+            <Select
+              value={source()}
+              onChange={onSourceChange}
+              align="right"
+              // Il pannello sta dentro un modale: il menu si apre verso
+              // sinistra e si tronca, invece di uscire dal bordo destro.
+              panelClass="max-w-[18rem]"
+              class="max-w-[14rem] rounded-md border border-input bg-input px-2 py-1 text-xs text-foreground"
+              options={[
+                { value: "default", label: "default" },
+                ...instances().map(name => ({ value: `i:${name}`, label: `instance ${name}` })),
+              ]}
+              title="View an instance's settings without copying them"
+            />
+          </div>
+        </Show>
       </div>
 
       <Show when={view() && !view()!.exists}>
         <p class="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          Questa modlist non ha ancora un <code>options.txt</code>. Nasce dal globale alla
-          creazione, oppure si promuove da un'istanza qui sotto.
+          <Show
+            when={modlistName() !== null}
+            fallback={
+              <>
+                There is no global <code>options.txt</code> yet. It is written the first
+                time you promote a mod-list's settings to the global default.
+              </>
+            }
+          >
+            <>
+              This mod-list has no <code>options.txt</code> yet. It is born from the global
+              file when the mod-list is created, or promoted from an instance below.
+            </>
+          </Show>
         </p>
       </Show>
 
@@ -414,21 +448,28 @@ export function GameOptionsPanel(props: Props) {
           class="rounded-md border border-red-700/40 bg-red-900/20 px-3 py-2 text-xs text-red-300"
           data-testid="missing-version"
         >
-          A questo file manca la riga <code>version:</code>, e senza quella il gioco lo
-          tratta come DataVersion 0: alla prima lettura gli applicherebbe tutti i
-          datafixer delle opzioni, compreso quello che rimappa i codici dei tasti. Non ne
-          invento una, e non prenderla da un'istanza a caso: quel numero dice chi ha
-          scritto <em>questi</em> valori, e appiccicarne un altro li fa migrare storti.
-          O rimetti la riga che c'era, o scegli un'istanza nel menu «Da» qui sopra e premi
-          «Porta queste impostazioni», che porta file e numero insieme. Fino ad allora
-          salvare è disattivato.
+          This file has no <code>version:</code> line, and without it the game treats it as
+          DataVersion 0: on the first read it would apply every options datafixer, including
+          the one that remaps key codes. I will not invent one, and do not take it from a
+          random instance: that number says who wrote <em>these</em> values, and pasting a
+          different one migrates them wrong.
+          <Show
+            when={modlistName() !== null}
+            fallback={<> Put the line that was there back. Until then, saving is disabled.</>}
+          >
+            <>
+              {" "}Either put the line that was there back, or pick an instance in the “From”
+              menu above and press “Bring these settings”, which brings the file and the
+              number together. Until then, saving is disabled.
+            </>
+          </Show>
         </p>
       </Show>
 
       <Show when={view()?.derivationError && !missingVersion()}>
         <p class="rounded-md border border-amber-700/40 bg-amber-900/20 px-3 py-2 text-xs text-amber-300">
-          Non so dire quali chiavi siano vanilla: {view()!.derivationError}. Finché è così, non
-          si semina niente.
+          I can't tell which keys are vanilla: {view()!.derivationError}. While that is the
+          case, nothing is seeded.
         </p>
       </Show>
 
@@ -444,7 +485,7 @@ export function GameOptionsPanel(props: Props) {
           type="text"
           value={search()}
           onInput={event => setSearch(event.currentTarget.value)}
-          placeholder="Cerca fra le impostazioni…"
+          placeholder="Search settings…"
           class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
       </div>
@@ -452,7 +493,7 @@ export function GameOptionsPanel(props: Props) {
       <div class="max-h-[46vh] overflow-y-auto rounded-md border border-border">
         <Show
           when={!loading()}
-          fallback={<p class="px-3 py-6 text-center text-xs text-muted-foreground">Carico…</p>}
+          fallback={<p class="px-3 py-6 text-center text-xs text-muted-foreground">Loading…</p>}
         >
           <For each={groups()}>
             {group => (
@@ -481,8 +522,8 @@ export function GameOptionsPanel(props: Props) {
                           onChange={() => toggle(entry.key)}
                           title={
                             entry.vanilla
-                              ? "Copia questa riga quando si semina"
-                              : "Non è vanilla: non si semina mai"
+                              ? "Copy this line when seeding"
+                              : "Not vanilla: never seeded"
                           }
                         />
                         <code
@@ -496,7 +537,7 @@ export function GameOptionsPanel(props: Props) {
                           readOnly={previewing()}
                           title={
                             previewing()
-                              ? "Stai guardando un altro file: qui non si modifica"
+                              ? "An instance's options.txt belongs to the game: you can look at it and promote it, not edit it"
                               : undefined
                           }
                           onInput={event =>
@@ -523,22 +564,30 @@ export function GameOptionsPanel(props: Props) {
             data-testid="blocked-counter"
           >
             <MaterialIcon name={blockedOpen() ? "expand_more" : "chevron_right"} size="sm" />
-            {blocked().length} righe non passano
+            {blocked().length === 1 ? "1 line doesn't pass" : `${blocked().length} lines don't pass`}
           </button>
-          <div class="ml-auto flex items-center gap-2">
-            <span class="text-muted-foreground">seminando verso</span>
-            <Select
-              value={jump()}
-              onChange={value => setJump(value as "instance" | "modlist")}
-              class="rounded-md border border-input bg-input px-2 py-0.5 text-xs text-foreground"
-              options={[
-                { value: "instance", label: "un'istanza di questa modlist" },
-                { value: "modlist", label: "un'altra modlist o il globale" },
-              ]}
-              title="I default cambiano con il salto (D67)"
-              disabled={previewing()}
-            />
-          </div>
+          {/*
+            Il globale non ha istanze sotto di sé: il suo unico salto è verso
+            una modlist, e un selettore con una voce sola sarebbe finto.
+          */}
+          <Show when={modlistName() !== null}>
+            <div class="ml-auto flex items-center gap-2">
+              <span class="text-muted-foreground">seeding toward</span>
+              <Select
+                value={jump()}
+                onChange={value => setJump(value as "instance" | "modlist")}
+                align="right"
+                panelClass="max-w-[18rem]"
+                class="max-w-[14rem] rounded-md border border-input bg-input px-2 py-0.5 text-xs text-foreground"
+                options={[
+                  { value: "instance", label: "an instance of this mod-list" },
+                  { value: "modlist", label: "the global default" },
+                ]}
+                title="The defaults change with the hop (D67)"
+                disabled={previewing()}
+              />
+            </div>
+          </Show>
         </div>
         <Show when={blockedOpen()}>
           <div class="max-h-40 overflow-y-auto border-t border-border px-3 py-2">
@@ -568,44 +617,54 @@ export function GameOptionsPanel(props: Props) {
             onClick={copyFromSource}
             class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
           >
-            Porta queste impostazioni in «{props.modlist}»
+            Bring these settings into “{modlistName()}”
           </button>
           <span class="text-xs text-muted-foreground">
-            stai guardando {sourceLabel()}: gli altri gesti tornano scegliendo «default»
+            viewing {sourceLabel()}, read-only: the other actions come back when you pick
+            “default”
           </span>
         </Show>
         <Show when={!previewing()}>
-          <Select
-            value={instance()}
-            onChange={setInstance}
-            placeholder="scegli un'istanza"
-            class="rounded-md border border-input bg-input px-2 py-1 text-xs text-foreground"
-            options={instances().map(name => ({ value: name, label: name }))}
-            title="Le istanze di questa modlist"
-          />
-          <button
-            type="button"
-            onClick={reapply}
-            disabled={!instance()}
-            class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
-          >
-            Ri-applica all'istanza
-          </button>
-          <button
-            type="button"
-            onClick={promoteToGlobal}
-            class="ml-auto rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
-          >
-            Promuovi a default globale
-          </button>
+          {/*
+            Ri-applicare e promuovere sono gesti di una modlist: dal globale
+            non c'è un'istanza a cui applicare, e promuovere il globale a sé
+            stesso non vuol dire niente.
+          */}
+          <Show when={modlistName() !== null}>
+            <Select
+              value={instance()}
+              onChange={setInstance}
+              placeholder="pick an instance"
+              align="right"
+              panelClass="max-w-[18rem]"
+              class="max-w-[14rem] rounded-md border border-input bg-input px-2 py-1 text-xs text-foreground"
+              options={instances().map(name => ({ value: name, label: name }))}
+              title="The instances of this mod-list"
+            />
+            <button
+              type="button"
+              onClick={reapply}
+              disabled={!instance()}
+              class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
+            >
+              Re-apply to instance
+            </button>
+            <button
+              type="button"
+              onClick={promoteToGlobal}
+              class="ml-auto rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
+            >
+              Promote to global default
+            </button>
+          </Show>
           <button
             type="button"
             onClick={() => void save()}
             disabled={missingVersion()}
-            title={missingVersion() ? "Manca la riga version: nel file" : undefined}
-            class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            title={missingVersion() ? "The file has no version: line" : undefined}
+            class="ml-auto rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            Salva
+            Save
           </button>
         </Show>
       </div>
@@ -627,7 +686,7 @@ export function GameOptionsPanel(props: Props) {
                 onClick={() => setConfirm(null)}
                 class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
               >
-                Annulla
+                Cancel
               </button>
               <button
                 type="button"
@@ -638,7 +697,7 @@ export function GameOptionsPanel(props: Props) {
                 }}
                 class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
-                Sovrascrivi
+                Overwrite
               </button>
             </div>
           </div>
