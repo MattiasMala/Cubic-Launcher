@@ -118,7 +118,16 @@ export function GameOptionsPanel(props: Props) {
 
   const [source, setSource] = createSignal("default");
   const [instance, setInstance] = createSignal("");
-  const [jump, setJump] = createSignal<"instance" | "modlist">("instance");
+  /**
+   * Verso dove si sta per seminare, che decide i default delle spunte (D67).
+   * Dal globale l'unico salto possibile è verso una modlist — istanze sotto di
+   * sé non ne ha — quindi lì parte di lì e il selettore non si mostra: se
+   * restasse su «istanza», il contatore userebbe i default di un salto che da
+   * quel file non si può fare, e direbbe che i resource pack passano.
+   */
+  const [jump, setJump] = createSignal<"instance" | "modlist">(
+    props.scope.level === "global" ? "modlist" : "instance",
+  );
   const [confirm, setConfirm] = createSignal<null | {
     title: string;
     detail: string;
@@ -662,7 +671,11 @@ export function GameOptionsPanel(props: Props) {
             onClick={() => void save()}
             disabled={missingVersion()}
             title={missingVersion() ? "The file has no version: line" : undefined}
-            class="ml-auto rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            // Un solo `ml-auto` per riga: con due, lo spazio libero si divide
+            // fra i due bottoni e «Promote» resta a mezz'aria.
+            class={`rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 ${
+              modlistName() === null ? "ml-auto" : ""
+            }`}
           >
             Save
           </button>

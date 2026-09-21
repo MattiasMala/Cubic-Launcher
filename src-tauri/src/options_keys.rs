@@ -1279,4 +1279,54 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    /// Il lookup `DataVersion → versione` non apre il jar quando la cache
+    /// delle chiavi c'è: è ciò che toglie 1,4 s all'apertura del pannello.
+    /// Il `client.jar` qui è **vuoto**, quindi leggerlo fallirebbe: se il
+    /// lookup tornasse ad aprirlo, questo test non troverebbe la versione.
+    #[test]
+    fn the_version_lookup_reads_the_keys_cache_instead_of_the_jar() {
+        let root = std::env::temp_dir().join(format!(
+            "cubic-options-keys-lookup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        let version_dir = root.join("cache/minecraft/1.20.1");
+        std::fs::create_dir_all(&version_dir).expect("version dir");
+        std::fs::write(version_dir.join(CLIENT_JAR_FILENAME), b"").expect("empty jar");
+        std::fs::write(
+            version_dir.join(CACHE_FILENAME),
+            serde_json::to_string(&sample_keys()).expect("serialize"),
+        )
+        .expect("cache");
+
+        let launcher_paths = LauncherPaths::new(root.clone());
+
+        assert_eq!(
+            find_version_for_data_version(&launcher_paths, 3465).expect("lookup"),
+            Some("1.20.1".to_string())
+        );
+        assert_eq!(
+            find_version_for_data_version(&launcher_paths, 5023).expect("lookup"),
+            None
+        );
+
+        // Una cache di un'altra versione non vale per questa cartella: senza
+        // il controllo, il jar vuoto la lascerebbe passare lo stesso.
+        let mut foreign = sample_keys();
+        foreign.version_id = "26.3".into();
+        std::fs::write(
+            version_dir.join(CACHE_FILENAME),
+            serde_json::to_string(&foreign).expect("serialize"),
+        )
+        .expect("cache");
+        assert_eq!(
+            find_version_for_data_version(&launcher_paths, 3465).expect("lookup"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
