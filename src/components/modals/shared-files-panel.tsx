@@ -246,7 +246,9 @@ export function SharedFilesPanel(props: Props) {
             <p class="mt-1 text-xs text-muted-foreground">
               <strong>{props.modlist}</strong> will adopt the server list, hotbars and command
               history of <strong>{other()}</strong>. The ones {props.modlist} has now are
-              replaced, not merged. Each instance keeps a <code>.bak</code> of the file it had.
+              replaced, not merged. The replacement happens at the next launch of each
+              instance, and the first time an instance's file is replaced the old one is kept
+              next to it as <code>.bak</code>.
             </p>
             <div class="mt-3 flex gap-2">
               <button

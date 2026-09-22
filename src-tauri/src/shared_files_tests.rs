@@ -773,3 +773,25 @@ fn the_backup_never_leaves_in_an_archive() {
     assert!(!is_excluded_from_export("options.txt.bak"));
     assert!(!is_excluded_from_export("servers.dat"));
 }
+
+#[test]
+fn hotbars_do_not_travel_when_nobody_can_say_which_version_reads_them() {
+    // Non sapere è un no. È il caso normale di un'istanza al primo avvio il cui
+    // jar non si è lasciato derivare: lasciar passare qui vorrebbe dire copiare
+    // hotbar che potrebbero svuotarsi.
+    let fixture = Fixture::new("hotbar-unknown");
+    let unknown = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_canonical("Drehmal", SharedFile::Hotbar, &hotbar_bytes(5023, "nuove"));
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &unknown, None);
+
+    let SharedFileAction::Refused { reason } = action_for(&statuses, SharedFile::Hotbar) else {
+        panic!(
+            "senza la DataVersion della destinazione la copia deve fermarsi, non passare: {:?}",
+            action_for(&statuses, SharedFile::Hotbar)
+        );
+    };
+    assert!(reason.contains("no way to tell"), "{reason}");
+    assert!(!instance_path(&unknown, SharedFile::Hotbar).exists());
+}

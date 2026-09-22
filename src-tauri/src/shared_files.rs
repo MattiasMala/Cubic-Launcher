@@ -476,8 +476,23 @@ fn nbt_data_version(bytes: &[u8]) -> Option<i64> {
 /// attraversano comunque, perché la conversione `tag` → `components` non sa
 /// cosa farsene di un `tag` che non è vanilla.
 fn hotbar_downgrade_refusal(source: &[u8], target_data_version: Option<i64>) -> Option<String> {
+    // Nessuna `DataVersion` nella sorgente vuol dire che quel file non l'ha
+    // scritto `HotbarManager`: non c'è niente da proteggere e non è compito di
+    // questo guardiano decidere cosa sia.
     let source_version = nbt_data_version(source)?;
-    let target_version = target_data_version?;
+
+    // **Non sapere è un no, non un sì.** Se la destinazione non dichiara una
+    // versione — il suo `hotbar.nbt` non esiste ancora e la derivazione della
+    // `DataVersion` del jar non è riuscita — il confronto non si può fare, e
+    // l'unico esito che non può perdere degli item è rifiutare. Lasciar
+    // passare qui sarebbe il difetto peggiore di questa funzione: sembra un
+    // caso raro e invece è il caso **normale** di un'istanza al primo avvio.
+    let Some(target_version) = target_data_version else {
+        return Some(format!(
+            "refused: the hotbars were saved by DataVersion {source_version} and there is no \
+             way to tell which one the destination reads; copying them could empty them (D79)"
+        ));
+    };
 
     if source_version > target_version {
         return Some(format!(
