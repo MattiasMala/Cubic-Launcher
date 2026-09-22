@@ -34,6 +34,7 @@ pub mod process_streaming;
 pub mod resolver;
 pub mod rules;
 pub mod screenshots;
+pub mod shared_files;
 pub mod token_storage;
 mod updater;
 pub mod worlds;
@@ -140,6 +141,10 @@ pub fn run() {
             screenshots::list_screenshots_command,
             screenshots::delete_screenshot_command,
             screenshots::open_screenshot_folder_command,
+            shared_files::shared_files_view_command,
+            shared_files::set_shared_file_enabled_command,
+            shared_files::link_shared_files_command,
+            shared_files::unlink_shared_files_command,
             worlds::list_worlds_command,
             worlds::set_world_hidden_command,
             worlds::open_world_folder_command,

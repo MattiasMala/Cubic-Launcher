@@ -362,10 +362,19 @@ pub(super) async fn fetch_launch_loader_metadata(
         .map_err(Into::into)
 }
 
+/// Quello che serve dopo l'uscita del gioco per riportare i tre file
+/// condivisi nella copia canonica della modlist (E2, D78).
+pub(super) struct SharedFilesContext {
+    pub launcher_paths: LauncherPaths,
+    pub modlist_name: String,
+    pub instance_root: PathBuf,
+}
+
 pub(super) fn spawn_minecraft_process(
     app_handle: tauri::AppHandle,
     launch_log_session: Arc<super::LaunchLogSession>,
     prepared_command: PreparedLaunchCommand,
+    shared_files: SharedFilesContext,
 ) -> Result<StartedLaunch> {
     let sink: Arc<dyn ProcessEventSink> = Arc::new(LoggingProcessEventSink::new(
         app_handle.clone(),
@@ -394,6 +403,16 @@ pub(super) fn spawn_minecraft_process(
         let _ = process.wait();
         *ACTIVE_MC_PID.lock().unwrap() = None;
         super::set_active_launch_log_session(None);
+        // Il gioco è uscito: da adesso nessuno sta più scrivendo i tre file
+        // condivisi, e quello che l'istanza ha in mano può tornare alla
+        // modlist. Se il launcher viene chiuso mentre il gioco gira questo
+        // punto non viene mai raggiunto e le modifiche restano solo
+        // nell'istanza — è il buco dichiarato di questa fase.
+        let _ = emit_log(
+            &app_for_wait,
+            ProcessLogStream::Stdout,
+            format!("[shared] {}", copy_shared_files_back(&shared_files)),
+        );
         let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
     });
 
@@ -401,6 +420,22 @@ pub(super) fn spawn_minecraft_process(
         pid,
         launch_log_dir: launch_log_session.dir().to_path_buf(),
     })
+}
+
+fn copy_shared_files_back(context: &SharedFilesContext) -> String {
+    let connection = match Connection::open(context.launcher_paths.database_path()) {
+        Ok(connection) => connection,
+        Err(error) => return format!("copy back skipped: {error}"),
+    };
+
+    let statuses = crate::shared_files::copy_back_from_instance(
+        &context.launcher_paths,
+        &connection,
+        &context.modlist_name,
+        &context.instance_root,
+    );
+
+    crate::shared_files::describe(&statuses, "copied back into the mod list")
 }
 
 pub(super) fn filter_minecraft_launch_game_arguments(arguments: &[String]) -> Vec<String> {
