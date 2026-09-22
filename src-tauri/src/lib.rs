@@ -34,6 +34,7 @@ pub mod process_streaming;
 pub mod resolver;
 pub mod rules;
 pub mod screenshots;
+pub mod shared_files;
 pub mod token_storage;
 mod updater;
 pub mod worlds;

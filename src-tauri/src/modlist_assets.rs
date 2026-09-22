@@ -578,6 +578,19 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
                     {
                         continue;
                     }
+                    // D77: la cronologia comandi non esce da qui, e non c'è
+                    // un'opzione per rimetterla. Il gioco scrive in
+                    // `command_history.txt` ogni riga di chat che comincia per
+                    // `/`, testo esatto e senza redazione, quindi il
+                    // `/login <password>` con cui si entra nei server AuthMe
+                    // finisce lì in chiaro — e un archivio di modlist è una
+                    // cosa che si manda a qualcun altro. Togliere questo filtro
+                    // è una perdita di credenziali, non una semplificazione.
+                    if crate::shared_files::is_excluded_from_export(
+                        &path.file_name().unwrap_or_default().to_string_lossy(),
+                    ) {
+                        continue;
+                    }
                     if path_contains_any_component(
                         &path,
                         &[
@@ -606,6 +619,15 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
                 for sel_path in &input.selected_other_paths {
                     let full_path = contained_join(&instances_dir, sel_path)?;
                     if full_path.is_file() {
+                        // Stesso filtro di D77 anche qui: nominare il file
+                        // esplicitamente non lo rende meno pericoloso, ed è
+                        // proprio questo il ramo che qualcuno userebbe per
+                        // aggirarlo.
+                        if crate::shared_files::is_excluded_from_export(
+                            &full_path.file_name().unwrap_or_default().to_string_lossy(),
+                        ) {
+                            continue;
+                        }
                         add_file_if_exists(
                             &mut archive,
                             &mut added_paths,
@@ -614,6 +636,11 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
                         )?;
                     } else if full_path.is_dir() {
                         for path in collect_files_recursive(&full_path)? {
+                            if crate::shared_files::is_excluded_from_export(
+                                &path.file_name().unwrap_or_default().to_string_lossy(),
+                            ) {
+                                continue;
+                            }
                             let relative =
                                 path.strip_prefix(&instances_dir).with_context(|| {
                                     format!("failed to make {} relative", path.display())
@@ -1037,6 +1064,69 @@ mod tests {
                 .is_ok(),
             "the contained selected file should be exported"
         );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D77. Il test morde da tutt'e due i lati: se qualcuno toglie il filtro
+    /// dal ramo "tutto" o da quello "file scelti a mano", uno dei due
+    /// `assert!` fallisce e dice perché.
+    #[test]
+    fn the_command_history_never_leaves_in_an_archive() {
+        let root_dir = unique_test_root();
+        let instances_dir = root_dir
+            .join("mod-lists")
+            .join("Safe Pack")
+            .join("instances");
+        let profile_dir = instances_dir.join("profile");
+        fs::create_dir_all(&profile_dir).expect("instance directory should exist");
+        fs::write(profile_dir.join("options.txt"), b"fov:70").expect("options should exist");
+        fs::write(profile_dir.join("servers.dat"), b"nbt").expect("servers should exist");
+        fs::write(
+            profile_dir.join("command_history.txt"),
+            b"/login hunter2\n/tp 100 64 -200\n",
+        )
+        .expect("the command history should exist");
+
+        for selected in [Vec::new(), vec!["profile/command_history.txt".to_string()]] {
+            let archive_path = root_dir.join(format!("export-{}.zip", selected.len()));
+            export_modlist_from_root(
+                &root_dir,
+                &ExportModlistInput {
+                    modlist_name: "Safe Pack".into(),
+                    destination_path: archive_path.display().to_string(),
+                    rules_json: false,
+                    mod_jars: false,
+                    config_files: false,
+                    resource_packs: false,
+                    data_packs: false,
+                    shaders: false,
+                    other_files: true,
+                    selected_other_paths: selected.clone(),
+                },
+            )
+            .expect("export should succeed");
+
+            let archive_file = fs::File::open(&archive_path).expect("archive should open");
+            let archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+            let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name.ends_with("command_history.txt")),
+                "the command history must never be exported (selected: {selected:?}); \
+                 the archive held {names:?}"
+            );
+            if selected.is_empty() {
+                assert!(
+                    names
+                        .iter()
+                        .any(|name| name.ends_with("instances/profile/servers.dat")),
+                    "the filter must be about one file, not about switching the branch off"
+                );
+            }
+        }
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

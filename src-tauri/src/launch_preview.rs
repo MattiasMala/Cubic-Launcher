@@ -794,7 +794,38 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         config_attribution: None,
     })?;
 
-    spawn_minecraft_process(app_handle, launch_log_session, prepared_command)
+    // I tre file condivisi entrano **prima dello spawn**: per `servers.dat` il
+    // margine è stretto, perché basta che il gioco apra la schermata
+    // Multigiocatore e risponda a un ping per riscriverlo (D76).
+    let shared_files = runtime::SharedFilesContext {
+        launcher_paths: launcher_paths.clone(),
+        modlist_name: modlist_name.clone(),
+        instance_root: instance_root.clone(),
+    };
+    {
+        let connection = rusqlite::Connection::open(launcher_paths.database_path())?;
+        let statuses = crate::shared_files::copy_into_instance(
+            &shared_files.launcher_paths,
+            &connection,
+            &shared_files.modlist_name,
+            &shared_files.instance_root,
+        );
+        let _ = emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[shared] {}",
+                crate::shared_files::describe(&statuses, "copied into the instance")
+            ),
+        );
+    }
+
+    spawn_minecraft_process(
+        app_handle,
+        launch_log_session,
+        prepared_command,
+        shared_files,
+    )
 }
 
 #[cfg(test)]
