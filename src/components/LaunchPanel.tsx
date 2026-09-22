@@ -1,6 +1,6 @@
 import { For, Show, createSignal, createEffect } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { MOD_LOADERS } from "../lib/types";
+import { MOD_LOADERS, type AccountSummary } from "../lib/types";
 import {
   selectedMcVersion, setSelectedMcVersion,
   selectedModLoader, setSelectedModLoader,
@@ -17,6 +17,20 @@ interface LaunchPanelProps {
   onSwitchAccount: (id: string) => Promise<void>;
   onVersionChange?: (version: string) => void;
   onLoaderChange?: (loader: string) => void;
+}
+
+// What the account under the Play button can actually do (F1). Before this it
+// said "Microsoft Account" even when every launch fell back to offline.
+function accountSubtitle(account: AccountSummary | undefined): { text: string; warn: boolean } {
+  switch (account?.credentials) {
+    case "unreadable":
+    case "signed_out":
+      return { text: "Offline · sign in again", warn: true };
+    case "keyring_unavailable":
+      return { text: "Offline · keyring unavailable", warn: true };
+    default:
+      return { text: "Microsoft Account", warn: false };
+  }
 }
 
 export function LaunchPanel(props: LaunchPanelProps) {
@@ -184,8 +198,8 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 <span class="text-sm font-semibold text-white">
                   {activeAccount()?.gamertag ?? "Not logged in"}
                 </span>
-                <span class="text-xs text-textMuted flex items-center gap-1">
-                  Microsoft Account
+                <span class={`text-xs flex items-center gap-1 ${accountSubtitle(activeAccount()).warn ? "text-warning" : "text-textMuted"}`}>
+                  {accountSubtitle(activeAccount()).text}
                   <MaterialIcon name="expand_more" size="sm" />
                 </span>
               </div>

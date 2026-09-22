@@ -21,7 +21,12 @@ tauri-build = { version = "2", features = [] }
 aes-gcm = "0.10"
 anyhow = "1"
 base64 = "0.22"
-keyring = "3"
+# Without a backend feature `keyring` silently falls back to its in-memory
+# mock store, which forgets the token key between two `Entry` values: every
+# saved account became undecryptable and every launch fell back to offline
+# (F1). One real store per shipped platform: Secret Service on Linux, the
+# Keychain on macOS, the Credential Manager on Windows.
+keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 libc = "0.2"
 open = "5"
 rand = "0.8"

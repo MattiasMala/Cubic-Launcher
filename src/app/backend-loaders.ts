@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
-import { normalizeModLoader, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
+import { normalizeModLoader, type ActiveAccountSnapshot, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   setModRowsState, setAccounts, setActiveAccountId,
@@ -47,6 +47,28 @@ export async function runResolution(modlistName?: string, mcVersion?: string, mo
   }
 }
 
+/**
+ * Puts the snapshot's active account at the head of the list. Status and
+ * credentials are the backend's word, never assumed: after a sign-in too (F1).
+ */
+export function applyActiveAccountFromSnapshot(active: ActiveAccountSnapshot) {
+  const gamertag = active.xbox_gamertag?.trim() || active.microsoft_id;
+  setAccounts(current => {
+    const rest = current.filter(account => account.id !== active.microsoft_id);
+    return [{
+      id: active.microsoft_id,
+      gamertag,
+      email: active.microsoft_id,
+      avatarUrl: active.avatar_url ?? undefined,
+      status: active.status,
+      lastMode: active.last_mode,
+      credentials: active.credentials,
+      credentialsDetail: active.credentials_detail,
+    }, ...rest];
+  });
+  setActiveAccountId(active.microsoft_id);
+}
+
 export async function loadShellSnapshot(preferredName?: string | null) {
   try {
     const snap: any = await invoke("load_shell_snapshot_command", {
@@ -83,15 +105,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
       setSelectedModListName("");
     }
 
-    if (snap.active_account) {
-      const active = snap.active_account;
-      const gamertag = active.xbox_gamertag?.trim() || active.microsoft_id;
-      setAccounts(current => {
-        const rest = current.filter(account => account.id !== active.microsoft_id);
-        return [{ id: active.microsoft_id, gamertag, email: active.microsoft_id, avatarUrl: active.avatar_url, status: active.status, lastMode: active.last_mode }, ...rest];
-      });
-      setActiveAccountId(active.microsoft_id);
-    }
+    if (snap.active_account) applyActiveAccountFromSnapshot(snap.active_account);
 
     const gs = snap.global_settings;
     if (gs) {

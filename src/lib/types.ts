@@ -104,6 +104,9 @@ export type LauncherUiError = {
   scope: "launch" | "download" | "account";
 };
 
+/** Why an account is online or not (F1): mirrors `CredentialState` in `token_storage.rs`. */
+export type AccountCredentials = "usable" | "signed_out" | "unreadable" | "keyring_unavailable";
+
 export type AccountSummary = {
   id: string;
   gamertag: string;
@@ -111,6 +114,9 @@ export type AccountSummary = {
   avatarUrl?: string;
   status: "online" | "offline";
   lastMode: "microsoft" | "offline";
+  /** Absent for accounts the backend has not described (only the active one is). */
+  credentials?: AccountCredentials;
+  credentialsDetail?: string | null;
 };
 
 export type LaunchResolutionStage = {
@@ -121,6 +127,16 @@ export type LaunchResolutionStage = {
 
 // ── Tauri IPC payloads ────────────────────────────────────────────────────────
 
+export type ActiveAccountSnapshot = {
+  microsoft_id: string;
+  xbox_gamertag?: string | null;
+  avatar_url?: string | null;
+  status: "online" | "offline";
+  last_mode: "microsoft" | "offline";
+  credentials: AccountCredentials;
+  credentials_detail?: string | null;
+};
+
 export type ShellSnapshot = {
   modlists: Array<{
     name: string;
@@ -128,12 +144,7 @@ export type ShellSnapshot = {
     author?: string | null;
     rule_count: number;
   }>;
-  active_account?: {
-    microsoft_id: string;
-    xbox_gamertag?: string | null;
-    status: "online" | "offline";
-    last_mode: "microsoft" | "offline";
-  } | null;
+  active_account?: ActiveAccountSnapshot | null;
   global_settings: {
     min_ram_mb: number;
     max_ram_mb: number;

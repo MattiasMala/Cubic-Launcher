@@ -37,14 +37,17 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
         }
     }
 
+    /// `replace_unreadable` is the user's explicit "Sign in again" (F1): see
+    /// `EncryptedAccountsRepository::save_login`.
     pub fn save_account_login(
         &self,
         profile: ManagedAccountProfile,
         tokens: ManagedAccountTokens,
         make_active: bool,
+        replace_unreadable: bool,
     ) -> Result<()> {
-        self.encrypted_accounts
-            .upsert_account(&PlaintextAccountRecord {
+        self.encrypted_accounts.save_login(
+            &PlaintextAccountRecord {
                 microsoft_id: profile.microsoft_id,
                 xbox_gamertag: profile.xbox_gamertag,
                 minecraft_uuid: profile.minecraft_uuid,
@@ -52,7 +55,16 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
                 refresh_token: tokens.refresh_token,
                 profile_data: profile.profile_data,
                 is_active: make_active,
-            })
+            },
+            replace_unreadable,
+        )
+    }
+
+    /// Fails before the browser opens when the sign-in could not be saved at
+    /// the end.
+    pub fn check_login_can_be_saved(&self, replace_unreadable: bool) -> Result<()> {
+        self.encrypted_accounts
+            .check_login_can_be_saved(replace_unreadable)
     }
 
     pub fn switch_active_account(&self, microsoft_id: &str) -> Result<()> {
@@ -180,6 +192,7 @@ mod tests {
                         refresh_token: Some("refresh-a".into()),
                     },
                     true,
+                    false,
                 )
                 .expect("first account should save");
             manager
@@ -194,6 +207,7 @@ mod tests {
                         access_token: "access-b".into(),
                         refresh_token: None,
                     },
+                    false,
                     false,
                 )
                 .expect("second account should save");
@@ -236,6 +250,7 @@ mod tests {
                         refresh_token: Some("refresh-a".into()),
                     },
                     true,
+                    false,
                 )
                 .expect("first account should save");
             manager
@@ -250,6 +265,7 @@ mod tests {
                         access_token: "access-b".into(),
                         refresh_token: Some("refresh-b".into()),
                     },
+                    false,
                     false,
                 )
                 .expect("second account should save");
