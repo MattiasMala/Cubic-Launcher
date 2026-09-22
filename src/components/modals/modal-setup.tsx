@@ -14,7 +14,6 @@ import {
   createModlistDescription, setCreateModlistDescription,
   createModlistBusy,
   selectedModListName,
-  modListCards,
 } from "../../store";
 import { Modal, ModalHeader } from "./modal-base";
 import { GameOptionsPanel } from "./game-options-panel";
@@ -231,6 +230,21 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     </Show>
                   </div>
                 </div>
+                {/*
+                  Il terzo livello di D66. Stesso componente della scheda
+                  «Game settings» di una modlist, su uno scope diverso: senza
+                  di questo, «Promote to global default» scriveva un file che
+                  poi non si poteva né vedere né modificare da nessuna parte.
+                */}
+                <div class="rounded-md border border-border bg-background p-4">
+                  <p class="mb-1 text-sm font-medium text-foreground">Game settings</p>
+                  <p class="mb-3 text-xs text-muted-foreground">
+                    The global <code>options.txt</code>: the template new mod-lists are born
+                    from. Changing it here does not touch mod-lists or instances that already
+                    exist.
+                  </p>
+                  <GameOptionsPanel scope={{ level: "global" }} />
+                </div>
               </div>
             </Show>
           </div>
@@ -434,12 +448,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
         </div>
         <Show when={tab() === "game"}>
           <div class="overflow-y-auto p-6">
-            <GameOptionsPanel
-              modlist={selectedModListName() ?? ""}
-              otherModlists={modListCards()
-                .map(card => card.name)
-                .filter(name => name !== selectedModListName())}
-            />
+            <GameOptionsPanel scope={{ level: "modlist", modlist: selectedModListName() ?? "" }} />
           </div>
         </Show>
         <Show when={tab() === "identity"}>

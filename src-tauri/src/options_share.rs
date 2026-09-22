@@ -206,7 +206,7 @@ impl SeedStatus {
     pub fn describe(&self) -> String {
         match self {
             SeedStatus::Seeded { report } => format!(
-                "seminate {} impostazioni da {} (version:{}, {}) verso {}; bloccate {}",
+                "seeded {} settings from {} (version:{}, {}) into {}; blocked {}",
                 report.seeded,
                 report.source,
                 report.data_version,
@@ -215,12 +215,12 @@ impl SeedStatus {
                 report.blocked.len()
             ),
             SeedStatus::SkippedTargetExists { target } => {
-                format!("niente da seminare: {target} esiste già")
+                format!("nothing to seed: {target} already exists")
             }
             SeedStatus::SkippedNoSource { source } => {
-                format!("niente da seminare: {source} non esiste")
+                format!("nothing to seed: {source} does not exist")
             }
-            SeedStatus::Refused { reason } => format!("semina rifiutata: {reason}"),
+            SeedStatus::Refused { reason } => format!("seeding refused: {reason}"),
         }
     }
 }
@@ -327,8 +327,8 @@ fn seed_into(
     let Some(data_version) = source.data_version() else {
         return SeedStatus::Refused {
             reason: format!(
-                "{} non ha una riga `{VERSION_KEY}:` leggibile, e senza quella non si sa \
-                 quali nomi fossero vanilla quando i valori sono stati scritti",
+                "{} has no readable `{VERSION_KEY}:` line, and without it there is no way \
+                 to tell which names were vanilla when the values were written",
                 source_path.display()
             ),
         };
@@ -339,8 +339,8 @@ fn seed_into(
         Ok(None) => {
             return SeedStatus::Refused {
                 reason: format!(
-                    "nessun client.jar in cache ha DataVersion {data_version}: \
-                     non si può derivare l'insieme vanilla della sorgente"
+                    "no client.jar in the cache has DataVersion {data_version}: \
+                     the source's vanilla set cannot be derived"
                 ),
             }
         }
@@ -516,13 +516,13 @@ pub fn load_shared_options(
             },
             Ok(None) => {
                 derivation_error = Some(format!(
-                    "nessun client.jar in cache ha DataVersion {data_version}"
+                    "no client.jar in the cache has DataVersion {data_version}"
                 ))
             }
             Err(error) => derivation_error = Some(error.to_string()),
         }
     } else if exists {
-        derivation_error = Some(format!("{} non ha una riga `{VERSION_KEY}:`", path.display()));
+        derivation_error = Some(format!("{} has no `{VERSION_KEY}:` line", path.display()));
     }
 
     // Due dati, due sorgenti, e si deve vedere: `keys` dice cosa è vanilla e
@@ -571,12 +571,32 @@ pub fn load_shared_options(
 // Comandi
 // ---------------------------------------------------------------------------
 
+/// I quattro comandi di questo modulo sono `async` e fanno il lavoro dentro
+/// [`tauri::async_runtime::spawn_blocking`]: un comando sincrono gira sul
+/// thread principale, e finché non ritorna la webview non ridisegna. Qui il
+/// lavoro è I/O su file — leggere `options.txt`, leggere la cache delle
+/// chiavi, e nel caso peggiore (cache assente) derivare da un `client.jar` —
+/// cioè lavoro che non ha niente da fare sul thread della GUI.
+///
+/// Il grosso del blocco misurato non stava qui ma in
+/// [`crate::options_keys::find_version_for_data_version`]; questo copre quello
+/// che resta, che è il primo avvio senza `options-keys.json`.
+async fn off_main_thread<T: Send + 'static>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(joined) => Err(joined.to_string()),
+    }
+}
+
 #[tauri::command]
-pub fn load_shared_options_command(
+pub async fn load_shared_options_command(
     launcher_paths: State<'_, LauncherPaths>,
     scope: OptionsScope,
 ) -> Result<SharedOptionsView, String> {
-    load_shared_options(&launcher_paths, &scope).map_err(|error| error.to_string())
+    let launcher_paths = launcher_paths.inner().clone();
+    off_main_thread(move || load_shared_options(&launcher_paths, &scope)).await
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -587,25 +607,37 @@ pub struct SharedOptionsEntryInput {
 }
 
 #[tauri::command]
-pub fn save_shared_options_command(
+pub async fn save_shared_options_command(
     launcher_paths: State<'_, LauncherPaths>,
     scope: OptionsScope,
     entries: Vec<SharedOptionsEntryInput>,
 ) -> Result<(), String> {
+    let launcher_paths = launcher_paths.inner().clone();
+    off_main_thread(move || save_shared_options(&launcher_paths, &scope, entries)).await
+}
+
+/// Il salvataggio, con il divieto di D73 davanti: l'`options.txt` di
+/// un'istanza è del gioco, il launcher lo crea al primo avvio e poi non lo
+/// riscrive mai. La GUI non offre nemmeno il bottone quando si guarda
+/// un'istanza, ma il divieto sta qui perché è qui che si può fare il danno.
+pub fn save_shared_options(
+    launcher_paths: &LauncherPaths,
+    scope: &OptionsScope,
+    entries: Vec<SharedOptionsEntryInput>,
+) -> anyhow::Result<()> {
     if !scope.is_writable() {
-        return Err(
-            "l'options.txt di un'istanza lo scrive il gioco: il launcher lo crea al primo \
-             avvio e poi non lo tocca più"
-                .to_string(),
+        anyhow::bail!(
+            "an instance's options.txt belongs to the game: the launcher creates it on the \
+             first launch and never touches it again"
         );
     }
 
-    let path = scope.path(&launcher_paths).map_err(|e| e.to_string())?;
+    let path = scope.path(launcher_paths)?;
     let mut file = OptionsFile::new();
     for entry in entries {
         file.set(&entry.key, &entry.value);
     }
-    write_with_version_guard(&file, &path).map_err(|error| error.to_string())
+    write_with_version_guard(&file, &path)
 }
 
 /// Nessuno scrive uno di questi file senza `version:`, nemmeno la GUI.
@@ -628,9 +660,8 @@ fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<(
 
     let Some(data_version) = existing else {
         anyhow::bail!(
-            "{} non può essere scritto senza una riga `{VERSION_KEY}:`: un file senza \
-             vale DataVersion 0 per il gioco, e a zero si applicano tutti i datafixer \
-             delle opzioni",
+            "{} cannot be written without a `{VERSION_KEY}:` line: to the game, a file \
+             without one is DataVersion 0, and at zero every options datafixer is applied",
             path.display()
         );
     };
@@ -650,21 +681,24 @@ fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<(
 /// sempre, perché qui è l'utente a chiederlo: la regola del "una volta sola"
 /// vale per la semina automatica, non per un gesto esplicito.
 #[tauri::command]
-pub fn apply_options_command(
+pub async fn apply_options_command(
     launcher_paths: State<'_, LauncherPaths>,
     from: OptionsScope,
     to: OptionsScope,
     unchecked: Vec<String>,
     include_resource_packs: bool,
 ) -> Result<SeedStatus, String> {
-    apply_options(
-        &launcher_paths,
-        &from,
-        &to,
-        &unchecked.into_iter().collect(),
-        include_resource_packs,
-    )
-    .map_err(|error| error.to_string())
+    let launcher_paths = launcher_paths.inner().clone();
+    off_main_thread(move || {
+        apply_options(
+            &launcher_paths,
+            &from,
+            &to,
+            &unchecked.into_iter().collect(),
+            include_resource_packs,
+        )
+    })
+    .await
 }
 
 pub fn apply_options(
@@ -687,7 +721,7 @@ pub fn apply_options(
     if source == target {
         return Ok(SeedStatus::Refused {
             reason: format!(
-                "sorgente e destinazione sono lo stesso file ({}): non si applica un file su sé stesso",
+                "source and target are the same file ({}): a file is never applied onto itself",
                 source.display()
             ),
         });
@@ -704,11 +738,12 @@ pub fn apply_options(
 }
 
 #[tauri::command]
-pub fn derive_option_keys_command(
+pub async fn derive_option_keys_command(
     launcher_paths: State<'_, LauncherPaths>,
     version_id: String,
 ) -> Result<VanillaOptionKeys, String> {
-    load_or_derive(&launcher_paths, &version_id).map_err(|error| error.to_string())
+    let launcher_paths = launcher_paths.inner().clone();
+    off_main_thread(move || load_or_derive(&launcher_paths, &version_id)).await
 }
 
 #[cfg(test)]
@@ -869,6 +904,40 @@ mod tests {
             instance: "1.20.1-forge".into()
         }
         .is_writable());
+    }
+
+    /// D73 dal lato che fa il danno: la GUI il bottone «Save» non lo mostra
+    /// nemmeno mentre si guarda un'istanza, ma se un domani ci arrivasse una
+    /// chiamata, il file dell'istanza deve restare quello che era.
+    #[test]
+    fn saving_an_instance_is_refused_and_leaves_the_file_alone() {
+        let root = temp_root("save-instance");
+        let launcher_paths = LauncherPaths::new(root.clone());
+        let instance_root = root.join("mod-lists/Drehmal/instances/1.20.1-fabric");
+        std::fs::create_dir_all(&instance_root).unwrap();
+        let path = instance_options_path(&instance_root);
+        OptionsFile::parse("version:3465\nfov:0.5\n").write(&path).unwrap();
+
+        let error = save_shared_options(
+            &launcher_paths,
+            &OptionsScope::Instance {
+                modlist: "Drehmal".into(),
+                instance: "1.20.1-fabric".into(),
+            },
+            vec![SharedOptionsEntryInput {
+                key: "fov".into(),
+                value: "1.0".into(),
+            }],
+        )
+        .expect_err("scrivere l'options.txt di un'istanza deve essere rifiutato");
+
+        assert!(error.to_string().contains("belongs to the game"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version:3465\nfov:0.5\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -1133,7 +1202,7 @@ mod tests {
 
         match status {
             SeedStatus::Refused { reason } => {
-                assert!(reason.contains("stesso file"), "unexpected refusal: {reason}")
+                assert!(reason.contains("the same file"), "unexpected refusal: {reason}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
