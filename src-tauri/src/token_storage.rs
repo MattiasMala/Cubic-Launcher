@@ -164,10 +164,20 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         }
     }
 
-    /// Classifies a saved refresh token with one keyring round trip. Never
+    /// Classifies an account's saved tokens with one keyring round trip. Never
     /// creates a key and never blocks later key creation: it only looks.
-    pub fn credential_state(&self, refresh_token_enc: Option<&[u8]>) -> CredentialState {
-        let Some(payload) = refresh_token_enc.filter(|payload| !payload.is_empty()) else {
+    ///
+    /// The refresh token decides `Usable`, but a lone access blob counts too:
+    /// the save guard looks at both columns, so an unreadable access blob must
+    /// show as `Unreadable` (with its way out), not as a plain `SignedOut`.
+    pub fn credential_state(
+        &self,
+        refresh_token_enc: Option<&[u8]>,
+        access_token_enc: Option<&[u8]>,
+    ) -> CredentialState {
+        let refresh = refresh_token_enc.filter(|payload| !payload.is_empty());
+        let Some(payload) = refresh.or(access_token_enc.filter(|payload| !payload.is_empty()))
+        else {
             return CredentialState::SignedOut;
         };
         let encoded_key = match self.secret_store.get_secret(&self.key_id) {
@@ -178,10 +188,10 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         let readable = decode_key_bytes(&encoded_key)
             .and_then(|key_bytes| decrypt_payload(&cipher_from_key(&key_bytes), payload))
             .is_ok();
-        if readable {
-            CredentialState::Usable
-        } else {
-            CredentialState::Unreadable
+        match (readable, refresh.is_some()) {
+            (false, _) => CredentialState::Unreadable,
+            (true, true) => CredentialState::Usable,
+            (true, false) => CredentialState::SignedOut,
         }
     }
 
@@ -440,8 +450,8 @@ mod tests {
     use crate::database::initialize_database;
 
     use super::{
-        AccountTokenCipher, EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore,
-        TOKEN_ENCRYPTION_VERSION, TOKEN_NONCE_LENGTH,
+        AccountTokenCipher, CredentialState, EncryptedAccountsRepository, PlaintextAccountRecord,
+        SecretStore, TOKEN_ENCRYPTION_VERSION, TOKEN_NONCE_LENGTH,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -806,16 +816,55 @@ mod tests {
         let blobs_after = blobs(&connection);
         assert_eq!(blobs_after.len(), 2, "no account row may disappear");
         assert_eq!(blobs_after[1], ("account-b".to_string(), None, None));
-        let active = EncryptedAccountsRepository::new(&connection, secret_store)
-            .load_active_account()
-            .expect("active account should load")
-            .expect("active account should exist");
+        let reload = || {
+            EncryptedAccountsRepository::new(&connection, secret_store.clone())
+                .load_active_account()
+                .expect("active account should load")
+                .expect("active account should exist")
+        };
+        let active = reload();
         assert_eq!(active.microsoft_id, "account-a");
+        assert_eq!(active.access_token.as_deref(), Some("access-after"));
         assert_eq!(active.refresh_token.as_deref(), Some("refresh-after"));
+
+        // With the key back, even the gesture must not rotate it: a new key
+        // at every sign-in would orphan the blobs of every other account.
+        let key_after_replace = secret_store
+            .values
+            .lock()
+            .expect("secret store mutex poisoned")
+            .clone();
+        repository
+            .save_login(&player("account-b", "later", false), true)
+            .expect("second sign in should save");
+        assert_eq!(
+            *secret_store.values.lock().expect("secret store mutex poisoned"),
+            key_after_replace
+        );
+        assert_eq!(reload().refresh_token.as_deref(), Some("refresh-after"));
 
         drop(repository);
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// F1: the save guard counts both columns, so a lone access blob that
+    /// nobody can decrypt must read as `Unreadable` (the state that offers
+    /// the way out), not as `SignedOut`.
+    #[test]
+    fn a_lone_unreadable_access_blob_is_not_signed_out() {
+        let secret_store = MemorySecretStore::default();
+        let cipher = AccountTokenCipher::new(secret_store.clone());
+        let access = cipher.encrypt_token("access").expect("token should encrypt");
+
+        assert_eq!(cipher.credential_state(None, Some(&access)), CredentialState::SignedOut);
+        secret_store
+            .values
+            .lock()
+            .expect("secret store mutex poisoned")
+            .clear();
+        assert_eq!(cipher.credential_state(None, Some(&access)), CredentialState::Unreadable);
+        assert_eq!(cipher.credential_state(None, None), CredentialState::SignedOut);
     }
 
     /// F1: a keyring that cannot be asked says nothing about the blobs, so

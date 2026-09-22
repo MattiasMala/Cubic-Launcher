@@ -385,7 +385,10 @@ fn load_active_account_summary_with_secret_store<S: SecretStore>(
             let clean_uuid = uuid.replace('-', "");
             format!("https://mc-heads.net/avatar/{clean_uuid}/32")
         });
-        let credentials = token_cipher.credential_state(account.refresh_token_enc.as_deref());
+        let credentials = token_cipher.credential_state(
+            account.refresh_token_enc.as_deref(),
+            account.access_token_enc.as_deref(),
+        );
         let connected = credentials == CredentialState::Usable;
         let credentials_detail = match &credentials {
             CredentialState::KeyringUnavailable(detail) => Some(detail.clone()),

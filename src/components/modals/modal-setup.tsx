@@ -373,11 +373,13 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                           <p class="font-medium text-warning">Not signed in</p>
                           <p class="mt-1 text-muted-foreground">
                             Games with this account start in offline mode until you sign in again.
+                            Saved sign-ins of other accounts that can no longer be read, if any, are
+                            discarded and replaced.
                           </p>
                           <button
                             class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
                             disabled={loggingIn()}
-                            onClick={() => void signIn(false)}
+                            onClick={() => void signIn(true)}
                           >
                             {loggingIn() ? "Signing in..." : "Sign in again"}
                           </button>

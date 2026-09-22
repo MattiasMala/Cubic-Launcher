@@ -28,8 +28,13 @@ function accountSubtitle(account: AccountSummary | undefined): { text: string; w
       return { text: "Offline · sign in again", warn: true };
     case "keyring_unavailable":
       return { text: "Offline · keyring unavailable", warn: true };
-    default:
+    case "usable":
       return { text: "Microsoft Account", warn: false };
+    default:
+      // Not described by the backend (no account at all, before the snapshot).
+      return account?.status === "online"
+        ? { text: "Microsoft Account", warn: false }
+        : { text: "Offline", warn: true };
   }
 }
 
