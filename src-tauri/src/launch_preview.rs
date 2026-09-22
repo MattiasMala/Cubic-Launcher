@@ -244,8 +244,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         ),
     )?;
 
-    let shell_snapshot =
-        load_shell_snapshot_from_root(launcher_paths.root_dir(), Some(&modlist_name))?;
+    let shell_snapshot = load_shell_snapshot_from_root(
+        launcher_paths.root_dir(),
+        Some(&modlist_name),
+        crate::token_storage::KeyringSecretStore::new(),
+    )?;
     let effective_settings = EffectiveLaunchSettings::from_shell_settings(
         &shell_snapshot.global_settings,
         &shell_snapshot.selected_modlist_overrides,

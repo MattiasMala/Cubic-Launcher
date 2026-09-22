@@ -34,7 +34,10 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # libdbus-1-dev: libdbus-sys links against it, for keyring's Secret Service
+          # backend, which keeps the key of the account tokens (F1). Direct build
+          # requirement: without it the Rust build fails, whatever webkit pulls in.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
 
       - name: Install frontend dependencies
         run: npm ci
@@ -78,7 +81,10 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # libdbus-1-dev: libdbus-sys links against it, for keyring's Secret Service
+          # backend, which keeps the key of the account tokens (F1). Direct build
+          # requirement: without it the Rust build fails, whatever webkit pulls in.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev
 
       - name: Install frontend dependencies
         run: npm ci

@@ -1,6 +1,8 @@
-import { For, Show, createEffect, createSignal, on } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
+import type { ShellSnapshot } from "../../lib/types";
+import { applyActiveAccountFromSnapshot } from "../../app/backend-loaders";
 import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
@@ -263,6 +265,23 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
 
+  // `replaceUnreadable` is the explicit "Sign in again" (F1): only that button
+  // lets the backend discard saved sign-ins the keyring says nobody can read.
+  const signIn = async (replaceUnreadable: boolean) => {
+    setLoggingIn(true);
+    setLoginError(null);
+    try {
+      await invoke("microsoft_login_command", { replaceUnreadable });
+      setAccountsModalOpen(false);
+      const snap = await invoke<ShellSnapshot>("load_shell_snapshot_command", { preferredModlistName: null });
+      if (snap.active_account) applyActiveAccountFromSnapshot(snap.active_account);
+    } catch (err) {
+      setLoginError(String(err));
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
   return (
     <Show when={accountsModalOpen()}>
       <Modal onClose={() => setAccountsModalOpen(false)}>
@@ -277,27 +296,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
             <button
               class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
               disabled={loggingIn()}
-              onClick={async () => {
-                setLoggingIn(true);
-                try {
-                  await invoke("microsoft_login_command");
-                  setAccountsModalOpen(false);
-                  const snap: any = await invoke("load_shell_snapshot_command", { preferredModlistName: null });
-                  if (snap.active_account) {
-                    const active = snap.active_account;
-                    const gamertag = active.xbox_gamertag?.trim() || active.microsoft_id;
-                    setAccounts(cur => {
-                      const rest = cur.filter(account => account.id !== active.microsoft_id);
-                      return [{ id: active.microsoft_id, gamertag, email: active.microsoft_id, avatarUrl: active.avatar_url, status: "online" as const, lastMode: "microsoft" as const }, ...rest];
-                    });
-                    setActiveAccountId(active.microsoft_id);
-                  }
-                } catch (err) {
-                  setLoginError(String(err));
-                } finally {
-                  setLoggingIn(false);
-                }
-              }}
+              onClick={() => void signIn(false)}
             >
               {loggingIn() ? "Logging in..." : "Login with Microsoft"}
             </button>
@@ -350,6 +349,56 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     </button>
                   </div>
                 </div>
+                <Show when={acc.credentials && acc.credentials !== "usable" ? acc.credentials : undefined}>
+                  {credentials => (
+                    <div class="mt-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+                      <Switch>
+                        <Match when={credentials() === "unreadable"}>
+                          <p class="font-medium text-warning">Saved sign-in can't be read</p>
+                          <p class="mt-1 text-muted-foreground">
+                            Games with this account start in offline mode, so servers that check
+                            accounts turn you away. Sign in again to fix it: the saved sign-ins that
+                            can no longer be read are discarded and replaced. The account stays in
+                            this list.
+                          </p>
+                          <button
+                            class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                            disabled={loggingIn()}
+                            onClick={() => void signIn(true)}
+                          >
+                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                          </button>
+                        </Match>
+                        <Match when={credentials() === "signed_out"}>
+                          <p class="font-medium text-warning">Not signed in</p>
+                          <p class="mt-1 text-muted-foreground">
+                            Games with this account start in offline mode until you sign in again.
+                            Saved sign-ins of other accounts that can no longer be read, if any, are
+                            discarded and replaced.
+                          </p>
+                          <button
+                            class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                            disabled={loggingIn()}
+                            onClick={() => void signIn(true)}
+                          >
+                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                          </button>
+                        </Match>
+                        <Match when={credentials() === "keyring_unavailable"}>
+                          <p class="font-medium text-warning">System keyring unavailable</p>
+                          <p class="mt-1 text-muted-foreground">
+                            The launcher keeps your sign-in in the system keyring and can't reach it,
+                            so games start in offline mode. Start or unlock your keyring, then reopen
+                            the launcher.
+                          </p>
+                          <Show when={acc.credentialsDetail}>
+                            <p class="mt-1 break-all font-mono text-[10px] text-muted-foreground">{acc.credentialsDetail}</p>
+                          </Show>
+                        </Match>
+                      </Switch>
+                    </div>
+                  )}
+                </Show>
               </div>
             )}
           </For>

@@ -13,7 +13,7 @@ use crate::microsoft_auth::{
     configured_microsoft_client_id, run_microsoft_login, AccountsRepository,
 };
 use crate::rules::{ModList, RULES_FILENAME};
-use crate::token_storage::{AccountTokenCipher, KeyringSecretStore, SecretStore};
+use crate::token_storage::{AccountTokenCipher, CredentialState, KeyringSecretStore, SecretStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
@@ -41,6 +41,12 @@ pub struct ShellActiveAccount {
     pub avatar_url: Option<String>,
     pub status: String,
     pub last_mode: String,
+    /// `usable`, `signed_out`, `unreadable` or `keyring_unavailable` (F1):
+    /// why `status` says what it says, so the interface can tell the user
+    /// what to do instead of launching offline in silence.
+    pub credentials: String,
+    /// The keyring's own error, only for `keyring_unavailable`.
+    pub credentials_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,8 +117,12 @@ pub fn load_shell_snapshot_command(
     launcher_paths: State<'_, LauncherPaths>,
     selected_modlist_name: Option<String>,
 ) -> Result<ShellSnapshot, String> {
-    load_shell_snapshot_from_root(launcher_paths.root_dir(), selected_modlist_name.as_deref())
-        .map_err(|error| error.to_string())
+    load_shell_snapshot_from_root(
+        launcher_paths.root_dir(),
+        selected_modlist_name.as_deref(),
+        KeyringSecretStore::new(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -131,10 +141,15 @@ pub fn switch_active_account_command(
 /// Starts the Microsoft OAuth login flow, opens the browser, waits for
 /// callback, exchanges tokens through Xbox Live → XSTS → Minecraft, and
 /// saves the account to the database.
+///
+/// `replace_unreadable` is the "Sign in again" button (F1): it allows the save
+/// to discard saved sign-ins that the keyring says nobody can decrypt.
 #[tauri::command]
 pub async fn microsoft_login_command(
     launcher_paths: State<'_, LauncherPaths>,
+    replace_unreadable: Option<bool>,
 ) -> Result<String, String> {
+    let replace_unreadable = replace_unreadable.unwrap_or(false);
     let env_path = launcher_paths.root_dir().join(".env");
     let client_id = configured_microsoft_client_id(&env_path)
         .map_err(|e| e.to_string())?
@@ -150,6 +165,15 @@ pub async fn microsoft_login_command(
         })?;
 
     let db_path = launcher_paths.database_path().to_path_buf();
+
+    // Before the browser: a sign-in that could not be saved must not cost the
+    // user the whole OAuth round trip first.
+    {
+        let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        AccountManager::new(&connection, KeyringSecretStore::new())
+            .check_login_can_be_saved(replace_unreadable)
+            .map_err(|e| format!("{e:#}"))?;
+    }
 
     let login_result = run_microsoft_login(&client_id)
         .await
@@ -174,8 +198,9 @@ pub async fn microsoft_login_command(
                 refresh_token: login_result.microsoft_refresh_token,
             },
             true, // make active
+            replace_unreadable,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
 
     Ok(login_result
         .xbox_gamertag
@@ -230,9 +255,13 @@ pub fn save_modlist_overrides_command(
     save_modlist_overrides(&connection, &overrides).map_err(|error| error.to_string())
 }
 
-pub fn load_shell_snapshot_from_root(
+/// `secret_store` is where the active account's token key lives. The commands
+/// pass the system keyring; tests pass a store in memory, so that a test run
+/// never reaches anyone's real credentials (F1b).
+pub fn load_shell_snapshot_from_root<S: SecretStore>(
     root_dir: &Path,
     selected_modlist_name: Option<&str>,
+    secret_store: S,
 ) -> Result<ShellSnapshot> {
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
@@ -246,7 +275,8 @@ pub fn load_shell_snapshot_from_root(
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
         .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
-    let active_account = load_active_account_summary(&connection)?;
+    let active_account =
+        load_active_account_summary_with_secret_store(&connection, secret_store)?;
     let global_settings = load_global_settings(&connection)?;
     let selected_modlist_overrides =
         load_modlist_overrides(&connection, selected_modlist_name.as_deref())?;
@@ -341,10 +371,6 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
     Ok(summaries)
 }
 
-fn load_active_account_summary(connection: &Connection) -> Result<Option<ShellActiveAccount>> {
-    load_active_account_summary_with_secret_store(connection, KeyringSecretStore::new())
-}
-
 fn load_active_account_summary_with_secret_store<S: SecretStore>(
     connection: &Connection,
     secret_store: S,
@@ -364,11 +390,15 @@ fn load_active_account_summary_with_secret_store<S: SecretStore>(
             let clean_uuid = uuid.replace('-', "");
             format!("https://mc-heads.net/avatar/{clean_uuid}/32")
         });
-        let connected = account
-            .refresh_token_enc
-            .as_deref()
-            .map(|payload| token_cipher.decrypt_token(payload).is_ok())
-            .unwrap_or(false);
+        let credentials = token_cipher.credential_state(
+            account.refresh_token_enc.as_deref(),
+            account.access_token_enc.as_deref(),
+        );
+        let connected = credentials == CredentialState::Usable;
+        let credentials_detail = match &credentials {
+            CredentialState::KeyringUnavailable(detail) => Some(detail.clone()),
+            _ => None,
+        };
 
         ShellActiveAccount {
             microsoft_id: account.microsoft_id,
@@ -385,6 +415,8 @@ fn load_active_account_summary_with_secret_store<S: SecretStore>(
             } else {
                 "offline".to_string()
             },
+            credentials: credentials.as_str().to_string(),
+            credentials_detail,
         }
     }))
 }
@@ -743,7 +775,8 @@ mod tests {
         fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
 
         let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None).expect("snapshot should load");
+            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+                .expect("snapshot should load");
 
         assert!(snapshot.modlists.is_empty());
         assert!(snapshot.active_account.is_none());
@@ -840,7 +873,8 @@ mod tests {
         drop(connection);
 
         let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None).expect("snapshot should load");
+            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+                .expect("snapshot should load");
 
         assert_eq!(snapshot.modlists.len(), 1);
         assert_eq!(snapshot.modlists[0].name, "Cubic Vanilla+");
@@ -938,8 +972,12 @@ mod tests {
         .expect("modlist overrides should save");
         drop(connection);
 
-        let snapshot = load_shell_snapshot_from_root(&root_dir, Some("Beta Pack"))
-            .expect("snapshot should load");
+        let snapshot = load_shell_snapshot_from_root(
+            &root_dir,
+            Some("Beta Pack"),
+            MemorySecretStore::default(),
+        )
+        .expect("snapshot should load");
 
         assert_eq!(snapshot.modlists.len(), 2);
         assert_eq!(snapshot.global_settings.min_ram_mb, 2304);

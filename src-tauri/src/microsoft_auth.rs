@@ -322,6 +322,18 @@ impl<'connection> AccountsRepository<'connection> {
             .map_err(Into::into)
     }
 
+    /// Sets every token blob to NULL and keeps the rows. Only the explicit
+    /// "Sign in again" path calls it, when no blob can be decrypted any more.
+    pub fn discard_encrypted_tokens(&self) -> Result<usize> {
+        self.connection
+            .execute(
+                "UPDATE accounts SET access_token_enc = NULL, refresh_token_enc = NULL \
+                 WHERE access_token_enc IS NOT NULL OR refresh_token_enc IS NOT NULL",
+                [],
+            )
+            .map_err(Into::into)
+    }
+
 }
 
 pub fn build_authorization_url(

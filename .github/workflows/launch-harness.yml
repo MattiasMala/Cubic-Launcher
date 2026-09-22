@@ -44,6 +44,9 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
+          # libdbus-1-dev: libdbus-sys links against it, for keyring's Secret Service
+          # backend, which keeps the key of the account tokens (F1). Direct build
+          # requirement: without it the Rust build fails, whatever webkit pulls in.
           sudo apt-get install -y \
             xvfb \
             libwebkit2gtk-4.1-dev \
@@ -51,7 +54,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libasound2t64 \
-            mesa-utils libgl1-mesa-dri
+            mesa-utils libgl1-mesa-dri \
+            libdbus-1-dev
 
       - name: Cargo cache
         uses: actions/cache@v4
