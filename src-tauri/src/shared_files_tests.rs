@@ -205,6 +205,43 @@ fn an_instance_without_the_files_leaves_the_canonical_copy_alone() {
 }
 
 #[test]
+fn an_instance_with_its_own_list_loses_it_to_the_canonical_copy() {
+    // Il caso di aggiornamento, e non è teorico: chi ha due istanze con due
+    // liste diverse scritte prima di E2 ne perde una. La prima che viene
+    // lanciata presta la sua lista alla modlist; la seconda, al suo primo
+    // lancio, se la vede sostituire. **È l'ordine di lancio a decidere quale
+    // delle due sopravvive**, e niente lo rende visibile all'utente.
+    //
+    // Il test fissa il comportamento perché è la conseguenza diretta della
+    // copia semplice (D78): se un giorno si decide di tenere un `.bak` prima
+    // di sovrascrivere, o di rifiutare la prima sovrascrittura divergente,
+    // questo test deve fallire e far leggere questo commento.
+    let fixture = Fixture::new("overwrite");
+    let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
+    let fabric = fixture.instance_root("Drehmal", "1.20.1-fabric");
+    fixture.write_instance_file("Drehmal", "1.20.1-forge", SharedFile::Servers, b"lista-di-forge");
+    fixture.write_instance_file(
+        "Drehmal",
+        "1.20.1-fabric",
+        SharedFile::Servers,
+        b"lista-di-fabric-mai-condivisa",
+    );
+
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
+    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric);
+
+    assert_eq!(
+        action_for(&statuses, SharedFile::Servers),
+        &SharedFileAction::Copied { bytes: 14 }
+    );
+    assert_eq!(
+        fs::read(instance_path(&fabric, SharedFile::Servers)).unwrap(),
+        b"lista-di-forge",
+        "la lista che fabric aveva di suo è persa: limite dichiarato di D78"
+    );
+}
+
+#[test]
 fn all_three_files_travel_together() {
     let fixture = Fixture::new("all-three");
     let forge = fixture.instance_root("Drehmal", "1.20.1-forge");

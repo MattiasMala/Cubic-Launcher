@@ -1088,8 +1088,16 @@ mod tests {
         )
         .expect("the command history should exist");
 
-        for selected in [Vec::new(), vec!["profile/command_history.txt".to_string()]] {
-            let archive_path = root_dir.join(format!("export-{}.zip", selected.len()));
+        // I tre punti in cui il filtro deve mordere: il ramo che rastrella
+        // tutto, quello che nomina il file, e quello che nomina la cartella
+        // che lo contiene. Il terzo è quello che si può togliere restando
+        // verdi, se non lo si prova.
+        for (tag, selected) in [
+            ("all", Vec::new()),
+            ("file", vec!["profile/command_history.txt".to_string()]),
+            ("dir", vec!["profile".to_string()]),
+        ] {
+            let archive_path = root_dir.join(format!("export-{tag}.zip"));
             export_modlist_from_root(
                 &root_dir,
                 &ExportModlistInput {
@@ -1118,12 +1126,16 @@ mod tests {
                 "the command history must never be exported (selected: {selected:?}); \
                  the archive held {names:?}"
             );
-            if selected.is_empty() {
+            // Controprova: il filtro deve essere su un file, non un modo per
+            // spegnere il ramo. Nel caso "file" l'utente ha nominato solo la
+            // cronologia, quindi lì non c'è niente da controllare.
+            if tag != "file" {
                 assert!(
                     names
                         .iter()
                         .any(|name| name.ends_with("instances/profile/servers.dat")),
-                    "the filter must be about one file, not about switching the branch off"
+                    "the filter must be about one file, not about switching the branch off \
+                     ({tag}); the archive held {names:?}"
                 );
             }
         }
