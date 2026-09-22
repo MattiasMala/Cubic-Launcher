@@ -804,11 +804,21 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     };
     {
         let connection = rusqlite::Connection::open(launcher_paths.database_path())?;
+        // La `DataVersion` della versione che sta per partire serve al
+        // guardiano delle hotbar (D79) per l'istanza che un `hotbar.nbt` non
+        // ce l'ha ancora. Se non si riesce a ricavarla il guardiano non ha un
+        // termine di confronto e la copia delle hotbar si ferma lì: è la
+        // direzione sicura.
+        let instance_data_version =
+            crate::options_keys::load_or_derive(&launcher_paths, &target.minecraft_version)
+                .ok()
+                .map(|keys| keys.data_version);
         let statuses = crate::shared_files::copy_into_instance(
             &shared_files.launcher_paths,
             &connection,
             &shared_files.modlist_name,
             &shared_files.instance_root,
+            instance_data_version,
         );
         let _ = emit_log(
             &app_handle,

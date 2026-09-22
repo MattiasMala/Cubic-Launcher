@@ -95,7 +95,7 @@ fn the_first_instance_with_a_server_list_lends_it_to_the_mod_list() {
     let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
     fixture.write_instance_file("Drehmal", "1.20.1-forge", SharedFile::Servers, b"lista-vera");
 
-    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
+    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
 
     assert_eq!(
         action_for(&statuses, SharedFile::Servers),
@@ -128,8 +128,8 @@ fn a_second_instance_receives_the_list_it_never_had() {
     let fabric = fixture.instance_root("Drehmal", "1.20.1-fabric");
     fixture.write_instance_file("Drehmal", "1.20.1-forge", SharedFile::Servers, b"lista-vera");
 
-    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
-    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric);
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
 
     assert_eq!(
         action_for(&statuses, SharedFile::Servers),
@@ -146,7 +146,7 @@ fn an_instance_that_changed_nothing_does_not_rewrite_the_canonical_copy() {
     let fixture = Fixture::new("identical");
     let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
     fixture.write_instance_file("Drehmal", "1.20.1-forge", SharedFile::Servers, b"lista-vera");
-    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
 
     let statuses =
         copy_back_from_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
@@ -205,17 +205,12 @@ fn an_instance_without_the_files_leaves_the_canonical_copy_alone() {
 }
 
 #[test]
-fn an_instance_with_its_own_list_loses_it_to_the_canonical_copy() {
+fn the_list_an_instance_had_of_its_own_survives_as_a_backup() {
     // Il caso di aggiornamento, e non è teorico: chi ha due istanze con due
-    // liste diverse scritte prima di E2 ne perde una. La prima che viene
-    // lanciata presta la sua lista alla modlist; la seconda, al suo primo
-    // lancio, se la vede sostituire. **È l'ordine di lancio a decidere quale
-    // delle due sopravvive**, e niente lo rende visibile all'utente.
-    //
-    // Il test fissa il comportamento perché è la conseguenza diretta della
-    // copia semplice (D78): se un giorno si decide di tenere un `.bak` prima
-    // di sovrascrivere, o di rifiutare la prima sovrascrittura divergente,
-    // questo test deve fallire e far leggere questo commento.
+    // liste diverse scritte prima di E2 ne vede sostituire una, e a decidere
+    // quale è l'ordine di lancio. D80 non cambia quale vince — quella parte è
+    // D78 e resta — ma fa in modo che la perdente **resti su disco**, accanto
+    // al file, dove l'utente può ritrovarla.
     let fixture = Fixture::new("overwrite");
     let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
     let fabric = fixture.instance_root("Drehmal", "1.20.1-fabric");
@@ -227,18 +222,75 @@ fn an_instance_with_its_own_list_loses_it_to_the_canonical_copy() {
         b"lista-di-fabric-mai-condivisa",
     );
 
-    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
-    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric);
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
 
     assert_eq!(
         action_for(&statuses, SharedFile::Servers),
-        &SharedFileAction::Copied { bytes: 14 }
+        &SharedFileAction::CopiedAfterBackup {
+            bytes: 14,
+            backup: "servers.dat.bak".to_string()
+        }
     );
     assert_eq!(
         fs::read(instance_path(&fabric, SharedFile::Servers)).unwrap(),
         b"lista-di-forge",
-        "la lista che fabric aveva di suo è persa: limite dichiarato di D78"
+        "l'ultima parola resta alla copia canonica: limite dichiarato di D78"
     );
+    assert_eq!(
+        fs::read(backup_path(&instance_path(&fabric, SharedFile::Servers))).unwrap(),
+        b"lista-di-fabric-mai-condivisa",
+        "ma la lista che fabric aveva di suo è ancora lì (D80)"
+    );
+}
+
+#[test]
+fn the_backup_is_written_once_and_never_again() {
+    // La seconda volta il file che si sovrascrive è quello che abbiamo scritto
+    // noi: risalvarlo cancellerebbe l'unica cosa che vale la pena tenere.
+    let fixture = Fixture::new("backup-once");
+    let fabric = fixture.instance_root("Drehmal", "1.20.1-fabric");
+    fixture.write_instance_file(
+        "Drehmal",
+        "1.20.1-fabric",
+        SharedFile::Servers,
+        b"lista-originale-di-fabric",
+    );
+    fixture.write_canonical("Drehmal", SharedFile::Servers, b"prima-lista-condivisa");
+
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
+    fixture.write_canonical("Drehmal", SharedFile::Servers, b"seconda-lista-condivisa");
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
+
+    assert_eq!(
+        action_for(&statuses, SharedFile::Servers),
+        &SharedFileAction::Copied { bytes: 23 },
+        "il secondo passaggio non deve creare un altro .bak"
+    );
+    assert_eq!(
+        fs::read(backup_path(&instance_path(&fabric, SharedFile::Servers))).unwrap(),
+        b"lista-originale-di-fabric",
+        "il .bak resta la fotografia di prima della condivisione"
+    );
+}
+
+#[test]
+fn an_identical_file_never_leaves_a_backup() {
+    let fixture = Fixture::new("backup-identical");
+    let fabric = fixture.instance_root("Drehmal", "1.20.1-fabric");
+    fixture.write_instance_file("Drehmal", "1.20.1-fabric", SharedFile::Servers, b"stessa-lista");
+    fixture.write_canonical("Drehmal", SharedFile::Servers, b"stessa-lista");
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
+
+    assert_eq!(
+        action_for(&statuses, SharedFile::Servers),
+        &SharedFileAction::AlreadyIdentical
+    );
+    assert!(!backup_path(&instance_path(&fabric, SharedFile::Servers)).exists());
 }
 
 #[test]
@@ -254,8 +306,8 @@ fn all_three_files_travel_together() {
         fixture.write_instance_file("Drehmal", "1.20.1-forge", file, body);
     }
 
-    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
-    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric);
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &fabric, None);
 
     assert_eq!(
         fs::read(instance_path(&fabric, SharedFile::Hotbar)).unwrap(),
@@ -272,7 +324,7 @@ fn a_mod_list_name_that_escapes_its_directory_is_refused() {
     let fixture = Fixture::new("escape");
     let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
 
-    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "../evil", &forge);
+    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "../evil", &forge, None);
 
     assert!(matches!(
         action_for(&statuses, SharedFile::Servers),
@@ -299,6 +351,7 @@ fn linking_is_symmetric_and_both_sides_see_the_same_list() {
         &fixture.connection,
         "Drehmal",
         &drehmal_instance,
+        None,
     );
     assert_eq!(
         fs::read(instance_path(&drehmal_instance, SharedFile::Servers)).unwrap(),
@@ -322,6 +375,7 @@ fn linking_is_symmetric_and_both_sides_see_the_same_list() {
         &fixture.connection,
         "test2",
         &test2_instance,
+        None,
     );
 
     assert_eq!(
@@ -485,3 +539,237 @@ fn only_the_command_history_is_kept_out_of_an_archive() {
     assert!(!is_excluded_from_export("options.txt"));
 }
 
+
+// ---------------------------------------------------------------------------
+// Il guardiano delle hotbar (D79)
+// ---------------------------------------------------------------------------
+
+/// Un `hotbar.nbt` minimo ma vero: NBT **non compresso**, con la `DataVersion`
+/// che `NbtUtils.addCurrentDataVersion` mette in testa. È l'unico campo che il
+/// guardiano guarda.
+fn hotbar_bytes(data_version: i32, marker: &str) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct Hotbar<'a> {
+        #[serde(rename = "DataVersion")]
+        data_version: i32,
+        marker: &'a str,
+    }
+    fastnbt::to_bytes(&Hotbar {
+        data_version,
+        marker,
+    })
+    .expect("the test hotbar should serialize")
+}
+
+#[test]
+fn hotbars_never_travel_down_to_an_older_game() {
+    // 5023 è la DataVersion di 26.3, 3465 quella di 1.20.1: la copia canonica
+    // è in formato `components` e l'istanza la leggerebbe come stack vuoti.
+    let fixture = Fixture::new("hotbar-down");
+    let old = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_canonical("Drehmal", SharedFile::Hotbar, &hotbar_bytes(5023, "nuove"));
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &old, Some(3465));
+
+    let SharedFileAction::Refused { reason } = action_for(&statuses, SharedFile::Hotbar) else {
+        panic!("copiare hotbar 5023 in un'istanza 3465 deve essere rifiutato");
+    };
+    assert!(reason.contains("5023") && reason.contains("3465"), "{reason}");
+    assert!(
+        !instance_path(&old, SharedFile::Hotbar).exists(),
+        "rifiutare vuol dire non scrivere niente"
+    );
+}
+
+#[test]
+fn hotbars_travel_up_to_a_newer_game_because_the_datafixer_handles_that() {
+    let fixture = Fixture::new("hotbar-up");
+    let new = fixture.instance_root("Drehmal", "1.21.1-fabric");
+    fixture.write_canonical("Drehmal", SharedFile::Hotbar, &hotbar_bytes(3465, "vecchie"));
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &new, Some(5023));
+
+    assert!(
+        matches!(
+            action_for(&statuses, SharedFile::Hotbar),
+            SharedFileAction::Copied { .. }
+        ),
+        "all'insù il DataFixer fa il suo mestiere: {:?}",
+        action_for(&statuses, SharedFile::Hotbar)
+    );
+}
+
+#[test]
+fn an_old_instance_cannot_write_its_hotbars_over_newer_shared_ones() {
+    let fixture = Fixture::new("hotbar-back");
+    let old = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_instance_file(
+        "Drehmal",
+        "1.20.1-forge",
+        SharedFile::Hotbar,
+        &hotbar_bytes(3465, "vecchie"),
+    );
+    fixture.write_canonical("Drehmal", SharedFile::Hotbar, &hotbar_bytes(5023, "nuove"));
+
+    let statuses = copy_back_from_instance(&fixture.paths, &fixture.connection, "Drehmal", &old);
+
+    assert!(
+        matches!(
+            action_for(&statuses, SharedFile::Hotbar),
+            SharedFileAction::Refused { .. }
+        ),
+        "{:?}",
+        action_for(&statuses, SharedFile::Hotbar)
+    );
+    assert_eq!(
+        fs::read(fixture.canonical("Drehmal", SharedFile::Hotbar)).unwrap(),
+        hotbar_bytes(5023, "nuove")
+    );
+}
+
+#[test]
+fn a_newer_instance_can_still_write_its_hotbars_back() {
+    // La simmetria è ingannevole e il verso sbagliato congelerebbe la copia
+    // canonica per sempre: qui la scrittura deve passare.
+    let fixture = Fixture::new("hotbar-back-up");
+    let new = fixture.instance_root("Drehmal", "1.21.1-fabric");
+    fixture.write_instance_file(
+        "Drehmal",
+        "1.21.1-fabric",
+        SharedFile::Hotbar,
+        &hotbar_bytes(5023, "nuove"),
+    );
+    fixture.write_canonical("Drehmal", SharedFile::Hotbar, &hotbar_bytes(3465, "vecchie"));
+
+    let statuses = copy_back_from_instance(&fixture.paths, &fixture.connection, "Drehmal", &new);
+
+    assert!(
+        matches!(
+            action_for(&statuses, SharedFile::Hotbar),
+            SharedFileAction::Copied { .. }
+        ),
+        "{:?}",
+        action_for(&statuses, SharedFile::Hotbar)
+    );
+    assert_eq!(
+        fs::read(fixture.canonical("Drehmal", SharedFile::Hotbar)).unwrap(),
+        hotbar_bytes(5023, "nuove")
+    );
+}
+
+#[test]
+fn the_guard_only_looks_at_the_hotbars() {
+    // Il `servers.dat` non ha nessuna DataVersion da rispettare: il formato
+    // non è mai cambiato fra le versioni che ci interessano.
+    let fixture = Fixture::new("hotbar-guard-scope");
+    let old = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_canonical("Drehmal", SharedFile::Servers, b"lista");
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &old, Some(3465));
+
+    assert_eq!(
+        action_for(&statuses, SharedFile::Servers),
+        &SharedFileAction::Copied { bytes: 5 }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gli interruttori e la vista della GUI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_file_is_shared_until_someone_says_otherwise() {
+    let fixture = Fixture::new("toggles-default");
+    for file in SharedFile::ALL {
+        assert!(shared_file_enabled(&fixture.connection, "Drehmal", file));
+    }
+}
+
+#[test]
+fn a_file_switched_off_is_neither_copied_in_nor_out() {
+    let fixture = Fixture::new("toggles-off");
+    let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_canonical("Drehmal", SharedFile::CommandHistory, b"/login segreta\n");
+    set_shared_file_enabled(
+        &fixture.connection,
+        "Drehmal",
+        SharedFile::CommandHistory,
+        false,
+    )
+    .expect("the switch should persist");
+
+    let statuses =
+        copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+
+    assert_eq!(
+        action_for(&statuses, SharedFile::CommandHistory),
+        &SharedFileAction::Disabled
+    );
+    assert!(!instance_path(&forge, SharedFile::CommandHistory).exists());
+
+    // E l'altro verso: il file dell'istanza non finisce nella modlist.
+    fixture.write_instance_file(
+        "Drehmal",
+        "1.20.1-forge",
+        SharedFile::CommandHistory,
+        b"/login altra\n",
+    );
+    let back = copy_back_from_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
+    assert_eq!(
+        action_for(&back, SharedFile::CommandHistory),
+        &SharedFileAction::Disabled
+    );
+    assert_eq!(
+        fs::read(fixture.canonical("Drehmal", SharedFile::CommandHistory)).unwrap(),
+        b"/login segreta\n"
+    );
+}
+
+#[test]
+fn a_switch_belongs_to_one_mod_list_and_one_file() {
+    let fixture = Fixture::new("toggles-scope");
+    set_shared_file_enabled(&fixture.connection, "Drehmal", SharedFile::Hotbar, false)
+        .expect("the switch should persist");
+
+    assert!(!shared_file_enabled(&fixture.connection, "Drehmal", SharedFile::Hotbar));
+    assert!(shared_file_enabled(&fixture.connection, "Drehmal", SharedFile::Servers));
+    assert!(shared_file_enabled(&fixture.connection, "test2", SharedFile::Hotbar));
+}
+
+#[test]
+fn the_view_says_who_holds_the_files_and_who_can_still_be_linked() {
+    let fixture = Fixture::new("view");
+    for name in ["Drehmal", "test2", "terza"] {
+        let dir = fixture.paths.modlists_dir().join(name);
+        fs::create_dir_all(&dir).expect("the mod list directory should be creatable");
+        fs::write(dir.join("rules.json"), b"{}").expect("rules.json should be writable");
+    }
+
+    let before = shared_files_view(&fixture.paths, &fixture.connection, "Drehmal")
+        .expect("the view should build");
+    assert!(before.group.is_empty(), "senza collegamenti non c'è gruppo");
+    assert_eq!(before.canonical, "Drehmal");
+    assert_eq!(before.linkable, vec!["terza".to_string(), "test2".to_string()]);
+    assert_eq!(before.files.len(), 3);
+    assert!(before.files.iter().all(|toggle| toggle.enabled));
+
+    link_modlists(&fixture.connection, "Drehmal", "test2").expect("linking should persist");
+    let after = shared_files_view(&fixture.paths, &fixture.connection, "Drehmal")
+        .expect("the view should build");
+
+    assert_eq!(after.canonical, "test2", "chi configura adotta");
+    assert_eq!(after.group, vec!["test2".to_string(), "Drehmal".to_string()]);
+    assert_eq!(after.linkable, vec!["terza".to_string()]);
+}
+
+#[test]
+fn the_backup_never_leaves_in_an_archive() {
+    assert!(is_excluded_from_export("servers.dat.bak"));
+    assert!(is_excluded_from_export("hotbar.nbt.bak"));
+    assert!(is_excluded_from_export("command_history.txt.bak"));
+    assert!(!is_excluded_from_export("options.txt.bak"));
+    assert!(!is_excluded_from_export("servers.dat"));
+}

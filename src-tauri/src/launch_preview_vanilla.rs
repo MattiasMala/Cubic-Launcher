@@ -213,11 +213,16 @@ pub(super) async fn run_vanilla_launch_pipeline(
     };
     {
         let connection = rusqlite::Connection::open(launcher_paths.database_path())?;
+        let instance_data_version =
+            crate::options_keys::load_or_derive(&launcher_paths, &target.minecraft_version)
+                .ok()
+                .map(|keys| keys.data_version);
         let statuses = crate::shared_files::copy_into_instance(
             &launcher_paths,
             &connection,
             &modlist_name,
             &instance_root,
+            instance_data_version,
         );
         emit_log(
             &app_handle,
