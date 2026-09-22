@@ -117,8 +117,12 @@ pub fn load_shell_snapshot_command(
     launcher_paths: State<'_, LauncherPaths>,
     selected_modlist_name: Option<String>,
 ) -> Result<ShellSnapshot, String> {
-    load_shell_snapshot_from_root(launcher_paths.root_dir(), selected_modlist_name.as_deref())
-        .map_err(|error| error.to_string())
+    load_shell_snapshot_from_root(
+        launcher_paths.root_dir(),
+        selected_modlist_name.as_deref(),
+        KeyringSecretStore::new(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -251,9 +255,13 @@ pub fn save_modlist_overrides_command(
     save_modlist_overrides(&connection, &overrides).map_err(|error| error.to_string())
 }
 
-pub fn load_shell_snapshot_from_root(
+/// `secret_store` is where the active account's token key lives. The commands
+/// pass the system keyring; tests pass a store in memory, so that a test run
+/// never reaches anyone's real credentials (F1b).
+pub fn load_shell_snapshot_from_root<S: SecretStore>(
     root_dir: &Path,
     selected_modlist_name: Option<&str>,
+    secret_store: S,
 ) -> Result<ShellSnapshot> {
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
@@ -267,7 +275,8 @@ pub fn load_shell_snapshot_from_root(
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
         .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
-    let active_account = load_active_account_summary(&connection)?;
+    let active_account =
+        load_active_account_summary_with_secret_store(&connection, secret_store)?;
     let global_settings = load_global_settings(&connection)?;
     let selected_modlist_overrides =
         load_modlist_overrides(&connection, selected_modlist_name.as_deref())?;
@@ -360,10 +369,6 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
 
     summaries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(summaries)
-}
-
-fn load_active_account_summary(connection: &Connection) -> Result<Option<ShellActiveAccount>> {
-    load_active_account_summary_with_secret_store(connection, KeyringSecretStore::new())
 }
 
 fn load_active_account_summary_with_secret_store<S: SecretStore>(
@@ -770,7 +775,8 @@ mod tests {
         fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
 
         let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None).expect("snapshot should load");
+            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+                .expect("snapshot should load");
 
         assert!(snapshot.modlists.is_empty());
         assert!(snapshot.active_account.is_none());
@@ -867,7 +873,8 @@ mod tests {
         drop(connection);
 
         let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None).expect("snapshot should load");
+            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+                .expect("snapshot should load");
 
         assert_eq!(snapshot.modlists.len(), 1);
         assert_eq!(snapshot.modlists[0].name, "Cubic Vanilla+");
@@ -965,8 +972,12 @@ mod tests {
         .expect("modlist overrides should save");
         drop(connection);
 
-        let snapshot = load_shell_snapshot_from_root(&root_dir, Some("Beta Pack"))
-            .expect("snapshot should load");
+        let snapshot = load_shell_snapshot_from_root(
+            &root_dir,
+            Some("Beta Pack"),
+            MemorySecretStore::default(),
+        )
+        .expect("snapshot should load");
 
         assert_eq!(snapshot.modlists.len(), 2);
         assert_eq!(snapshot.global_settings.min_ram_mb, 2304);
