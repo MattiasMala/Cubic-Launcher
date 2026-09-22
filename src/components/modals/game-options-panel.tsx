@@ -677,7 +677,7 @@ export function GameOptionsPanel(props: Props) {
               modlistName() === null ? "ml-auto" : ""
             }`}
           >
-            Save
+            Save options.txt
           </button>
         </Show>
       </div>

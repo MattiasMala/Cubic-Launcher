@@ -115,7 +115,7 @@ impl VanillaOptionKeys {
     pub fn verify(&self) -> Result<()> {
         if self.plain.len() < MIN_PLAIN_KEYS {
             bail!(
-                "derivazione sospetta per {}: {} impostazioni semplici, soglia {}",
+                "suspicious derivation for {}: {} simple settings, threshold {}",
                 self.version_id,
                 self.plain.len(),
                 MIN_PLAIN_KEYS
@@ -123,7 +123,7 @@ impl VanillaOptionKeys {
         }
         if self.keybinds.len() < MIN_KEYBINDS {
             bail!(
-                "derivazione sospetta per {}: {} keybind, soglia {}",
+                "suspicious derivation for {}: {} keybinds, threshold {}",
                 self.version_id,
                 self.keybinds.len(),
                 MIN_KEYBINDS
@@ -131,7 +131,7 @@ impl VanillaOptionKeys {
         }
         if self.sound_categories.is_empty() || self.model_parts.is_empty() {
             bail!(
-                "derivazione sospetta per {}: {} categorie audio e {} parti del modello",
+                "suspicious derivation for {}: {} sound categories and {} model parts",
                 self.version_id,
                 self.sound_categories.len(),
                 self.model_parts.len()
@@ -145,7 +145,7 @@ impl VanillaOptionKeys {
             .collect();
         if !missing.is_empty() {
             bail!(
-                "derivazione sospetta per {}: manca il nucleo storico ({})",
+                "suspicious derivation for {}: the historic core is missing ({})",
                 self.version_id,
                 missing.join(", ")
             );
@@ -251,11 +251,11 @@ pub fn derive_from_client_jar(jar_path: &Path) -> Result<VanillaOptionKeys> {
 
     if anchor_hits.len() != 1 {
         bail!(
-            "il letterale `{ANCHOR_LITERAL}` doveva stare in una classe sola di {}, invece sta in {} ({})",
+            "the `{ANCHOR_LITERAL}` literal had to live in exactly one class of {}, it lives in {} instead ({})",
             jar_path.display(),
             anchor_hits.len(),
             if anchor_hits.is_empty() {
-                "nessuna".to_string()
+                "none".to_string()
             } else {
                 anchor_hits.join(", ")
             }
@@ -263,7 +263,7 @@ pub fn derive_from_client_jar(jar_path: &Path) -> Result<VanillaOptionKeys> {
     }
     let options_class = anchor_hits.remove(0);
     let class_bytes = options_class_bytes
-        .ok_or_else(|| anyhow!("classe delle opzioni trovata ma non letta"))?;
+        .ok_or_else(|| anyhow!("options class found but not read"))?;
 
     let manifest_bytes = manifest_bytes
         .ok_or_else(|| anyhow!("{JAR_VERSION_ENTRY} missing from {}", jar_path.display()))?;
@@ -622,14 +622,14 @@ struct ClassMethod {
 fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
     let slice = bytes
         .get(offset..offset + 2)
-        .ok_or_else(|| anyhow!("class file troncato a {offset}"))?;
+        .ok_or_else(|| anyhow!("class file truncated at {offset}"))?;
     Ok(u16::from_be_bytes([slice[0], slice[1]]))
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
     let slice = bytes
         .get(offset..offset + 4)
-        .ok_or_else(|| anyhow!("class file troncato a {offset}"))?;
+        .ok_or_else(|| anyhow!("class file truncated at {offset}"))?;
     Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
@@ -639,7 +639,7 @@ fn i32_at(bytes: &[u8], offset: usize) -> Result<i32> {
 
 fn parse_constant_pool(bytes: &[u8]) -> Result<(Vec<CpEntry>, usize)> {
     if bytes.len() < 10 || bytes[0..4] != [0xca, 0xfe, 0xba, 0xbe] {
-        bail!("non è un class file");
+        bail!("not a class file");
     }
 
     let count = u16_at(bytes, 8)? as usize;
@@ -651,7 +651,7 @@ fn parse_constant_pool(bytes: &[u8]) -> Result<(Vec<CpEntry>, usize)> {
     while index < count {
         let tag = *bytes
             .get(offset)
-            .ok_or_else(|| anyhow!("constant pool troncato"))?;
+            .ok_or_else(|| anyhow!("constant pool truncated"))?;
         offset += 1;
 
         match tag {
@@ -660,7 +660,7 @@ fn parse_constant_pool(bytes: &[u8]) -> Result<(Vec<CpEntry>, usize)> {
                 offset += 2;
                 let raw = bytes
                     .get(offset..offset + length)
-                    .ok_or_else(|| anyhow!("utf8 troncata nel constant pool"))?;
+                    .ok_or_else(|| anyhow!("utf8 truncated in the constant pool"))?;
                 pool.push(CpEntry::Utf8(String::from_utf8_lossy(raw).into_owned()));
                 offset += length;
             }
@@ -687,7 +687,7 @@ fn parse_constant_pool(bytes: &[u8]) -> Result<(Vec<CpEntry>, usize)> {
                 offset += 8;
                 index += 1;
             }
-            other => bail!("tag {other} sconosciuto nel constant pool"),
+            other => bail!("unknown tag {other} in the constant pool"),
         }
 
         index += 1;
@@ -718,7 +718,7 @@ fn skip_attributes(bytes: &[u8], mut offset: usize) -> Result<usize> {
         offset += 6 + length;
     }
     if offset > bytes.len() {
-        bail!("attributi oltre la fine del class file");
+        bail!("attributes past the end of the class file");
     }
     Ok(offset)
 }
@@ -758,13 +758,13 @@ fn parse_methods(bytes: &[u8], pool: &[CpEntry], mut offset: usize) -> Result<Ve
             let body_start = offset + 6;
             let body = bytes
                 .get(body_start..body_start + length)
-                .ok_or_else(|| anyhow!("attributo troncato"))?;
+                .ok_or_else(|| anyhow!("attribute truncated"))?;
 
             if attribute_name == "Code" && code.is_none() {
                 let code_length = u32_at(body, 4)? as usize;
                 let bytecode = body
                     .get(8..8 + code_length)
-                    .ok_or_else(|| anyhow!("bytecode troncato"))?;
+                    .ok_or_else(|| anyhow!("bytecode truncated"))?;
                 code = Some(bytecode.to_vec());
             }
 
@@ -790,7 +790,7 @@ fn ldc_strings(code: &[u8], pool: &[CpEntry]) -> Result<Vec<String>> {
             0x12 => {
                 let index = *code
                     .get(pc + 1)
-                    .ok_or_else(|| anyhow!("ldc troncata"))? as u16;
+                    .ok_or_else(|| anyhow!("ldc truncated"))? as u16;
                 if let Some(text) = string_literal_at(pool, index) {
                     literals.push(text.to_string());
                 }
@@ -811,7 +811,7 @@ fn ldc_strings(code: &[u8], pool: &[CpEntry]) -> Result<Vec<String>> {
 fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
     let opcode = *code
         .get(pc)
-        .ok_or_else(|| anyhow!("bytecode oltre la fine"))?;
+        .ok_or_else(|| anyhow!("bytecode past the end"))?;
 
     let length = match opcode {
         // tableswitch: padding a multiplo di 4, poi default/low/high e i salti
@@ -820,7 +820,7 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
             let low = i32_at(code, padded + 4)?;
             let high = i32_at(code, padded + 8)?;
             if high < low {
-                bail!("tableswitch con estremi invertiti");
+                bail!("tableswitch with inverted bounds");
             }
             let entries = (high as i64 - low as i64 + 1) as usize;
             padded + 12 + 4 * entries - pc
@@ -830,7 +830,7 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
             let padded = (pc + 4) & !3usize;
             let pairs = i32_at(code, padded + 4)?;
             if pairs < 0 {
-                bail!("lookupswitch con numero di coppie negativo");
+                bail!("lookupswitch with a negative pair count");
             }
             padded + 8 + 8 * (pairs as usize) - pc
         }
@@ -838,7 +838,7 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
         0xc4 => {
             let widened = *code
                 .get(pc + 1)
-                .ok_or_else(|| anyhow!("wide troncata"))?;
+                .ok_or_else(|| anyhow!("wide truncated"))?;
             if widened == 0x84 {
                 6
             } else {
@@ -854,7 +854,7 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
     };
 
     if length == 0 {
-        bail!("istruzione di lunghezza zero a {pc}");
+        bail!("zero-length instruction at {pc}");
     }
     Ok(length)
 }
@@ -946,7 +946,7 @@ mod tests {
         let error = derive_from_client_jar(&jar).expect_err("a keyless jar must not derive");
 
         assert!(
-            error.to_string().contains("derivazione sospetta"),
+            error.to_string().contains("suspicious derivation"),
             "unexpected error: {error}"
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -1161,7 +1161,7 @@ mod tests {
         let error = derive_from_client_jar(&jar).expect_err("two anchors is ambiguous");
 
         assert!(
-            error.to_string().contains("invece sta in 2"),
+            error.to_string().contains("it lives in 2 instead"),
             "unexpected error: {error}"
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -1257,7 +1257,7 @@ mod tests {
         let error = sample_keys().verify().expect_err("5 plain keys must not pass");
 
         assert!(
-            error.to_string().contains("impostazioni semplici"),
+            error.to_string().contains("simple settings"),
             "unexpected error: {error}"
         );
     }
@@ -1275,7 +1275,7 @@ mod tests {
         let error = keys.verify().expect_err("missing core must not pass");
 
         assert!(
-            error.to_string().contains("nucleo storico"),
+            error.to_string().contains("historic core is missing"),
             "unexpected error: {error}"
         );
     }

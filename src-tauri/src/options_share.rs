@@ -206,7 +206,7 @@ impl SeedStatus {
     pub fn describe(&self) -> String {
         match self {
             SeedStatus::Seeded { report } => format!(
-                "seminate {} impostazioni da {} (version:{}, {}) verso {}; bloccate {}",
+                "seeded {} settings from {} (version:{}, {}) into {}; blocked {}",
                 report.seeded,
                 report.source,
                 report.data_version,
@@ -215,12 +215,12 @@ impl SeedStatus {
                 report.blocked.len()
             ),
             SeedStatus::SkippedTargetExists { target } => {
-                format!("niente da seminare: {target} esiste già")
+                format!("nothing to seed: {target} already exists")
             }
             SeedStatus::SkippedNoSource { source } => {
-                format!("niente da seminare: {source} non esiste")
+                format!("nothing to seed: {source} does not exist")
             }
-            SeedStatus::Refused { reason } => format!("semina rifiutata: {reason}"),
+            SeedStatus::Refused { reason } => format!("seeding refused: {reason}"),
         }
     }
 }
@@ -327,8 +327,8 @@ fn seed_into(
     let Some(data_version) = source.data_version() else {
         return SeedStatus::Refused {
             reason: format!(
-                "{} non ha una riga `{VERSION_KEY}:` leggibile, e senza quella non si sa \
-                 quali nomi fossero vanilla quando i valori sono stati scritti",
+                "{} has no readable `{VERSION_KEY}:` line, and without it there is no way \
+                 to tell which names were vanilla when the values were written",
                 source_path.display()
             ),
         };
@@ -339,8 +339,8 @@ fn seed_into(
         Ok(None) => {
             return SeedStatus::Refused {
                 reason: format!(
-                    "nessun client.jar in cache ha DataVersion {data_version}: \
-                     non si può derivare l'insieme vanilla della sorgente"
+                    "no client.jar in the cache has DataVersion {data_version}: \
+                     the source's vanilla set cannot be derived"
                 ),
             }
         }
@@ -516,13 +516,13 @@ pub fn load_shared_options(
             },
             Ok(None) => {
                 derivation_error = Some(format!(
-                    "nessun client.jar in cache ha DataVersion {data_version}"
+                    "no client.jar in the cache has DataVersion {data_version}"
                 ))
             }
             Err(error) => derivation_error = Some(error.to_string()),
         }
     } else if exists {
-        derivation_error = Some(format!("{} non ha una riga `{VERSION_KEY}:`", path.display()));
+        derivation_error = Some(format!("{} has no `{VERSION_KEY}:` line", path.display()));
     }
 
     // Due dati, due sorgenti, e si deve vedere: `keys` dice cosa è vanilla e
@@ -627,8 +627,8 @@ pub fn save_shared_options(
 ) -> anyhow::Result<()> {
     if !scope.is_writable() {
         anyhow::bail!(
-            "l'options.txt di un'istanza lo scrive il gioco: il launcher lo crea al primo \
-             avvio e poi non lo tocca più"
+            "an instance's options.txt belongs to the game: the launcher creates it on the \
+             first launch and never touches it again"
         );
     }
 
@@ -660,9 +660,8 @@ fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<(
 
     let Some(data_version) = existing else {
         anyhow::bail!(
-            "{} non può essere scritto senza una riga `{VERSION_KEY}:`: un file senza \
-             vale DataVersion 0 per il gioco, e a zero si applicano tutti i datafixer \
-             delle opzioni",
+            "{} cannot be written without a `{VERSION_KEY}:` line: to the game, a file \
+             without one is DataVersion 0, and at zero every options datafixer is applied",
             path.display()
         );
     };
@@ -722,7 +721,7 @@ pub fn apply_options(
     if source == target {
         return Ok(SeedStatus::Refused {
             reason: format!(
-                "sorgente e destinazione sono lo stesso file ({}): non si applica un file su sé stesso",
+                "source and target are the same file ({}): a file is never applied onto itself",
                 source.display()
             ),
         });
@@ -932,7 +931,7 @@ mod tests {
         )
         .expect_err("scrivere l'options.txt di un'istanza deve essere rifiutato");
 
-        assert!(error.to_string().contains("lo scrive il gioco"));
+        assert!(error.to_string().contains("belongs to the game"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "version:3465\nfov:0.5\n"
@@ -1203,7 +1202,7 @@ mod tests {
 
         match status {
             SeedStatus::Refused { reason } => {
-                assert!(reason.contains("stesso file"), "unexpected refusal: {reason}")
+                assert!(reason.contains("the same file"), "unexpected refusal: {reason}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
