@@ -29,8 +29,12 @@ base64 = "0.22"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 libc = "0.2"
 open = "5"
+# Already in the lock through tauri/tokio; direct for the skin screen's shared
+# state (E7), whose guards never need a poisoning branch.
+parking_lot = "0.12"
 rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+# `multipart` for the skin upload (E7): Mojang takes the PNG as a form field.
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

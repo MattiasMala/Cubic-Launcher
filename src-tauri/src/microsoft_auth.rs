@@ -478,10 +478,120 @@ struct MinecraftAuthResponse {
     access_token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ── The profile's skins and capes (E7) ──────────────────────────────────────
+//
+// `MinecraftProfile` is also the last step of the sign-in chain, so everything
+// below is read defensively: a value Mojang adds later, or an element that is
+// not what we expect, degrades to `Unknown` or is dropped. It never fails the
+// profile, because failing the profile would fail every sign-in. Modrinth keeps
+// the same `Unknown` fallback for variant and state.
+
+/// Classic (4-pixel arms) or slim (3-pixel arms). Mojang writes `CLASSIC` and
+/// `SLIM`; the launcher writes lowercase, which is also what the upload form
+/// field takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkinVariant {
+    #[serde(alias = "CLASSIC")]
+    Classic,
+    #[serde(alias = "SLIM")]
+    Slim,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextureState {
+    #[serde(alias = "ACTIVE")]
+    Active,
+    #[serde(alias = "INACTIVE")]
+    Inactive,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSkin {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub state: TextureState,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub texture_key: Option<String>,
+    #[serde(default)]
+    pub variant: SkinVariant,
+    /// Set only on the skins Mojang assigns by default (`"KAI"` after a reset,
+    /// measured in E7 phase A); absent on an uploaded skin.
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+impl ProfileSkin {
+    /// The texture's content address: the sha256 of the PNG Mojang serves.
+    /// `textureKey` was present in every response measured; the URL's last
+    /// segment is the same hash and covers a response without it.
+    pub fn texture_key(&self) -> Option<&str> {
+        self.texture_key
+            .as_deref()
+            .or_else(|| self.url.rsplit('/').next())
+            .filter(|key| !key.is_empty())
+    }
+}
+
+/// A cape the player **owns**. Capes cannot be added, only shown or hidden:
+/// the list is every cape of the account, with at most one `Active`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileCape {
+    pub id: String,
+    #[serde(default)]
+    pub state: TextureState,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MinecraftProfile {
     pub id: String,
     pub name: String,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub skins: Vec<ProfileSkin>,
+    #[serde(default, deserialize_with = "lenient_list")]
+    pub capes: Vec<ProfileCape>,
+}
+
+impl MinecraftProfile {
+    pub fn active_skin(&self) -> Option<&ProfileSkin> {
+        self.skins.iter().find(|skin| skin.state == TextureState::Active)
+    }
+
+    pub fn active_cape(&self) -> Option<&ProfileCape> {
+        self.capes.iter().find(|cape| cape.state == TextureState::Active)
+    }
+}
+
+/// A list whose elements are read one by one: an element that does not parse
+/// is dropped, and anything that is not an array (`null` included) is empty.
+fn lenient_list<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Full auth chain: Microsoft access token → Xbox Live → XSTS → Minecraft token + profile.
@@ -825,7 +935,7 @@ mod tests {
         default_agent_author_name, default_loopback_redirect_uri, generate_url_safe_random_bytes,
         join_scopes, microsoft_client_id_from_env, parse_authorization_callback,
         validate_oauth_config, AccountRecord, AccountsRepository, MicrosoftOAuthClient,
-        MicrosoftOAuthConfig,
+        MicrosoftOAuthConfig, MinecraftProfile, SkinVariant, TextureState,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -1036,5 +1146,107 @@ mod tests {
         assert_eq!(client_id, "test-client-id");
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// The shape `GET /minecraft/profile` returned for a real account on
+    /// 2026-09-22 (E7 phase A), with the player's id, name and cape ids
+    /// replaced. Texture keys are public and kept.
+    const MEASURED_PROFILE: &str = r#"{
+        "id": "0123456789abcdef0123456789abcdef",
+        "name": "Player",
+        "skins": [{
+            "id": "6edef170-324a-46cd-a6de-584470b34b15",
+            "state": "ACTIVE",
+            "url": "http://textures.minecraft.net/texture/9df9e241bf5af8500d7146fcecdb36606d8b885ae41d0e08a4539ccf7221655c",
+            "textureKey": "9df9e241bf5af8500d7146fcecdb36606d8b885ae41d0e08a4539ccf7221655c",
+            "variant": "CLASSIC"
+        }],
+        "capes": [{
+            "id": "00000000-0000-4000-8000-000000000001",
+            "state": "INACTIVE",
+            "url": "http://textures.minecraft.net/texture/28de4a81688ad18b49e735a273e086c18f1e3966956123ccb574034c06f5d336",
+            "alias": "Pan"
+        }, {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "state": "ACTIVE",
+            "url": "http://textures.minecraft.net/texture/2340c0e03dd24a11b15a8b33c2a7e9e32abb2051b2481d0ba7defd635ca7a933",
+            "alias": "Migrator"
+        }],
+        "profileActions": {}
+    }"#;
+
+    #[test]
+    fn profile_keeps_the_skins_and_capes_mojang_sends() {
+        let profile: MinecraftProfile =
+            serde_json::from_str(MEASURED_PROFILE).expect("the measured profile must parse");
+
+        let skin = profile.active_skin().expect("the active skin must be kept");
+        assert_eq!(
+            skin.texture_key(),
+            Some("9df9e241bf5af8500d7146fcecdb36606d8b885ae41d0e08a4539ccf7221655c")
+        );
+        assert_eq!(skin.variant, SkinVariant::Classic);
+        assert_eq!(skin.state, TextureState::Active);
+
+        assert_eq!(profile.capes.len(), 2, "every owned cape, active or not");
+        assert_eq!(profile.capes[0].alias.as_deref(), Some("Pan"));
+        assert_eq!(profile.capes[0].state, TextureState::Inactive);
+        assert_eq!(
+            profile.active_cape().map(|cape| cape.id.as_str()),
+            Some("00000000-0000-4000-8000-000000000002")
+        );
+    }
+
+    /// The profile is also the last step of the sign-in chain: a value Mojang
+    /// adds tomorrow must not turn every sign-in into an error.
+    #[test]
+    fn profile_survives_values_mojang_may_add_tomorrow() {
+        let profile: MinecraftProfile = serde_json::from_str(
+            r#"{
+                "id": "0123456789abcdef0123456789abcdef",
+                "name": "Player",
+                "skins": [
+                    { "id": "a", "state": "EQUIPPED", "url": "http://textures.minecraft.net/texture/abc", "variant": "WIDE" },
+                    42
+                ],
+                "capes": null
+            }"#,
+        )
+        .expect("unknown values must not fail the profile");
+
+        assert_eq!(profile.skins.len(), 1, "an element that is not a skin is dropped, the rest kept");
+        assert_eq!(profile.skins[0].variant, SkinVariant::Unknown);
+        assert_eq!(profile.skins[0].state, TextureState::Unknown);
+        assert_eq!(
+            profile.skins[0].texture_key(),
+            Some("abc"),
+            "without `textureKey` the key is the texture URL's last segment"
+        );
+        assert!(profile.capes.is_empty());
+        assert!(profile.active_skin().is_none(), "an unknown state is not `ACTIVE`");
+    }
+
+    #[test]
+    fn profile_without_skins_or_capes_still_reads() {
+        let profile: MinecraftProfile = serde_json::from_str(
+            r#"{ "id": "0123456789abcdef0123456789abcdef", "name": "Player" }"#,
+        )
+        .expect("the two fields sign-in needs are enough");
+
+        assert_eq!(profile.name, "Player");
+        assert!(profile.skins.is_empty());
+        assert!(profile.capes.is_empty());
+    }
+
+    #[test]
+    fn skin_variant_round_trips_in_the_launcher_spelling() {
+        assert_eq!(
+            serde_json::to_string(&SkinVariant::Slim).expect("variant must serialize"),
+            r#""slim""#
+        );
+        assert_eq!(
+            serde_json::from_str::<SkinVariant>(r#""slim""#).expect("our own spelling must read back"),
+            SkinVariant::Slim
+        );
     }
 }
