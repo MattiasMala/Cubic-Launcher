@@ -150,6 +150,7 @@ pub fn run() {
             skins::load_skins_command,
             skins::add_skin_command,
             skins::set_saved_skin_variant_command,
+            skins::rename_saved_skin_command,
             skins::remove_saved_skin_command,
             skins::equip_skin_command,
             skins::reset_skin_command,

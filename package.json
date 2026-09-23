@@ -16,6 +16,8 @@
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2",
     "@thisbeyond/solid-dnd": "^0.7.5",
+    "skinview-utils": "^0.7.1",
+    "skinview3d": "^3.4.2",
     "solid-js": "^1.9.3"
   },
   "devDependencies": {

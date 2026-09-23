@@ -7,6 +7,9 @@
 //! 429s on purpose, and a high volume of 429s on skin uploads is a documented
 //! cause of account suspension.
 
+// A build with the fake backend (`skins_fake.rs`) never reaches the live one.
+#![cfg_attr(feature = "skins-fake-backend", allow(dead_code))]
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;

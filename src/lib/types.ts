@@ -295,6 +295,56 @@ export type WorldEntry = {
   hidden: boolean;
 };
 
+// ── Skins (E7) — the shapes `skins.rs` serializes ─────────────────────────────
+
+/** `unknown` is an arm model Mojang may add tomorrow; the library only saves the two. */
+export type SkinVariant = "classic" | "slim" | "unknown";
+
+/**
+ * Where a card comes from: the player's library, the eighteen vanilla
+ * defaults, or the skin worn on the profile that is in neither.
+ */
+export type SkinSource = "saved" | "default" | "external";
+
+export type SkinCard = {
+  source: SkinSource;
+  textureKey: string;
+  variant: SkinVariant;
+  name: string | null;
+  /** Worn on the profile right now. */
+  active: boolean;
+  /** A data URL for saved and default cards (works offline); Mojang's https URL for an external one. */
+  textureUrl: string;
+};
+
+export type CapeCard = {
+  id: string;
+  alias: string | null;
+  /** Always Mojang's https URL: without a network a cape can't be drawn. */
+  textureUrl: string;
+  active: boolean;
+};
+
+export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library";
+
+/** Every skin command rejects with this object, never a string: read `kind`, not `message`. */
+export type SkinError = {
+  kind: SkinErrorKind;
+  message: string;
+  status: number | null;
+  retryAfterSeconds: number | null;
+};
+
+export type SkinsView = {
+  playerUuid: string;
+  playerName: string | null;
+  /** External first, then saved (newest first), then the defaults. */
+  skins: SkinCard[];
+  capes: CapeCard[];
+  /** Mojang did not answer: the library is shown anyway and no card is active. */
+  profileError: SkinError | null;
+};
+
 // ── Static constants ──────────────────────────────────────────────────────────
 
 export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Vanilla"] as const;

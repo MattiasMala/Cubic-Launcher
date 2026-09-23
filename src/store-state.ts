@@ -61,10 +61,10 @@ export const [selectedModListName, setSelectedModListName] = createSignal<string
  * Which destination of the icon rail is showing. "home" is the Modrinth-style
  * landing page — the worlds to jump into, then the mod list library;
  * "modlist" is the editor plus its launch panel, which is where picking a mod
- * list lands; "screenshots" is the global gallery. The Skin icon is a
- * placeholder and has no view (E7).
+ * list lands; "skins" is the skin screen (E7); "screenshots" is the global
+ * gallery.
  */
-export type RailView = "home" | "modlist" | "screenshots";
+export type RailView = "home" | "modlist" | "skins" | "screenshots";
 export const [activeRailView, setActiveRailView] = createSignal<RailView>("home");
 /**
  * The world folder the next launch should open directly, or `null` for the

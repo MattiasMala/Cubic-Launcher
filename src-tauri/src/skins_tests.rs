@@ -437,6 +437,79 @@ fn changing_the_arms_of_a_saved_skin_keeps_its_file_and_its_place() {
 }
 
 #[test]
+fn renaming_names_one_entry_in_place_and_an_empty_name_clears_it() {
+    let root = unique_root("rename");
+    let connection = open_test_database(&root);
+    let skins_dir = root.join("skins");
+    fs::create_dir_all(&skins_dir).unwrap();
+    let first = fake_png(64, 64, b"first");
+    let second = fake_png(64, 64, b"second");
+    for (player, png) in [(PLAYER, &first), (PLAYER, &second), (OTHER_PLAYER, &first)] {
+        add_to_library(
+            &connection,
+            &skins_dir,
+            player,
+            png,
+            SkinVariant::Classic,
+            None,
+        )
+        .unwrap();
+    }
+
+    rename_in_library(
+        &connection,
+        PLAYER,
+        &sha(&first),
+        SkinVariant::Classic,
+        Some("  Knight  ".to_string()),
+    )
+    .unwrap();
+    let named = |player: &str| -> Vec<(String, Option<String>)> {
+        saved_skins_for(&connection, player)
+            .unwrap()
+            .into_iter()
+            .map(|skin| (skin.texture_key, skin.name))
+            .collect()
+    };
+    assert_eq!(
+        named(PLAYER),
+        vec![
+            (sha(&second), None),
+            (sha(&first), Some("Knight".to_string())),
+        ],
+        "trimmed, and the entry keeps its place"
+    );
+    assert_eq!(
+        named(OTHER_PLAYER),
+        vec![(sha(&first), None)],
+        "the other player's entry for the same file is another entry"
+    );
+
+    rename_in_library(
+        &connection,
+        PLAYER,
+        &sha(&first),
+        SkinVariant::Classic,
+        Some("   ".to_string()),
+    )
+    .unwrap();
+    assert_eq!(named(PLAYER)[1], (sha(&first), None));
+
+    let error = rename_in_library(
+        &connection,
+        PLAYER,
+        &sha(&first),
+        SkinVariant::Slim,
+        Some("Slim".to_string()),
+    )
+    .expect_err("no entry with slim arms");
+    assert_eq!(error.kind, SkinErrorKind::Library);
+
+    drop(connection);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn saved_skins_are_files_named_by_their_hash_with_entries_per_player() {
     let root = unique_root("library");
     let connection = open_test_database(&root);

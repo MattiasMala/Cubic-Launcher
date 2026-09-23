@@ -36,7 +36,12 @@ pub use api::{
     classify_mojang_error, texture_url, SkinError, SkinErrorKind, WriteGuard,
     ASSUMED_WRITES_PER_MINUTE, DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
 };
+#[cfg_attr(feature = "skins-fake-backend", allow(unused_imports))]
 pub(crate) use api::{LiveBackend, SkinBackend};
+
+#[cfg(feature = "skins-fake-backend")]
+#[path = "skins_fake.rs"]
+mod fake;
 
 #[cfg(test)]
 #[path = "skins_tests.rs"]
@@ -536,6 +541,26 @@ pub fn set_variant_in_library(
     write_saved_skins(connection, &all)
 }
 
+/// Names one saved skin, keeping its place; an empty name clears it.
+pub fn rename_in_library(
+    connection: &Connection,
+    player_uuid: &str,
+    texture_key: &str,
+    variant: SkinVariant,
+    name: Option<String>,
+) -> Result<(), SkinError> {
+    let player_uuid = normalize_uuid(player_uuid);
+    let mut all = load_saved_skins(connection)?;
+    let skin = all
+        .iter_mut()
+        .find(|skin| is_entry(skin, &player_uuid, texture_key, variant))
+        .ok_or_else(|| SkinError::library("That skin is not in the library"))?;
+    skin.name = name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    write_saved_skins(connection, &all)
+}
+
 /// After an upload: the entries that pointed at the file the player saved now
 /// point at the file Mojang made of it, and the old file goes if nobody uses
 /// it. Two entries that become the same are kept once.
@@ -958,6 +983,24 @@ pub(crate) async fn set_saved_variant<B: SkinBackend>(
     build_view(ctx, profile.as_ref(), error)
 }
 
+pub(crate) async fn rename_saved<B: SkinBackend>(
+    ctx: &SkinContext,
+    backend: &B,
+    texture_key: &str,
+    variant: SkinVariant,
+    name: Option<String>,
+) -> Result<SkinsView, SkinError> {
+    rename_in_library(
+        &open_database(&ctx.db_path)?,
+        &ctx.player_uuid,
+        texture_key,
+        variant,
+        name,
+    )?;
+    let (profile, error) = known_profile(ctx, backend).await;
+    build_view(ctx, profile.as_ref(), error)
+}
+
 pub(crate) async fn remove_saved<B: SkinBackend>(
     ctx: &SkinContext,
     backend: &B,
@@ -979,9 +1022,24 @@ pub(crate) async fn remove_saved<B: SkinBackend>(
 //
 // Each returns the whole screen. The error is an object (`SkinError`), not a
 // string: the frontend reads `kind`, and `retryAfterSeconds` for a 429.
+//
+// Which Mojang they talk to is decided when the binary is built: the live one,
+// or — only in a build with the `skins-fake-backend` feature, which no release
+// turns on — the fake of `skins_fake.rs`, with its own scratch library.
+
+#[cfg(not(feature = "skins-fake-backend"))]
+type CommandBackend<'a> = LiveBackend<'a>;
+#[cfg(feature = "skins-fake-backend")]
+type CommandBackend<'a> = fake::FakeBackend<'a>;
+
+#[cfg(not(feature = "skins-fake-backend"))]
+use self::skin_context as command_context;
+#[cfg(feature = "skins-fake-backend")]
+use fake::skin_context as command_context;
 
 /// The active account's player, from the database: the library opens without
 /// a network.
+#[cfg_attr(feature = "skins-fake-backend", allow(dead_code))]
 fn skin_context(paths: &LauncherPaths) -> Result<SkinContext, SkinError> {
     let connection = open_database(paths.database_path())?;
     let account = AccountsRepository::new(&connection)
@@ -1023,8 +1081,8 @@ pub async fn load_skins_command(
     launcher_paths: State<'_, LauncherPaths>,
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    load_view(&ctx, &LiveBackend::new(&launcher_paths, &skins)?).await
+    let ctx = command_context(&launcher_paths)?;
+    load_view(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
 }
 
 #[tauri::command]
@@ -1035,8 +1093,8 @@ pub async fn add_skin_command(
     variant: SkinVariant,
     name: Option<String>,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    let backend = LiveBackend::new(&launcher_paths, &skins)?;
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
     add_file(&ctx, &backend, Path::new(&path), variant, name).await
 }
 
@@ -1048,9 +1106,22 @@ pub async fn set_saved_skin_variant_command(
     variant: SkinVariant,
     new_variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    let backend = LiveBackend::new(&launcher_paths, &skins)?;
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
     set_saved_variant(&ctx, &backend, &texture_key, variant, new_variant).await
+}
+
+#[tauri::command]
+pub async fn rename_saved_skin_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    skins: State<'_, SkinsState>,
+    texture_key: String,
+    variant: SkinVariant,
+    name: Option<String>,
+) -> Result<SkinsView, SkinError> {
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    rename_saved(&ctx, &backend, &texture_key, variant, name).await
 }
 
 #[tauri::command]
@@ -1060,8 +1131,8 @@ pub async fn remove_saved_skin_command(
     texture_key: String,
     variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    let backend = LiveBackend::new(&launcher_paths, &skins)?;
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
     remove_saved(&ctx, &backend, &texture_key, variant).await
 }
 
@@ -1072,8 +1143,8 @@ pub async fn equip_skin_command(
     texture_key: String,
     variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    let backend = LiveBackend::new(&launcher_paths, &skins)?;
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
     equip(&ctx, &backend, &texture_key, variant).await
 }
 
@@ -1082,8 +1153,8 @@ pub async fn reset_skin_command(
     launcher_paths: State<'_, LauncherPaths>,
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    reset(&ctx, &LiveBackend::new(&launcher_paths, &skins)?).await
+    let ctx = command_context(&launcher_paths)?;
+    reset(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
 }
 
 #[tauri::command]
@@ -1092,8 +1163,8 @@ pub async fn set_cape_command(
     skins: State<'_, SkinsState>,
     cape_id: Option<String>,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    let backend = LiveBackend::new(&launcher_paths, &skins)?;
+    let ctx = command_context(&launcher_paths)?;
+    let backend = CommandBackend::new(&launcher_paths, &skins)?;
     set_cape(&ctx, &backend, cape_id.as_deref()).await
 }
 
@@ -1102,6 +1173,6 @@ pub async fn save_worn_skin_command(
     launcher_paths: State<'_, LauncherPaths>,
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
-    let ctx = skin_context(&launcher_paths)?;
-    save_worn(&ctx, &LiveBackend::new(&launcher_paths, &skins)?).await
+    let ctx = command_context(&launcher_paths)?;
+    save_worn(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
 }

@@ -14,6 +14,13 @@ edition = "2021"
 name = "cubic_launcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Dev only (E7 phase 2): every skin command talks to an in-process fake Mojang
+# with its own scratch library, so the screen can be tried without spending
+# real writes on a real account. No release build turns it on:
+# `npm run tauri dev -- --features skins-fake-backend`.
+skins-fake-backend = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
