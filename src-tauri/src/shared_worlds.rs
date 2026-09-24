@@ -335,13 +335,13 @@ fn create_directory_link(world_dir: &Path, link: &Path) -> Result<()> {
 /// **The crate's default feature `unstable_admin` stays on, deliberately.** It
 /// only changes a retry: `junction` opens the reparse point, and *only* if that
 /// comes back `PermissionDenied` does it try to enable a privilege and open
-/// again (`internals/helpers.rs:16-33` of `junction 2.0.0`). With the feature
+/// again (`internals/helpers.rs:26-32` of `junction 2.0.0`). With the feature
 /// the privilege asked for is `SE_RESTORE_NAME`; **without** it, it is
-/// `SE_CREATE_SYMBOLIC_LINK_NAME` — the one an ordinary Windows user does not
-/// have, and the whole reason D97 chose a junction over `symlink_dir`. Turning
-/// the feature off would therefore make the fallback ask for exactly the wrong
-/// thing. On the ordinary path, where the user owns the folder, neither
-/// privilege is ever requested.
+/// `SE_CREATE_SYMBOLIC_LINK_NAME` (`helpers.rs:46-55`) — the one an ordinary
+/// Windows user does not have, and the whole reason D97 chose a junction over
+/// `symlink_dir`. Turning the feature off would therefore make the fallback
+/// ask for exactly the wrong thing. On the ordinary path, where the user owns
+/// the folder, neither privilege is ever requested.
 #[cfg(windows)]
 fn create_directory_link(world_dir: &Path, link: &Path) -> Result<()> {
     junction::create(world_dir, link).map_err(Into::into)
