@@ -231,12 +231,36 @@ fn holds_a_session_lock_helper() {
         .open(&path)
         .expect("the lock file must be there");
     assert!(
-        try_take_exclusive_lock(&file).expect("locking must not error"),
+        take_the_lock_the_game_takes(&file),
         "the helper must get the lock first"
     );
     fs::write(&marker, b"held").expect("the marker must be writable");
     // Held until the parent kills this process.
     std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+/// The lock **Minecraft** takes, written out here instead of borrowed from
+/// `shared_worlds`.
+///
+/// The duplication is the point. `DirectoryLock.create` calls
+/// `FileChannel.tryLock`, which on unix is `fcntl(F_SETLK)`; Rust's
+/// `File::try_lock` is `flock`, and the two are independent lock spaces —
+/// measured, report `065`. If both sides of this test used the production
+/// function, a silent return to `File::try_lock` would still pass, because two
+/// `flock`s in two processes conflict with each other perfectly well. Taking
+/// the game's own lock here means that regression turns the test red.
+fn take_the_lock_the_game_takes(file: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = 0;
+    lock.l_len = 0;
+
+    // SAFETY: the descriptor outlives the call and `fcntl` only reads the
+    // `flock` it is handed.
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0 }
 }
 
 /// Dropping the last instance is allowed, and the world does not disappear

@@ -191,9 +191,15 @@ fn move_directory(source: &Path, destination: &Path) -> Result<()> {
         }
     }
 
+    // **The rollback window closes here.** Removing the destination is only
+    // safe while the source is whole, which is true of every branch above and
+    // of none below: `remove_dir_all` can fail after gutting part of the
+    // source, and a destination removed then would be the only intact copy.
+    // So a failure at this point keeps the verified destination and reports
+    // the leftovers, which are debris and not lost bytes.
     fs::remove_dir_all(source).with_context(|| {
         format!(
-            "the world is safe at {} but {} could not be cleared",
+            "the world is safe at {} but {} could not be cleared: what is left there can be removed by hand",
             destination.display(),
             source.display()
         )
@@ -325,6 +331,17 @@ fn create_directory_link(world_dir: &Path, link: &Path) -> Result<()> {
 
 /// A junction, not `symlink_dir`: D97. No copy fallback — a copied world is two
 /// worlds.
+///
+/// **The crate's default feature `unstable_admin` stays on, deliberately.** It
+/// only changes a retry: `junction` opens the reparse point, and *only* if that
+/// comes back `PermissionDenied` does it try to enable a privilege and open
+/// again (`internals/helpers.rs:16-33` of `junction 2.0.0`). With the feature
+/// the privilege asked for is `SE_RESTORE_NAME`; **without** it, it is
+/// `SE_CREATE_SYMBOLIC_LINK_NAME` — the one an ordinary Windows user does not
+/// have, and the whole reason D97 chose a junction over `symlink_dir`. Turning
+/// the feature off would therefore make the fallback ask for exactly the wrong
+/// thing. On the ordinary path, where the user owns the folder, neither
+/// privilege is ever requested.
 #[cfg(windows)]
 fn create_directory_link(world_dir: &Path, link: &Path) -> Result<()> {
     junction::create(world_dir, link).map_err(Into::into)
