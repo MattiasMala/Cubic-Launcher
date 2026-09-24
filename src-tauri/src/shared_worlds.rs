@@ -359,14 +359,85 @@ fn remove_directory_link(link: &Path) -> std::io::Result<()> {
     fs::remove_dir(link)
 }
 
+// ── Names ────────────────────────────────────────────────────────────────────
+
+/// What a world's folder is called once it belongs to the mod list (D98).
+///
+/// The rename costs nothing — the world is being moved anyway — and it buys
+/// the way out of a dead end Mattias found: two instances of one mod list can
+/// both have a `New World`, which is exactly what his disk looks like, and a
+/// link cannot take a name a real world already holds. A world called
+/// `New World` becomes `New World shared`, and the links go under that name
+/// wherever it is free.
+///
+/// **`level.dat` is never rewritten.** The name in the game's own world list
+/// is `LevelName` and stays the player's; this is a folder name, which is
+/// launcher business.
+const SHARED_SUFFIX: &str = " shared";
+
+/// `base`, `base (2)`, `base (3)`… until `free` accepts one.
+///
+/// The shape follows Minecraft's own: the real disk already holds a
+/// `New World (1)` the game made that way.
+fn first_free_name(base: &str, mut free: impl FnMut(&str) -> bool) -> Result<String> {
+    for attempt in 1..1_000 {
+        let candidate = if attempt == 1 {
+            base.to_string()
+        } else {
+            format!("{base} ({attempt})")
+        };
+        if free(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("no free name left for '{base}'")
+}
+
+/// A name nothing at all occupies. Used for the mod list's `worlds/`, where the
+/// launcher is the only thing that writes.
+fn name_free_in(dir: &Path) -> impl FnMut(&str) -> bool + '_ {
+    move |candidate| fs::symlink_metadata(dir.join(candidate)).is_err()
+}
+
+/// A name this instance's `saves/` can give to a link at `world_dir`.
+///
+/// Free means one of three things, and the third is what keeps a second share
+/// from piling up `… shared (2)` next to the link it already made: nothing
+/// under that name, a **dangling** link — which `link_world_into` replaces the
+/// way `create_file_link` does — or a link that already points at this very
+/// world.
+///
+/// A real directory is never free. That guard is the one thing D98 must not
+/// soften: it is a world of the user's.
+fn link_name_free_in<'a>(saves_dir: &'a Path, world_dir: &Path) -> impl FnMut(&str) -> bool + 'a {
+    let resolved_world = fs::canonicalize(world_dir).ok();
+    move |candidate| {
+        let path = saves_dir.join(candidate);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return true;
+        };
+        if !metadata.file_type().is_symlink() {
+            return false;
+        }
+        match (fs::canonicalize(&path), resolved_world.as_ref()) {
+            (Err(_), _) => true,
+            (Ok(resolved), Some(world)) => resolved == *world,
+            (Ok(_), None) => false,
+        }
+    }
+}
+
 // ── Sharing ──────────────────────────────────────────────────────────────────
 
 /// Give `target_instance_name` a way into this world, moving the world into the
 /// mod list first if it is still inside an instance.
 ///
 /// `instance_name` is where the world is today: `Some` for a world that has
-/// never been shared, `None` for one that already lives in `worlds/`. The
-/// result is the world's new id, which is always a shared one.
+/// never been shared — and then `folder_name` is the folder in that instance's
+/// `saves/` — `None` for one that already lives in `worlds/`, and then
+/// `folder_name` is its folder there. The result is the world's id, which is
+/// always a shared one, and whose `folder_name` is **not** necessarily the one
+/// that came in: see [`SHARED_SUFFIX`].
 pub fn share_world_with_instance(
     root_dir: &Path,
     modlist_name: &str,
@@ -385,65 +456,97 @@ pub fn share_world_with_instance(
             .with_context(|| format!("invalid instance name '{instance_name}'"))?;
     }
 
-    let world_dir = modlist_worlds_dir(root_dir, modlist_name).join(folder_name);
+    let worlds_dir = modlist_worlds_dir(root_dir, modlist_name);
+    let shared_folder_name = match instance_name {
+        Some(instance_name) => {
+            let source =
+                instance_saves_dir(root_dir, modlist_name, instance_name).join(folder_name);
+            let metadata = fs::symlink_metadata(&source)
+                .with_context(|| format!("no world at {}", source.display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "{} is already a link: the world it points at is the one to share",
+                    source.display()
+                );
+            }
+            if !metadata.is_dir() {
+                bail!("{} is not a world folder", source.display());
+            }
 
-    if let Some(instance_name) = instance_name {
-        let source = instance_saves_dir(root_dir, modlist_name, instance_name).join(folder_name);
-        let metadata = fs::symlink_metadata(&source)
-            .with_context(|| format!("no world at {}", source.display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "{} is already a link: the world it points at is the one to share",
-                source.display()
-            );
-        }
-        if !metadata.is_dir() {
-            bail!("{} is not a world folder", source.display());
-        }
-        if fs::symlink_metadata(&world_dir).is_ok() {
-            bail!(
-                "{} already holds a world called '{folder_name}'",
-                world_dir.display()
-            );
-        }
+            fs::create_dir_all(&worlds_dir)
+                .with_context(|| format!("failed to create {}", worlds_dir.display()))?;
+            let shared_folder_name = first_free_name(
+                &format!("{folder_name}{SHARED_SUFFIX}"),
+                name_free_in(&worlds_dir),
+            )?;
+            let world_dir = worlds_dir.join(&shared_folder_name);
 
-        // Held across the move, not checked before it.
-        let _lock = try_hold_session_lock(&source)?;
-        fs::create_dir_all(modlist_worlds_dir(root_dir, modlist_name)).with_context(|| {
-            format!(
-                "failed to create {}",
-                modlist_worlds_dir(root_dir, modlist_name).display()
-            )
-        })?;
-        move_directory(&source, &world_dir)?;
+            // Held across the move, not checked before it.
+            let _lock = try_hold_session_lock(&source)?;
+            move_directory(&source, &world_dir)?;
 
-        // The instance the world came from is an instance like the others now:
-        // it gets a link back, in the place the directory used to be.
-        if let Err(error) = link_world_into(&world_dir, &source) {
-            // The world is whole in the mod list, so nothing is lost; putting
-            // it back is still the state the user asked for least.
-            let _ = move_directory(&world_dir, &source);
-            return Err(error);
+            // The instance the world came from is an instance like the others
+            // now: it gets a link back, under the shared name where the name
+            // it vacated is free — which it is, unless something else took it
+            // in between.
+            if let Err(error) = link_into_instance(root_dir, modlist_name, instance_name, &world_dir)
+            {
+                // The world is whole in the mod list, so nothing is lost;
+                // putting it back is still the state the user asked for least.
+                let _ = move_directory(&world_dir, &source);
+                return Err(error);
+            }
+            shared_folder_name
         }
-    } else if !world_dir.is_dir() {
-        bail!("no shared world at {}", world_dir.display());
-    }
+        None => {
+            if !worlds_dir.join(folder_name).is_dir() {
+                bail!("no shared world at {}", worlds_dir.join(folder_name).display());
+            }
+            folder_name.to_string()
+        }
+    };
 
-    let target = instance_saves_dir(root_dir, modlist_name, target_instance_name).join(folder_name);
-    link_world_into(&world_dir, &target)?;
+    let world_dir = worlds_dir.join(&shared_folder_name);
+    link_into_instance(root_dir, modlist_name, target_instance_name, &world_dir)?;
 
     Ok(WorldId {
         modlist_name: modlist_name.to_string(),
         instance_name: None,
-        folder_name: folder_name.to_string(),
+        folder_name: shared_folder_name,
     })
+}
+
+/// Link `world_dir` into one instance's `saves/`, under the first name that
+/// instance has free for it.
+fn link_into_instance(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    world_dir: &Path,
+) -> Result<()> {
+    let saves_dir = instance_saves_dir(root_dir, modlist_name, instance_name);
+    fs::create_dir_all(&saves_dir)
+        .with_context(|| format!("failed to create {}", saves_dir.display()))?;
+
+    let world_folder_name = world_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("the shared world has no usable folder name")?;
+    let link_name = first_free_name(world_folder_name, link_name_free_in(&saves_dir, world_dir))?;
+
+    link_world_into(world_dir, &saves_dir.join(link_name))
 }
 
 /// Take one instance's way into a shared world away.
 ///
+/// `folder_name` is the name **that instance's own `saves/` uses**, which is
+/// what `WorldInstanceLink::folder_name` carries and what the screen shows.
+/// Since D98 it need not be the name the world has in `worlds/`: the
+/// destination may have had that one taken.
+///
 /// **Only a link is ever removed**, never a directory: if the name in that
-/// instance's `saves/` is a real world, or a link pointing somewhere else, this
-/// refuses and touches nothing.
+/// instance's `saves/` is a real world, or a link pointing anywhere other than
+/// into this mod list's `worlds/`, this refuses and touches nothing.
 ///
 /// Taking the last one away is allowed and loses nothing: the world stays in
 /// the mod list's `worlds/` folder and stays in the listing with an empty
@@ -465,9 +568,9 @@ pub fn unshare_world_from_instance(
     validate_path_component(instance_name)
         .with_context(|| format!("invalid instance name '{instance_name}'"))?;
 
-    let world_dir = modlist_worlds_dir(root_dir, modlist_name).join(folder_name);
-    let resolved_world = fs::canonicalize(&world_dir)
-        .with_context(|| format!("no shared world at {}", world_dir.display()))?;
+    let worlds_dir = modlist_worlds_dir(root_dir, modlist_name);
+    let resolved_worlds_dir = fs::canonicalize(&worlds_dir)
+        .with_context(|| format!("no shared worlds at {}", worlds_dir.display()))?;
 
     let link = instance_saves_dir(root_dir, modlist_name, instance_name).join(folder_name);
     let metadata = fs::symlink_metadata(&link)
@@ -480,9 +583,9 @@ pub fn unshare_world_from_instance(
     }
     let resolved_link = fs::canonicalize(&link)
         .with_context(|| format!("failed to resolve {}", link.display()))?;
-    if resolved_link != resolved_world {
+    if resolved_link.parent() != Some(resolved_worlds_dir.as_path()) {
         bail!(
-            "{} points at {}, not at the shared world",
+            "{} points at {}, which is not a world of this mod list",
             link.display(),
             resolved_link.display()
         );

@@ -42,7 +42,7 @@ import {
   setContentLookupFailures,
   LAUNCH_STAGES, wait,
 } from "./store";
-import { normalizeModLoader, parseInstanceName, type ModRow, type UpdatePrecheckResult, type WorldEntry } from "./lib/types";
+import { normalizeModLoader, parseInstanceName, type ModRow, type UpdatePrecheckResult, type WorldEntry, type WorldInstanceLink } from "./lib/types";
 import { buildResolvedContent, buildResolvedVersions } from "./lib/update-selection";
 import { fetchContentProjects } from "./lib/content-meta";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
@@ -1081,14 +1081,18 @@ export default function App() {
    * every question the launch can ask live there; leaving the user on the
    * home would look like nothing happened.
    */
-  const handlePlayWorld = async (world: WorldEntry, openTheWorld: boolean) => {
+  const handlePlayWorld = async (
+    world: WorldEntry,
+    through: WorldInstanceLink,
+    openTheWorld: boolean,
+  ) => {
     if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
 
-    const target = parseInstanceName(world.instanceName);
+    const target = parseInstanceName(through.instanceName);
     if (!target) {
       pushUiError({
         title: "Unknown instance",
-        message: `'${world.instanceName}' is not a target this launcher built.`,
+        message: `'${through.instanceName}' is not a target this launcher built.`,
         detail: "An instance directory is named '<minecraft version>-<loader>'.",
         severity: "warning",
         scope: "launch",
@@ -1097,12 +1101,15 @@ export default function App() {
     }
 
     await handleSelectModList(world.modlistName);
-    // After the mod list's own saved target: the world lives in one specific
-    // instance and that is the one to launch.
+    // The instance the card was asked about: for a shared world (D95) the
+    // home asked which one, and for an ordinary one there is only its own.
     setSelectedMcVersion(target.minecraftVersion);
     setSelectedModLoader(target.modLoader);
     setActiveRailView("modlist");
-    await handleLaunch(openTheWorld ? world.folderName : null);
+    // The folder name is that instance's own: a shared world can be linked
+    // under a different name in each of them (D98), and Quick Play takes the
+    // name the instance sees.
+    await handleLaunch(openTheWorld ? through.folderName : null);
   };
 
   const handleOpenModlist = async (modlistName: string) => {
@@ -1126,8 +1133,8 @@ export default function App() {
         <Switch>
           <Match when={activeRailView() === "home"}>
             <HomeView
-              onPlayWorld={world => void handlePlayWorld(world, true)}
-              onPlayModlistOf={world => void handlePlayWorld(world, false)}
+              onPlayWorld={(world, through) => void handlePlayWorld(world, through, true)}
+              onPlayModlistOf={(world, through) => void handlePlayWorld(world, through, false)}
               onOpenModlist={name => void handleOpenModlist(name)}
             />
           </Match>

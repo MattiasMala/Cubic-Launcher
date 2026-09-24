@@ -274,16 +274,35 @@ export type ScreenshotListing = {
 export type WorldGameMode = "survival" | "creative" | "adventure" | "spectator" | "unknown";
 
 /**
- * One singleplayer world found under an instance's `saves/`.
+ * One way into a world: an instance, and the name that instance's own
+ * `saves/` uses for it.
  *
- * The identity is the triple, never the name: two worlds can be called
+ * The two names come apart as soon as a name is taken (D98): a world shared
+ * into an instance that already has a `New World` is linked under
+ * `New World shared`, or `New World shared (2)`. `folderName` is the one to
+ * pass to Quick Play and to the unshare command.
+ */
+export type WorldInstanceLink = {
+  instanceName: string;
+  folderName: string;
+};
+
+/**
+ * One singleplayer world.
+ *
+ * The identity is the id, never the name: two worlds can be called
  * `New World` and live in a folder called `New World` in two different
  * instances, which is exactly the case on this machine.
  */
 export type WorldEntry = {
   modlistName: string;
-  instanceName: string;
-  /** The `saves/` directory name, which is what Quick Play takes. */
+  /**
+   * The instance the world lives in, or **`null` for a shared world** (D94),
+   * which lives in the mod list's own `worlds/` folder and belongs to no
+   * single instance.
+   */
+  instanceName: string | null;
+  /** The world's own folder name: in its instance, or in `worlds/`. */
   folderName: string;
   /** `LevelName`: what the player sees in game, and not the folder name. */
   levelName: string;
@@ -293,6 +312,15 @@ export type WorldEntry = {
   iconPath: string | null;
   /** Hidden from "Jump in" right now (D65); playing it again brings it back. */
   hidden: boolean;
+  /**
+   * Every instance that can open this world, sorted by name. One entry for an
+   * ordinary world — itself — and one per link for a shared one.
+   *
+   * **Empty is a real state**: a shared world every instance has dropped stays
+   * in the mod list with nothing able to open it, and the card has to say so
+   * rather than offer a Play that cannot work.
+   */
+  instances: WorldInstanceLink[];
 };
 
 // ── Skins (E7) — the shapes `skins.rs` serializes ─────────────────────────────

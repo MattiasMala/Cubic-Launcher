@@ -122,21 +122,25 @@ fn sharing_moves_the_world_into_the_mod_list_and_links_it_back() {
         .expect("sharing must succeed");
 
     assert_eq!(id.instance_name, None, "a shared world belongs to the mod list");
-    let moved = modlist_worlds_dir(&root, "pack").join("Shared");
+    // D98: the folder takes the shared name on the way into the mod list.
+    assert_eq!(id.folder_name, "Shared shared");
+    let moved = modlist_worlds_dir(&root, "pack").join("Shared shared");
     assert!(
         directories_match(&before, &moved).expect("the comparison must run"),
         "every byte of the world must survive the move"
     );
 
-    // The instance it came from now reaches it through a link, in the place
-    // the directory used to be.
-    let link = fs::symlink_metadata(&source).expect("the source name must still be there");
+    // The instance it came from now reaches it through a link, and the name
+    // the directory used to have is free again.
+    assert!(!instance_world(&root, "pack", "1.20.1-forge", "Shared").exists());
+    let origin_link = instance_world(&root, "pack", "1.20.1-forge", "Shared shared");
+    let link = fs::symlink_metadata(&origin_link).expect("the origin must keep a way in");
     assert!(link.file_type().is_symlink(), "the origin keeps a link, not the world");
     assert_eq!(
-        fs::canonicalize(&source).unwrap(),
+        fs::canonicalize(&origin_link).unwrap(),
         fs::canonicalize(&moved).unwrap()
     );
-    let target = instance_world(&root, "pack", "1.20.1-fabric", "Shared");
+    let target = instance_world(&root, "pack", "1.20.1-fabric", "Shared shared");
     assert!(fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
     assert_eq!(
         fs::canonicalize(&target).unwrap(),
@@ -272,14 +276,14 @@ fn dropping_every_instance_leaves_the_world_in_the_mod_list_and_in_the_listing()
     share_world_with_instance(&root, "pack", Some("1.20.1-forge"), "Shared", "1.20.1-fabric")
         .expect("sharing must succeed");
 
-    unshare_world_from_instance(&root, "pack", "Shared", "1.20.1-fabric")
+    unshare_world_from_instance(&root, "pack", "Shared shared", "1.20.1-fabric")
         .expect("dropping one instance must succeed");
-    unshare_world_from_instance(&root, "pack", "Shared", "1.20.1-forge")
+    unshare_world_from_instance(&root, "pack", "Shared shared", "1.20.1-forge")
         .expect("dropping the last instance must succeed");
 
-    let world = modlist_worlds_dir(&root, "pack").join("Shared");
+    let world = modlist_worlds_dir(&root, "pack").join("Shared shared");
     assert!(world.join("level.dat").is_file(), "the world must still be there");
-    assert!(!instance_world(&root, "pack", "1.20.1-forge", "Shared").exists());
+    assert!(!instance_world(&root, "pack", "1.20.1-forge", "Shared shared").exists());
 
     let entries = list_worlds(&root, &[]).expect("listing must not fail");
     assert_eq!(entries.len(), 1, "an orphaned world must stay visible");
@@ -289,7 +293,7 @@ fn dropping_every_instance_leaves_the_world_in_the_mod_list_and_in_the_listing()
     );
 
     // Sharing it again needs no move: it is already the mod list's.
-    share_world_with_instance(&root, "pack", None, "Shared", "1.20.1-forge")
+    share_world_with_instance(&root, "pack", None, "Shared shared", "1.20.1-forge")
         .expect("re-sharing must succeed");
     let back = list_worlds(&root, &[]).expect("listing must not fail");
     assert_eq!(back[0].instances.len(), 1);
@@ -306,23 +310,34 @@ fn nothing_that_is_not_our_link_is_ever_removed() {
     share_world_with_instance(&root, "pack", Some("1.20.1-forge"), "Shared", "1.20.1-fabric")
         .expect("sharing must succeed");
 
-    // A world of the user's, in a third instance, that happens to have the
-    // same folder name.
-    let his_own = instance_world(&root, "pack", "1.20.1-neoforge", "Shared");
+    // A world of the user's, in a third instance, under the name the shared
+    // world carries.
+    let his_own = instance_world(&root, "pack", "1.20.1-neoforge", "Shared shared");
     write_world(&his_own, "His Own", 1_000);
+    let his_own_backup = root.join("his-own-before");
+    copy_directory(&his_own, &his_own_backup).expect("failed to take the reference copy");
 
-    let refused = unshare_world_from_instance(&root, "pack", "Shared", "1.20.1-neoforge")
+    let refused = unshare_world_from_instance(&root, "pack", "Shared shared", "1.20.1-neoforge")
         .expect_err("a real world must not be unshared");
     assert!(format!("{refused:#}").contains("not a link"));
     assert!(his_own.join("level.dat").is_file(), "and must still be there");
 
-    // Sharing onto a name that is already a real world refuses too, instead of
-    // replacing it.
-    let onto_his_own =
-        share_world_with_instance(&root, "pack", None, "Shared", "1.20.1-neoforge")
-            .expect_err("a real world must not be replaced by a link");
-    assert!(format!("{onto_his_own:#}").contains("not a link to a world"));
-    assert!(his_own.join("level.dat").is_file());
+    // Sharing into that instance does not replace it either. Since D98 the
+    // share no longer refuses — it takes the next free name — but the rule it
+    // must not soften is this one: the directory is still the user's world,
+    // byte for byte, and still a directory.
+    share_world_with_instance(&root, "pack", None, "Shared shared", "1.20.1-neoforge")
+        .expect("the share goes around the name instead of through it");
+    assert!(!fs::symlink_metadata(&his_own).unwrap().file_type().is_symlink());
+    assert!(
+        directories_match(&his_own_backup, &his_own).expect("the comparison must run"),
+        "the world already under that name must not have lost a byte"
+    );
+    let link = instance_world(&root, "pack", "1.20.1-neoforge", "Shared shared (2)");
+    assert_eq!(
+        fs::canonicalize(&link).unwrap(),
+        fs::canonicalize(modlist_worlds_dir(&root, "pack").join("Shared shared")).unwrap()
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -334,7 +349,7 @@ fn nothing_that_is_not_our_link_is_ever_removed() {
 #[test]
 fn a_dangling_link_under_the_name_is_replaced_instead_of_failing() {
     let root = scratch("dangling");
-    let target = instance_world(&root, "pack", "1.20.1-fabric", "Shared");
+    let target = instance_world(&root, "pack", "1.20.1-fabric", "Shared shared");
     std::os::unix::fs::symlink(root.join("gone"), &target).expect("failed to make a dangling link");
     assert!(!target.exists(), "`exists` follows the link and says nothing is there");
 
@@ -343,7 +358,7 @@ fn a_dangling_link_under_the_name_is_replaced_instead_of_failing() {
 
     assert_eq!(
         fs::canonicalize(&target).unwrap(),
-        fs::canonicalize(modlist_worlds_dir(&root, "pack").join("Shared")).unwrap()
+        fs::canonicalize(modlist_worlds_dir(&root, "pack").join("Shared shared")).unwrap()
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -395,15 +410,150 @@ fn serializes_the_payload_contract_the_next_phase_reads() {
         world["instanceName"].is_null(),
         "a shared world belongs to no instance: {world}"
     );
-    assert_eq!(world["folderName"], "Shared");
+    assert_eq!(world["folderName"], "Shared shared");
     assert_eq!(world["levelName"], "Shared");
     assert_eq!(
         world["instances"],
         serde_json::json!([
-            { "instanceName": "1.20.1-fabric", "folderName": "Shared" },
-            { "instanceName": "1.20.1-forge", "folderName": "Shared" },
+            { "instanceName": "1.20.1-fabric", "folderName": "Shared shared" },
+            { "instanceName": "1.20.1-forge", "folderName": "Shared shared" },
         ])
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **The dead end D98 closes.** Both instances already have a world called
+/// `New World` — which is what the real disk looks like — so the link cannot
+/// take that name in the destination, and until D98 the share had no way out
+/// at all.
+///
+/// Nothing of the user's may be touched to get out of it: the world already
+/// sitting in the destination must still be there, byte for byte, with its own
+/// `level.dat`.
+#[test]
+fn a_destination_that_already_has_a_world_of_that_name_is_still_shared_with() {
+    let root = unique_root("collision");
+    let source = instance_world(&root, "pack", "26.3-fabric", "New World");
+    write_world(&source, "New World", 5_000);
+    // A different world, of the user's, under the same name in the other
+    // instance. Same folder name, same `LevelName`, different bytes.
+    let his_own = instance_world(&root, "pack", "26.3-neoforge", "New World");
+    write_world(&his_own, "New World", 9_000);
+    fs::write(his_own.join("region").join("r.0.0.mca"), b"his own chunks")
+        .expect("failed to make the two worlds differ");
+    let his_own_backup = root.join("his-own-before");
+    copy_directory(&his_own, &his_own_backup).expect("failed to take the reference copy");
+
+    let id = share_world_with_instance(&root, "pack", Some("26.3-fabric"), "New World", "26.3-neoforge")
+        .expect("a name already taken in the destination must not be a dead end");
+
+    // The shared world took a name of its own, and the move still happened.
+    assert_eq!(id.folder_name, "New World shared");
+    assert!(modlist_worlds_dir(&root, "pack")
+        .join("New World shared")
+        .join("level.dat")
+        .is_file());
+
+    // The user's world in the destination is untouched, and is still a real
+    // directory rather than a link.
+    assert!(
+        fs::symlink_metadata(&his_own).unwrap().file_type().is_dir()
+            && !fs::symlink_metadata(&his_own).unwrap().file_type().is_symlink(),
+        "the world already in the destination must still be a world"
+    );
+    assert!(
+        directories_match(&his_own_backup, &his_own).expect("the comparison must run"),
+        "and must not have lost a byte"
+    );
+
+    // Both instances can reach the shared world, each under the name its own
+    // `saves/` had free.
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+    let shared = entries
+        .iter()
+        .find(|entry| entry.id.instance_name.is_none())
+        .expect("the shared world must be listed");
+    let ways_in: Vec<(&str, &str)> = shared
+        .instances
+        .iter()
+        .map(|link| (link.instance_name.as_str(), link.folder_name.as_str()))
+        .collect();
+    assert_eq!(
+        ways_in,
+        vec![
+            ("26.3-fabric", "New World shared"),
+            ("26.3-neoforge", "New World shared"),
+        ]
+    );
+    for (instance, folder) in ways_in {
+        let link = instance_world(&root, "pack", instance, folder);
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            fs::canonicalize(modlist_worlds_dir(&root, "pack").join("New World shared")).unwrap()
+        );
+    }
+
+    // And the user's own world is still listed next to it.
+    assert_eq!(entries.len(), 2);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The second collision, one level down: the disambiguated name is taken too.
+/// `New World shared` is a folder a user can perfectly well have made by hand.
+#[test]
+fn a_disambiguated_name_that_is_also_taken_gets_another_one() {
+    let root = unique_root("collision-twice");
+    let source = instance_world(&root, "pack", "26.3-fabric", "New World");
+    write_world(&source, "New World", 5_000);
+    for taken in ["New World", "New World shared"] {
+        let his_own = instance_world(&root, "pack", "26.3-neoforge", taken);
+        write_world(&his_own, taken, 9_000);
+    }
+
+    share_world_with_instance(&root, "pack", Some("26.3-fabric"), "New World", "26.3-neoforge")
+        .expect("two names taken must still not be a dead end");
+
+    let link = instance_world(&root, "pack", "26.3-neoforge", "New World shared (2)");
+    assert!(
+        fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        "the third name is the one that was free"
+    );
+    assert_eq!(
+        fs::canonicalize(&link).unwrap(),
+        fs::canonicalize(modlist_worlds_dir(&root, "pack").join("New World shared")).unwrap()
+    );
+    // Both of the user's worlds are still real directories.
+    for taken in ["New World", "New World shared"] {
+        let his_own = instance_world(&root, "pack", "26.3-neoforge", taken);
+        assert!(!fs::symlink_metadata(&his_own).unwrap().file_type().is_symlink());
+        assert!(his_own.join("level.dat").is_file());
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Sharing the same world with the same instance twice must reuse the link it
+/// already made, not pile up `… shared (2)`, `… shared (3)` beside it.
+#[test]
+fn sharing_twice_with_the_same_instance_reuses_the_link() {
+    let root = scratch("twice");
+    share_world_with_instance(&root, "pack", Some("1.20.1-forge"), "Shared", "1.20.1-fabric")
+        .expect("the first share must succeed");
+    share_world_with_instance(&root, "pack", None, "Shared shared", "1.20.1-fabric")
+        .expect("the second share must succeed");
+
+    let saves = instance_world(&root, "pack", "1.20.1-fabric", "Shared shared")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let names: Vec<String> = fs::read_dir(&saves)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["Shared shared".to_string()]);
 
     let _ = fs::remove_dir_all(&root);
 }
