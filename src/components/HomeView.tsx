@@ -169,7 +169,10 @@ function WorldCard(props: {
   onHide: () => void;
   onShareWith: (instanceName: string) => void;
   onUnshareFrom: (through: WorldInstanceLink) => void;
-  /** Whether this card's ⋮ menu is the open one; at most one ever is. */
+  /** Which question this card's Play is asking, or `null`. */
+  asking: "world" | "modlist" | null;
+  onAsk: (mode: "world" | "modlist") => void;
+  onAnswered: () => void;
   menuOpen: boolean;
   onToggleMenu: () => void;
   onCloseMenu: () => void;
@@ -183,27 +186,28 @@ function WorldCard(props: {
   const isShared = () => props.world.instanceName === null;
 
   /**
-   * Which instance the Play is waiting on, or `null`.
-   *
    * D95: a shared world does not know which instance to launch with, so it
    * has to ask. One way in is not a question — it is answered before it is
    * asked, and the click goes straight through.
+   *
+   * The state lives in [`HomeView`], next to the open ⋮, so the same
+   * click-outside and Escape handlers close it. A popover only one card knows
+   * about is a popover nothing can close.
    */
-  const [asking, setAsking] = createSignal<"world" | "modlist" | null>(null);
   const start = (mode: "world" | "modlist") => {
     const list = ways();
     if (list.length === 0) return;
     if (list.length === 1) {
-      setAsking(null);
+      props.onAnswered();
       if (mode === "world") props.onPlay(list[0]);
       else props.onPlayModlist(list[0]);
       return;
     }
-    setAsking(current => (current === mode ? null : mode));
+    props.onAsk(mode);
   };
   const answer = (through: WorldInstanceLink) => {
-    const mode = asking();
-    setAsking(null);
+    const mode = props.asking;
+    props.onAnswered();
     if (mode === "world") props.onPlay(through);
     else if (mode === "modlist") props.onPlayModlist(through);
   };
@@ -284,10 +288,10 @@ function WorldCard(props: {
           </Show>
         </button>
 
-        <Show when={asking()}>
+        <Show when={props.asking}>
           <div class="absolute right-0 top-full mt-1 w-64 rounded-lg border border-borderColor bg-popover shadow-xl py-1 z-30">
             <div class="px-3 py-1.5 text-xs text-textMuted">
-              {asking() === "world" ? "Open this world with" : "Play which instance"}
+              {props.asking === "world" ? "Open this world with" : "Play which instance"}
             </div>
             <For each={ways()}>
               {link => (
@@ -411,11 +415,28 @@ export function HomeView(props: HomeViewProps) {
    */
   const [openMenuKey, setOpenMenuKey] = createSignal<string | null>(null);
 
+  /**
+   * The card whose Play is asking which instance to launch with, and what it
+   * will do with the answer.
+   *
+   * It lives here and not in the card for one reason: the two handlers below.
+   * A popover a card keeps to itself has nothing to close it — no click
+   * outside, no Escape — so it would sit open until something else was
+   * clicked, next to the ⋮ menu if that was open too.
+   */
+  const [openChooser, setOpenChooser] = createSignal<
+    { key: string; mode: "world" | "modlist" } | null
+  >(null);
+
   const closeOnOutside = (event: MouseEvent) => {
-    if (!(event.target as HTMLElement | null)?.closest("[data-world-menu]")) setOpenMenuKey(null);
+    if ((event.target as HTMLElement | null)?.closest("[data-world-menu]")) return;
+    setOpenMenuKey(null);
+    setOpenChooser(null);
   };
   const closeOnEscape = (event: KeyboardEvent) => {
-    if (event.key === "Escape") setOpenMenuKey(null);
+    if (event.key !== "Escape") return;
+    setOpenMenuKey(null);
+    setOpenChooser(null);
   };
   document.addEventListener("click", closeOnOutside);
   document.addEventListener("keydown", closeOnEscape);
@@ -520,17 +541,11 @@ export function HomeView(props: HomeViewProps) {
     return twice;
   });
 
-  /**
-   * Both sharing commands answer with the listing as it now stands, so the
-   * view is redrawn from what the disk says and not from what it believed.
-   */
-  const applyListing = (listing: WorldEntry[]) => {
-    mutateWorlds(listing);
-  };
-
+  // Both sharing commands answer with the listing as it now stands, so the
+  // view is redrawn from what the disk says and not from what it believed.
   const shareWith = async (world: WorldEntry, instanceName: string) => {
     try {
-      applyListing(
+      mutateWorlds(
         await invoke<WorldEntry[]>("share_world_with_instance_command", {
           modlistName: world.modlistName,
           instanceName: world.instanceName,
@@ -552,7 +567,7 @@ export function HomeView(props: HomeViewProps) {
 
   const unshareFrom = async (world: WorldEntry, through: WorldInstanceLink) => {
     try {
-      applyListing(
+      mutateWorlds(
         await invoke<WorldEntry[]>("unshare_world_from_instance_command", {
           modlistName: world.modlistName,
           folderName: through.folderName,
@@ -610,10 +625,23 @@ export function HomeView(props: HomeViewProps) {
                     onHide={() => void hideWorld(world)}
                     onShareWith={instanceName => void shareWith(world, instanceName)}
                     onUnshareFrom={through => void unshareFrom(world, through)}
-                    menuOpen={openMenuKey() === worldKey(world)}
-                    onToggleMenu={() =>
-                      setOpenMenuKey(current => (current === worldKey(world) ? null : worldKey(world)))
+                    asking={
+                      openChooser()?.key === worldKey(world) ? openChooser()!.mode : null
                     }
+                    onAsk={mode => {
+                      setOpenMenuKey(null);
+                      setOpenChooser(current =>
+                        current?.key === worldKey(world) && current.mode === mode
+                          ? null
+                          : { key: worldKey(world), mode },
+                      );
+                    }}
+                    onAnswered={() => setOpenChooser(null)}
+                    menuOpen={openMenuKey() === worldKey(world)}
+                    onToggleMenu={() => {
+                      setOpenChooser(null);
+                      setOpenMenuKey(current => (current === worldKey(world) ? null : worldKey(world)));
+                    }}
                     onCloseMenu={() => setOpenMenuKey(null)}
                   />
                 )}
