@@ -23,6 +23,7 @@
 //!   See [`quick_play_arguments`]: the criterion is the launch data, not a
 //!   comparison of version strings.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -41,6 +42,12 @@ const SAVES_DIR_NAME: &str = "saves";
 const LEVEL_DAT_FILE_NAME: &str = "level.dat";
 const WORLD_ICON_FILE_NAME: &str = "icon.png";
 
+/// Where a shared world lives: `mod-lists/<name>/worlds/<folder>` (D94), a
+/// sibling of `local-jars/` and of the content categories, and deliberately
+/// **not** under `.cubic/`, which holds derived data the user is not meant to
+/// open (D39). A world is the opposite of derived.
+pub const MODLIST_WORLDS_DIR_NAME: &str = "worlds";
+
 /// The `global_settings` key the hidden list lives under. One row holds a JSON
 /// array of world triples and their `LastPlayed` baselines: the table is
 /// already key/value and this list does not deserve a schema of its own.
@@ -57,6 +64,27 @@ const MAX_LEVEL_DAT_BYTES: u64 = 16 * 1024 * 1024;
 #[serde(rename_all = "camelCase")]
 pub struct WorldId {
     pub modlist_name: String,
+    /// The instance the world lives in, or **`None` for a world that lives in
+    /// the mod list's own `worlds/` folder** (D94). A shared world belongs to
+    /// no single instance: it was moved out of the one that made it and every
+    /// instance that can open it, that one included, reaches it through a
+    /// link. Keying it on an instance would mean hiding it in one place and
+    /// not in another, which is exactly what D95 refuses.
+    #[serde(default)]
+    pub instance_name: Option<String>,
+    pub folder_name: String,
+}
+
+/// One way into a world: an instance, and the name that instance's own
+/// `saves/` uses for it.
+///
+/// The name matters because it is what `--quickPlaySingleplayer` takes
+/// ([`quick_play_arguments`]), and nothing forces a link to carry the name of
+/// its target — the launcher always gives it the same one, but a link made by
+/// hand need not.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldInstanceLink {
     pub instance_name: String,
     pub folder_name: String,
 }
@@ -120,6 +148,16 @@ pub struct WorldEntry {
     /// Whether this world is hidden right now. Playing it after it was hidden
     /// makes it visible again without changing the stored hidden list.
     pub hidden: bool,
+    /// Every instance that can open this world, sorted by name. One entry for
+    /// an ordinary world — itself — and one per link for a shared one, which
+    /// is both the sign D96 asks for and the list the Play button needs to
+    /// offer a choice (D95).
+    ///
+    /// **Empty is a real state**: a shared world every instance has dropped
+    /// stays in the mod list's `worlds/` folder and stays on this list, with
+    /// nothing able to open it until it is shared again. Losing sight of it
+    /// would be the only way this feature could lose bytes.
+    pub instances: Vec<WorldInstanceLink>,
 }
 
 /// The three fields a world listing needs out of `level.dat`.
@@ -146,8 +184,16 @@ struct LevelDatData {
 
 // ── Listing ──────────────────────────────────────────────────────────────────
 
-/// Every world under `mod-lists/<modlist>/instances/<instance>/saves/`,
-/// newest first.
+/// Every world of every mod list, newest first: the ones that sit in an
+/// instance's `saves/`, and the ones that were moved into the mod list's own
+/// `worlds/` folder because they are shared (D94).
+///
+/// **The unit is the world, not the place.** A shared world is reachable from
+/// two instances and must still be one row (D95), so the scan collects
+/// candidates by their **canonical path** and merges everything that resolves
+/// to the same bytes. That is also what tells a link from its target: `064`
+/// measured that two links with different names in one `saves/` resolve to the
+/// same world and that nothing in this file used to notice.
 ///
 /// `hidden` decides only the current `hidden` flag on each entry; nothing is
 /// filtered out here. An entry with no baseline counts as hidden: it is the
@@ -157,47 +203,111 @@ pub fn list_worlds(root_dir: &Path, hidden: &[HiddenWorld]) -> Result<Vec<WorldE
     let modlists_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
         .to_path_buf();
+    // A root that is not there yet is not an error: it is a launcher that has
+    // never made a mod list.
+    let Ok(resolved_modlists_dir) = fs::canonicalize(&modlists_dir) else {
+        return Ok(Vec::new());
+    };
 
-    let mut entries: Vec<WorldEntry> = Vec::new();
+    let mut found: BTreeMap<PathBuf, FoundWorld> = BTreeMap::new();
     for modlist_dir in child_directories(&modlists_dir)? {
         let Some(modlist_name) = utf8_file_name(&modlist_dir) else {
             continue;
         };
+
+        // The mod list's own worlds. Real directories only: `worlds/` is a
+        // folder the launcher fills, not one it follows links out of.
+        for world_dir in child_directories(&modlist_dir.join(MODLIST_WORLDS_DIR_NAME))? {
+            let (Some(folder_name), Ok(canonical)) =
+                (utf8_file_name(&world_dir), fs::canonicalize(&world_dir))
+            else {
+                continue;
+            };
+            claim(
+                &mut found,
+                canonical,
+                Owner::ModlistWorlds,
+                WorldId {
+                    modlist_name: modlist_name.clone(),
+                    instance_name: None,
+                    folder_name,
+                },
+                world_dir,
+            );
+        }
+
         for instance_dir in child_directories(&modlist_dir.join(INSTANCES_DIR_NAME))? {
             let Some(instance_name) = utf8_file_name(&instance_dir) else {
                 continue;
             };
-            for world_dir in child_directories(&instance_dir.join(SAVES_DIR_NAME))? {
-                let Some(folder_name) = utf8_file_name(&world_dir) else {
+            for entry in saves_entries(&instance_dir.join(SAVES_DIR_NAME), &resolved_modlists_dir)? {
+                let Some(folder_name) = utf8_file_name(&entry.path) else {
                     continue;
                 };
-                let Some(level) = read_level_dat(&world_dir.join(LEVEL_DAT_FILE_NAME)) else {
-                    continue;
+                let owner = if entry.is_link {
+                    Owner::Link
+                } else {
+                    Owner::InstanceSaves
                 };
-
-                let id = WorldId {
-                    modlist_name: modlist_name.clone(),
-                    instance_name: instance_name.clone(),
-                    folder_name,
-                };
-                let last_played_ms = level.last_played.unwrap_or(0);
-                let is_hidden = hidden.iter().any(|stored| {
-                    &stored.id == &id
-                        && match stored.hidden_at_last_played_ms {
-                            Some(hidden_at) => last_played_ms <= hidden_at,
-                            None => true,
-                        }
-                });
-                entries.push(WorldEntry {
-                    level_name: level.level_name.unwrap_or_else(|| id.folder_name.clone()),
-                    game_mode: WorldGameMode::from_game_type(level.game_type),
-                    last_played_ms,
-                    icon_path: world_icon_path(&world_dir),
-                    hidden: is_hidden,
-                    id,
-                });
+                let slot = claim(
+                    &mut found,
+                    entry.canonical,
+                    owner,
+                    WorldId {
+                        modlist_name: modlist_name.clone(),
+                        instance_name: Some(instance_name.clone()),
+                        folder_name: folder_name.clone(),
+                    },
+                    entry.path,
+                );
+                slot.links.push((
+                    modlist_name.clone(),
+                    WorldInstanceLink {
+                        instance_name: instance_name.clone(),
+                        folder_name,
+                    },
+                ));
             }
         }
+    }
+
+    let mut entries: Vec<WorldEntry> = Vec::new();
+    for world in found.into_values() {
+        let Some(level) = read_level_dat(&world.directory.join(LEVEL_DAT_FILE_NAME)) else {
+            continue;
+        };
+
+        // A link from another mod list's instance is not a way into this mod
+        // list's world: D92 shares within one mod list, and an instance name
+        // alone could not say which mod list it belongs to.
+        let mut instances: Vec<WorldInstanceLink> = world
+            .links
+            .into_iter()
+            .filter(|(modlist_name, _)| *modlist_name == world.id.modlist_name)
+            .map(|(_, link)| link)
+            .collect();
+        instances.sort();
+        instances.dedup();
+
+        let last_played_ms = level.last_played.unwrap_or(0);
+        let is_hidden = hidden.iter().any(|stored| {
+            stored.id == world.id
+                && match stored.hidden_at_last_played_ms {
+                    Some(hidden_at) => last_played_ms <= hidden_at,
+                    None => true,
+                }
+        });
+        entries.push(WorldEntry {
+            level_name: level
+                .level_name
+                .unwrap_or_else(|| world.id.folder_name.clone()),
+            game_mode: WorldGameMode::from_game_type(level.game_type),
+            last_played_ms,
+            icon_path: world_icon_path(&world.directory),
+            hidden: is_hidden,
+            instances,
+            id: world.id,
+        });
     }
 
     // Most recently played first. The triple is the tie-break so two worlds
@@ -211,6 +321,118 @@ pub fn list_worlds(root_dir: &Path, hidden: &[HiddenWorld]) -> Result<Vec<WorldE
             .then_with(|| left.id.folder_name.cmp(&right.id.folder_name))
     });
 
+    Ok(entries)
+}
+
+/// One world while the scan is still merging the places it was seen from.
+struct FoundWorld {
+    owner: Owner,
+    id: WorldId,
+    /// The path `level.dat` and `icon.png` are read through. Any of the paths
+    /// that resolve to this world would do — reading follows links — but the
+    /// owner's is the one that is not going to move.
+    directory: PathBuf,
+    /// `(mod list, way in)` for every `saves/` entry that resolved here.
+    links: Vec<(String, WorldInstanceLink)>,
+}
+
+/// Which of the places a world was seen from gets to name it. Higher wins,
+/// and the scan order must not decide: a link in an instance that sorts early
+/// can be met before the directory it points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Owner {
+    /// A `saves/` entry that is a symlink. It names the world only while
+    /// nothing better has been seen — a link is a way in, not a home.
+    Link,
+    /// A real directory in an instance's `saves/`: an ordinary world.
+    InstanceSaves,
+    /// The mod list's `worlds/` folder: a shared world, which outranks every
+    /// instance that links it.
+    ModlistWorlds,
+}
+
+/// Record one sighting of the world at `canonical`, letting the better owner
+/// win, and hand back the slot so the caller can add its way in.
+fn claim(
+    found: &mut BTreeMap<PathBuf, FoundWorld>,
+    canonical: PathBuf,
+    owner: Owner,
+    id: WorldId,
+    directory: PathBuf,
+) -> &mut FoundWorld {
+    let slot = found.entry(canonical).or_insert_with(|| FoundWorld {
+        owner,
+        id: id.clone(),
+        directory: directory.clone(),
+        links: Vec::new(),
+    });
+    if owner > slot.owner {
+        slot.owner = owner;
+        slot.id = id;
+        slot.directory = directory;
+    }
+    slot
+}
+
+/// One entry of an instance's `saves/`.
+struct SavesEntry {
+    path: PathBuf,
+    canonical: PathBuf,
+    is_link: bool,
+}
+
+/// The worlds an instance can open: the real directories in its `saves/`, and
+/// the symlinks that point at a directory **inside `mod-lists/`**.
+///
+/// The containment is the whole reason this function exists instead of
+/// [`child_directories`]. Following links is what makes a shared world visible
+/// from the instances that link it (D94); following them without checking
+/// where they land gives back the refusal the old docstring promised — *"a
+/// link cannot make the listing report a world that lives outside the launcher
+/// root"* — and `064` measured the cost: the card is drawn and the Play button
+/// works, but `resolve_world_directory` refuses the same world, so the ⋮ menu
+/// errors on something the home offered. One `canonicalize` per entry buys
+/// back the agreement between the two.
+///
+/// A missing `saves/` yields nothing: an instance that never ran has none, and
+/// that is an ordinary state.
+fn saves_entries(dir: &Path, resolved_modlists_dir: &Path) -> Result<Vec<SavesEntry>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", dir.display()))
+        }
+    };
+
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        // A dangling link, or one pointing at a file: `canonicalize` follows,
+        // so both fall out here rather than becoming a world that is not one.
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canonical.is_dir() {
+            continue;
+        }
+        if !canonical.starts_with(resolved_modlists_dir) {
+            continue;
+        }
+        entries.push(SavesEntry {
+            path,
+            canonical,
+            is_link: file_type.is_symlink(),
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
 }
 
@@ -282,8 +504,10 @@ fn world_icon_path(world_dir: &Path) -> Option<String> {
 /// Directory children of `dir`, sorted. A missing `dir` yields nothing: an
 /// instance that never ran has no `saves/`, and that is an ordinary state.
 ///
-/// Symlinked children are not followed, so a link cannot make the listing
-/// report a world that lives outside the launcher root.
+/// Symlinked children are not followed. Used for the mod list, instance and
+/// `worlds/` levels, none of which is a place a link is ever expected: only
+/// an instance's `saves/` holds links, and [`saves_entries`] reads that one
+/// with the containment check a followed link needs.
 fn child_directories(dir: &Path) -> Result<Vec<PathBuf>> {
     let read_dir = match fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
@@ -428,36 +652,52 @@ pub fn quick_play_arguments(
 
 // ── The folder a world lives in ──────────────────────────────────────────────
 
-/// Rebuild one world's directory from the triple the listing handed out, or
+/// Rebuild one world's directory from the id the listing handed out, or
 /// refuse.
+///
+/// Two shapes, because D94 gave worlds two homes:
+/// `<modlist>/instances/<instance>/saves/<folder>` for an ordinary world and
+/// `<modlist>/worlds/<folder>` for a shared one, which is what
+/// `instance_name: None` means.
 ///
 /// Same pact as `screenshots::resolve_screenshot`: the caller never passes a
 /// path, each name MUST be a single path component, and the join is
 /// canonicalised and checked against `<root>/mod-lists` so a `saves`
 /// directory that is a symlink elsewhere resolves to its real location and
-/// fails the test.
+/// fails the test. A shared world is reached through its own folder and not
+/// through any instance's link, so the answer does not depend on which
+/// instance the caller happened to be looking at.
 fn resolve_world_directory(
     root_dir: &Path,
     modlist_name: &str,
-    instance_name: &str,
+    instance_name: Option<&str>,
     folder_name: &str,
 ) -> Result<PathBuf> {
     validate_path_component(modlist_name)
         .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
-    validate_path_component(instance_name)
-        .with_context(|| format!("invalid instance name '{instance_name}'"))?;
+    if let Some(instance_name) = instance_name {
+        validate_path_component(instance_name)
+            .with_context(|| format!("invalid instance name '{instance_name}'"))?;
+    }
     validate_path_component(folder_name)
         .with_context(|| format!("invalid world folder name '{folder_name}'"))?;
 
     let modlists_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
         .to_path_buf();
-    let world_dir = modlists_dir
-        .join(modlist_name)
-        .join(INSTANCES_DIR_NAME)
-        .join(instance_name)
-        .join(SAVES_DIR_NAME)
-        .join(folder_name);
+    let world_dir = match instance_name {
+        Some(instance_name) => modlists_dir
+            .join(modlist_name)
+            .join(INSTANCES_DIR_NAME)
+            .join(instance_name)
+            .join(SAVES_DIR_NAME)
+            .join(folder_name),
+        None => modlists_dir
+            .join(modlist_name)
+            .join(MODLIST_WORLDS_DIR_NAME)
+            .join(folder_name),
+    };
+    let owner = instance_name.unwrap_or(MODLIST_WORLDS_DIR_NAME);
 
     let resolved = fs::canonicalize(&world_dir)
         .with_context(|| format!("no world folder at {}", world_dir.display()))?;
@@ -465,7 +705,7 @@ fn resolve_world_directory(
         .with_context(|| format!("failed to resolve {}", modlists_dir.display()))?;
 
     let relative = resolved.strip_prefix(&resolved_modlists_dir).map_err(|_| {
-        anyhow::anyhow!("the world folder of '{modlist_name}/{instance_name}' is outside the mod lists directory")
+        anyhow::anyhow!("the world folder of '{modlist_name}/{owner}' is outside the mod lists directory")
     })?;
     let segments: Vec<&std::ffi::OsStr> = relative
         .components()
@@ -474,11 +714,12 @@ fn resolve_world_directory(
             _ => None,
         })
         .collect();
-    let shaped_like_a_world = segments.len() == 5
+    let shaped_like_a_world = (segments.len() == 5
         && segments[1] == INSTANCES_DIR_NAME
-        && segments[3] == SAVES_DIR_NAME;
+        && segments[3] == SAVES_DIR_NAME)
+        || (segments.len() == 3 && segments[1] == MODLIST_WORLDS_DIR_NAME);
     if !shaped_like_a_world {
-        bail!("the world folder of '{modlist_name}/{instance_name}' is outside the mod lists directory");
+        bail!("the world folder of '{modlist_name}/{owner}' is outside the mod lists directory");
     }
     if !resolved.is_dir() {
         bail!("{} is not a directory", resolved.display());
@@ -500,27 +741,41 @@ pub fn list_worlds_command(
         .map_err(|error| error.to_string())
 }
 
+/// Hide or unhide one world.
+///
+/// `instance_name` is absent for a shared world, and that is the whole point
+/// of D95: the hidden list keys on the world, so hiding it hides the one card
+/// the home draws instead of hiding it in one instance and leaving it in the
+/// other.
 #[tauri::command]
 pub fn set_world_hidden_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-    instance_name: String,
+    instance_name: Option<String>,
     folder_name: String,
     hidden: bool,
 ) -> Result<Vec<WorldId>, String> {
     validate_path_component(&modlist_name).map_err(|error| error.to_string())?;
-    validate_path_component(&instance_name).map_err(|error| error.to_string())?;
+    if let Some(instance_name) = instance_name.as_deref() {
+        validate_path_component(instance_name).map_err(|error| error.to_string())?;
+    }
     validate_path_component(&folder_name).map_err(|error| error.to_string())?;
     let hidden_at_last_played_ms = if hidden {
-        let level_dat_path = launcher_paths
-            .modlists_dir()
-            .join(&modlist_name)
-            .join(INSTANCES_DIR_NAME)
-            .join(&instance_name)
-            .join(SAVES_DIR_NAME)
-            .join(&folder_name)
-            .join(LEVEL_DAT_FILE_NAME);
-        read_level_dat(&level_dat_path).and_then(|level| level.last_played)
+        let world_dir = match instance_name.as_deref() {
+            Some(instance_name) => launcher_paths
+                .modlists_dir()
+                .join(&modlist_name)
+                .join(INSTANCES_DIR_NAME)
+                .join(instance_name)
+                .join(SAVES_DIR_NAME)
+                .join(&folder_name),
+            None => launcher_paths
+                .modlists_dir()
+                .join(&modlist_name)
+                .join(MODLIST_WORLDS_DIR_NAME)
+                .join(&folder_name),
+        };
+        read_level_dat(&world_dir.join(LEVEL_DAT_FILE_NAME)).and_then(|level| level.last_played)
     } else {
         None
     };
@@ -545,19 +800,19 @@ pub fn set_world_hidden_command(
 /// Open the world's folder in the system file manager.
 ///
 /// The ⋮ menu of a world card offers it, and the card only ever holds the
-/// triple: the path is rebuilt here, refused rather than guessed, exactly
+/// id: the path is rebuilt here, refused rather than guessed, exactly
 /// like `screenshots::open_screenshot_folder_command` does for a screenshot.
 #[tauri::command]
 pub fn open_world_folder_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-    instance_name: String,
+    instance_name: Option<String>,
     folder_name: String,
 ) -> Result<(), String> {
     let folder = resolve_world_directory(
         launcher_paths.root_dir(),
         &modlist_name,
-        &instance_name,
+        instance_name.as_deref(),
         &folder_name,
     )
     .map_err(|error| format!("{error:#}"))?;

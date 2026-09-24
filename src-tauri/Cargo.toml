@@ -64,3 +64,6 @@ flate2 = "1"
 # NBT. `flate2` above handles the gzip; this handles the NBT.
 fastnbt = "2"
 tar = "0.4"
+
+[target."cfg(windows)".dependencies]
+junction = "=2.0.0"
