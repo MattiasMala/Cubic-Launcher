@@ -353,7 +353,6 @@ export function SkinsScreen() {
                   skinUrl={selectedCard()?.textureUrl ?? null}
                   variant={selectedCard()?.variant ?? "classic"}
                   capeUrl={previewCape()?.textureUrl ?? null}
-                  nameTag={current().playerName}
                   onSkinLoad={setSkinLoad}
                   onCapeLoad={setCapeLoad}
                 />

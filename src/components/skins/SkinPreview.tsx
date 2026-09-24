@@ -22,7 +22,6 @@ interface SkinPreviewProps {
   skinUrl: string | null;
   variant: SkinVariant;
   capeUrl: string | null;
-  nameTag: string | null;
   onSkinLoad?: (state: PreviewLoad) => void;
   onCapeLoad?: (state: PreviewLoad) => void;
 }
@@ -110,10 +109,6 @@ export function SkinPreview(props: SkinPreviewProps) {
           current.loadCape(null);
           props.onCapeLoad?.("failed");
         });
-    });
-
-    createEffect(() => {
-      if (viewer) viewer.nameTag = props.nameTag;
     });
   });
 
