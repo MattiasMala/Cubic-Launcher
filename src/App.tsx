@@ -80,6 +80,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ModListEditor } from "./components/ModListEditor";
 import { ScreenshotsView } from "./components/ScreenshotsView";
 import { HomeView } from "./components/HomeView";
+import { SkinsScreen } from "./components/SkinsScreen";
 import { bumpContentVersion, seedContentName } from "./components/mod-list-editor/ContentTabView";
 import { LaunchPanel } from "./components/LaunchPanel";
 import { AddModDialog } from "./components/AddModDialog";
@@ -1121,7 +1122,7 @@ export default function App() {
       <div class="flex flex-1 overflow-hidden relative">
         <Sidebar onSelectModList={handleSelectModList} />
 
-        {/* One of three destinations: the home, a mod list, the gallery. */}
+        {/* One of four destinations: the home, a mod list, the skins, the gallery. */}
         <Switch>
           <Match when={activeRailView() === "home"}>
             <HomeView
@@ -1129,6 +1130,9 @@ export default function App() {
               onPlayModlistOf={world => void handlePlayWorld(world, false)}
               onOpenModlist={name => void handleOpenModlist(name)}
             />
+          </Match>
+          <Match when={activeRailView() === "skins"}>
+            <SkinsScreen />
           </Match>
           <Match when={activeRailView() === "screenshots"}>
             <ScreenshotsView />

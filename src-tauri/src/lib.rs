@@ -35,6 +35,7 @@ pub mod resolver;
 pub mod rules;
 pub mod screenshots;
 pub mod shared_files;
+pub mod skins;
 pub mod token_storage;
 mod updater;
 pub mod worlds;
@@ -68,6 +69,7 @@ pub fn run() {
             }
 
             app.manage(launcher_paths.clone());
+            app.manage(skins::SkinsState::default());
 
             if launch_preview::automation_mode_enabled() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -145,6 +147,15 @@ pub fn run() {
             shared_files::set_shared_file_enabled_command,
             shared_files::link_shared_files_command,
             shared_files::unlink_shared_files_command,
+            skins::load_skins_command,
+            skins::add_skin_command,
+            skins::set_saved_skin_variant_command,
+            skins::rename_saved_skin_command,
+            skins::remove_saved_skin_command,
+            skins::equip_skin_command,
+            skins::reset_skin_command,
+            skins::set_cape_command,
+            skins::save_worn_skin_command,
             worlds::list_worlds_command,
             worlds::set_world_hidden_command,
             worlds::open_world_folder_command,

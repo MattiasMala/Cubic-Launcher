@@ -16,6 +16,7 @@ pub struct LauncherPaths {
     content_packs_cache_dir: PathBuf,
     modlists_dir: PathBuf,
     java_runtimes_dir: PathBuf,
+    skins_dir: PathBuf,
     database_path: PathBuf,
 }
 
@@ -30,6 +31,7 @@ impl LauncherPaths {
         let content_packs_cache_dir = cache_dir.join("content-packs");
         let modlists_dir = root_dir.join("mod-lists");
         let java_runtimes_dir = root_dir.join("java-runtimes");
+        let skins_dir = root_dir.join("skins");
         let database_path = root_dir.join(DATABASE_FILENAME);
 
         Self {
@@ -42,6 +44,7 @@ impl LauncherPaths {
             content_packs_cache_dir,
             modlists_dir,
             java_runtimes_dir,
+            skins_dir,
             database_path,
         }
     }
@@ -107,6 +110,14 @@ impl LauncherPaths {
         &self.java_runtimes_dir
     }
 
+    /// `<root>/skins/`: the saved skins, one `<texture_key>.png` each (E7).
+    /// Global like `mod-lists/`, because a skin belongs to the player and not
+    /// to a mod list; the list of which skins each player saved lives in
+    /// `global_settings`, not here.
+    pub fn skins_dir(&self) -> &std::path::Path {
+        &self.skins_dir
+    }
+
     pub fn mc_cache_dir(&self) -> PathBuf {
         self.cache_dir.join("minecraft")
     }
@@ -134,6 +145,7 @@ impl LauncherPaths {
             &self.content_packs_cache_dir,
             &self.modlists_dir,
             &self.java_runtimes_dir,
+            &self.skins_dir,
         ] {
             fs::create_dir_all(directory)?;
         }
@@ -211,5 +223,22 @@ mod tests {
         let paths = LauncherPaths::new(&root_dir);
 
         assert_eq!(paths.database_path(), root_dir.join("launcher_data.db"));
+    }
+
+    /// Saved skins are the player's, not a mod list's: a top-level folder next
+    /// to `mod-lists/`, not inside a mod list and not under `.cubic/`.
+    #[test]
+    fn skins_dir_is_a_top_level_folder_created_with_the_others() {
+        let root_dir = unique_test_root();
+        let paths = LauncherPaths::new(&root_dir);
+
+        assert_eq!(paths.skins_dir(), root_dir.join("skins"));
+
+        paths
+            .create_required_directories()
+            .expect("directory initialization should succeed");
+        assert!(paths.skins_dir().is_dir(), "the skins folder should exist");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root directory should be removable");
     }
 }

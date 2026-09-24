@@ -28,8 +28,6 @@ interface SidebarProps {
 interface RailItemProps {
   tooltip: string;
   active?: boolean;
-  /** A placeholder: visible, inert, and saying so in its tooltip. */
-  disabled?: boolean;
   onClick?: () => void;
   children: JSX.Element;
 }
@@ -50,28 +48,19 @@ function RailItem(props: RailItemProps) {
       <button
         ref={setAnchor}
         type="button"
-        // `aria-disabled` rather than the `disabled` attribute: a disabled
-        // button fires no mouse events, and an icon with no name and no
-        // tooltip says nothing at all.
-        aria-disabled={props.disabled ? "true" : undefined}
         aria-current={props.active ? "page" : undefined}
-        onClick={() => {
-          if (props.disabled) return;
-          props.onClick?.();
-        }}
+        onClick={() => props.onClick?.()}
         onMouseEnter={show}
         onMouseLeave={() => setPosition(null)}
         onFocus={show}
         onBlur={() => setPosition(null)}
         class={`relative w-12 h-12 rounded-xl flex items-center justify-center shrink-0 transition-colors duration-75 ${
-          props.disabled
-            ? "text-textMuted/40 cursor-not-allowed"
-            : props.active
-              ? "bg-bgHover text-white cursor-pointer"
-              : "text-textMuted hover:bg-bgHover hover:text-white cursor-pointer"
+          props.active
+            ? "bg-bgHover text-white cursor-pointer"
+            : "text-textMuted hover:bg-bgHover hover:text-white cursor-pointer"
         }`}
       >
-        <Show when={props.active && !props.disabled}>
+        <Show when={props.active}>
           <span class="absolute -left-2 top-1/2 -translate-y-1/2 h-6 w-1 rounded-r bg-primary" />
         </Show>
         {props.children}
@@ -107,7 +96,11 @@ export function Sidebar(props: SidebarProps) {
         <MaterialIcon name="home" size="lg" />
       </RailItem>
 
-      <RailItem tooltip="Skin — not available yet" disabled>
+      <RailItem
+        tooltip="Skins"
+        active={activeRailView() === "skins"}
+        onClick={() => setActiveRailView("skins")}
+      >
         <MaterialIcon name="person" size="lg" />
       </RailItem>
 
