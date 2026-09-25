@@ -50,18 +50,11 @@ fn world_dir(root: &Path, modlist: &str, instance: &str, folder: &str) -> PathBu
         .join(folder)
 }
 
-/// Write a world whose `level.dat` is gzipped NBT, like the real ones.
-fn write_world(
-    root: &Path,
-    modlist: &str,
-    instance: &str,
-    folder: &str,
-    level_name: &str,
-    game_type: i32,
-    last_played: i64,
-) -> PathBuf {
-    let directory = world_dir(root, modlist, instance, folder);
-    fs::create_dir_all(&directory).expect("failed to create the world directory");
+/// Write a world whose `level.dat` is gzipped NBT, like the real ones, at an
+/// arbitrary directory. A shared world lives in the mod list's `worlds/`, so
+/// the instance triple is no longer the only place one can sit.
+fn write_level_dat(directory: &Path, level_name: &str, game_type: i32, last_played: i64) {
+    fs::create_dir_all(directory).expect("failed to create the world directory");
 
     let nbt = fastnbt::to_bytes(&TestLevelDat {
         data: TestLevelDatData {
@@ -77,8 +70,31 @@ fn write_world(
     encoder.write_all(&nbt).expect("failed to gzip the level.dat");
     let gzipped = encoder.finish().expect("failed to finish the gzip stream");
     fs::write(directory.join(LEVEL_DAT_FILE_NAME), gzipped).expect("failed to write the level.dat");
+}
 
+fn write_world(
+    root: &Path,
+    modlist: &str,
+    instance: &str,
+    folder: &str,
+    level_name: &str,
+    game_type: i32,
+    last_played: i64,
+) -> PathBuf {
+    let directory = world_dir(root, modlist, instance, folder);
+    write_level_dat(&directory, level_name, game_type, last_played);
     directory
+}
+
+/// The id of a world that lives in one instance's `saves/`.
+fn instance_id(modlist: &str, instance: &str, folder: &str) -> WorldId {
+    WorldId {
+        home: WorldHome::Instance {
+            modlist_name: modlist.to_string(),
+            instance_name: instance.to_string(),
+        },
+        folder_name: folder.to_string(),
+    }
 }
 
 fn open_test_database(root: &Path) -> Connection {
@@ -92,8 +108,8 @@ fn ids(entries: &[WorldEntry]) -> Vec<(String, String, String)> {
         .iter()
         .map(|entry| {
             (
-                entry.id.modlist_name.clone(),
-                entry.id.instance_name.clone(),
+                entry.id.modlist_name().unwrap_or_default().to_string(),
+                entry.id.instance_name().unwrap_or_default().to_string(),
                 entry.id.folder_name.clone(),
             )
         })
@@ -245,11 +261,7 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
     write_world(&root, "test2", "26.3-fabric", "New World", "New World", 1, 2_000);
 
     let hidden = vec![HiddenWorld {
-        id: WorldId {
-            modlist_name: "test2".into(),
-            instance_name: "26.3-fabric".into(),
-            folder_name: "New World".into(),
-        },
+        id: instance_id("test2", "26.3-fabric", "New World"),
         hidden_at_last_played_ms: Some(2_000),
     }];
 
@@ -257,7 +269,7 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
 
     let flags: Vec<(String, bool)> = entries
         .iter()
-        .map(|entry| (entry.id.modlist_name.clone(), entry.hidden))
+        .map(|entry| (entry.id.modlist_name().unwrap_or_default().to_string(), entry.hidden))
         .collect();
     assert_eq!(
         flags,
@@ -272,14 +284,15 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
 
 #[test]
 fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
-    // A row written before D65: the triple, no baseline. It must not mean
-    // "hidden forever" — there is no show-hidden switch to escape through —
-    // so the first listing adopts the world's current `LastPlayed` and the
-    // world behaves like anything hidden today.
+    // A row written before D65: an id, no baseline. It must not mean "hidden
+    // forever" — there is no show-hidden switch to escape through — so the
+    // first listing adopts the world's current `LastPlayed` and the world
+    // behaves like anything hidden today. (The id is in today's shape: what
+    // this test is about is the missing baseline, not the id.)
     let root = unique_root("old-hidden-row");
     let directory = write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_000);
     let connection = open_test_database(&root);
-    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
+    let old_value = r#"[{"scope":"instance","modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
     connection
         .execute(
             "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
@@ -290,11 +303,7 @@ fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
     assert_eq!(
         load_hidden_worlds(&connection).expect("the old-format row should deserialize"),
         vec![HiddenWorld {
-            id: WorldId {
-                modlist_name: "pack".into(),
-                instance_name: "1.20.1-forge".into(),
-                folder_name: "Old World".into(),
-            },
+            id: instance_id("pack", "1.20.1-forge", "Old World"),
             hidden_at_last_played_ms: None,
         }]
     );
@@ -305,11 +314,7 @@ fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
     assert_eq!(
         load_hidden_worlds(&connection).expect("the row must read back"),
         vec![HiddenWorld {
-            id: WorldId {
-                modlist_name: "pack".into(),
-                instance_name: "1.20.1-forge".into(),
-                folder_name: "Old World".into(),
-            },
+            id: instance_id("pack", "1.20.1-forge", "Old World"),
             hidden_at_last_played_ms: Some(9_000),
         }],
         "the missing baseline is adopted from the world itself"
@@ -332,7 +337,7 @@ fn a_backfill_leaves_a_hidden_world_that_is_no_longer_on_disk_alone() {
     let root = unique_root("old-hidden-gone");
     fs::create_dir_all(&root).expect("failed to create the root");
     let connection = open_test_database(&root);
-    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Deleted"}]"#;
+    let old_value = r#"[{"scope":"instance","modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Deleted"}]"#;
     connection
         .execute(
             "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
@@ -356,11 +361,7 @@ fn a_world_becomes_visible_when_last_played_advances_past_the_hide_baseline() {
     let root = unique_root("hidden-until-played");
     write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_000);
     let hidden = vec![HiddenWorld {
-        id: WorldId {
-            modlist_name: "pack".into(),
-            instance_name: "1.20.1-forge".into(),
-            folder_name: "World".into(),
-        },
+        id: instance_id("pack", "1.20.1-forge", "World"),
         hidden_at_last_played_ms: Some(1_000),
     }];
 
@@ -379,11 +380,7 @@ fn rehiding_after_a_later_play_updates_the_stored_baseline() {
     let root = unique_root("rehide-baseline");
     let directory = write_world(&root, "pack", "1.20.1-forge", "World", "World", 0, 1_000);
     let connection = open_test_database(&root);
-    let world = WorldId {
-        modlist_name: "pack".into(),
-        instance_name: "1.20.1-forge".into(),
-        folder_name: "World".into(),
-    };
+    let world = instance_id("pack", "1.20.1-forge", "World");
     let level_dat_path = directory.join(LEVEL_DAT_FILE_NAME);
 
     let first_baseline = read_level_dat(&level_dat_path).and_then(|level| level.last_played);
@@ -418,16 +415,8 @@ fn hiding_a_world_persists_one_entry_and_unhiding_removes_it() {
     fs::create_dir_all(&root).expect("failed to create the root");
     let connection = open_test_database(&root);
 
-    let world = WorldId {
-        modlist_name: "test2".into(),
-        instance_name: "26.3-fabric".into(),
-        folder_name: "New World".into(),
-    };
-    let other = WorldId {
-        modlist_name: "Drehmal APOTHEOSIS".into(),
-        instance_name: "1.20.1-forge".into(),
-        folder_name: "New World".into(),
-    };
+    let world = instance_id("test2", "26.3-fabric", "New World");
+    let other = instance_id("Drehmal APOTHEOSIS", "1.20.1-forge", "New World");
 
     assert!(load_hidden_worlds(&connection)
         .expect("a missing row is an empty list")
@@ -471,11 +460,7 @@ fn saving_the_settings_form_leaves_the_hidden_worlds_alone() {
     fs::create_dir_all(&root).expect("failed to create the root");
     let connection = open_test_database(&root);
 
-    let world = WorldId {
-        modlist_name: "test2".into(),
-        instance_name: "26.3-fabric".into(),
-        folder_name: "New World".into(),
-    };
+    let world = instance_id("test2", "26.3-fabric", "New World");
     set_world_hidden(&connection, &world, true, Some(1_000)).expect("hiding must persist");
 
     save_global_settings(
@@ -534,6 +519,227 @@ fn quick_play_is_offered_only_when_the_version_declares_it() {
     // A world that is not on disk, and a name that tries to leave `saves/`.
     assert!(quick_play_arguments(&instance_root, Some("Deleted"), true).is_empty());
     assert!(quick_play_arguments(&instance_root, Some("../../options.txt"), true).is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ── E4: i mondi condivisi ────────────────────────────────────────────────────
+
+/// A world reached through a directory symlink into **another instance's
+/// `saves/`** — a link the launcher never makes, made by hand — is still one
+/// world and not two: the scan merges by canonical path.
+///
+/// **Changed meaning in E4 phase 3.** Until then the test also asserted that
+/// the hand-made link counted as a way in (`["1.20.1-fabric", "1.20.1-forge"]`).
+/// It no longer does: see `a_hand_made_link_into_another_instances_world_is_not_a_way_in`
+/// for why, and for what the removed cross-mod-list filter let through.
+#[test]
+fn a_link_that_stays_inside_the_mod_lists_directory_is_listed() {
+    let root = unique_root("link-inside");
+    write_world(&root, "pack", "1.20.1-forge", "Shared", "Shared", 0, 4_000);
+    let real = world_dir(&root, "pack", "1.20.1-forge", "Shared");
+
+    let other_saves = root
+        .join("mod-lists")
+        .join("pack")
+        .join(INSTANCES_DIR_NAME)
+        .join("1.20.1-fabric")
+        .join(SAVES_DIR_NAME);
+    fs::create_dir_all(&other_saves).expect("failed to create the second instance");
+    std::os::unix::fs::symlink(&real, other_saves.join("Shared")).expect("failed to link");
+
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+
+    // One world, not two: the two instances are two ways onto the same bytes.
+    assert_eq!(entries.len(), 1, "one world is one card, not one per path to it");
+    assert_eq!(entries[0].id, instance_id("pack", "1.20.1-forge", "Shared"));
+    let instances: Vec<&str> = entries[0]
+        .instances
+        .iter()
+        .map(|link| link.instance_name.as_str())
+        .collect();
+    assert_eq!(instances, vec!["1.20.1-forge"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The hole the containment closes. `child_directories` refused to follow any
+/// link at all, and its docstring said why: *"a link cannot make the listing
+/// report a world that lives outside the launcher root"*. Following links
+/// without a containment check hands that refusal back, and the recon `064`
+/// measured what it costs — the world is listed and launchable but
+/// `resolve_world_directory` refuses to open its folder, so the ⋮ menu errors
+/// on a card the home drew.
+#[test]
+fn a_link_that_leaves_the_mod_lists_directory_is_not_listed() {
+    let root = unique_root("link-outside");
+    write_world(&root, "pack", "1.20.1-forge", "Mine", "Mine", 0, 4_000);
+
+    // A world of the user's, somewhere else entirely.
+    let elsewhere = unique_root("link-outside-target");
+    write_level_dat(&elsewhere, "Not The Launcher's", 0, 9_000);
+
+    let saves = root
+        .join("mod-lists")
+        .join("pack")
+        .join(INSTANCES_DIR_NAME)
+        .join("1.20.1-forge")
+        .join(SAVES_DIR_NAME);
+    std::os::unix::fs::symlink(&elsewhere, saves.join("Escape")).expect("failed to link");
+
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.level_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Mine"], "a link out of the root is not a world");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&elsewhere);
+}
+
+// ── E4 fase 3: i mondi fuori dalle modlist (D99) ─────────────────────────────
+
+fn saves_of(root: &Path, modlist: &str, instance: &str) -> PathBuf {
+    let saves = root
+        .join("mod-lists")
+        .join(modlist)
+        .join(INSTANCES_DIR_NAME)
+        .join(instance)
+        .join(SAVES_DIR_NAME);
+    fs::create_dir_all(&saves).expect("failed to create the saves folder");
+    saves
+}
+
+/// The positive case of D99: a world in `<root>/worlds/`, linked from two
+/// instances **of two different mod lists**, is one card that both can open,
+/// and each way in says which mod list it belongs to.
+#[test]
+fn a_world_shared_across_mod_lists_lists_every_instance_that_links_it() {
+    let root = unique_root("across-modlists");
+    let shared = root.join(WORLDS_DIR_NAME).join("Shared");
+    write_level_dat(&shared, "Shared", 0, 4_000);
+
+    std::os::unix::fs::symlink(&shared, saves_of(&root, "test2", "26.3-fabric").join("Shared"))
+        .expect("failed to link");
+    std::os::unix::fs::symlink(
+        &shared,
+        saves_of(&root, "Drehmal APOTHEOSIS", "1.20.1-forge").join("Shared (2)"),
+    )
+    .expect("failed to link");
+
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].id,
+        WorldId {
+            home: WorldHome::Shared,
+            folder_name: "Shared".into(),
+        }
+    );
+    let ways: Vec<(&str, &str, &str)> = entries[0]
+        .instances
+        .iter()
+        .map(|link| {
+            (
+                link.modlist_name.as_str(),
+                link.instance_name.as_str(),
+                link.folder_name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ways,
+        vec![
+            ("Drehmal APOTHEOSIS", "1.20.1-forge", "Shared (2)"),
+            ("test2", "26.3-fabric", "Shared"),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **What the cross-mod-list filter used to stop.** It dropped any way in
+/// from another mod list, on the argument that an instance name alone could
+/// not say which mod list it belonged to. D99 puts the mod list into the way
+/// in, so the argument is gone and the filter has to go too — otherwise the
+/// positive test above could not pass.
+///
+/// Removing it lets through one thing the launcher never makes: a hand-made
+/// link from one instance into **another instance's own world**. Measured with
+/// the filter gone and nothing in its place, that link became a way in, and
+/// the card of a world that is not shared offered to launch it from another
+/// mod list — with no Shared badge, no "Stop sharing" entry that could work
+/// (the unshare only removes links into `<root>/worlds/`), and the D94
+/// asymmetry back: delete the owning instance and the other one loses it.
+///
+/// What holds in its place: **a way in is either the world's own directory
+/// or a link into `<root>/worlds/`**. An instance's world has exactly one —
+/// itself — and a shared world has one per link.
+#[test]
+fn a_hand_made_link_into_another_instances_world_is_not_a_way_in() {
+    let root = unique_root("hand-made-link");
+    write_world(&root, "test2", "26.3-fabric", "Mine", "Mine", 0, 4_000);
+    let real = world_dir(&root, "test2", "26.3-fabric", "Mine");
+    std::os::unix::fs::symlink(
+        &real,
+        saves_of(&root, "Drehmal APOTHEOSIS", "1.20.1-forge").join("Borrowed"),
+    )
+    .expect("failed to link");
+
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+
+    assert_eq!(entries.len(), 1, "the link does not make a second world");
+    assert_eq!(entries[0].id, instance_id("test2", "26.3-fabric", "Mine"));
+    let ways: Vec<(&str, &str)> = entries[0]
+        .instances
+        .iter()
+        .map(|link| (link.modlist_name.as_str(), link.instance_name.as_str()))
+        .collect();
+    assert_eq!(
+        ways,
+        vec![("test2", "26.3-fabric")],
+        "only the world's own instance can open a world that is not shared"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// **The containment, extended and not loosened.** D99 put worlds in a second
+/// place, `<root>/worlds/`, and the one-line way to admit it would have been
+/// "anything under `<root>`". That admits every other folder the launcher
+/// keeps: a link into `cache/`, `skins/` or `java-runtimes/` would become a
+/// card, launchable, whose folder `resolve_world_directory` then refuses —
+/// the hole `065` saw open and closed, one floor up.
+#[test]
+fn a_link_into_another_folder_of_the_launcher_is_not_listed() {
+    let root = unique_root("link-into-cache");
+    write_world(&root, "pack", "1.20.1-forge", "Mine", "Mine", 0, 4_000);
+
+    // Inside the launcher root, but in neither of the two places a world may be.
+    let decoy = root.join("cache").join("Decoy");
+    write_level_dat(&decoy, "Decoy", 0, 9_000);
+    std::os::unix::fs::symlink(&decoy, saves_of(&root, "pack", "1.20.1-forge").join("Decoy"))
+        .expect("failed to link");
+
+    // And one level too deep inside the shared folder: a directory of a
+    // world is not a world.
+    let nested = root.join(WORLDS_DIR_NAME).join("Real").join("DIM1");
+    write_level_dat(&nested, "Nested", 0, 8_000);
+    std::os::unix::fs::symlink(&nested, saves_of(&root, "pack", "1.20.1-forge").join("Nested"))
+        .expect("failed to link");
+
+    let entries = list_worlds(&root, &[]).expect("listing must not fail");
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.level_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Mine"],
+        "only the two roots hold worlds, and only at the depth a world sits"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

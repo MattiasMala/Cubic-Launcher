@@ -1,13 +1,15 @@
 // The landing page: the worlds to jump back into, then the mod list library.
 //
-// Three decisions worth stating once, because all three are visible on this
+// Five decisions worth stating once, because all five are visible on this
 // machine's real data:
 //
-// - **The two real worlds are both called `New World`, both in creative,
-//   both without an icon.** So the name cannot carry the card: what tells
-//   them apart is the mod list and the instance, and that line is given the
-//   same weight as the name. The icon tile is generated from the triple, so
-//   two worlds with the same name still look different at a glance.
+// - **Three of the real worlds are called `New World`.** So the name cannot
+//   carry the card: what tells them apart is the mod list and the instance,
+//   and that line is given the same weight as the name. When two visible
+//   worlds still share a name, the folder name is shown as well — only then,
+//   because on a screen where every card carries one it stops meaning
+//   anything. The icon tile is generated from the id, so two worlds with the
+//   same name still look different at a glance.
 // - **"No icon" is the normal case, not the edge case.** Minecraft writes
 //   `icon.png` when the player leaves a world through the menu, and neither
 //   real world has one. The fallback is designed — a tinted tile with the
@@ -16,20 +18,32 @@
 //   on purpose (D65): the backend un-hides a world by itself the next time
 //   its `LastPlayed` moves, so a hidden card comes back after the next
 //   session in it.
+// - **A shared world is one card, not one per instance** (D95). It carries
+//   the instances that can open it, and Play asks which one — but only when
+//   there is something to ask: a world with a single way in gets no question,
+//   because a question with one answer is a click the user did not need.
+// - **No instance at all is a state that gets drawn** (E4 phase 1): a shared
+//   world every instance has been taken off still exists, still holds its
+//   bytes, and the card says so instead of offering a Play that cannot work.
 
 import { For, Show, createMemo, createResource, createSignal, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import {
   librarySearch, modListCards, pushUiError, setCreateModlistModalOpen, setLibrarySearch,
 } from "../store";
-import type { ModListCard, WorldEntry, WorldGameMode } from "../lib/types";
+import { worldIdOf, type ModListCard, type ShareOutcome, type WorldEntry, type WorldGameMode, type WorldInstanceLink } from "../lib/types";
+import { loadInstancesByModlist } from "../lib/instances";
 import { MaterialIcon } from "./icons";
 
 interface HomeViewProps {
-  /** Launch this world's instance and open the world directly. */
-  onPlayWorld: (world: WorldEntry) => void;
-  /** Launch this world's instance the ordinary way, stopping at the menu. */
-  onPlayModlistOf: (world: WorldEntry) => void;
+  /**
+   * Launch through the chosen way in and open the world directly. The way in
+   * carries everything the launch needs — mod list, instance, and the folder
+   * name that instance's `saves/` uses — so the world itself is not passed.
+   */
+  onPlayWorld: (through: WorldInstanceLink) => void;
+  /** Launch the chosen instance the ordinary way, stopping at the menu. */
+  onPlayModlistOf: (through: WorldInstanceLink) => void;
   /** Show the mod list's editor and launch panel, as its rail icon does. */
   onOpenModlist: (modlistName: string) => void;
 }
@@ -65,13 +79,26 @@ function playedAgo(lastPlayedMs: number): string {
 }
 
 /**
- * A stable hue for a world, taken from its whole triple.
+ * The id of a world as one string: mod list and instance, or `shared` for a
+ * shared one, and folder.
+ *
+ * It keys the open ⋮ menu and seeds the tile's hue, and it has to be the
+ * whole id: three of the real worlds are called `New World`.
+ */
+function worldKey(world: WorldEntry): string {
+  return world.scope === "shared"
+    ? `shared/${world.folderName}`
+    : `${world.modlistName}/${world.instanceName}/${world.folderName}`;
+}
+
+/**
+ * A stable hue for a world, taken from its whole id.
  *
  * It is what keeps two worlds called `New World` from looking identical
  * while neither of them has an icon.
  */
 function worldHue(world: WorldEntry): number {
-  const key = `${world.modlistName}/${world.instanceName}/${world.folderName}`;
+  const key = worldKey(world);
   let hash = 0;
   for (let index = 0; index < key.length; index += 1) {
     hash = (Math.imul(hash, 31) + key.charCodeAt(index)) >>> 0;
@@ -115,35 +142,66 @@ function WorldTile(props: { world: WorldEntry; modlist: ModListCard | undefined 
         {source => <img src={source()} alt="" class="w-16 h-16 rounded-lg object-cover" />}
       </Show>
 
-      {/* Whose mod list this world belongs to, on the tile itself. */}
+      {/* Whose mod list this world belongs to, on the tile itself — or, for a
+          shared world, which belongs to none (D99), the link sign. */}
       <span
         class="absolute -bottom-1 -right-1 w-6 h-6 rounded-md overflow-hidden border border-bgDark bg-muted flex items-center justify-center"
-        title={props.world.modlistName}
+        title={props.world.scope === "instance" ? props.world.modlistName : "Shared world"}
       >
         <Show
-          when={props.modlist?.iconImage}
-          fallback={
-            <span class="text-[9px] font-bold text-white">
-              {(props.modlist?.displayName || props.world.modlistName).trim().slice(0, 2).toUpperCase()}
-            </span>
-          }
+          when={props.world.scope === "instance"}
+          fallback={<MaterialIcon name="link" size="sm" class="text-primary" />}
         >
-          <img src={props.modlist!.iconImage} alt="" class="w-6 h-6 object-cover" />
+          <Show
+            when={props.modlist?.iconImage}
+            fallback={
+              <span class="text-[9px] font-bold text-white">
+                {(props.modlist?.displayName ||
+                  (props.world.scope === "instance" ? props.world.modlistName : ""))
+                  .trim()
+                  .slice(0, 2)
+                  .toUpperCase()}
+              </span>
+            }
+          >
+            <img src={props.modlist!.iconImage} alt="" class="w-6 h-6 object-cover" />
+          </Show>
         </Show>
       </span>
     </div>
   );
 }
 
+/** An instance a world can be shared with: which mod list, which instance. */
+export type ShareTarget = { modlistName: string; instanceName: string };
+
+/**
+ * `test2 · 26.3-fabric`: since D99 an instance name alone is ambiguous — two
+ * mod lists can both have a `1.20.1-forge` — so every place that names a way
+ * in names its mod list too. Four call sites in this card.
+ */
+function wayLabel(way: ShareTarget): string {
+  return `${way.modlistName} · ${way.instanceName}`;
+}
+
 function WorldCard(props: {
   world: WorldEntry;
   modlist: ModListCard | undefined;
-  onPlay: () => void;
-  onPlayModlist: () => void;
+  /** Show the folder name too: another visible world carries the same name. */
+  showFolderName: boolean;
+  /** Every instance of every mod list, for the "Share with" list (D99). */
+  allInstances: ShareTarget[];
+  onPlay: (through: WorldInstanceLink) => void;
+  onPlayModlist: (through: WorldInstanceLink) => void;
   onOpenModlist: () => void;
   onOpenFolder: () => void;
   onHide: () => void;
-  /** Whether this card's ⋮ menu is the open one; at most one ever is. */
+  onShareWith: (target: ShareTarget) => void;
+  onUnshareFrom: (through: WorldInstanceLink) => void;
+  /** Which question this card's Play is asking, or `null`. */
+  asking: "world" | "modlist" | null;
+  onAsk: (mode: "world" | "modlist") => void;
+  onAnswered: () => void;
   menuOpen: boolean;
   onToggleMenu: () => void;
   onCloseMenu: () => void;
@@ -153,34 +211,136 @@ function WorldCard(props: {
     action();
   };
 
+  const ways = () => props.world.instances;
+  const isShared = () => props.world.scope === "shared";
+
+  /**
+   * D95: a shared world does not know which instance to launch with, so it
+   * has to ask. One way in is not a question — it is answered before it is
+   * asked, and the click goes straight through.
+   *
+   * The state lives in [`HomeView`], next to the open ⋮, so the same
+   * click-outside and Escape handlers close it. A popover only one card knows
+   * about is a popover nothing can close.
+   */
+  const start = (mode: "world" | "modlist") => {
+    const list = ways();
+    if (list.length === 0) return;
+    if (list.length === 1) {
+      props.onAnswered();
+      if (mode === "world") props.onPlay(list[0]);
+      else props.onPlayModlist(list[0]);
+      return;
+    }
+    props.onAsk(mode);
+  };
+  const answer = (through: WorldInstanceLink) => {
+    const mode = props.asking;
+    props.onAnswered();
+    if (mode === "world") props.onPlay(through);
+    else if (mode === "modlist") props.onPlayModlist(through);
+  };
+
+  /** The instances, of any mod list, that cannot open the world yet. */
+  const shareCandidates = () => {
+    const already = new Set(ways().map(link => `${link.modlistName}/${link.instanceName}`));
+    return props.allInstances.filter(
+      target => !already.has(`${target.modlistName}/${target.instanceName}`),
+    );
+  };
+
   return (
     <div class="flex items-center gap-4 p-4 rounded-xl bg-bgPanel border border-borderColor hover:border-primary/60 transition-colors">
       <WorldTile world={props.world} modlist={props.modlist} />
 
       <div class="min-w-0 flex-1">
-        <div class="text-textMain font-semibold truncate" title={props.world.levelName}>
-          {props.world.levelName}
-        </div>
-        {/* The line that tells two worlds of the same name apart. */}
-        <div class="flex items-center gap-1.5 text-sm text-textMain/90 truncate">
-          <MaterialIcon name="folder_managed" size="sm" class="text-textMuted" />
-          <span class="truncate" title={`${props.world.modlistName} — ${props.world.instanceName}`}>
-            {props.modlist?.displayName || props.world.modlistName}
-            <span class="text-textMuted"> · {props.world.instanceName}</span>
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-textMain font-semibold truncate" title={props.world.levelName}>
+            {props.world.levelName}
           </span>
+          {/* D96: the card says the world is shared, and with whom. */}
+          <Show when={isShared()}>
+            <span
+              class="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-primary/20 text-primary border border-primary/40 flex items-center gap-1"
+              title={
+                ways().length > 0
+                  ? `Shared with ${ways().map(wayLabel).join(", ")}`
+                  : "Shared, but no instance can open it right now"
+              }
+            >
+              <MaterialIcon name="link" size="sm" /> Shared
+            </span>
+          </Show>
+          {/* Only when it is needed to tell two cards apart. */}
+          <Show when={props.showFolderName}>
+            <span class="shrink-0 text-xs text-textMuted truncate" title="The folder this world lives in">
+              {props.world.folderName}
+            </span>
+          </Show>
+        </div>
+
+        <div class="flex items-center gap-1.5 text-sm text-textMain/90 truncate">
+          <MaterialIcon name={isShared() ? "link" : "folder_managed"} size="sm" class="text-textMuted" />
+          <Show
+            when={props.world.scope === "instance" ? props.world : null}
+            fallback={
+              <Show
+                when={ways().length > 0}
+                fallback={<span class="text-warning truncate">No instance can open it</span>}
+              >
+                <span class="truncate text-textMuted">{ways().map(wayLabel).join(" · ")}</span>
+              </Show>
+            }
+          >
+            {own => (
+              <span class="truncate">
+                {props.modlist?.displayName || own().modlistName}
+                <span class="text-textMuted"> · {own().instanceName}</span>
+              </span>
+            )}
+          </Show>
         </div>
         <div class="text-xs text-textMuted truncate">
           Singleplayer · {GAME_MODE_LABELS[props.world.gameMode]} · played {playedAgo(props.world.lastPlayedMs)}
         </div>
       </div>
 
-      <button
-        class="px-4 h-9 rounded-lg bg-primary hover:bg-brandPurpleHover text-white text-sm font-medium flex items-center gap-1.5 shrink-0"
-        onClick={props.onPlay}
-      >
-        <MaterialIcon name="play_arrow" size="sm" />
-        Play
-      </button>
+      <div class="relative shrink-0" data-world-menu>
+        <button
+          class="px-4 h-9 rounded-lg bg-primary hover:bg-brandPurpleHover disabled:bg-muted disabled:text-textMuted disabled:cursor-not-allowed text-white text-sm font-medium flex items-center gap-1.5"
+          disabled={ways().length === 0}
+          title={
+            ways().length === 0
+              ? "No instance can open this world. Share it with one from the ⋮ menu."
+              : undefined
+          }
+          onClick={() => start("world")}
+        >
+          <MaterialIcon name="play_arrow" size="sm" />
+          Play
+          <Show when={ways().length > 1}>
+            <MaterialIcon name="expand_more" size="sm" />
+          </Show>
+        </button>
+
+        <Show when={props.asking}>
+          <div class="absolute right-0 top-full mt-1 w-64 rounded-lg border border-borderColor bg-popover shadow-xl py-1 z-30">
+            <div class="px-3 py-1.5 text-xs text-textMuted">
+              {props.asking === "world" ? "Open this world with" : "Play which instance"}
+            </div>
+            <For each={ways()}>
+              {link => (
+                <button
+                  class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
+                  onClick={() => answer(link)}
+                >
+                  <MaterialIcon name="deployed_code" size="sm" /> {wayLabel(link)}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </div>
 
       <div class="relative shrink-0" data-world-menu>
         <button
@@ -192,25 +352,68 @@ function WorldCard(props: {
         </button>
 
         <Show when={props.menuOpen}>
-          <div class="absolute right-0 top-full mt-1 w-56 rounded-lg border border-borderColor bg-popover shadow-xl py-1 z-30">
+          <div class="absolute right-0 top-full mt-1 w-72 max-h-96 overflow-y-auto rounded-lg border border-borderColor bg-popover shadow-xl py-1 z-30">
             <button
               class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
               onClick={() => run(props.onOpenFolder)}
             >
               <MaterialIcon name="folder_open" size="sm" /> Open folder
             </button>
-            <button
-              class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
-              onClick={() => run(props.onPlayModlist)}
-            >
-              <MaterialIcon name="play_circle" size="sm" /> Play the mod list
-            </button>
-            <button
-              class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
-              onClick={() => run(props.onOpenModlist)}
-            >
-              <MaterialIcon name="tune" size="sm" /> Go to the mod list
-            </button>
+            <Show when={ways().length > 0}>
+              <button
+                class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
+                onClick={() => {
+                  props.onCloseMenu();
+                  start("modlist");
+                }}
+              >
+                <MaterialIcon name="play_circle" size="sm" /> Play the mod list
+              </button>
+            </Show>
+            {/* A shared world belongs to no mod list (D99): there is no single
+                one to go to. */}
+            <Show when={!isShared()}>
+              <button
+                class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
+                onClick={() => run(props.onOpenModlist)}
+              >
+                <MaterialIcon name="tune" size="sm" /> Go to the mod list
+              </button>
+            </Show>
+
+            {/* ── Sharing (E4) ───────────────────────────────────────── */}
+            <Show when={shareCandidates().length > 0}>
+              <div class="my-1 border-t border-borderColor" />
+              <div class="px-3 py-1.5 text-xs text-textMuted">
+                {isShared() ? "Share with" : "Share with — the world moves to the shared folder"}
+              </div>
+              <For each={shareCandidates()}>
+                {target => (
+                  <button
+                    class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
+                    onClick={() => run(() => props.onShareWith(target))}
+                  >
+                    <MaterialIcon name="add_link" size="sm" /> {wayLabel(target)}
+                  </button>
+                )}
+              </For>
+            </Show>
+            <Show when={isShared() && ways().length > 0}>
+              <div class="my-1 border-t border-borderColor" />
+              <div class="px-3 py-1.5 text-xs text-textMuted">Stop sharing with</div>
+              <For each={ways()}>
+                {link => (
+                  <button
+                    class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
+                    onClick={() => run(() => props.onUnshareFrom(link))}
+                    title="The world stays in the shared folder; only this instance's way in goes"
+                  >
+                    <MaterialIcon name="link_off" size="sm" /> {wayLabel(link)}
+                  </button>
+                )}
+              </For>
+            </Show>
+
             <div class="my-1 border-t border-borderColor" />
             <button
               class="w-full px-3 py-2 text-left text-sm text-textMain hover:bg-bgHover flex items-center gap-2"
@@ -227,7 +430,7 @@ function WorldCard(props: {
 }
 
 export function HomeView(props: HomeViewProps) {
-  const [worlds, { refetch }] = createResource(async () => {
+  const [worlds, { refetch, mutate: mutateWorlds }] = createResource(async () => {
     try {
       return await invoke<WorldEntry[]>("list_worlds_command");
     } catch (error) {
@@ -243,21 +446,36 @@ export function HomeView(props: HomeViewProps) {
   });
 
   /**
-   * The triple of the world whose ⋮ menu is open, or `null`.
+   * The id of the world whose ⋮ menu is open, or `null`.
    *
    * One signal for every card, because two dropdowns open at once is what a
-   * per-card one produced: his two worlds have the same name, so the second
-   * menu opening while the first stayed up was genuinely confusing.
+   * per-card one produced: three of his worlds have the same name, so the
+   * second menu opening while the first stayed up was genuinely confusing.
    */
   const [openMenuKey, setOpenMenuKey] = createSignal<string | null>(null);
-  const menuKey = (world: WorldEntry) =>
-    `${world.modlistName}/${world.instanceName}/${world.folderName}`;
+
+  /**
+   * The card whose Play is asking which instance to launch with, and what it
+   * will do with the answer.
+   *
+   * It lives here and not in the card for one reason: the two handlers below.
+   * A popover a card keeps to itself has nothing to close it — no click
+   * outside, no Escape — so it would sit open until something else was
+   * clicked, next to the ⋮ menu if that was open too.
+   */
+  const [openChooser, setOpenChooser] = createSignal<
+    { key: string; mode: "world" | "modlist" } | null
+  >(null);
 
   const closeOnOutside = (event: MouseEvent) => {
-    if (!(event.target as HTMLElement | null)?.closest("[data-world-menu]")) setOpenMenuKey(null);
+    if ((event.target as HTMLElement | null)?.closest("[data-world-menu]")) return;
+    setOpenMenuKey(null);
+    setOpenChooser(null);
   };
   const closeOnEscape = (event: KeyboardEvent) => {
-    if (event.key === "Escape") setOpenMenuKey(null);
+    if (event.key !== "Escape") return;
+    setOpenMenuKey(null);
+    setOpenChooser(null);
   };
   document.addEventListener("click", closeOnOutside);
   document.addEventListener("keydown", closeOnEscape);
@@ -280,12 +498,7 @@ export function HomeView(props: HomeViewProps) {
 
   const hideWorld = async (world: WorldEntry) => {
     try {
-      await invoke("set_world_hidden_command", {
-        modlistName: world.modlistName,
-        instanceName: world.instanceName,
-        folderName: world.folderName,
-        hidden: true,
-      });
+      await invoke("set_world_hidden_command", { world: worldIdOf(world), hidden: true });
       void refetch();
     } catch (error) {
       pushUiError({
@@ -300,11 +513,7 @@ export function HomeView(props: HomeViewProps) {
 
   const openWorldFolder = async (world: WorldEntry) => {
     try {
-      await invoke("open_world_folder_command", {
-        modlistName: world.modlistName,
-        instanceName: world.instanceName,
-        folderName: world.folderName,
-      });
+      await invoke("open_world_folder_command", { world: worldIdOf(world) });
     } catch (error) {
       pushUiError({
         title: "The folder could not be opened",
@@ -313,6 +522,80 @@ export function HomeView(props: HomeViewProps) {
         severity: "error",
         scope: "launch",
       });
+    }
+  };
+
+  /**
+   * Every instance of every mod list, so the ⋮ menu can offer the ones that
+   * cannot open the world yet — of any mod list, since D99.
+   */
+  const [allInstances] = createResource(
+    () => modListCards().map(card => card.name).sort(),
+    async (modlistNames): Promise<ShareTarget[]> => {
+      const byModlist = await loadInstancesByModlist(modlistNames);
+      return modlistNames.flatMap(modlistName =>
+        (byModlist[modlistName] ?? []).map(instanceName => ({ modlistName, instanceName })),
+      );
+    },
+  );
+
+  /**
+   * The level names carried by more than one visible world.
+   *
+   * Those cards get the folder name as well. Every card is not given one:
+   * three of the four real worlds are called `New World`, but the fourth is
+   * not, and a folder name on it would be noise.
+   */
+  const ambiguousNames = createMemo(() => {
+    const seen = new Set<string>();
+    const twice = new Set<string>();
+    for (const world of visibleWorlds()) {
+      if (seen.has(world.levelName)) twice.add(world.levelName);
+      seen.add(world.levelName);
+    }
+    return twice;
+  });
+
+  // Both sharing commands answer with the listing as it now stands, so the
+  // view is redrawn from what the disk says and not from what it believed.
+  const shareWith = async (world: WorldEntry, target: ShareTarget) => {
+    try {
+      const outcome = await invoke<ShareOutcome>("share_world_with_instance_command", {
+        world: worldIdOf(world),
+        targetModlistName: target.modlistName,
+        targetInstanceName: target.instanceName,
+      });
+      mutateWorlds(outcome.worlds);
+    } catch (error) {
+      pushUiError({
+        title: "The world could not be shared",
+        message: `'${world.levelName}' was not shared with ${wayLabel(target)}.`,
+        detail: String(error),
+        severity: "error",
+        scope: "launch",
+      });
+      void refetch();
+    }
+  };
+
+  const unshareFrom = async (world: WorldEntry, through: WorldInstanceLink) => {
+    try {
+      mutateWorlds(
+        await invoke<WorldEntry[]>("unshare_world_from_instance_command", {
+          modlistName: through.modlistName,
+          instanceName: through.instanceName,
+          folderName: through.folderName,
+        }),
+      );
+    } catch (error) {
+      pushUiError({
+        title: "The world is still shared",
+        message: `${wayLabel(through)} still reaches '${world.levelName}'.`,
+        detail: String(error),
+        severity: "error",
+        scope: "launch",
+      });
+      void refetch();
     }
   };
 
@@ -345,16 +628,39 @@ export function HomeView(props: HomeViewProps) {
                 {world => (
                   <WorldCard
                     world={world}
-                    modlist={modListCards().find(card => card.name === world.modlistName)}
-                    onPlay={() => props.onPlayWorld(world)}
-                    onPlayModlist={() => props.onPlayModlistOf(world)}
-                    onOpenModlist={() => props.onOpenModlist(world.modlistName)}
+                    modlist={
+                      world.scope === "instance"
+                        ? modListCards().find(card => card.name === world.modlistName)
+                        : undefined
+                    }
+                    showFolderName={ambiguousNames().has(world.levelName)}
+                    allInstances={allInstances() ?? []}
+                    onPlay={through => props.onPlayWorld(through)}
+                    onPlayModlist={through => props.onPlayModlistOf(through)}
+                    onOpenModlist={() => {
+                      if (world.scope === "instance") props.onOpenModlist(world.modlistName);
+                    }}
                     onOpenFolder={() => void openWorldFolder(world)}
                     onHide={() => void hideWorld(world)}
-                    menuOpen={openMenuKey() === menuKey(world)}
-                    onToggleMenu={() =>
-                      setOpenMenuKey(current => (current === menuKey(world) ? null : menuKey(world)))
+                    onShareWith={target => void shareWith(world, target)}
+                    onUnshareFrom={through => void unshareFrom(world, through)}
+                    asking={
+                      openChooser()?.key === worldKey(world) ? openChooser()!.mode : null
                     }
+                    onAsk={mode => {
+                      setOpenMenuKey(null);
+                      setOpenChooser(current =>
+                        current?.key === worldKey(world) && current.mode === mode
+                          ? null
+                          : { key: worldKey(world), mode },
+                      );
+                    }}
+                    onAnswered={() => setOpenChooser(null)}
+                    menuOpen={openMenuKey() === worldKey(world)}
+                    onToggleMenu={() => {
+                      setOpenChooser(null);
+                      setOpenMenuKey(current => (current === worldKey(world) ? null : worldKey(world)));
+                    }}
                     onCloseMenu={() => setOpenMenuKey(null)}
                   />
                 )}

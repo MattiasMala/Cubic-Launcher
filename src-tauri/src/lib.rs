@@ -35,6 +35,7 @@ pub mod resolver;
 pub mod rules;
 pub mod screenshots;
 pub mod shared_files;
+pub mod shared_worlds;
 pub mod skins;
 pub mod token_storage;
 mod updater;
@@ -159,6 +160,8 @@ pub fn run() {
             worlds::list_worlds_command,
             worlds::set_world_hidden_command,
             worlds::open_world_folder_command,
+            shared_worlds::share_world_with_instance_command,
+            shared_worlds::unshare_world_from_instance_command,
             updater::check_for_updates,
             updater::install_update
         ])

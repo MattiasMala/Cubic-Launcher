@@ -20,6 +20,7 @@ import {
 import { Modal, ModalHeader } from "./modal-base";
 import { GameOptionsPanel } from "./game-options-panel";
 import { SharedFilesPanel } from "./shared-files-panel";
+import { WorldsPanel } from "./worlds-panel";
 import { ChevronDownIcon, ChevronRightIcon } from "../icons";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
@@ -418,7 +419,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
   const [saving, setSaving] = createSignal(false);
   const [confirmDelete, setConfirmDelete] = createSignal(false);
   const [deleting, setDeleting] = createSignal(false);
-  const [tab, setTab] = createSignal<"identity" | "game" | "shared">("identity");
+  const [tab, setTab] = createSignal<"identity" | "game" | "shared" | "worlds">("identity");
 
   createEffect(() => {
     if (instancePresentationOpen()) {
@@ -482,6 +483,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
             { id: "identity" as const, label: "Identity" },
             { id: "game" as const, label: "Game settings" },
             { id: "shared" as const, label: "Shared files" },
+            { id: "worlds" as const, label: "Worlds" },
           ]}>
             {entry => (
               <button
@@ -505,6 +507,11 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
         <Show when={tab() === "shared"}>
           <div class="overflow-y-auto p-6">
             <SharedFilesPanel modlist={selectedModListName() ?? ""} />
+          </div>
+        </Show>
+        <Show when={tab() === "worlds"}>
+          <div class="overflow-y-auto p-6">
+            <WorldsPanel modlist={selectedModListName() ?? ""} />
           </div>
         </Show>
         <Show when={tab() === "identity"}>
