@@ -17,6 +17,7 @@ pub struct LauncherPaths {
     modlists_dir: PathBuf,
     java_runtimes_dir: PathBuf,
     skins_dir: PathBuf,
+    worlds_dir: PathBuf,
     database_path: PathBuf,
 }
 
@@ -32,6 +33,7 @@ impl LauncherPaths {
         let modlists_dir = root_dir.join("mod-lists");
         let java_runtimes_dir = root_dir.join("java-runtimes");
         let skins_dir = root_dir.join("skins");
+        let worlds_dir = root_dir.join("worlds");
         let database_path = root_dir.join(DATABASE_FILENAME);
 
         Self {
@@ -45,6 +47,7 @@ impl LauncherPaths {
             modlists_dir,
             java_runtimes_dir,
             skins_dir,
+            worlds_dir,
             database_path,
         }
     }
@@ -118,6 +121,18 @@ impl LauncherPaths {
         &self.skins_dir
     }
 
+    /// `<root>/worlds/`: the shared singleplayer worlds, one folder each
+    /// (D99).
+    ///
+    /// Global, next to `skins/` and for the same reason: a world two instances
+    /// share can be shared **across mod lists**, and then "which mod list owns
+    /// it" has no right answer. Keeping it in the first one that shared it
+    /// would put back, one floor up, exactly the asymmetry D94 removed between
+    /// instances — delete that mod list and every other one loses the world.
+    pub fn worlds_dir(&self) -> &std::path::Path {
+        &self.worlds_dir
+    }
+
     pub fn mc_cache_dir(&self) -> PathBuf {
         self.cache_dir.join("minecraft")
     }
@@ -146,6 +161,7 @@ impl LauncherPaths {
             &self.modlists_dir,
             &self.java_runtimes_dir,
             &self.skins_dir,
+            &self.worlds_dir,
         ] {
             fs::create_dir_all(directory)?;
         }

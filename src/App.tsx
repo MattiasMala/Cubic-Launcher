@@ -42,7 +42,7 @@ import {
   setContentLookupFailures,
   LAUNCH_STAGES, wait,
 } from "./store";
-import { normalizeModLoader, parseInstanceName, type ModRow, type UpdatePrecheckResult, type WorldEntry, type WorldInstanceLink } from "./lib/types";
+import { normalizeModLoader, parseInstanceName, type ModRow, type UpdatePrecheckResult, type WorldInstanceLink } from "./lib/types";
 import { buildResolvedContent, buildResolvedVersions } from "./lib/update-selection";
 import { fetchContentProjects } from "./lib/content-meta";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "./store";
@@ -1081,11 +1081,7 @@ export default function App() {
    * every question the launch can ask live there; leaving the user on the
    * home would look like nothing happened.
    */
-  const handlePlayWorld = async (
-    world: WorldEntry,
-    through: WorldInstanceLink,
-    openTheWorld: boolean,
-  ) => {
+  const handlePlayWorld = async (through: WorldInstanceLink, openTheWorld: boolean) => {
     if (launchState() === "resolving" || launchState() === "running" || updateCheckRunning()) return;
 
     const target = parseInstanceName(through.instanceName);
@@ -1100,7 +1096,9 @@ export default function App() {
       return;
     }
 
-    await handleSelectModList(world.modlistName);
+    // The mod list of the way in, not of the world: since D99 a shared world
+    // belongs to none, and the instance chosen can be of any of them.
+    await handleSelectModList(through.modlistName);
     // The instance the card was asked about: for a shared world (D95) the
     // home asked which one, and for an ordinary one there is only its own.
     setSelectedMcVersion(target.minecraftVersion);
@@ -1133,8 +1131,8 @@ export default function App() {
         <Switch>
           <Match when={activeRailView() === "home"}>
             <HomeView
-              onPlayWorld={(world, through) => void handlePlayWorld(world, through, true)}
-              onPlayModlistOf={(world, through) => void handlePlayWorld(world, through, false)}
+              onPlayWorld={through => void handlePlayWorld(through, true)}
+              onPlayModlistOf={through => void handlePlayWorld(through, false)}
               onOpenModlist={name => void handleOpenModlist(name)}
             />
           </Match>

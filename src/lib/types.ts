@@ -274,36 +274,50 @@ export type ScreenshotListing = {
 export type WorldGameMode = "survival" | "creative" | "adventure" | "spectator" | "unknown";
 
 /**
- * One way into a world: an instance, and the name that instance's own
- * `saves/` uses for it.
+ * One way into a world: an instance of some mod list, and the name that
+ * instance's own `saves/` uses for it.
  *
- * The two names come apart as soon as a name is taken (D98): a world shared
- * into an instance that already has a `New World` is linked under
- * `New World shared`, or `New World shared (2)`. `folderName` is the one to
- * pass to Quick Play and to the unshare command.
+ * The mod list is part of it since D99: a world can be shared across mod
+ * lists, and an instance name alone would not say whose it is. The folder
+ * name can differ from the world's own (D98) — it is the one to pass to Quick
+ * Play and to the unshare command.
  */
 export type WorldInstanceLink = {
+  modlistName: string;
   instanceName: string;
   folderName: string;
 };
 
 /**
+ * Where a world lives, which is also its identity (`worlds.rs`, `WorldHome`).
+ *
+ * A discriminated union and not two nullable fields: a shared world (D99)
+ * belongs to **no** mod list and **no** instance, and the type says so instead
+ * of leaving `modlistName` there to be read by mistake.
+ */
+export type WorldId =
+  | { scope: "instance"; modlistName: string; instanceName: string; folderName: string }
+  | { scope: "shared"; folderName: string };
+
+/** Just the id out of a listing entry, which is what the world commands take. */
+export function worldIdOf(world: WorldId): WorldId {
+  return world.scope === "shared"
+    ? { scope: "shared", folderName: world.folderName }
+    : {
+        scope: "instance",
+        modlistName: world.modlistName,
+        instanceName: world.instanceName,
+        folderName: world.folderName,
+      };
+}
+
+/**
  * One singleplayer world.
  *
- * The identity is the id, never the name: two worlds can be called
- * `New World` and live in a folder called `New World` in two different
- * instances, which is exactly the case on this machine.
+ * The identity is the id, never the name: three worlds on this machine are
+ * called `New World`.
  */
-export type WorldEntry = {
-  modlistName: string;
-  /**
-   * The instance the world lives in, or **`null` for a shared world** (D94),
-   * which lives in the mod list's own `worlds/` folder and belongs to no
-   * single instance.
-   */
-  instanceName: string | null;
-  /** The world's own folder name: in its instance, or in `worlds/`. */
-  folderName: string;
+export type WorldEntry = WorldId & {
   /** `LevelName`: what the player sees in game, and not the folder name. */
   levelName: string;
   gameMode: WorldGameMode;
@@ -313,14 +327,20 @@ export type WorldEntry = {
   /** Hidden from "Jump in" right now (D65); playing it again brings it back. */
   hidden: boolean;
   /**
-   * Every instance that can open this world, sorted by name. One entry for an
-   * ordinary world — itself — and one per link for a shared one.
+   * Every instance that can open this world, sorted. One entry for an ordinary
+   * world — itself — and one per link for a shared one, from any mod list.
    *
    * **Empty is a real state**: a shared world every instance has dropped stays
-   * in the mod list with nothing able to open it, and the card has to say so
-   * rather than offer a Play that cannot work.
+   * in `<root>/worlds/` with nothing able to open it, and the card has to say
+   * so rather than offer a Play that cannot work.
    */
   instances: WorldInstanceLink[];
+};
+
+/** What a share answers with: the world's id after it, and the listing. */
+export type ShareOutcome = {
+  world: WorldId;
+  worlds: WorldEntry[];
 };
 
 // ── Skins (E7) — the shapes `skins.rs` serializes ─────────────────────────────

@@ -1,13 +1,16 @@
-//! Sharing one world between the instances of a mod list (E4).
+//! Sharing one world between instances — of one mod list or of several (E4).
 //!
-//! Four decisions shape everything here, and the order matters:
+//! Five decisions shape everything here, and the order matters:
 //!
-//! - **The world moves into the mod list** (D94). It does not stay in the
+//! - **The world moves out of the instance** (D94). It does not stay in the
 //!   instance that made it with the others linking to it: at the first share it
-//!   is moved to `mod-lists/<name>/worlds/<folder>` and **every** instance that
-//!   can open it, the original one included, reaches it through a link. The
-//!   alternative leaves an owning instance, and deleting that instance takes
-//!   the world away from all the others.
+//!   is moved to a shared folder and **every** instance that can open it, the
+//!   original one included, reaches it through a link. The alternative leaves
+//!   an owning instance, and deleting that instance takes the world away from
+//!   all the others.
+//! - **The shared folder is global** (D99): `<root>/worlds/`, not a mod list's.
+//!   A world can be shared across mod lists, and a mod list that held it would
+//!   be the owning instance of D94 one floor up.
 //! - **A directory link, never a hard link.** The `region/*.mca` are written in
 //!   place, so hard-linking the files inside would make two worlds into one
 //!   world with two names, while `level.dat` goes through `level.dat_new` +
@@ -24,7 +27,7 @@
 //! - **Nothing here overwrites and nothing here deletes a world.** The only
 //!   destructive call in this file is the removal of the *source* after a
 //!   verified copy, and the only link this file removes is one it can prove
-//!   points at the world it was asked about.
+//!   points at a shared world.
 //!
 //! The move is the dangerous operation, and it is guarded three ways: the
 //! world's own `session.lock` is held for the whole of it so a running game
@@ -41,20 +44,12 @@ use tauri::State;
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::validate_path_component;
 use crate::worlds::{
-    list_worlds_with_baseline_backfill, WorldEntry, WorldId, MODLIST_WORLDS_DIR_NAME,
+    list_worlds_with_baseline_backfill, WorldEntry, WorldHome, WorldId, WorldPlace, WorldRoots,
 };
 
 const INSTANCES_DIR_NAME: &str = "instances";
 const SAVES_DIR_NAME: &str = "saves";
 const SESSION_LOCK_FILE_NAME: &str = "session.lock";
-
-/// `mod-lists/<modlist>/worlds/`.
-pub fn modlist_worlds_dir(root_dir: &Path, modlist_name: &str) -> PathBuf {
-    LauncherPaths::new(root_dir.to_path_buf())
-        .modlists_dir()
-        .join(modlist_name)
-        .join(MODLIST_WORLDS_DIR_NAME)
-}
 
 fn instance_saves_dir(root_dir: &Path, modlist_name: &str, instance_name: &str) -> PathBuf {
     LauncherPaths::new(root_dir.to_path_buf())
@@ -429,38 +424,40 @@ fn link_name_free_in<'a>(saves_dir: &'a Path, world_dir: &Path) -> impl FnMut(&s
 
 // ── Sharing ──────────────────────────────────────────────────────────────────
 
-/// Give `target_instance_name` a way into this world, moving the world into the
-/// mod list first if it is still inside an instance.
+/// Give one instance — of any mod list — a way into this world, moving the
+/// world to `<root>/worlds/` first if it is still inside an instance.
 ///
-/// `instance_name` is where the world is today: `Some` for a world that has
-/// never been shared — and then `folder_name` is the folder in that instance's
-/// `saves/` — `None` for one that already lives in `worlds/`, and then
-/// `folder_name` is its folder there. The result is the world's id, which is
-/// always a shared one, and whose `folder_name` is **not** necessarily the one
-/// that came in: see [`SHARED_SUFFIX`].
+/// `world` is the id the listing handed out. For a world that has never been
+/// shared it names the instance and folder it sits in; for a shared one it
+/// names the folder in `<root>/worlds/`. The result is the world's id, which
+/// is always a shared one, and whose `folder_name` is **not** necessarily the
+/// one that came in: see [`SHARED_SUFFIX`].
 pub fn share_world_with_instance(
     root_dir: &Path,
-    modlist_name: &str,
-    instance_name: Option<&str>,
-    folder_name: &str,
+    world: &WorldId,
+    target_modlist_name: &str,
     target_instance_name: &str,
 ) -> Result<WorldId> {
-    validate_path_component(modlist_name)
-        .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
-    validate_path_component(folder_name)
-        .with_context(|| format!("invalid world folder name '{folder_name}'"))?;
+    validate_path_component(&world.folder_name)
+        .with_context(|| format!("invalid world folder name '{}'", world.folder_name))?;
+    validate_path_component(target_modlist_name)
+        .with_context(|| format!("invalid mod list name '{target_modlist_name}'"))?;
     validate_path_component(target_instance_name)
         .with_context(|| format!("invalid instance name '{target_instance_name}'"))?;
-    if let Some(instance_name) = instance_name {
-        validate_path_component(instance_name)
-            .with_context(|| format!("invalid instance name '{instance_name}'"))?;
-    }
 
-    let worlds_dir = modlist_worlds_dir(root_dir, modlist_name);
-    let shared_folder_name = match instance_name {
-        Some(instance_name) => {
-            let source =
-                instance_saves_dir(root_dir, modlist_name, instance_name).join(folder_name);
+    let paths = LauncherPaths::new(root_dir.to_path_buf());
+    let worlds_dir = paths.worlds_dir().to_path_buf();
+    let shared_folder_name = match &world.home {
+        WorldHome::Instance {
+            modlist_name,
+            instance_name,
+        } => {
+            validate_path_component(modlist_name)
+                .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
+            validate_path_component(instance_name)
+                .with_context(|| format!("invalid instance name '{instance_name}'"))?;
+            let source = instance_saves_dir(root_dir, modlist_name, instance_name)
+                .join(&world.folder_name);
             let metadata = fs::symlink_metadata(&source)
                 .with_context(|| format!("no world at {}", source.display()))?;
             if metadata.file_type().is_symlink() {
@@ -476,7 +473,7 @@ pub fn share_world_with_instance(
             fs::create_dir_all(&worlds_dir)
                 .with_context(|| format!("failed to create {}", worlds_dir.display()))?;
             let shared_folder_name = first_free_name(
-                &format!("{folder_name}{SHARED_SUFFIX}"),
+                &format!("{}{SHARED_SUFFIX}", world.folder_name),
                 name_free_in(&worlds_dir),
             )?;
             let world_dir = worlds_dir.join(&shared_folder_name);
@@ -486,32 +483,32 @@ pub fn share_world_with_instance(
             move_directory(&source, &world_dir)?;
 
             // The instance the world came from is an instance like the others
-            // now: it gets a link back, under the shared name where the name
-            // it vacated is free — which it is, unless something else took it
-            // in between.
+            // now: it gets a link back, under the shared name where it is free.
             if let Err(error) = link_into_instance(root_dir, modlist_name, instance_name, &world_dir)
             {
-                // The world is whole in the mod list, so nothing is lost;
+                // The world is whole in `<root>/worlds/`, so nothing is lost;
                 // putting it back is still the state the user asked for least.
                 let _ = move_directory(&world_dir, &source);
                 return Err(error);
             }
             shared_folder_name
         }
-        None => {
-            if !worlds_dir.join(folder_name).is_dir() {
-                bail!("no shared world at {}", worlds_dir.join(folder_name).display());
+        WorldHome::Shared => {
+            if !worlds_dir.join(&world.folder_name).is_dir() {
+                bail!(
+                    "no shared world at {}",
+                    worlds_dir.join(&world.folder_name).display()
+                );
             }
-            folder_name.to_string()
+            world.folder_name.clone()
         }
     };
 
     let world_dir = worlds_dir.join(&shared_folder_name);
-    link_into_instance(root_dir, modlist_name, target_instance_name, &world_dir)?;
+    link_into_instance(root_dir, target_modlist_name, target_instance_name, &world_dir)?;
 
     Ok(WorldId {
-        modlist_name: modlist_name.to_string(),
-        instance_name: None,
+        home: WorldHome::Shared,
         folder_name: shared_folder_name,
     })
 }
@@ -539,53 +536,48 @@ fn link_into_instance(
 
 /// Take one instance's way into a shared world away.
 ///
-/// `folder_name` is the name **that instance's own `saves/` uses**, which is
-/// what `WorldInstanceLink::folder_name` carries and what the screen shows.
-/// Since D98 it need not be the name the world has in `worlds/`: the
-/// destination may have had that one taken.
+/// The three names are a `WorldInstanceLink` as the listing hands it out:
+/// the mod list and instance, and the name **that instance's own `saves/`
+/// uses**. Since D98 it need not be the world's own folder name.
 ///
 /// **Only a link is ever removed**, never a directory: if the name in that
 /// instance's `saves/` is a real world, or a link pointing anywhere other than
-/// into this mod list's `worlds/`, this refuses and touches nothing.
+/// at a shared world in `<root>/worlds/`, this refuses and touches nothing.
 ///
 /// Taking the last one away is allowed and loses nothing: the world stays in
-/// the mod list's `worlds/` folder and stays in the listing with an empty
-/// instance list, so it is still visible, still openable from the ⋮ menu, and
-/// one share away from being playable again. The alternative — moving it back
-/// into the instance that is being dropped — would put a world somewhere the
-/// user did not ask for, and refusing outright would leave no way to undo a
-/// share.
+/// `<root>/worlds/` and stays in the listing with an empty instance list, so
+/// it is still visible, still openable from the ⋮ menu, and one share away
+/// from being playable again. The alternative — moving it back into the
+/// instance that is being dropped — would put a world somewhere the user did
+/// not ask for, and refusing outright would leave no way to undo a share.
 pub fn unshare_world_from_instance(
     root_dir: &Path,
     modlist_name: &str,
-    folder_name: &str,
     instance_name: &str,
+    folder_name: &str,
 ) -> Result<()> {
     validate_path_component(modlist_name)
         .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
-    validate_path_component(folder_name)
-        .with_context(|| format!("invalid world folder name '{folder_name}'"))?;
     validate_path_component(instance_name)
         .with_context(|| format!("invalid instance name '{instance_name}'"))?;
-
-    let worlds_dir = modlist_worlds_dir(root_dir, modlist_name);
-    let resolved_worlds_dir = fs::canonicalize(&worlds_dir)
-        .with_context(|| format!("no shared worlds at {}", worlds_dir.display()))?;
+    validate_path_component(folder_name)
+        .with_context(|| format!("invalid world folder name '{folder_name}'"))?;
 
     let link = instance_saves_dir(root_dir, modlist_name, instance_name).join(folder_name);
     let metadata = fs::symlink_metadata(&link)
         .with_context(|| format!("{} does not hold this world", link.display()))?;
     if !metadata.file_type().is_symlink() {
         bail!(
-            "{} is a world folder of its own, not a link to the shared one",
+            "{} is a world folder of its own, not a link to a shared one",
             link.display()
         );
     }
     let resolved_link = fs::canonicalize(&link)
         .with_context(|| format!("failed to resolve {}", link.display()))?;
-    if resolved_link.parent() != Some(resolved_worlds_dir.as_path()) {
+    let roots = WorldRoots::resolve(&LauncherPaths::new(root_dir.to_path_buf()));
+    if roots.place(&resolved_link) != Some(WorldPlace::SharedWorlds) {
         bail!(
-            "{} points at {}, which is not a world of this mod list",
+            "{} points at {}, which is not a shared world",
             link.display(),
             resolved_link.display()
         );
@@ -597,41 +589,49 @@ pub fn unshare_world_from_instance(
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
-/// Share a world with one instance, and hand back the listing as it now
-/// stands — the same shape `set_world_hidden_command` follows, so the caller
-/// never has to guess what the disk looks like afterwards.
+/// What a share answers with: the world's id **after** the share — which
+/// differs from the one that came in the first time, because the world moved
+/// and took the ` shared` suffix — and the listing as it now stands, so the
+/// caller never has to guess what the disk looks like afterwards.
+#[derive(Debug, serde::Serialize)]
+pub struct ShareOutcome {
+    pub world: WorldId,
+    pub worlds: Vec<WorldEntry>,
+}
+
 #[tauri::command]
 pub fn share_world_with_instance_command(
     launcher_paths: State<'_, LauncherPaths>,
-    modlist_name: String,
-    instance_name: Option<String>,
-    folder_name: String,
+    world: WorldId,
+    target_modlist_name: String,
     target_instance_name: String,
-) -> Result<Vec<WorldEntry>, String> {
-    share_world_with_instance(
+) -> Result<ShareOutcome, String> {
+    let world = share_world_with_instance(
         launcher_paths.root_dir(),
-        &modlist_name,
-        instance_name.as_deref(),
-        &folder_name,
+        &world,
+        &target_modlist_name,
         &target_instance_name,
     )
     .map_err(|error| format!("{error:#}"))?;
 
-    listing(&launcher_paths)
+    Ok(ShareOutcome {
+        world,
+        worlds: listing(&launcher_paths)?,
+    })
 }
 
 #[tauri::command]
 pub fn unshare_world_from_instance_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-    folder_name: String,
     instance_name: String,
+    folder_name: String,
 ) -> Result<Vec<WorldEntry>, String> {
     unshare_world_from_instance(
         launcher_paths.root_dir(),
         &modlist_name,
-        &folder_name,
         &instance_name,
+        &folder_name,
     )
     .map_err(|error| format!("{error:#}"))?;
 
