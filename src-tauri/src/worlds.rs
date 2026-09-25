@@ -70,7 +70,7 @@ const MAX_LEVEL_DAT_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// The tag is in the JSON (`scope`), so the frontend gets a discriminated
 /// union rather than a pair of nullable fields it has to correlate by hand.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum WorldHome {
     /// In one instance's `saves/`, and nowhere else. It is that instance's
@@ -87,57 +87,20 @@ pub enum WorldHome {
 }
 
 /// The identity of one world. Not the name — see the module docs.
+///
+/// Stored as is in the hidden list. The two older shapes — E10's
+/// `(modlist, instance, folder)` and D94's `instanceName: null` — are **not**
+/// read back: no release ever wrote a hidden row (the feature is newer than
+/// `v0.1.2`), and the only machine that ran the unreleased builds has none
+/// (checked, report `067`). A reader for rows that do not exist would be
+/// machinery for nothing, in the one place — nested `flatten` over a tagged
+/// enum — where serde is least forgiving.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", try_from = "StoredWorldId")]
+#[serde(rename_all = "camelCase")]
 pub struct WorldId {
     #[serde(flatten)]
     pub home: WorldHome,
     pub folder_name: String,
-}
-
-/// Every shape a world id has been written in, read back into the one it has
-/// now.
-///
-/// The hidden list is stored JSON, and it outlives the shapes: an E10 row is
-/// `{modlistName, instanceName, folderName}` with no `scope`, a D94 row for a
-/// shared world has `instanceName: null`, and a row written today carries the
-/// tag. There is no such row on the real disk right now (checked), but the
-/// test `an_old_hidden_row_hides_today_and_comes_back_after_the_next_play`
-/// writes an E10 one on purpose, and an unreadable row would silently unhide
-/// everything — `load_hidden_worlds` reads a bad value as an empty list.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredWorldId {
-    scope: Option<String>,
-    modlist_name: Option<String>,
-    instance_name: Option<String>,
-    folder_name: String,
-}
-
-impl TryFrom<StoredWorldId> for WorldId {
-    type Error = String;
-
-    fn try_from(stored: StoredWorldId) -> Result<Self, Self::Error> {
-        let home = match (stored.scope.as_deref(), stored.modlist_name, stored.instance_name) {
-            (Some("shared"), _, _) => WorldHome::Shared,
-            // D94: a shared world was a mod list's with no instance. Its
-            // folder moved to `<root>/worlds/` under the same name (D99).
-            (None, _, None) => WorldHome::Shared,
-            (Some("instance") | None, Some(modlist_name), Some(instance_name)) => {
-                WorldHome::Instance {
-                    modlist_name,
-                    instance_name,
-                }
-            }
-            (scope, _, _) => {
-                return Err(format!("a world id with scope {scope:?} is not one this build reads"))
-            }
-        };
-        Ok(WorldId {
-            home,
-            folder_name: stored.folder_name,
-        })
-    }
 }
 
 impl WorldId {

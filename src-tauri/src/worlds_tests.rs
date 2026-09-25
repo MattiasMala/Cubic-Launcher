@@ -284,14 +284,15 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
 
 #[test]
 fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
-    // A row written before D65: the triple, no baseline. It must not mean
-    // "hidden forever" — there is no show-hidden switch to escape through —
-    // so the first listing adopts the world's current `LastPlayed` and the
-    // world behaves like anything hidden today.
+    // A row written before D65: an id, no baseline. It must not mean "hidden
+    // forever" — there is no show-hidden switch to escape through — so the
+    // first listing adopts the world's current `LastPlayed` and the world
+    // behaves like anything hidden today. (The id is in today's shape: what
+    // this test is about is the missing baseline, not the id.)
     let root = unique_root("old-hidden-row");
     let directory = write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_000);
     let connection = open_test_database(&root);
-    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
+    let old_value = r#"[{"scope":"instance","modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
     connection
         .execute(
             "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
@@ -336,7 +337,7 @@ fn a_backfill_leaves_a_hidden_world_that_is_no_longer_on_disk_alone() {
     let root = unique_root("old-hidden-gone");
     fs::create_dir_all(&root).expect("failed to create the root");
     let connection = open_test_database(&root);
-    let old_value = r#"[{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Deleted"}]"#;
+    let old_value = r#"[{"scope":"instance","modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Deleted"}]"#;
     connection
         .execute(
             "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",

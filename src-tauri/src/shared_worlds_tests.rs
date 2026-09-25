@@ -449,28 +449,26 @@ fn serializes_the_payload_contract_the_next_phase_reads() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Hidden rows are stored JSON and outlive the shape of the id. Every shape
-/// ever written must still read back, or `load_hidden_worlds` would treat the
-/// row as corrupt and silently unhide everything.
+/// A hidden row is written by the serializer and read back by the
+/// deserializer, and the two must agree on both kinds of id — nested `flatten`
+/// over a tagged enum is where serde gets fragile, and a row that does not
+/// read back is treated as corrupt and silently unhides everything. The field
+/// names are pinned too: the first version of the enum wrote `modlist_name`.
 #[test]
-fn every_stored_shape_of_a_world_id_still_reads() {
-    let read = |json: &str| serde_json::from_str::<WorldId>(json).expect(json);
-
-    // E10, before sharing existed.
-    assert_eq!(
-        read(r#"{"modlistName":"pack","instanceName":"1.20.1-forge","folderName":"W"}"#),
-        instance_id("pack", "1.20.1-forge", "W")
-    );
-    // D94, a shared world that still belonged to a mod list: its folder is
-    // in `<root>/worlds/` now under the same name.
-    assert_eq!(
-        read(r#"{"modlistName":"pack","instanceName":null,"folderName":"W shared"}"#),
-        shared_id("W shared")
-    );
-    // Today's, both kinds, round-tripped through the serializer itself.
+fn a_stored_world_id_reads_back_as_itself() {
     for id in [instance_id("pack", "1.20.1-forge", "W"), shared_id("W shared")] {
-        assert_eq!(read(&serde_json::to_string(&id).unwrap()), id);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<WorldId>(&json).expect(&json), id);
     }
+    assert_eq!(
+        serde_json::to_value(instance_id("pack", "1.20.1-forge", "W")).unwrap(),
+        serde_json::json!({
+            "scope": "instance",
+            "modlistName": "pack",
+            "instanceName": "1.20.1-forge",
+            "folderName": "W"
+        })
+    );
     // A scope this build does not know is an error, not a guess.
     assert!(serde_json::from_str::<WorldId>(r#"{"scope":"cloud","folderName":"W"}"#).is_err());
 }
