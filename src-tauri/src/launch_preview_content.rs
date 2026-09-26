@@ -331,8 +331,8 @@ fn install_local_content_packs(
     let mut installed = Vec::new();
 
     // What the last launch says it put here. It decides one thing only: whether
-    // a real directory already under a pack's name may be replaced. Without it
-    // the install would `remove_dir_all` a folder the user unpacked themselves.
+    // a real directory or a real file already under a pack's name may be
+    // replaced. Without it the install would delete what the user put there.
     let previous = crate::instance_content::read_manifest_files(
         &crate::instance_content::manifest_path(instance_root, instance_subdir),
     );
@@ -352,8 +352,8 @@ fn install_local_content_packs(
         }
 
         let target_path = instance_dir.join(&pack.file_name);
-        let directory_is_ours = previous.iter().any(|name| name == &pack.file_name);
-        let outcome = link_local_pack(&pack.source_path, &target_path, directory_is_ours)
+        let target_is_ours = previous.iter().any(|name| name == &pack.file_name);
+        let outcome = link_local_pack(&pack.source_path, &target_path, target_is_ours)
             .with_context(|| {
                 format!(
                     "failed to install local content pack '{}' into instance",
@@ -366,15 +366,20 @@ fn install_local_content_packs(
             // Not silent: a copied folder is a second set of bytes on disk, and
             // whoever reads the log has to be able to tell why.
             PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
-            PackLinkOutcome::SkippedForeignDirectory => {
+            PackLinkOutcome::SkippedForeignDirectory | PackLinkOutcome::SkippedForeignFile => {
                 // Left out of `installed` on purpose: the name is not in the
-                // manifest, so the sync will not remove it either, and the
-                // user's folder stays exactly as it is.
+                // manifest, so the sync will not remove it either, and what the
+                // user put there stays exactly as it is.
+                let what = if outcome == PackLinkOutcome::SkippedForeignFile {
+                    "a file"
+                } else {
+                    "a directory"
+                };
                 emit_log(
                     app_handle,
                     ProcessLogStream::Stdout,
                     format!(
-                        "[Content] Skipped local pack '{}': {} is a directory the launcher did not create",
+                        "[Content] Skipped local pack '{}': {} is {what} the launcher did not create",
                         pack.file_name,
                         target_path.display()
                     ),
@@ -487,6 +492,10 @@ pub(super) async fn resolve_and_install_content_packs(
         // directory is touched.
         let mut installed: Vec<String> = Vec::new();
         let mut lookups_complete = true;
+        // Whether a real file under a pack's name is ours to replace (D1).
+        let previous = crate::instance_content::read_manifest_files(
+            &crate::instance_content::manifest_path(instance_root, instance_subdir),
+        );
 
         if !active_entries.is_empty() {
             std::fs::create_dir_all(&instance_dir)
@@ -578,9 +587,26 @@ pub(super) async fn resolve_and_install_content_packs(
             .await
             .with_context(|| format!("failed to download content pack '{entry_id}'"))?;
             let target_path = instance_dir.join(&file.filename);
-            crate::instance_mods::create_file_link(&cached_path, &target_path).with_context(
-                || format!("failed to link content pack '{entry_id}' into instance"),
-            )?;
+            let target_is_ours = previous.iter().any(|name| name == &file.filename);
+            let outcome = crate::instance_content::link_content_file(
+                &cached_path,
+                &target_path,
+                target_is_ours,
+            )
+            .with_context(|| format!("failed to link content pack '{entry_id}' into instance"))?;
+            if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
+                // Left out of `installed`: the name is not in the manifest, so
+                // the sync will not remove it either.
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
+                        target_path.display()
+                    ),
+                )?;
+                continue;
+            }
             if !installed.iter().any(|name| name == &file.filename) {
                 installed.push(file.filename.clone());
             }
@@ -650,6 +676,10 @@ async fn install_datapacks(
     let instance_dir = instance_root.join("datapacks");
     let mut installed: Vec<String> = Vec::new();
     let mut lookups_complete = true;
+    // Whether a real file under a pack's name is ours to replace (D1).
+    let previous = crate::instance_content::read_manifest_files(
+        &crate::instance_content::manifest_path(instance_root, "datapacks"),
+    );
 
     if !active_entries.is_empty() {
         std::fs::create_dir_all(&instance_dir)
@@ -735,8 +765,23 @@ async fn install_datapacks(
         .await
         .with_context(|| format!("failed to download data pack '{entry_id}'"))?;
         let target_path = instance_dir.join(&file.filename);
-        crate::instance_mods::create_file_link(&cached_path, &target_path)
-            .with_context(|| format!("failed to link data pack '{entry_id}' into instance"))?;
+        let target_is_ours = previous.iter().any(|name| name == &file.filename);
+        let outcome =
+            crate::instance_content::link_content_file(&cached_path, &target_path, target_is_ours)
+                .with_context(|| format!("failed to link data pack '{entry_id}' into instance"))?;
+        if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
+            // Left out of `installed`: the name is not in the manifest, so the
+            // sync will not remove it either.
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
+                    target_path.display()
+                ),
+            )?;
+            continue;
+        }
         if !installed.iter().any(|name| name == &file.filename) {
             installed.push(file.filename.clone());
         }

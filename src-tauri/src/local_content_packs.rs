@@ -401,6 +401,10 @@ pub enum PackLinkOutcome {
     /// Nothing was done: a real directory already sits under that name and the
     /// manifest does not claim it, so it is not ours to delete.
     SkippedForeignDirectory,
+    /// Nothing was done: a real file already sits under that name and the
+    /// manifest does not claim it — a pack the user dropped in by hand. Linking
+    /// over it would delete their bytes, and nothing would bring them back.
+    SkippedForeignFile,
 }
 
 /// Put a local pack into the instance directory, replacing what the last launch
@@ -414,24 +418,31 @@ pub enum PackLinkOutcome {
 /// dependency and zipping the pack would change the bytes the user chose and
 /// take away the point of keeping it unpacked.
 ///
-/// `directory_is_ours` says whether the previous manifest lists this name, and
-/// it gates the one destructive case. A real directory already under that name
-/// is either the copy fallback from our own last launch or a folder the user
+/// `target_is_ours` says whether the previous manifest lists this name, and it
+/// gates the destructive cases. A real directory already under that name is
+/// either the copy fallback from our own last launch or a folder the user
 /// unpacked there; `remove_dir_all` on the second is C1's wipe in a new costume.
-/// Without the manifest's word the install is skipped and nothing is touched —
-/// the same rule as removal, ownership comes from the manifest, applied on the
-/// way in.
+/// A real file is either the hard-link fallback of our own last launch or a zip
+/// the user dropped in, and deleting the second is the same loss (D1). Without
+/// the manifest's word the install is skipped and nothing is touched — the same
+/// rule as removal, ownership comes from the manifest, applied on the way in.
+/// A link under that name holds no bytes of its own and is always replaced.
 pub fn link_local_pack(
     source: &Path,
     target: &Path,
-    directory_is_ours: bool,
+    target_is_ours: bool,
 ) -> Result<PackLinkOutcome> {
     let source_is_dir = fs::metadata(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .is_dir();
 
-    if target_is_real_dir(target) && !directory_is_ours {
-        return Ok(PackLinkOutcome::SkippedForeignDirectory);
+    if !target_is_ours {
+        if target_is_real_dir(target) {
+            return Ok(PackLinkOutcome::SkippedForeignDirectory);
+        }
+        if crate::instance_content::is_real_file(target) {
+            return Ok(PackLinkOutcome::SkippedForeignFile);
+        }
     }
 
     remove_existing_target(target)?;
@@ -450,8 +461,8 @@ pub fn link_local_pack(
     }
 }
 
-/// A directory, and not a symlink pointing at one: the only shape whose removal
-/// can destroy something the launcher did not create.
+/// A directory, and not a symlink pointing at one: with a real file, the shape
+/// whose removal can destroy something the launcher did not create.
 fn target_is_real_dir(target: &Path) -> bool {
     fs::symlink_metadata(target)
         .map(|metadata| {
@@ -461,9 +472,9 @@ fn target_is_real_dir(target: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Clear the instance-side name before installing over it. Symmetric with
-/// `create_file_link`, which also removes an existing target; the directory
-/// cases are the ones it cannot handle.
+/// Clear the instance-side name before installing over it, once the manifest
+/// has said it is ours. `create_file_link` removes only a link, so the real
+/// file and directory cases are cleared here.
 fn remove_existing_target(target: &Path) -> Result<()> {
     let Ok(metadata) = fs::symlink_metadata(target) else {
         return Ok(());
@@ -1609,12 +1620,46 @@ mod tests {
         );
         assert!(target.join("pack.png").exists());
 
-        // A stale file under that name is replaced either way: that is what
-        // `create_file_link` already does for Modrinth packs.
+        // A stale file under that name is replaced when the manifest names it:
+        // it is the hard-link fallback of our own last launch.
         fs::remove_file(&target).expect("the link should be removable");
         fs::write(&target, b"stale file").expect("stale file should be written");
-        link_local_pack(&source, &target, false).expect("install over a file");
+        link_local_pack(&source, &target, true).expect("install over our own file");
         assert!(target.join("pack.png").exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The directory rule, applied to a file. A zip the user dropped into the
+    /// instance under the name a local pack takes is theirs until the manifest
+    /// says otherwise; linking over it deleted their bytes for good.
+    #[test]
+    fn a_real_file_the_manifest_does_not_name_is_left_alone() {
+        let root = unique_test_root();
+        let source = root.join("modlist").join("Local Pack.zip");
+        fs::create_dir_all(root.join("modlist")).expect("mod list dir should be created");
+        fs::write(&source, b"from the mod list").expect("the local pack should exist");
+        let instance_dir = root.join("instance").join("resourcepacks");
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+        let target = instance_dir.join("Local Pack.zip");
+        fs::write(&target, b"the user's own copy").expect("the user's file should exist");
+
+        let outcome =
+            link_local_pack(&source, &target, false).expect("a foreign file is not an error");
+
+        assert_eq!(
+            fs::read(&target).expect("the user's file should be readable"),
+            b"the user's own copy",
+            "byte for byte what the user put there"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .expect("the name should still be there")
+                .file_type()
+                .is_symlink(),
+            "the user's file must not have become a link"
+        );
+        assert_eq!(outcome, PackLinkOutcome::SkippedForeignFile);
 
         fs::remove_dir_all(&root).ok();
     }
