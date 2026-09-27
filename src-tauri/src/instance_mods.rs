@@ -98,7 +98,7 @@ pub fn clear_instance_mods_directory(instance_mods_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace `target_path` with a link to `source_path`.
+/// Replace the link at `target_path` with a link to `source_path`.
 ///
 /// The existence check is `symlink_metadata`, not `exists`, because `exists`
 /// **follows** the link: on a symlink whose source is gone it answers "nothing
@@ -108,15 +108,23 @@ pub fn clear_instance_mods_directory(instance_mods_dir: &Path) -> Result<()> {
 /// at a deleted cache entry is not a corner case: it is what any cleanup of
 /// the cache produces, the one C5's layout change invites.
 ///
-/// Only a file (or a link) is removed here. A real directory under that name
-/// fails, as it did before, and that is deliberate: `link_local_pack` is the
-/// caller that knows whether a directory is the launcher's to delete
-/// (`local_content_packs.rs:433-437`), and it clears the target itself before
-/// calling in.
+/// Only a **link** is removed here. A real file or a real directory under that
+/// name fails and is left as it is: this function cannot tell a pack the user
+/// dropped in from the hard-link fallback of our own last launch, and deleting
+/// the first is a loss nothing brings back (D1). The callers that hold the
+/// manifest decide, and clear the target themselves when it is theirs:
+/// [`crate::instance_content::link_content_file`] and `link_local_pack`
+/// (`local_content_packs.rs`).
 pub fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
-    if fs::symlink_metadata(target_path).is_ok() {
+    if let Ok(metadata) = fs::symlink_metadata(target_path) {
+        if !metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to replace {}: it is not a link, and only the manifest can say it is ours",
+                target_path.display()
+            );
+        }
         fs::remove_file(target_path).with_context(|| {
-            format!("failed to remove existing target {}", target_path.display())
+            format!("failed to remove existing link {}", target_path.display())
         })?;
     }
 
@@ -371,4 +379,37 @@ mod tests {
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 
+    /// `create_file_link` cannot know whose a file is, so it must not delete
+    /// one. Before D1 it did: a zip the user dropped in under a pack's name was
+    /// removed and replaced by a link into the cache, with no trace left.
+    #[test]
+    fn a_real_file_at_the_target_is_refused_and_left_byte_for_byte() {
+        let root_dir = unique_test_root();
+        let cache_dir = root_dir.join("cache");
+        let instance_dir = root_dir.join("instance");
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+        let source_path = cache_dir.join("pack.zip");
+        fs::write(&source_path, b"from the cache").expect("the cache entry should exist");
+        let occupied = instance_dir.join("pack.zip");
+        fs::write(&occupied, b"the user's own pack").expect("the user's file should exist");
+
+        let result = create_file_link(&source_path, &occupied);
+
+        assert_eq!(
+            fs::read(&occupied).expect("the user's file should be readable"),
+            b"the user's own pack",
+            "byte for byte what the user put there"
+        );
+        assert!(
+            !fs::symlink_metadata(&occupied)
+                .expect("the name should still be there")
+                .file_type()
+                .is_symlink(),
+            "the user's file must not have become a link"
+        );
+        assert!(result.is_err(), "a real file must not be replaced by a link");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
 }

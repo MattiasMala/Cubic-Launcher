@@ -274,6 +274,50 @@ fn remove_symlink(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
+/// What [`link_content_file`] did under one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentLinkOutcome {
+    Linked,
+    /// Nothing was done: a real file sits under that name and the previous
+    /// manifest does not claim it, so it is not ours to replace.
+    SkippedForeignFile,
+}
+
+/// Link a downloaded pack under `target`, applying the manifest rule on the way
+/// in as [`plan_stale_removals`] applies it on the way out (D1).
+///
+/// `target_is_ours` says whether the previous manifest names this file. A link
+/// under that name is always replaced — ours or not, dangling or not, it holds
+/// no bytes of its own. A real file is replaced only when the manifest names
+/// it: that is the hard-link fallback of our own last launch on Windows. A real
+/// file the manifest does not name is a pack the user dropped in, and it is
+/// left exactly as it is; the caller says so in the launch log and keeps the
+/// name out of the new manifest, so the sync does not remove it either.
+pub fn link_content_file(
+    source: &Path,
+    target: &Path,
+    target_is_ours: bool,
+) -> Result<ContentLinkOutcome> {
+    if is_real_file(target) {
+        if !target_is_ours {
+            return Ok(ContentLinkOutcome::SkippedForeignFile);
+        }
+        fs::remove_file(target)
+            .with_context(|| format!("failed to replace {}", target.display()))?;
+    }
+
+    crate::instance_mods::create_file_link(source, target)?;
+    Ok(ContentLinkOutcome::Linked)
+}
+
+/// A regular file, and not a link pointing at one: the shape the launcher
+/// cannot tell from a user's file without the manifest.
+pub fn is_real_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -282,8 +326,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        carry_forward, manifest_path, plan_stale_removals, read_manifest_files,
-        sync_managed_content_dir, ManagedContentManifest, PresentEntry,
+        carry_forward, link_content_file, manifest_path, plan_stale_removals,
+        read_manifest_files, sync_managed_content_dir, write_manifest, ContentLinkOutcome,
+        ManagedContentManifest, PresentEntry,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -589,5 +634,163 @@ mod tests {
             carry_forward(&names(&["a.zip", "b.zip"]), &names(&["b.zip", "c.zip"])),
             names(&["a.zip", "b.zip", "c.zip"])
         );
+    }
+
+    // ── Linking under a name: the manifest rule on the way in (D1) ──────────
+
+    /// The launch's question, asked the way the launch asks it: does the
+    /// previous manifest on disk name this file?
+    fn named_by_manifest(instance_root: &Path, category: &str, name: &str) -> bool {
+        read_manifest_files(&manifest_path(instance_root, category))
+            .iter()
+            .any(|listed| listed == name)
+    }
+
+    /// `<cache>/<version id>/<file>`, the C5 layout the launch links from.
+    fn cached_pack(root: &Path, version_id: &str, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = root.join("cache").join(version_id);
+        fs::create_dir_all(&dir).expect("cache entry dir should be created");
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("cache entry should be written");
+        path
+    }
+
+    fn is_symlink(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .expect("the name should be there")
+            .file_type()
+            .is_symlink()
+    }
+
+    /// The defect: a zip the user dropped into `resourcepacks/` under the name
+    /// of a managed pack was deleted by the launch and replaced by a link into
+    /// the cache, without a word.
+    #[test]
+    fn a_file_the_user_dropped_in_under_a_pack_name_survives_the_link() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let source = cached_pack(&root_dir, "AbCd1234", "Faithful 32x.zip", b"from modrinth");
+        write_manifest(
+            &manifest_path(&root_dir, "resourcepacks"),
+            "resourcepacks",
+            &names(&["Some other pack.zip"]),
+        )
+        .expect("previous manifest should be written");
+        let target = instance_dir.join("Faithful 32x.zip");
+        fs::write(&target, b"the user's own edit").expect("the user's file should exist");
+
+        let outcome = link_content_file(
+            &source,
+            &target,
+            named_by_manifest(&root_dir, "resourcepacks", "Faithful 32x.zip"),
+        );
+
+        assert_eq!(
+            fs::read(&target).expect("the user's file should be readable"),
+            b"the user's own edit",
+            "byte for byte what the user put there"
+        );
+        assert!(!is_symlink(&target), "the user's file must not have become a link");
+        assert_eq!(
+            outcome.expect("a foreign file is not an error"),
+            ContentLinkOutcome::SkippedForeignFile
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// The normal update: the manifest names the file, our link from the last
+    /// launch sits there, and it is relinked to the new version.
+    #[test]
+    fn a_name_the_manifest_grants_is_relinked_over_our_own_link() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let old = cached_pack(&root_dir, "OldVer01", "pack.zip", b"v1");
+        let new = cached_pack(&root_dir, "NewVer02", "pack.zip", b"v2");
+        let target = instance_dir.join("pack.zip");
+        crate::instance_mods::create_file_link(&old, &target).expect("last launch's link");
+        write_manifest(
+            &manifest_path(&root_dir, "resourcepacks"),
+            "resourcepacks",
+            &names(&["pack.zip"]),
+        )
+        .expect("previous manifest should be written");
+
+        let outcome = link_content_file(
+            &new,
+            &target,
+            named_by_manifest(&root_dir, "resourcepacks", "pack.zip"),
+        )
+        .expect("our own link gives way");
+
+        assert_eq!(outcome, ContentLinkOutcome::Linked);
+        assert_eq!(fs::read_link(&target).expect("still a link"), new);
+        assert_eq!(fs::read(&old).expect("the old cache entry is untouched"), b"v1");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// `fix/content-pack-cache-key`: a link whose cache entry was deleted is
+    /// still a link and still gives way, manifest or not. With no manifest at
+    /// all — the "I do not know what I put here" state — the answer is the same.
+    #[test]
+    fn a_dangling_link_is_replaced_even_without_a_manifest() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "shaderpacks");
+        let gone = cached_pack(&root_dir, "OldVer01", "shader.zip", b"v1");
+        let new = cached_pack(&root_dir, "NewVer02", "shader.zip", b"v2");
+        let target = instance_dir.join("shader.zip");
+        crate::instance_mods::create_file_link(&gone, &target).expect("last launch's link");
+        fs::remove_file(&gone).expect("the cache entry should be deletable");
+        assert!(!target.exists(), "precondition: the link dangles");
+
+        let outcome = link_content_file(
+            &new,
+            &target,
+            named_by_manifest(&root_dir, "shaderpacks", "shader.zip"),
+        )
+        .expect("a dangling link must not stop the relink");
+
+        assert_eq!(outcome, ContentLinkOutcome::Linked);
+        assert_eq!(fs::read(&target).expect("relinked"), b"v2");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// The state the Windows fallback of `create_file_link` leaves: a hard
+    /// link, i.e. a real file, indistinguishable from a user's file except by
+    /// the manifest. Built here with `fs::hard_link` on the same filesystem as
+    /// the cache; the symlink failure that leads to it on Windows is not.
+    #[test]
+    fn our_hard_link_is_replaced_when_the_manifest_names_it() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "datapacks");
+        let old = cached_pack(&root_dir, "OldVer01", "data.zip", b"v1");
+        let new = cached_pack(&root_dir, "NewVer02", "data.zip", b"v2");
+        let target = instance_dir.join("data.zip");
+        fs::hard_link(&old, &target).expect("the fallback's hard link");
+        assert!(!is_symlink(&target), "precondition: a real file, not a link");
+        write_manifest(
+            &manifest_path(&root_dir, "datapacks"),
+            "datapacks",
+            &names(&["data.zip"]),
+        )
+        .expect("previous manifest should be written");
+
+        let outcome = link_content_file(
+            &new,
+            &target,
+            named_by_manifest(&root_dir, "datapacks", "data.zip"),
+        )
+        .expect("our own hard link gives way");
+
+        assert_eq!(outcome, ContentLinkOutcome::Linked);
+        assert_eq!(fs::read(&target).expect("relinked"), b"v2");
+        assert_eq!(
+            fs::read(&old).expect("removing the hard link leaves the cache entry"),
+            b"v1"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 }
