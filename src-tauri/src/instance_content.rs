@@ -132,7 +132,7 @@ fn write_manifest(manifest_path: &Path, category: &str, files: &[String]) -> Res
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    fs::write(manifest_path, body).with_context(|| {
+    crate::atomic_write::write_atomically(manifest_path, body).with_context(|| {
         format!(
             "failed to write managed content manifest at {}",
             manifest_path.display()

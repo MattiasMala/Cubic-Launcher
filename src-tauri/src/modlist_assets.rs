@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use zip::write::FileOptions;
 
+use crate::atomic_write::write_atomically;
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::{contained_join, validate_path_component};
 use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
@@ -367,7 +368,7 @@ pub fn save_modlist_presentation_from_root(
     }
     let json = serde_json::to_string_pretty(&presentation)
         .with_context(|| "failed to serialize modlist presentation".to_string())?;
-    fs::write(&presentation_path, format!("{json}\n")).with_context(|| {
+    write_atomically(&presentation_path, format!("{json}\n")).with_context(|| {
         format!(
             "failed to write modlist presentation file at {}",
             presentation_path.display()
@@ -419,7 +420,7 @@ pub fn save_modlist_groups_from_root(
 
     let json = serde_json::to_string_pretty(&layout)
         .with_context(|| "failed to serialize modlist group layout".to_string())?;
-    fs::write(&layout_path, format!("{json}\n")).with_context(|| {
+    write_atomically(&layout_path, format!("{json}\n")).with_context(|| {
         format!(
             "failed to write modlist group layout file at {}",
             layout_path.display()

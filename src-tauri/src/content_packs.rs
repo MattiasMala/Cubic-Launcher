@@ -100,7 +100,7 @@ pub fn load_content_list(modlist_dir: &Path, content_type: &str) -> Result<Conte
 pub fn save_content_list(modlist_dir: &Path, list: &ContentList) -> Result<()> {
     let path = modlist_dir.join(filename_for_type(&list.content_type));
     let json = serde_json::to_string_pretty(list).context("failed to serialize content list")?;
-    fs::write(&path, format!("{json}\n"))
+    crate::atomic_write::write_atomically(&path, format!("{json}\n"))
         .with_context(|| format!("failed to write {}", path.display()))
 }
 

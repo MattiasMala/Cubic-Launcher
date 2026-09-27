@@ -710,7 +710,7 @@ impl PinSnapshot {
     /// and replacing it would hide why the pin failed (same reasoning as
     /// `local_content_packs::remove_partial_import`).
     fn restore(&self) {
-        std::fs::write(&self.rules_path, &self.rules_contents).ok();
+        crate::atomic_write::write_atomically(&self.rules_path, &self.rules_contents).ok();
         if !self.jar_existed {
             std::fs::remove_file(&self.jar_destination).ok();
         }

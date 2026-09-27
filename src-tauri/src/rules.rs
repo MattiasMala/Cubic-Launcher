@@ -136,7 +136,7 @@ impl ModList {
         let json =
             serde_json::to_string_pretty(&file).context("failed to serialize modlist to JSON")?;
 
-        fs::write(path, format!("{json}\n"))
+        crate::atomic_write::write_atomically(path, format!("{json}\n"))
             .with_context(|| format!("failed to write rules file at {}", path.display()))?;
 
         Ok(())
