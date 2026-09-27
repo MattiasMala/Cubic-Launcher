@@ -602,7 +602,7 @@ async fn fetch_version_json(
         .await
         .context("failed to read version JSON body")?;
 
-    std::fs::write(&cached_path, &bytes)
+    crate::atomic_write::write_atomically(&cached_path, &bytes)
         .with_context(|| format!("failed to cache version JSON at {}", cached_path.display()))?;
 
     serde_json::from_slice::<VersionJson>(&bytes)

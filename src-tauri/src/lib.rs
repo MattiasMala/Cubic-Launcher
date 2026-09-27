@@ -3,6 +3,7 @@ use tauri::Manager;
 pub mod account_manager;
 pub mod adoptium;
 pub mod app_shell;
+mod atomic_write;
 pub mod config_attribution;
 pub mod content_packs;
 mod database;
