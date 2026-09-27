@@ -1314,12 +1314,20 @@ mod tests {
             if !pack.present {
                 continue;
             }
-            link_local_pack(
+            let outcome = link_local_pack(
                 &pack.source_path,
                 &instance_dir.join(&pack.file_name),
                 previous.iter().any(|name| name == &pack.file_name),
             )
             .expect("a present pack should install");
+            // A skipped pack stays out of `installed`, as in the launch: the
+            // name then never enters the manifest.
+            if matches!(
+                outcome,
+                PackLinkOutcome::SkippedForeignDirectory | PackLinkOutcome::SkippedForeignFile
+            ) {
+                continue;
+            }
             installed.push(pack.file_name.clone());
         }
 
@@ -1660,6 +1668,50 @@ mod tests {
             "the user's file must not have become a link"
         );
         assert_eq!(outcome, PackLinkOutcome::SkippedForeignFile);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The skip must also keep the name out of the manifest. If it went in,
+    /// the next launch would read "ours" and replace the user's file — the
+    /// deletion arriving one launch later instead of not at all.
+    #[test]
+    fn a_users_file_under_a_local_pack_name_survives_two_launches_and_is_not_adopted() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let instance_root = modlist.join("instances").join("1.20.1-forge");
+        let zip = root.join("Zipped Pack.zip");
+        write_zip_pack(&zip, &[("pack.png", PNG_BYTES)]);
+        import(&root, "Sky Pack", "resourcepack", &zip).expect("zip import should work");
+        let list = load_content_list(&modlist, "resourcepack").expect("list should load");
+        let entries: Vec<&ContentEntry> = list.entries.iter().collect();
+
+        let instance_dir = instance_root.join("resourcepacks");
+        fs::create_dir_all(&instance_dir).expect("instance dir should be created");
+        let users_file = instance_dir.join("Zipped Pack.zip");
+        fs::write(&users_file, b"the user's own copy").expect("the user's file should exist");
+        let manifest = crate::instance_content::manifest_path(&instance_root, "resourcepacks");
+
+        for launch in ["first", "second"] {
+            simulate_launch(
+                &modlist,
+                &instance_root,
+                "resourcepack",
+                "resourcepacks",
+                &entries,
+                true,
+            );
+            assert_eq!(
+                fs::read(&users_file).expect("the user's file should be readable"),
+                b"the user's own copy",
+                "{launch} launch: byte for byte what the user put there"
+            );
+            assert!(
+                !crate::instance_content::read_manifest_files(&manifest)
+                    .contains(&"Zipped Pack.zip".to_string()),
+                "{launch} launch: a skipped name must not enter the manifest"
+            );
+        }
 
         fs::remove_dir_all(&root).ok();
     }
