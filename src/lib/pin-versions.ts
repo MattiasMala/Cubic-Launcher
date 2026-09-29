@@ -1,11 +1,13 @@
+import { MODRINTH_HEADERS } from "./modrinth-user-agent";
+
 /**
  * Modrinth releases for one project on one target, for the "pin a version"
  * modal.
  *
  * The frontend already talks to Modrinth directly in three other places
  * (`add-mod-dialog/shared.ts`, `app/backend-loaders.ts`,
- * `mod-list-editor/use-content-tab-state.ts`); this follows the same shape and
- * the same User-Agent instead of adding a fourth convention.
+ * `lib/content-meta.ts`); this follows the same shape and sends the same
+ * `MODRINTH_HEADERS` instead of adding a fourth convention.
  */
 
 export type PinRelease = {
@@ -41,7 +43,7 @@ export async function fetchPinReleases(
 
   const response = await fetch(
     `https://api.modrinth.com/v2/project/${encodeURIComponent(slug)}/version?${params}`,
-    { headers: { "User-Agent": "CubicLauncher/0.1.0" } }
+    { headers: MODRINTH_HEADERS }
   );
   if (!response.ok) throw new Error(`Modrinth returned HTTP ${response.status}`);
 

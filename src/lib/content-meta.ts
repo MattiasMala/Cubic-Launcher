@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import { MODRINTH_HEADERS } from "./modrinth-user-agent";
 
 /**
  * What Modrinth says about one content-pack project, cached for the whole app.
@@ -68,7 +69,7 @@ export async function fetchContentProjects(ids: string[]): Promise<void> {
   try {
     const param = encodeURIComponent(JSON.stringify(missing));
     const response = await fetch(`https://api.modrinth.com/v2/projects?ids=${param}`, {
-      headers: { "User-Agent": "CubicLauncher/0.1.0" },
+      headers: MODRINTH_HEADERS,
     });
     if (response.ok) projects = await response.json();
   } catch {

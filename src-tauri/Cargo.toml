@@ -3,6 +3,9 @@ name = "cubic_launcher"
 version = "0.1.2"
 description = "Cubic Launcher desktop application"
 authors = ["Cubic Launcher"]
+# Also the `License:` tag of the `.rpm`: without `bundle.license` in
+# `tauri.conf.json`, the Tauri CLI falls back to this field.
+license = "GPL-3.0-only"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

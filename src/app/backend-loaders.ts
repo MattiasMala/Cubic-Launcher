@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
+import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
 import { normalizeModLoader, type ActiveAccountSnapshot, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
@@ -413,7 +414,7 @@ export async function fetchMetadataForIds(ids: string[]) {
     const param = encodeURIComponent(JSON.stringify(missing));
     const response = await fetch(
       `https://api.modrinth.com/v2/projects?ids=${param}`,
-      { headers: { "User-Agent": "CubicLauncher/0.1.0" } }
+      { headers: MODRINTH_HEADERS }
     );
     if (!response.ok) return;
     const projects: Array<{ id: string; slug: string; title: string; icon_url?: string | null }> = await response.json();
