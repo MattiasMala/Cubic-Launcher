@@ -262,7 +262,7 @@ pub(super) async fn run_update_precheck(
 
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
     let modrinth_client = ModrinthClient::new();
-    let http_client = reqwest::Client::new();
+    let http_client = crate::modrinth::build_download_client();
 
     let selection = resolve_online_selection(
         app_handle,

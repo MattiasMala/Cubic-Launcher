@@ -1,5 +1,6 @@
 import { MOCK_MODRINTH } from "../../store";
 import type { ModrinthResult } from "../../lib/types";
+import { MODRINTH_HEADERS } from "../../lib/modrinth-user-agent";
 import type { LocalImportFailure } from "../../lib/contentImportErrors";
 
 /**
@@ -83,7 +84,7 @@ export async function searchModrinth(query: string, filters: SearchFilters, offs
     params.set("index", (!query.trim() && filters.sortBy === "relevance") ? "downloads" : (filters.sortBy || "relevance"));
 
     const url = `https://api.modrinth.com/v2/search?${params}`;
-    const res = await fetch(url, { headers: { "User-Agent": "CubicLauncher/0.1.0" } });
+    const res = await fetch(url, { headers: MODRINTH_HEADERS });
     if (!res.ok) throw new Error(`Modrinth returned HTTP ${res.status}`);
     const data: { hits: ModrinthHit[]; total_hits: number } = await res.json();
     return {

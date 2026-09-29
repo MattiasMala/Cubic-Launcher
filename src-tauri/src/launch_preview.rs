@@ -254,7 +254,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &shell_snapshot.selected_modlist_overrides,
     );
 
-    let http_client = reqwest::Client::new();
+    let http_client = crate::modrinth::build_download_client();
     if target.mod_loader == ModLoader::Vanilla {
         return run_vanilla_launch_pipeline(
             app_handle,

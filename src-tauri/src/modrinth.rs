@@ -196,10 +196,31 @@ const MAX_HASHES_PER_UPDATE_REQUEST: usize = 1_000;
 /// never splits a real modlist either.
 const MAX_IDS_PER_VERSIONS_REQUEST: usize = 1_000;
 
+/// Who the launcher says it is to Modrinth, on the API and on the CDN alike.
+/// Modrinth traces a misbehaving client through this header, so it names the
+/// repository that exists; the version comes from `Cargo.toml` instead of
+/// being written by hand. The frontend builds the same string in
+/// `src/lib/modrinth-user-agent.ts`.
+pub(crate) const USER_AGENT: &str = concat!(
+    "cubic-launcher/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/MattiasMala/Cubic-Launcher)"
+);
+
 pub(crate) fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("cubic-launcher/0.1.0 (https://github.com/arius-c/Cubic-Launcher)")
+        .user_agent(USER_AGENT)
         .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
+/// The launch pipeline's client, which downloads the jars from Modrinth's CDN
+/// as well as the game, loader and content files. No `REQUEST_TIMEOUT`: that
+/// bounds a whole request, body included, and 20 s is an API call, not a jar.
+pub(crate) fn build_download_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .build()
         .unwrap_or_default()
 }
@@ -1566,5 +1587,58 @@ mod tests {
             version.dependencies[1].dependency_type,
             DependencyType::Required
         );
+    }
+
+    /// The `User-Agent` header `client` actually puts on the wire, read back by
+    /// a one-shot local server.
+    async fn sent_user_agent(client: reqwest::Client) -> Option<String> {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .expect("request should be readable");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .expect("response should be written");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+
+        client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("the local request should succeed");
+        let request = server.join().expect("server thread should finish");
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("user-agent")
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn every_modrinth_client_names_the_package_version_and_the_real_repository() {
+        let expected_prefix = format!("cubic-launcher/{} ", env!("CARGO_PKG_VERSION"));
+        for (label, client) in [
+            ("API client", super::build_http_client()),
+            ("launch download client", super::build_download_client()),
+        ] {
+            let user_agent = sent_user_agent(client)
+                .await
+                .unwrap_or_else(|| panic!("the {label} sent no User-Agent"));
+            assert!(
+                user_agent.starts_with(&expected_prefix),
+                "the {label} sent {user_agent:?}, not the version in Cargo.toml"
+            );
+            assert!(
+                user_agent.contains("https://github.com/MattiasMala/Cubic-Launcher"),
+                "the {label} sent {user_agent:?}, not the repository Modrinth can reach"
+            );
+        }
     }
 }
