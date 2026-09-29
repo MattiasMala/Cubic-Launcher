@@ -48,7 +48,25 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # Some Rust tests read the real client.jar of 1.20.1 and 26.3 from the
+      # launcher cache (src-tauri/src/test_client_jars.rs). A runner has no such
+      # cache: without these two steps those tests would skip and pass empty.
+      # The key hashes the script, which holds the version list.
+      - name: Cache client jars
+        id: client-jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/com.cubic.launcher/cache/minecraft
+          key: client-jars-${{ hashFiles('scripts/ci/fetch_client_jars.py') }}
+
+      - name: Fetch client jars
+        if: steps.client-jars.outputs.cache-hit != 'true'
+        run: python3 scripts/ci/fetch_client_jars.py
+
       - name: Test Rust
+        env:
+          # A missing jar fails the test instead of skipping it.
+          CUBIC_REQUIRE_CLIENT_JARS: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Lint Rust

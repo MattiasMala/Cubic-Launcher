@@ -30,8 +30,10 @@ launcher-data/
 # Local helper scripts
 # =============================================================================
 scripts/*
-# Launch-verification harness IS tracked (deliverable); other local scripts stay ignored.
+# Launch-verification harness IS tracked (deliverable); so are the CI helpers;
+# other local scripts stay ignored.
 !scripts/launch-harness/
+!scripts/ci/
 
 # =============================================================================
 # Environment & secrets

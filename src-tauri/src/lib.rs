@@ -38,6 +38,8 @@ pub mod screenshots;
 pub mod shared_files;
 pub mod shared_worlds;
 pub mod skins;
+#[cfg(test)]
+mod test_client_jars;
 pub mod token_storage;
 mod updater;
 pub mod worlds;

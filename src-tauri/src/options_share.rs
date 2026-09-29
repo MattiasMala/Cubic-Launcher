@@ -956,19 +956,21 @@ mod tests {
     /// decina di millisecondi, e ha il vantaggio di non condividere l'inode con
     /// la cache vera.
     fn copy_real_jar(root: &Path, version: &str) -> bool {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        let Some(source) = crate::test_client_jars::cached_client_jar(version) else {
             return false;
         };
-        let source = home
-            .join(".local/share/com.cubic.launcher/cache/minecraft")
-            .join(version)
-            .join("client.jar");
-        if !source.is_file() {
-            return false;
-        }
         let version_dir = root.join("cache/minecraft").join(version);
         std::fs::create_dir_all(&version_dir).expect("version dir");
-        std::fs::copy(&source, version_dir.join("client.jar")).is_ok()
+        let destination = version_dir.join("client.jar");
+        if let Err(error) = std::fs::copy(&source, &destination) {
+            let _: Option<()> = crate::test_client_jars::unavailable(format!(
+                "copying {} to {} failed: {error}",
+                source.display(),
+                destination.display()
+            ));
+            return false;
+        }
+        true
     }
 
     #[test]
