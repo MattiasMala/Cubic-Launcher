@@ -102,9 +102,7 @@ Java runtimes are auto-managed. The launcher first looks for the exact required 
 
 Downloaded cache files are published only after the complete response and any available size or
 checksum checks succeed. The bytes are written to a sibling `<name>.part` and renamed to the final
-name, so a final-name cache hit never observes a download in progress. Modrinth JAR rows that carry
-a SHA-1 are also checked when selected from the cache; a mismatch is removed from the
-launch-visible name and handled as a missing, restorable artifact.
+name, so a final-name cache hit never observes a download in progress.
 
 ## Authentication and credential storage
 

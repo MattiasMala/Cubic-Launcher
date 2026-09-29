@@ -709,20 +709,7 @@ async fn ensure_assets(
         .with_context(|| format!("failed to parse asset index {}", index_path.display()))?;
     let is_virtual = asset_index.is_virtual;
 
-    // Count how many assets need downloading.
-    let to_download: Vec<String> = asset_index
-        .objects
-        .values()
-        .map(|obj| {
-            let hash = &obj.hash;
-            let prefix = asset_hash_prefix(hash)?;
-            let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
-            Ok((hash.clone(), dest))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(hash, dest)| (!dest.exists()).then_some(hash))
-        .collect();
+    let to_download = missing_asset_hashes(&asset_index, &objects_dir)?;
 
     if !to_download.is_empty() {
         on_progress(
@@ -770,6 +757,24 @@ async fn ensure_assets(
     }
 
     Ok(is_virtual)
+}
+
+/// The asset objects not yet on disk, each hash once. An index can list the
+/// same object under several names (indexes 5, 8 and 17 do), and two
+/// concurrent downloads of one object would share its `.part`: the second
+/// rename would find the partial already moved and fail the launch.
+fn missing_asset_hashes(asset_index: &AssetIndexJson, objects_dir: &Path) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for object in asset_index.objects.values() {
+        let prefix = asset_hash_prefix(&object.hash)?;
+        let dest = contained_join(objects_dir, &format!("{prefix}/{}", object.hash))?;
+        if !dest.exists() {
+            missing.push(object.hash.clone());
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    Ok(missing)
 }
 
 /// Copy hashed asset objects into `assets/virtual/<id>/<real/path>` for legacy
@@ -856,7 +861,6 @@ fn flatten_args(entries: &[ArgEntry], filter_by_os: bool) -> Vec<String> {
 
 /// Extract native JARs into the instance `natives/` directory.
 pub fn extract_natives(native_paths: &[PathBuf], natives_dir: &Path) -> Result<()> {
-
     std::fs::create_dir_all(natives_dir)
         .with_context(|| format!("failed to create natives dir {}", natives_dir.display()))?;
 
@@ -1094,6 +1098,29 @@ mod tests {
             b"previous bytes"
         );
         assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[test]
+    fn an_object_listed_under_two_names_is_downloaded_once() {
+        let root = scratch_root("duplicate-assets");
+        let shared = "a".repeat(40);
+        let present = "b".repeat(40);
+        let index: AssetIndexJson = serde_json::from_str(&format!(
+            r#"{{ "objects": {{
+                "minecraft/sounds/one.ogg": {{ "hash": "{shared}" }},
+                "minecraft/sounds/two.ogg": {{ "hash": "{shared}" }},
+                "minecraft/lang/present.json": {{ "hash": "{present}" }}
+            }} }}"#
+        ))
+        .expect("asset index should deserialize");
+        let present_path = root.join("bb").join(&present);
+        fs::create_dir_all(present_path.parent().expect("object folder")).expect("object folder");
+        fs::write(&present_path, b"already here").expect("present object");
+
+        let missing = missing_asset_hashes(&index, &root).expect("hashes are well formed");
+
+        assert_eq!(missing, vec![shared]);
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }
