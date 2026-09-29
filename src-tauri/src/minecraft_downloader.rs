@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -235,10 +236,19 @@ fn arg_rule_passes(rules: &[OsRule]) -> bool {
 // ── SHA-1 verification ────────────────────────────────────────────────────────
 
 fn sha1_of_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read file for SHA1 check: {}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open file for SHA1 check: {}", path.display()))?;
     let mut hasher = Sha1::new();
-    hasher.update(&bytes);
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read file for SHA1 check: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -279,21 +289,20 @@ pub(crate) async fn download_file_verified(
         .await
         .with_context(|| format!("failed to read response body from {url}"))?;
 
-    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
-
-    // Verify after write
     let actual = {
         let mut hasher = Sha1::new();
         hasher.update(&bytes);
         format!("{:x}", hasher.finalize())
     };
     if !actual.eq_ignore_ascii_case(expected_sha1) {
-        std::fs::remove_file(dest).ok();
         bail!(
             "SHA1 mismatch for {}: expected {expected_sha1}, got {actual}",
             dest.display()
         );
     }
+
+    crate::atomic_write::write_atomically(dest, &bytes)
+        .with_context(|| format!("failed to publish {}", dest.display()))?;
 
     Ok(())
 }
@@ -317,7 +326,8 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
         .bytes()
         .await
         .with_context(|| format!("failed to read response body from {url}"))?;
-    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
+    crate::atomic_write::write_atomically(dest, &bytes)
+        .with_context(|| format!("failed to publish {}", dest.display()))?;
     Ok(())
 }
 
@@ -699,20 +709,7 @@ async fn ensure_assets(
         .with_context(|| format!("failed to parse asset index {}", index_path.display()))?;
     let is_virtual = asset_index.is_virtual;
 
-    // Count how many assets need downloading.
-    let to_download: Vec<String> = asset_index
-        .objects
-        .values()
-        .map(|obj| {
-            let hash = &obj.hash;
-            let prefix = asset_hash_prefix(hash)?;
-            let dest = contained_join(objects_dir.as_path(), &format!("{prefix}/{hash}"))?;
-            Ok((hash.clone(), dest))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(hash, dest)| (!dest.exists()).then_some(hash))
-        .collect();
+    let to_download = missing_asset_hashes(&asset_index, &objects_dir)?;
 
     if !to_download.is_empty() {
         on_progress(
@@ -760,6 +757,24 @@ async fn ensure_assets(
     }
 
     Ok(is_virtual)
+}
+
+/// The asset objects not yet on disk, each hash once. An index can list the
+/// same object under several names (indexes 5, 8 and 17 do), and two
+/// concurrent downloads of one object would share its `.part`: the second
+/// rename would find the partial already moved and fail the launch.
+fn missing_asset_hashes(asset_index: &AssetIndexJson, objects_dir: &Path) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for object in asset_index.objects.values() {
+        let prefix = asset_hash_prefix(&object.hash)?;
+        let dest = contained_join(objects_dir, &format!("{prefix}/{}", object.hash))?;
+        if !dest.exists() {
+            missing.push(object.hash.clone());
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    Ok(missing)
 }
 
 /// Copy hashed asset objects into `assets/virtual/<id>/<real/path>` for legacy
@@ -846,8 +861,6 @@ fn flatten_args(entries: &[ArgEntry], filter_by_os: bool) -> Vec<String> {
 
 /// Extract native JARs into the instance `natives/` directory.
 pub fn extract_natives(native_paths: &[PathBuf], natives_dir: &Path) -> Result<()> {
-    use std::io::Read;
-
     std::fs::create_dir_all(natives_dir)
         .with_context(|| format!("failed to create natives dir {}", natives_dir.display()))?;
 
@@ -896,6 +909,48 @@ pub fn extract_natives(native_paths: &[PathBuf], natives_dir: &Path) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("download-tests")
+            .join(format!("minecraft-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&root).expect("scratch root should be created");
+        root
+    }
+
+    fn fixed_server(body: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.write_all(body).expect("body");
+            stream.flush().expect("flush");
+        });
+        format!("http://127.0.0.1:{port}/download")
+    }
+
+    fn partial_path(path: &Path) -> PathBuf {
+        let mut name = path.file_name().expect("target file name").to_os_string();
+        name.push(".part");
+        path.with_file_name(name)
+    }
 
     #[test]
     fn library_allowed_with_no_rules() {
@@ -1009,5 +1064,63 @@ mod tests {
             serde_json::from_str(legacy).expect("the version json should deserialize");
         let (game_arguments, _) = extract_arguments(&legacy);
         assert!(!declares_quick_play_singleplayer(&game_arguments));
+    }
+    #[tokio::test]
+    async fn unverified_asset_download_replaces_a_stale_partial_and_lands_whole() {
+        let root = scratch_root("asset");
+        let destination = root.join("asset");
+        fs::write(partial_path(&destination), b"stale partial").expect("stale partial");
+        let url = fixed_server(b"complete asset");
+
+        download_file(&reqwest::Client::new(), &url, &destination)
+            .await
+            .expect("asset download should complete");
+
+        assert_eq!(fs::read(&destination).expect("asset"), b"complete asset");
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn verified_hash_mismatch_leaves_the_previous_file_untouched() {
+        let root = scratch_root("wrong-hash");
+        let destination = root.join("library.jar");
+        fs::write(&destination, b"previous bytes").expect("previous library");
+        let url = fixed_server(b"different bytes");
+
+        let result =
+            download_file_verified(&reqwest::Client::new(), &url, &destination, &"0".repeat(40))
+                .await;
+
+        assert!(result.is_err(), "hash mismatch must be reported");
+        assert_eq!(
+            fs::read(&destination).expect("previous library remains"),
+            b"previous bytes"
+        );
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[test]
+    fn an_object_listed_under_two_names_is_downloaded_once() {
+        let root = scratch_root("duplicate-assets");
+        let shared = "a".repeat(40);
+        let present = "b".repeat(40);
+        let index: AssetIndexJson = serde_json::from_str(&format!(
+            r#"{{ "objects": {{
+                "minecraft/sounds/one.ogg": {{ "hash": "{shared}" }},
+                "minecraft/sounds/two.ogg": {{ "hash": "{shared}" }},
+                "minecraft/lang/present.json": {{ "hash": "{present}" }}
+            }} }}"#
+        ))
+        .expect("asset index should deserialize");
+        let present_path = root.join("bb").join(&present);
+        fs::create_dir_all(present_path.parent().expect("object folder")).expect("object folder");
+        fs::write(&present_path, b"already here").expect("present object");
+
+        let missing = missing_asset_hashes(&index, &root).expect("hashes are well formed");
+
+        assert_eq!(missing, vec![shared]);
+        fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }
