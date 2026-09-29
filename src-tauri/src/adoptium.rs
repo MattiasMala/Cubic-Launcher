@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::path_safety::validate_path_component;
 
@@ -101,14 +102,30 @@ impl AdoptiumClient {
                 format!("failed to read Java runtime archive from {}", package.link)
             })?;
 
-        tokio::fs::write(destination_path, bytes)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to write Java runtime archive to {}",
-                    destination_path.display()
-                )
-            })?;
+        if bytes.len() as u64 != package.size {
+            bail!(
+                "Java runtime archive from {} has {} bytes; expected {}",
+                package.link,
+                bytes.len(),
+                package.size
+            );
+        }
+        let actual_checksum = format!("{:x}", Sha256::digest(&bytes));
+        if !actual_checksum.eq_ignore_ascii_case(&package.checksum) {
+            bail!(
+                "Java runtime archive checksum mismatch from {}: expected {}, got {}",
+                package.link,
+                package.checksum,
+                actual_checksum
+            );
+        }
+
+        crate::atomic_write::write_atomically(destination_path, bytes).with_context(|| {
+            format!(
+                "failed to publish Java runtime archive to {}",
+                destination_path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -237,12 +254,64 @@ pub fn normalize_adoptium_architecture(architecture: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         build_latest_assets_url, normalize_adoptium_architecture, plan_runtime_download,
-        select_latest_package, AdoptiumPackage, AdoptiumRelease,
+        select_latest_package, AdoptiumClient, AdoptiumPackage, AdoptiumRelease,
     };
+    use sha2::{Digest, Sha256};
+
+    fn scratch_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("download-tests")
+            .join(format!("adoptium-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&root).expect("scratch root should be created");
+        root
+    }
+
+    fn fixed_server(body: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.write_all(body).expect("body");
+            stream.flush().expect("flush");
+        });
+        format!("http://127.0.0.1:{port}/runtime.tar.gz")
+    }
+
+    fn package(link: String, body: &[u8]) -> AdoptiumPackage {
+        AdoptiumPackage {
+            name: "runtime.tar.gz".into(),
+            link,
+            checksum: format!("{:x}", Sha256::digest(body)),
+            size: body.len() as u64,
+        }
+    }
+
+    fn partial_path(path: &Path) -> PathBuf {
+        let mut name = path.file_name().expect("target file name").to_os_string();
+        name.push(".part");
+        path.with_file_name(name)
+    }
 
     fn sample_releases_json() -> &'static str {
         r#"[
@@ -361,5 +430,44 @@ mod tests {
         assert_eq!(normalize_adoptium_architecture("arm64"), "aarch64");
         assert_eq!(normalize_adoptium_architecture("aarch64"), "aarch64");
         assert_eq!(normalize_adoptium_architecture("x86_64"), "x64");
+    }
+    #[tokio::test]
+    async fn runtime_archive_lands_whole_and_replaces_a_stale_partial() {
+        let root = scratch_root("complete");
+        let destination = root.join("runtime.tar.gz");
+        fs::write(partial_path(&destination), b"stale partial").expect("stale partial");
+        let body = b"complete runtime archive";
+        let package = package(fixed_server(body), body);
+
+        AdoptiumClient::new()
+            .download_package(&package, &destination)
+            .await
+            .expect("runtime download should complete");
+
+        assert_eq!(fs::read(&destination).expect("runtime archive"), body);
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn runtime_archive_with_wrong_checksum_never_replaces_the_previous_file() {
+        let root = scratch_root("bad-checksum");
+        let destination = root.join("runtime.tar.gz");
+        fs::write(&destination, b"previous complete archive").expect("previous archive");
+        let body = b"wrong downloaded bytes";
+        let mut package = package(fixed_server(body), body);
+        package.checksum = "0".repeat(64);
+
+        let result = AdoptiumClient::new()
+            .download_package(&package, &destination)
+            .await;
+
+        assert!(result.is_err(), "checksum mismatch must be reported");
+        assert_eq!(
+            fs::read(&destination).expect("previous archive remains"),
+            b"previous complete archive"
+        );
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }

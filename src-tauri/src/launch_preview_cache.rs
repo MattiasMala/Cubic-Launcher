@@ -39,9 +39,6 @@ pub(super) async fn ensure_remote_version_cached(
     let record = cache_record_from_version(version, target)?;
     let destination_path =
         cached_artifact_path_for_record(launcher_paths.mods_cache_dir(), &record);
-    if destination_path.exists() {
-        return Ok(destination_path);
-    }
 
     let file = version.primary_file().with_context(|| {
         format!(
@@ -59,7 +56,10 @@ pub(super) async fn ensure_remote_version_cached(
             )
             .await?
         }
-        None => download_file(http_client, &file.url, &destination_path).await?,
+        None if !destination_path.exists() => {
+            download_file(http_client, &file.url, &destination_path).await?
+        }
+        None => {}
     }
 
     Ok(destination_path)
@@ -485,9 +485,8 @@ pub(super) async fn download_file(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    tokio::fs::write(destination_path, bytes)
-        .await
-        .with_context(|| format!("failed to write {}", destination_path.display()))?;
+    crate::atomic_write::write_atomically(destination_path, bytes)
+        .with_context(|| format!("failed to publish {}", destination_path.display()))?;
 
     Ok(())
 }
@@ -614,4 +613,198 @@ pub(super) fn build_cached_mod_jars(
     }
 
     Ok(jars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolver::ModLoader;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("download-tests")
+            .join(format!("{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&root).expect("scratch root should be created");
+        root
+    }
+
+    fn fixed_server(body: &'static [u8]) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/artifact.jar"), requests)
+    }
+
+    fn cut_short_server(prefix: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                prefix.len() * 2
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.write_all(prefix).expect("partial body");
+            stream.flush().expect("flush");
+        });
+        format!("http://127.0.0.1:{port}/interrupted.jar")
+    }
+
+    fn version(url: &str, body: &[u8]) -> ModrinthVersion {
+        let sha1 = format!("{:x}", Sha1::digest(body));
+        serde_json::from_value(serde_json::json!({
+            "id": "version-complete",
+            "project_id": "project-complete",
+            "version_number": "1.0.0",
+            "name": "Complete",
+            "game_versions": ["1.20.1"],
+            "loaders": ["fabric"],
+            "version_type": "release",
+            "files": [{
+                "hashes": { "sha1": sha1 },
+                "url": url,
+                "filename": "complete.jar",
+                "primary": true,
+                "size": body.len()
+            }],
+            "date_published": "2026-09-29T00:00:00Z"
+        }))
+        .expect("version fixture should deserialize")
+    }
+
+    fn target() -> ResolutionTarget {
+        ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Fabric,
+        }
+    }
+
+    fn partial_path(path: &Path) -> PathBuf {
+        let mut name = path.file_name().expect("target file name").to_os_string();
+        name.push(".part");
+        path.with_file_name(name)
+    }
+
+    #[tokio::test]
+    async fn a_truncated_cached_mod_is_not_returned_to_the_launch() {
+        let root = scratch_root("truncated-mod");
+        let paths = LauncherPaths::new(&root);
+        let complete = b"the complete mod jar";
+        let (url, requests) = fixed_server(complete);
+        let version = version(&url, complete);
+        let destination = paths.remote_mod_artifact_path(
+            target().mod_loader.as_modrinth_loader(),
+            &version.id,
+            "complete.jar",
+        );
+        fs::create_dir_all(destination.parent().expect("cache parent")).expect("cache parent");
+        fs::write(&destination, b"the complete").expect("truncated cache fixture");
+
+        let returned =
+            ensure_remote_version_cached(&reqwest::Client::new(), &paths, &version, &target())
+                .await
+                .expect("the corrupt cache entry should be repaired");
+
+        assert_eq!(returned, destination);
+        assert_eq!(fs::read(&returned).expect("launch-visible jar"), complete);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the truncated jar must not suppress its replacement"
+        );
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_complete_download_lands_without_a_partial() {
+        let root = scratch_root("complete");
+        let destination = root.join("complete.jar");
+        let (url, _) = fixed_server(b"whole file");
+
+        download_file(&reqwest::Client::new(), &url, &destination)
+            .await
+            .expect("download should complete");
+
+        assert_eq!(fs::read(&destination).expect("final file"), b"whole file");
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_partial_left_by_a_killed_download_does_not_block_the_next_one() {
+        let root = scratch_root("stale-partial");
+        let destination = root.join("complete.jar");
+        fs::write(partial_path(&destination), b"half").expect("stale partial");
+        let (url, _) = fixed_server(b"whole file");
+
+        download_file(&reqwest::Client::new(), &url, &destination)
+            .await
+            .expect("retry should complete");
+
+        assert_eq!(fs::read(&destination).expect("final file"), b"whole file");
+        assert!(!partial_path(&destination).exists());
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_download_cut_short_never_appears_under_the_final_name() {
+        let root = scratch_root("cut-short-new");
+        let destination = root.join("complete.jar");
+        let url = cut_short_server(b"half");
+
+        let result = download_file(&reqwest::Client::new(), &url, &destination).await;
+
+        assert!(result.is_err(), "the short body must be reported");
+        assert!(!destination.exists(), "the final name must stay absent");
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_download_cut_short_leaves_the_previous_file_untouched() {
+        let root = scratch_root("cut-short-existing");
+        let destination = root.join("complete.jar");
+        fs::write(&destination, b"previous complete file").expect("previous file");
+        let url = cut_short_server(b"half");
+
+        let result = download_file(&reqwest::Client::new(), &url, &destination).await;
+
+        assert!(result.is_err(), "the short body must be reported");
+        assert_eq!(
+            fs::read(&destination).expect("previous file remains"),
+            b"previous complete file"
+        );
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
 }

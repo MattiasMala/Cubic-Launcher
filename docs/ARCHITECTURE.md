@@ -100,6 +100,12 @@ At a high level, the backend:
 
 Java runtimes are auto-managed. The launcher first looks for the exact required major; when that major is unavailable from Adoptium, it walks upward and uses the nearest available higher major while surfacing a notice.
 
+Downloaded cache files are published only after the complete response and any available size or
+checksum checks succeed. The bytes are written to a sibling `<name>.part` and renamed to the final
+name, so a final-name cache hit never observes a download in progress. Modrinth JAR rows that carry
+a SHA-1 are also checked when selected from the cache; a mismatch is removed from the
+launch-visible name and handled as a missing, restorable artifact.
+
 ## Authentication and credential storage
 
 Microsoft login opens the system browser, receives the OAuth redirect on a loopback listener, validates the OAuth state, and exchanges the authorization code using PKCE. The resulting Microsoft token feeds the Xbox Live, XSTS, and Minecraft authentication chain.

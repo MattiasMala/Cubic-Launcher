@@ -647,7 +647,19 @@ impl SqliteModCacheRepository<'_> {
 
         let artifact_path = cached_artifact_path_for_record(&self.mods_cache_dir, &record);
         if artifact_path.exists() {
-            return Ok(Some(record));
+            if record.is_local || record.file_hash.is_none() {
+                return Ok(Some(record));
+            }
+            if legacy_file_matches_record(&artifact_path, &record)? {
+                return Ok(Some(record));
+            }
+            fs::remove_file(&artifact_path).with_context(|| {
+                format!(
+                    "failed to remove corrupt cached artifact {}",
+                    artifact_path.display()
+                )
+            })?;
+            return Ok(None);
         }
 
         let legacy_path = legacy_cached_artifact_path(&self.mods_cache_dir, &record.jar_filename);
@@ -862,6 +874,7 @@ mod tests {
         legacy_cached_artifact_path, pending_download_from_record, pending_download_from_version,
         validate_cache_key, CacheProbe, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
     };
+    const JAR_SHA1: &str = "f92e777f4341930bad9b2422283c4680d00dbc06";
 
     fn unique_test_root() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -893,7 +906,7 @@ mod tests {
               "dependencies": [],
               "files": [
                 {{
-                  "hashes": {{ "sha1": "{version_id}-sha1" }},
+                  "hashes": {{ "sha1": "{JAR_SHA1}" }},
                   "url": "https://cdn.modrinth.com/data/{project_id}/{filename}",
                   "filename": "{filename}",
                   "primary": true,
@@ -940,7 +953,7 @@ mod tests {
             pending_download_from_version(&version, &target()).expect("download should build");
 
         assert_eq!(record.jar_filename, "sodium.jar");
-        assert_eq!(record.file_hash.as_deref(), Some("version-1-sha1"));
+        assert_eq!(record.file_hash.as_deref(), Some(JAR_SHA1));
         assert_eq!(
             pending.download_url,
             "https://cdn.modrinth.com/data/sodium/sodium.jar"
@@ -1022,8 +1035,8 @@ mod tests {
             .expect("old artifact parent should be created");
         fs::create_dir_all(new_path.parent().expect("new parent should exist"))
             .expect("new artifact parent should be created");
-        fs::write(old_path, b"old").expect("old jar should exist");
-        fs::write(new_path, b"new").expect("new jar should exist");
+        fs::write(old_path, b"jar").expect("old jar should exist");
+        fs::write(new_path, b"jar").expect("new jar should exist");
 
         let record = repository
             .find_compatible_by_project("sodium", &target())
@@ -1110,14 +1123,14 @@ mod tests {
                 .find_cached_file_hash_by_project("canonical-sodium", &target())
                 .expect("hash lookup should succeed")
                 .as_deref(),
-            Some("version-1-sha1")
+            Some(JAR_SHA1)
         );
         assert_eq!(
             repository
                 .find_cached_file_hash_by_project_or_alias("sodium", &target())
                 .expect("alias hash lookup should succeed")
                 .as_deref(),
-            Some("version-1-sha1")
+            Some(JAR_SHA1)
         );
 
         drop(connection);
@@ -1299,7 +1312,7 @@ mod tests {
                 .find_cached_file_hash_by_project("sodium", &target())
                 .expect("hash lookup should succeed")
                 .as_deref(),
-            Some("hashed-row-sha1")
+            Some(JAR_SHA1)
         );
         assert_eq!(
             repository
@@ -1419,6 +1432,47 @@ mod tests {
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn a_truncated_registered_jar_is_missing_not_ready_for_launch() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let mut registered = repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        let complete_sha1 = "d6f61cd535cad8c3bf52935bb0dcb5edff1b69cb";
+        connection
+            .execute(
+                "UPDATE mod_cache SET file_hash = ?1 WHERE modrinth_version_id = ?2",
+                [complete_sha1, "version-1"],
+            )
+            .expect("real fixture hash should be stored");
+        registered.file_hash = Some(complete_sha1.into());
+        let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &registered);
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
+            .expect("artifact parent should be created");
+        fs::write(&artifact_path, b"complete").expect("truncated jar fixture");
+
+        assert_eq!(
+            repository
+                .probe_version("version-1", &target())
+                .expect("probe should succeed"),
+            CacheProbe::JarMissing(registered)
+        );
+        assert!(
+            !artifact_path.exists(),
+            "the corrupt bytes must not remain under the launch-visible name"
+        );
+
+        drop(connection);
+        fs::remove_dir_all(root_dir).expect("temporary root should be removable");
     }
 
     #[test]
