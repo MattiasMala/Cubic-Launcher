@@ -1167,20 +1167,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// I jar veri, quando ci sono. Sono i due che la ricognizione ha misurato a
-    /// mano: gli insiemi devono coincidere esattamente, non approssimarsi.
-    fn cached_client_jar(version: &str) -> Option<std::path::PathBuf> {
-        let jar = dirs_next_home()?
-            .join(".local/share/com.cubic.launcher/cache/minecraft")
-            .join(version)
-            .join(CLIENT_JAR_FILENAME);
-        jar.is_file().then_some(jar)
-    }
-
-    fn dirs_next_home() -> Option<std::path::PathBuf> {
-        std::env::var_os("HOME").map(std::path::PathBuf::from)
-    }
-
     /// Gli insiemi misurati a mano nella ricognizione erano quelli **scritti
     /// nei file** dal gioco: 86 chiavi semplici su 1.20.1 e 114 su 26.3. Il
     /// derivato è più grande di poco perché include anche quello che il gioco
@@ -1195,7 +1181,7 @@ mod tests {
         ];
 
         for (version, data_version, plain, keybinds, sounds, model_parts) in expectations {
-            let Some(jar) = cached_client_jar(version) else {
+            let Some(jar) = crate::test_client_jars::cached_client_jar(version) else {
                 eprintln!("skipping {version}: client.jar not in the local cache");
                 continue;
             };
