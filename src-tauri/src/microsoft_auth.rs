@@ -612,6 +612,12 @@ pub struct MinecraftLoginResult {
     pub microsoft_refresh_token: Option<String>,
 }
 
+impl Default for MinecraftAuthChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MinecraftAuthChain {
     pub fn new() -> Self {
         Self {
