@@ -359,7 +359,6 @@ pub(super) async fn fetch_launch_loader_metadata(
     LoaderMetadataClient::new()
         .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
         .await
-        .map_err(Into::into)
 }
 
 /// Quello che serve dopo l'uscita del gioco per riportare i tre file
