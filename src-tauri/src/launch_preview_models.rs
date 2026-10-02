@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
-use crate::launch_command::{decide_profiler, FlightRecording, JavaLaunchSettings, ProfilerDecision};
+use crate::launch_command::{
+    decide_profiler, FlightRecording, JavaLaunchSettings, ProfilerDecision,
+};
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 

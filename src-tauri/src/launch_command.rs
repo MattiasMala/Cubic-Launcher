@@ -46,9 +46,13 @@ pub enum ProfilerDecision {
     Off,
     Record(FlightRecording),
     /// D111: i JVM args dell'utente contengono già `argument`, e vincono loro.
-    UserArgumentsProfile { argument: String },
+    UserArgumentsProfile {
+        argument: String,
+    },
     /// V3: il lancio usa una Java sotto `FLIGHT_RECORDING_MIN_JAVA`.
-    JavaTooOld { java_major: u32 },
+    JavaTooOld {
+        java_major: u32,
+    },
 }
 
 pub fn decide_profiler(
@@ -266,8 +270,8 @@ mod tests {
     use crate::resolver::ModLoader;
 
     use super::{
-        build_launch_command, join_classpath_entries, split_argument_string, JavaLaunchRequest,
-        FlightRecording, JavaLaunchSettings, PreparedLaunchCommand,
+        build_launch_command, join_classpath_entries, split_argument_string, FlightRecording,
+        JavaLaunchRequest, JavaLaunchSettings, PreparedLaunchCommand,
     };
 
     fn sample_loader_metadata() -> LoaderMetadata {
@@ -321,10 +325,7 @@ mod tests {
 
     #[test]
     fn split_argument_string_preserves_quoted_spaces() {
-        assert_eq!(
-            split_argument_string("-Dfoo=\"a b\""),
-            vec!["-Dfoo=a b"]
-        );
+        assert_eq!(split_argument_string("-Dfoo=\"a b\""), vec!["-Dfoo=a b"]);
         assert_eq!(
             split_argument_string("-Xmx2G -Dbar=baz"),
             vec!["-Xmx2G", "-Dbar=baz"]
@@ -333,10 +334,7 @@ mod tests {
             split_argument_string("--arg 'x y z'"),
             vec!["--arg", "x y z"]
         );
-        assert_eq!(
-            split_argument_string("   "),
-            Vec::<String>::new()
-        );
+        assert_eq!(split_argument_string("   "), Vec::<String>::new());
         assert_eq!(split_argument_string(""), Vec::<String>::new());
     }
 

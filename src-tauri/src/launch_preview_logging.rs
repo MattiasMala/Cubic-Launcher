@@ -8,10 +8,10 @@ use anyhow::{Context, Result};
 use tauri::Emitter;
 
 use crate::instance_mods::CachedModJar;
+use crate::launch_command::FlightRecording;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{ModAcquisitionPlan, ModCacheRecord};
 use crate::modrinth::ModrinthVersion;
-use crate::launch_command::FlightRecording;
 use crate::process_streaming::{
     ProcessEventSink, ProcessExitEvent, ProcessLogEvent, ProcessLogStream, TauriProcessEventSink,
     MINECRAFT_LOG_EVENT,
@@ -417,7 +417,11 @@ pub(super) fn launch_profiler(
         emit_log(app_handle, ProcessLogStream::Stdout, line)?;
     }
     let recording = decision.into_recording();
-    remember_profile_recording(recording.as_ref().map(|recording| recording.output_file.clone()));
+    remember_profile_recording(
+        recording
+            .as_ref()
+            .map(|recording| recording.output_file.clone()),
+    );
     Ok(recording)
 }
 

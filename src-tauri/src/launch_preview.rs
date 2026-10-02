@@ -50,7 +50,6 @@ mod precheck_content;
 use precheck_content::*;
 pub use precheck_content::{ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow};
 
-
 #[path = "launch_preview_models.rs"]
 mod models;
 use models::*;
@@ -374,9 +373,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         let project_aliases = parent_artifacts
             .iter()
             .filter_map(|(mod_id, artifact)| match artifact {
-                RemoteArtifact::Live(version) => {
-                    Some((mod_id.clone(), version.project_id.clone()))
-                }
+                RemoteArtifact::Live(version) => Some((mod_id.clone(), version.project_id.clone())),
                 RemoteArtifact::Cached(_) | RemoteArtifact::MissingJar(_) => None,
             })
             .collect::<Vec<_>>();

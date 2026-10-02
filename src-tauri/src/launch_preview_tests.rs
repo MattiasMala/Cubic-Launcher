@@ -8,20 +8,16 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     automation_exit_code, build_instance_root, build_modded_classpath_entries,
-    contained_loader_library_path,
-    embedded_min_java_requirement, fabric_dependency_predicates_match,
-    filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
-    load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
-    maven_artifact_relative_path,
+    contained_loader_library_path, embedded_min_java_requirement,
+    fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
+    forge_wrapper_installer_artifact, load_active_account_for_launch_with_diagnostics,
+    load_modlist, local_mod_jar_path, maven_artifact_relative_path,
     merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
     minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
     relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
-    EffectiveLaunchSettings,
-    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
-    LaunchVerificationRequest,
-    LaunchVerificationResult,
-    PlayerIdentity,
+    EffectiveLaunchSettings, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
+    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath, LaunchVerificationRequest,
+    LaunchVerificationResult, PlayerIdentity,
 };
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
 
@@ -271,7 +267,10 @@ fn jfr_is_left_out_below_java_11_and_the_launch_log_says_so() {
         .profiler_decision(8, &profiler_launch_dir())
         .launch_log_line()
         .expect("a skipped profiler is said in the launch log");
-    assert!(line.contains("Java 11") && line.contains("Java 8"), "{line}");
+    assert!(
+        line.contains("Java 11") && line.contains("Java 8"),
+        "{line}"
+    );
 
     assert!(jvm_args_for(&settings, 11)
         .iter()
@@ -934,7 +933,10 @@ fn automation_env_does_not_silently_drop_fields() {
         modlist_name: "Pack".into(),
         minecraft_version: "1.20.1".into(),
         mod_loader: "neoforge".into(),
-        resolved_versions: Some(HashMap::from([("sodium".to_string(), "abc123".to_string())])),
+        resolved_versions: Some(HashMap::from([(
+            "sodium".to_string(),
+            "abc123".to_string(),
+        )])),
         resolved_content: Some(HashMap::from([(
             "resourcepack".to_string(),
             HashMap::from([("fresh-animations".to_string(), "xN57JJts".to_string())]),
@@ -956,7 +958,10 @@ fn automation_env_does_not_silently_drop_fields() {
     let launch_request = back.into_launch_request();
     assert_eq!(
         launch_request.resolved_versions,
-        Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
+        Some(HashMap::from([(
+            "sodium".to_string(),
+            "abc123".to_string()
+        )]))
     );
     assert_eq!(
         launch_request.resolved_content,
@@ -988,6 +993,9 @@ fn a_launch_request_without_a_version_map_is_the_request_of_today() {
 
     assert_eq!(
         with_map.resolved_versions,
-        Some(HashMap::from([("sodium".to_string(), "abc123".to_string())]))
+        Some(HashMap::from([(
+            "sodium".to_string(),
+            "abc123".to_string()
+        )]))
     );
 }
