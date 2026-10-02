@@ -166,6 +166,21 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <textarea rows={3} value={modlistDraft().customJvmArgs} disabled={!modlistDraft().customArgsEnabled} onInput={e => setModlistDraft(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="flex-1 resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground disabled:opacity-40 focus:outline-none" />
                   </div>
                 )}
+                {field("Profiler",
+                  <div class="flex gap-3">
+                    <input type="checkbox" checked={modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
+                    <label class={`flex flex-1 items-center gap-2 text-sm text-foreground ${modlistDraft().profilerEnabled ? "" : "opacity-40"}`}>
+                      <input type="checkbox" checked={modlistDraft().profilerActive} disabled={!modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerActive: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                      Record a JFR profile for this mod list
+                    </label>
+                  </div>
+                )}
+                {field("Wrapper Command (Linux)",
+                  <div class="flex gap-3">
+                    <input type="checkbox" checked={modlistDraft().wrapperEnabled} onChange={e => setModlistDraft(c => ({ ...c, wrapperEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
+                    <input type="text" value={modlistDraft().wrapperCommand} disabled={!modlistDraft().wrapperEnabled} onInput={e => setModlistDraft(c => ({ ...c, wrapperCommand: e.currentTarget.value }))} placeholder="gamemoderun mangohud" class="flex-1 rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground disabled:opacity-40 focus:outline-none focus:ring-1 focus:ring-ring" />
+                  </div>
+                )}
               </div>
             }>
               <div class="space-y-4">
@@ -200,7 +215,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <input type="checkbox" checked={globalDraft().profilerEnabled} onChange={e => setGlobalDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Enable profiler globally</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Adds JVM profiling flags to the launch command, useful for diagnosing performance issues.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Records a Java Flight Recorder profile (profile.jfr) into the launch's log folder. Needs Java 11 or newer. If your Custom JVM Args already contain a profiling flag, yours win and nothing is added.</p>
                 </div>
                 <div>
                   <label class="flex items-center gap-3 text-sm">
