@@ -1196,30 +1196,38 @@ export default function App() {
       <ErrorCenter />
       <ExportModal onExport={handleExport} />
       <Show when={pendingUpdatePrecheck()} keyed>
-        {precheck => (
-          <UpdatePopup
-            updates={precheck.updates}
-            contentUpdates={precheck.contentUpdates.filter(row => contentCategoryNotificationsEnabled(row.category))}
-            contentWithoutVersions={precheck.contentWithoutVersions}
-            contentLookupFailures={precheck.contentLookupFailures}
-            versionNumberLookupError={precheck.versionNumberLookupError}
-            onChoose={(accepted, acceptedContent) => {
-              setPendingUpdatePrecheck(null);
-              void startLaunch(
-                buildResolvedVersions(precheck.resolved, precheck.updates, accepted),
-                // Every row, not only the ones on screen: a category whose
-                // checkbox is off was filtered out of `contentUpdates` before
-                // the popup, and those rows have to be refused, not dropped.
-                buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, acceptedContent),
-              );
-            }}
-            // D26: the X and the backdrop cancel the launch. "Skip" means
-            // "launch without updating"; closing means "I have not decided".
-            // A cancelled launch also drops the world it was going to open,
-            // which would otherwise sit there until the next Play took it.
-            onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
-          />
-        )}
+        {precheck => {
+          // D116: with update notifications off the popup only opens for the
+          // mods the launch leaves out, and shows only those. No update row
+          // means both accepted sets come back empty, which is the
+          // notifications-off launch of `handleLaunch` (D30).
+          const notifyUpdates = globalSettings().updateNotificationsEnabled;
+          return (
+            <UpdatePopup
+              updates={notifyUpdates ? precheck.updates : []}
+              contentUpdates={notifyUpdates ? precheck.contentUpdates.filter(row => contentCategoryNotificationsEnabled(row.category)) : []}
+              contentWithoutVersions={notifyUpdates ? precheck.contentWithoutVersions : []}
+              contentLookupFailures={notifyUpdates ? precheck.contentLookupFailures : []}
+              versionNumberLookupError={notifyUpdates ? precheck.versionNumberLookupError : null}
+              droppedMods={precheck.droppedMods}
+              onChoose={(accepted, acceptedContent) => {
+                setPendingUpdatePrecheck(null);
+                void startLaunch(
+                  buildResolvedVersions(precheck.resolved, precheck.updates, accepted),
+                  // Every row, not only the ones on screen: a category whose
+                  // checkbox is off was filtered out of `contentUpdates` before
+                  // the popup, and those rows have to be refused, not dropped.
+                  buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, acceptedContent),
+                );
+              }}
+              // D26: the X and the backdrop cancel the launch. "Skip" means
+              // "launch without updating"; closing means "I have not decided".
+              // A cancelled launch also drops the world it was going to open,
+              // which would otherwise sit there until the next Play took it.
+              onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
+            />
+          );
+        }}
       </Show>
     </div>
   );
