@@ -25,7 +25,11 @@ jobs:
           node-version: 20
           cache: npm
 
+      # rustfmt e clippy nominati esplicitamente: l'action installa con
+      # `--profile minimal`, che non garantisce né l'uno né l'altro.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -69,8 +73,11 @@ jobs:
           CUBIC_REQUIRE_CLIENT_JARS: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
       - name: Lint Rust
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --tests
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
   build:
     strategy:
