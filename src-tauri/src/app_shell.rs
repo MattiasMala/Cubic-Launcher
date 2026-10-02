@@ -772,6 +772,7 @@ mod tests {
                 refresh_token_enc: Some(refresh_token_enc),
                 profile_data: None,
                 is_active: true,
+                plays_offline: false,
             })
             .expect("account should insert");
 
@@ -827,6 +828,7 @@ mod tests {
                     }),
                     profile_data: None,
                     is_active,
+                    plays_offline: false,
                 })
                 .expect("account should insert");
         }
@@ -962,6 +964,7 @@ mod tests {
                 refresh_token_enc: Some(vec![4, 5, 6]),
                 profile_data: Some("{}".into()),
                 is_active: true,
+                plays_offline: false,
             })
             .expect("account should insert");
         drop(connection);

@@ -54,6 +54,7 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
             refresh_token_enc: Some(vec![1, 2, 3]),
             profile_data: Some(r#"{"username":"ProfilePlayer"}"#.into()),
             is_active: true,
+            plays_offline: false,
         })
         .expect("insert active account");
 

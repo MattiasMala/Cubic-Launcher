@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     refresh_token_enc   BLOB,
     last_login          DATETIME,
     profile_data        TEXT,
-    is_active           BOOLEAN DEFAULT FALSE
+    is_active           BOOLEAN DEFAULT FALSE,
+    plays_offline       BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS java_installations (
@@ -92,7 +93,29 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     connection.execute_batch(SCHEMA_SQL)?;
     migrate_mod_cache_schema(&connection)?;
     migrate_mod_cache_target_key(&connection)?;
+    migrate_accounts_plays_offline(&connection)?;
 
+    Ok(())
+}
+
+/// D115: the user's choice to play an account offline. `SCHEMA_SQL` declares
+/// the column, but on a database that already exists its `CREATE TABLE IF
+/// NOT EXISTS` does nothing, so every `accounts` table created before needs
+/// it added here. Idempotent: it asks the table first and only adds a column
+/// that is missing. The default keeps every existing account online, as it
+/// was.
+fn migrate_accounts_plays_offline(connection: &Connection) -> Result<()> {
+    let has_column: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'plays_offline')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE accounts ADD COLUMN plays_offline BOOLEAN NOT NULL DEFAULT FALSE",
+            [],
+        )?;
+    }
     Ok(())
 }
 
