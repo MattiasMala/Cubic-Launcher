@@ -296,9 +296,8 @@ pub(super) async fn run_update_precheck(
     // without (D16), and it is already complete here. One malformed version id
     // `400`s this whole request, so letting it fail the command would lose the
     // version map for a label.
-    let cached_version_numbers = VersionNumbers::from_lookup(
-        modrinth_client.fetch_versions_by_ids(&wanted_numbers).await,
-    );
+    let cached_version_numbers =
+        VersionNumbers::from_lookup(modrinth_client.fetch_versions_by_ids(&wanted_numbers).await);
     if let Some(error) = &cached_version_numbers.lookup_error {
         let _ = emit_log(
             app_handle,
@@ -417,7 +416,8 @@ mod tests {
         ]);
         let cached = string_map(&[("sodium", "sodium-v2"), ("lithium", "lithium-v7")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
+        let result =
+            build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert_eq!(
@@ -522,7 +522,8 @@ mod tests {
         ]);
         let cached = string_map(&[("sodium", "sodium-v2")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
+        let result =
+            build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert_eq!(
@@ -551,7 +552,8 @@ mod tests {
         let candidates = candidates(&[("sodium", "sodium-v2", "0.6.0")]);
         let cached = string_map(&[("sodium", "sodium-v1")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
+        let result =
+            build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert_eq!(result.updates.len(), 1);
         assert_eq!(result.updates[0].current_version_id, "sodium-v1");
@@ -567,7 +569,8 @@ mod tests {
         let candidates = candidates(&[("optifine", "optifine-v2", "1.0.1")]);
         let cached = string_map(&[("optifine", "optifine-v1")]);
 
-        let result = build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
+        let result =
+            build_precheck_result(&selected, &candidates, &cached, &VersionNumbers::default());
 
         assert!(result.updates.is_empty());
         assert!(result.resolved.is_empty());
@@ -624,7 +627,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sodium"]
         );
-        assert_eq!(resolved_pairs(&result), vec![("sodium".to_string(), "sodium-v2".to_string())]);
+        assert_eq!(
+            resolved_pairs(&result),
+            vec![("sodium".to_string(), "sodium-v2".to_string())]
+        );
     }
 
     #[test]

@@ -106,7 +106,10 @@ impl VanillaOptionKeys {
     }
 
     pub fn total(&self) -> usize {
-        self.plain.len() + self.keybinds.len() + self.sound_categories.len() + self.model_parts.len()
+        self.plain.len()
+            + self.keybinds.len()
+            + self.sound_categories.len()
+            + self.model_parts.len()
     }
 
     /// La verifica a valle (D72). Fallisce rumorosamente: è un errore del
@@ -167,8 +170,8 @@ struct JarVersionManifest {
 
 /// La `DataVersion` di un `client.jar`, senza derivare niente altro.
 pub fn read_jar_data_version(jar_path: &Path) -> Result<i64> {
-    let file = File::open(jar_path)
-        .with_context(|| format!("failed to open {}", jar_path.display()))?;
+    let file =
+        File::open(jar_path).with_context(|| format!("failed to open {}", jar_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("failed to read {}", jar_path.display()))?;
     let mut entry = archive
@@ -176,14 +179,18 @@ pub fn read_jar_data_version(jar_path: &Path) -> Result<i64> {
         .with_context(|| format!("{JAR_VERSION_ENTRY} missing from {}", jar_path.display()))?;
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    let manifest: JarVersionManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {JAR_VERSION_ENTRY} in {}", jar_path.display()))?;
+    let manifest: JarVersionManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse {JAR_VERSION_ENTRY} in {}",
+            jar_path.display()
+        )
+    })?;
     Ok(manifest.world_version)
 }
 
 pub fn derive_from_client_jar(jar_path: &Path) -> Result<VanillaOptionKeys> {
-    let file = File::open(jar_path)
-        .with_context(|| format!("failed to open {}", jar_path.display()))?;
+    let file =
+        File::open(jar_path).with_context(|| format!("failed to open {}", jar_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("failed to read {}", jar_path.display()))?;
 
@@ -262,16 +269,21 @@ pub fn derive_from_client_jar(jar_path: &Path) -> Result<VanillaOptionKeys> {
         );
     }
     let options_class = anchor_hits.remove(0);
-    let class_bytes = options_class_bytes
-        .ok_or_else(|| anyhow!("options class found but not read"))?;
+    let class_bytes =
+        options_class_bytes.ok_or_else(|| anyhow!("options class found but not read"))?;
 
     let manifest_bytes = manifest_bytes
         .ok_or_else(|| anyhow!("{JAR_VERSION_ENTRY} missing from {}", jar_path.display()))?;
-    let manifest: JarVersionManifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("failed to parse {JAR_VERSION_ENTRY} in {}", jar_path.display()))?;
+    let manifest: JarVersionManifest =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse {JAR_VERSION_ENTRY} in {}",
+                jar_path.display()
+            )
+        })?;
 
-    let lang_bytes = lang_bytes
-        .ok_or_else(|| anyhow!("{LANG_ENTRY} missing from {}", jar_path.display()))?;
+    let lang_bytes =
+        lang_bytes.ok_or_else(|| anyhow!("{LANG_ENTRY} missing from {}", jar_path.display()))?;
 
     let (plain, keybinds) = derive_from_options_class(&class_bytes, &options_class)?;
     let (sound_categories, model_parts) = derive_from_lang(&lang_bytes)?;
@@ -335,7 +347,10 @@ fn derive_from_options_class(
     for method in &methods {
         let Some(code) = &method.code else { continue };
         let literals = ldc_strings(code, &pool)?;
-        if !literals.iter().any(|literal| literal == LOAD_METHOD_LITERAL) {
+        if !literals
+            .iter()
+            .any(|literal| literal == LOAD_METHOD_LITERAL)
+        {
             continue;
         }
         for literal in literals {
@@ -403,7 +418,12 @@ fn assign_groups(
 ) -> BTreeMap<String, String> {
     let sized: Vec<(&str, usize)> = screen_classes
         .iter()
-        .map(|(name, literals)| (name.as_str(), literals.iter().filter(|l| plain.contains(*l)).count()))
+        .map(|(name, literals)| {
+            (
+                name.as_str(),
+                literals.iter().filter(|l| plain.contains(*l)).count(),
+            )
+        })
         .collect();
 
     let mut groups = BTreeMap::new();
@@ -417,7 +437,8 @@ fn assign_groups(
             best = match best {
                 None => Some(candidate),
                 Some((best_name, best_size)) => {
-                    if candidate.1 < best_size || (candidate.1 == best_size && candidate.0 < best_name)
+                    if candidate.1 < best_size
+                        || (candidate.1 == best_size && candidate.0 < best_name)
                     {
                         Some(candidate)
                     } else {
@@ -788,9 +809,7 @@ fn ldc_strings(code: &[u8], pool: &[CpEntry]) -> Result<Vec<String>> {
     while pc < code.len() {
         match code[pc] {
             0x12 => {
-                let index = *code
-                    .get(pc + 1)
-                    .ok_or_else(|| anyhow!("ldc truncated"))? as u16;
+                let index = *code.get(pc + 1).ok_or_else(|| anyhow!("ldc truncated"))? as u16;
                 if let Some(text) = string_literal_at(pool, index) {
                     literals.push(text.to_string());
                 }
@@ -836,9 +855,7 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
         }
         // wide: 6 byte se modifica iinc, 4 altrimenti
         0xc4 => {
-            let widened = *code
-                .get(pc + 1)
-                .ok_or_else(|| anyhow!("wide truncated"))?;
+            let widened = *code.get(pc + 1).ok_or_else(|| anyhow!("wide truncated"))?;
             if widened == 0x84 {
                 6
             } else {
@@ -846,8 +863,18 @@ fn instruction_length(code: &[u8], pc: usize) -> Result<usize> {
             }
         }
         0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
-        0x11 | 0x13 | 0x14 | 0x84 | 0x99..=0xa8 | 0xb2..=0xb8 | 0xbb | 0xbd | 0xc0 | 0xc1
-        | 0xc6 | 0xc7 => 3,
+        0x11
+        | 0x13
+        | 0x14
+        | 0x84
+        | 0x99..=0xa8
+        | 0xb2..=0xb8
+        | 0xbb
+        | 0xbd
+        | 0xc0
+        | 0xc1
+        | 0xc6
+        | 0xc7 => 3,
         0xc5 => 4,
         0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         _ => 1,
@@ -873,7 +900,9 @@ mod tests {
 
     #[test]
     fn key_shape_rejects_log_formats() {
-        assert!(!is_option_key_shape("Invalid keyMapping {} = {}, unbinding"));
+        assert!(!is_option_key_shape(
+            "Invalid keyMapping {} = {}, unbinding"
+        ));
         assert!(!is_option_key_shape("Failed to load options"));
         assert!(!is_option_key_shape(""));
         assert!(!is_option_key_shape("2"));
@@ -902,8 +931,8 @@ mod tests {
     fn write_stub_jar(path: &std::path::Path, class_literal: Option<&str>) {
         let file = std::fs::File::create(path).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
@@ -1074,8 +1103,8 @@ mod tests {
         let jar = directory.join("client.jar");
         let file = std::fs::File::create(&jar).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
             &mut archive,
@@ -1089,11 +1118,8 @@ mod tests {
         )
         .unwrap();
         archive.start_file("stub/Options.class", options).unwrap();
-        std::io::Write::write_all(
-            &mut archive,
-            &well_formed_options_class(&plain, &keybinds),
-        )
-        .unwrap();
+        std::io::Write::write_all(&mut archive, &well_formed_options_class(&plain, &keybinds))
+            .unwrap();
         archive.finish().unwrap();
 
         let derived = derive_from_client_jar(&jar).expect("a well-formed jar must derive");
@@ -1106,10 +1132,10 @@ mod tests {
         assert_eq!(derived.plain.len(), plain.len() + 2);
         assert!(derived.plain.contains("fullscreenResolution"));
         assert!(derived.plain.contains(VERSION_KEY));
-        assert!(!derived
-            .plain
-            .iter()
-            .any(|key| key.contains(' ')), "il formato di log non è una chiave");
+        assert!(
+            !derived.plain.iter().any(|key| key.contains(' ')),
+            "il formato di log non è una chiave"
+        );
         assert_eq!(derived.keybinds.len(), keybinds.len());
         assert!(!derived.keybinds.contains("key.categories.misc"));
         assert_eq!(derived.sound_categories.len(), 2);
@@ -1144,8 +1170,8 @@ mod tests {
         let jar = directory.join("client.jar");
         let file = std::fs::File::create(&jar).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
             &mut archive,
@@ -1193,7 +1219,11 @@ mod tests {
             assert_eq!(derived.plain.len(), plain, "{version} plain keys");
             assert_eq!(derived.keybinds.len(), keybinds, "{version} keybinds");
             assert_eq!(derived.sound_categories.len(), sounds, "{version} sounds");
-            assert_eq!(derived.model_parts.len(), model_parts, "{version} model parts");
+            assert_eq!(
+                derived.model_parts.len(),
+                model_parts,
+                "{version} model parts"
+            );
             assert!(derived.plain.contains("fullscreenResolution"));
 
             assert!(derived.accepts("fov"));
@@ -1209,10 +1239,16 @@ mod tests {
             version_id: "1.20.1".into(),
             data_version: 3465,
             options_class: "enr.class".into(),
-            plain: ["fov", "renderDistance", "guiScale", "mouseSensitivity", "version"]
-                .iter()
-                .map(|key| key.to_string())
-                .collect(),
+            plain: [
+                "fov",
+                "renderDistance",
+                "guiScale",
+                "mouseSensitivity",
+                "version",
+            ]
+            .iter()
+            .map(|key| key.to_string())
+            .collect(),
             keybinds: ["key.attack", "key.hotbar.1"]
                 .iter()
                 .map(|key| key.to_string())
@@ -1240,7 +1276,9 @@ mod tests {
 
     #[test]
     fn verify_rejects_a_set_that_is_too_small() {
-        let error = sample_keys().verify().expect_err("5 plain keys must not pass");
+        let error = sample_keys()
+            .verify()
+            .expect_err("5 plain keys must not pass");
 
         assert!(
             error.to_string().contains("simple settings"),

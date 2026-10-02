@@ -44,7 +44,11 @@ pub type ResolvedContentVersions = HashMap<String, HashMap<String, String>>;
 /// Checks whether a content entry is active for the current MC version +
 /// loader. Shared with the pre-check: the two must agree on which entries the
 /// launch even considers.
-pub(super) fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str) -> bool {
+pub(super) fn is_content_entry_active(
+    entry: &ContentEntry,
+    mc_version: &str,
+    loader: &str,
+) -> bool {
     for rule in &entry.version_rules {
         let version_match =
             rule.mc_versions.is_empty() || rule.mc_versions.iter().any(|v| v == mc_version);
@@ -198,10 +202,10 @@ impl<'a> ContentPackPlan<'a> {
         let mut dropped = named
             .iter()
             .flat_map(|(category, entries)| {
-                entries.iter().filter_map(move |(entry_id, version_id)| {
-                    (!self.metadata.contains_key(version_id))
-                        .then(|| format!("{category}/{entry_id}"))
-                })
+                entries
+                    .iter()
+                    .filter(move |&(_, version_id)| !self.metadata.contains_key(version_id))
+                    .map(move |(entry_id, _)| format!("{category}/{entry_id}"))
             })
             .collect::<Vec<_>>();
 
@@ -408,6 +412,10 @@ fn install_local_content_packs(
 /// re-resolves from scratch, which is what it always did — and which is also
 /// how a popup's answer used to be ignored in silence, since nothing carried
 /// it here.
+// Otto input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn resolve_and_install_content_packs(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
@@ -648,6 +656,10 @@ pub(super) async fn resolve_and_install_content_packs(
     .await
 }
 
+// Nove input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 async fn install_datapacks(
     app_handle: &tauri::AppHandle,
     modlist_dir: &Path,
@@ -661,12 +673,11 @@ async fn install_datapacks(
 ) -> Result<()> {
     // Data packs are world-specific, so put them in a top-level datapacks
     // folder supported by mods such as Open Loader.
-    let list =
-        load_content_list(modlist_dir, DATAPACK_CATEGORY).unwrap_or_else(|_| ContentList {
-            content_type: DATAPACK_CATEGORY.to_string(),
-            entries: vec![],
-            groups: vec![],
-        });
+    let list = load_content_list(modlist_dir, DATAPACK_CATEGORY).unwrap_or_else(|_| ContentList {
+        content_type: DATAPACK_CATEGORY.to_string(),
+        entries: vec![],
+        groups: vec![],
+    });
     let active_entries: Vec<&ContentEntry> = list
         .entries
         .iter()
@@ -832,7 +843,9 @@ mod tests {
             .expect("system time before unix epoch")
             .as_nanos();
 
-        env::temp_dir().join(format!("cubic-launcher-content-cache-test-{label}-{timestamp}"))
+        env::temp_dir().join(format!(
+            "cubic-launcher-content-cache-test-{label}-{timestamp}"
+        ))
     }
 
     /// A server that answers one fixed body and counts what it was asked for,
@@ -840,7 +853,10 @@ mod tests {
     /// observing the requests instead of the file.
     fn counting_server(body: &'static [u8]) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-        let port = listener.local_addr().expect("test server has an address").port();
+        let port = listener
+            .local_addr()
+            .expect("test server has an address")
+            .port();
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
 
@@ -1017,7 +1033,10 @@ mod tests {
                     .next()
                     .unwrap_or_default()
                     .to_string();
-                recorder.lock().expect("recorder").push(request_line.clone());
+                recorder
+                    .lock()
+                    .expect("recorder")
+                    .push(request_line.clone());
 
                 let body = routes
                     .iter()
@@ -1117,7 +1136,10 @@ mod tests {
             resolutions
                 .iter()
                 .map(|resolution| (
-                    resolution.version.as_ref().map(|version| version.id.as_str()),
+                    resolution
+                        .version
+                        .as_ref()
+                        .map(|version| version.id.as_str()),
                     resolution.preresolved
                 ))
                 .collect::<Vec<_>>(),
@@ -1155,13 +1177,20 @@ mod tests {
             .expect("the metadata lookup should succeed");
 
         let recorded = requests.lock().expect("recorder").clone();
-        assert_eq!(recorded.len(), 1, "one request for three ids, got {recorded:?}");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one request for three ids, got {recorded:?}"
+        );
         assert!(
             recorded[0].contains("/versions?ids="),
             "the bulk metadata endpoint is the one asked, got {recorded:?}"
         );
         assert_eq!(plan.covered(), 2);
-        assert_eq!(plan.dropped(), vec!["datapack/gone-from-modrinth".to_string()]);
+        assert_eq!(
+            plan.dropped(),
+            vec!["datapack/gone-from-modrinth".to_string()]
+        );
         assert_eq!(
             plan.version_for("resourcepack", "nature-x")
                 .map(|version| version.version_number.as_str()),

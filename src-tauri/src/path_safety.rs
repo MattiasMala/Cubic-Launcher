@@ -115,8 +115,8 @@ mod tests {
             Path::new("/launcher/libraries/net/minecraftforge/forge/forge.jar")
         );
 
-        let with_curdir = contained_join(base, "./ab/cd")
-            .expect("current-dir segments should be ignored");
+        let with_curdir =
+            contained_join(base, "./ab/cd").expect("current-dir segments should be ignored");
         assert_eq!(with_curdir, Path::new("/launcher/libraries/ab/cd"));
 
         let interior_parent = contained_join(base, "a/b/../c")

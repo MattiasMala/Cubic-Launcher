@@ -385,7 +385,9 @@ mod tests {
             .expect("system time before unix epoch")
             .as_nanos();
 
-        env::temp_dir().join(format!("cubic-launcher-precheck-content-{label}-{timestamp}"))
+        env::temp_dir().join(format!(
+            "cubic-launcher-precheck-content-{label}-{timestamp}"
+        ))
     }
 
     /// D16 for the packs: the launch needs a version for every selected entry,
@@ -401,11 +403,23 @@ mod tests {
         let versions = HashMap::from([
             (
                 "boss-refreshed",
-                vec![version("ZbZNRA1g", "YItTWWdj", "v2", "release", "2025-05-30")],
+                vec![version(
+                    "ZbZNRA1g",
+                    "YItTWWdj",
+                    "v2",
+                    "release",
+                    "2025-05-30",
+                )],
             ),
             (
                 "nature-x",
-                vec![version("8d8M3Qoz", "3c40Y4EH", "12.2", "release", "2025-01-28")],
+                vec![version(
+                    "8d8M3Qoz",
+                    "3c40Y4EH",
+                    "12.2",
+                    "release",
+                    "2025-01-28",
+                )],
             ),
         ]);
 
@@ -489,7 +503,10 @@ mod tests {
         );
 
         assert_eq!(
-            result.updates.first().map(|row| row.candidate_version_id.as_str()),
+            result
+                .updates
+                .first()
+                .map(|row| row.candidate_version_id.as_str()),
             Some("release16"),
             "the newest by date is the beta; the preferred one is the release"
         );
@@ -518,7 +535,10 @@ mod tests {
             vec![("fresh-animations".to_string(), "xN57JJts".to_string())]
         );
         assert_eq!(
-            result.updates.first().map(|row| row.candidate_version_number.as_str()),
+            result
+                .updates
+                .first()
+                .map(|row| row.candidate_version_number.as_str()),
             Some("1.10.4")
         );
     }
@@ -539,8 +559,7 @@ mod tests {
         // `boss-refreshed` is absent from the map: its lookup failed.
         let versions = HashMap::from([("visual-effects-plus", Vec::new())]);
 
-        let result =
-            build_category_precheck("resourcepack", &entries, &versions, &HashSet::new());
+        let result = build_category_precheck("resourcepack", &entries, &versions, &HashSet::new());
 
         assert_eq!(
             result.without_versions,

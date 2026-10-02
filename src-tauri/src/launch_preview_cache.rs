@@ -23,8 +23,8 @@ use crate::mod_cache::{
     ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
-use crate::process_streaming::ProcessLogStream;
 use crate::path_safety::validate_path_component;
+use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
@@ -298,9 +298,10 @@ pub(super) async fn download_pending_artifacts(
         tokio::select! {
             Some(delta) = progress_rx.recv() => {
                 downloaded_bytes = downloaded_bytes.saturating_add(delta);
-                if total_bytes > 0 {
-                    let progress = 42u8
-                        + ((16u64 * downloaded_bytes.min(total_bytes)) / total_bytes) as u8;
+                if let Some(sixteenths) =
+                    (16u64 * downloaded_bytes.min(total_bytes)).checked_div(total_bytes)
+                {
+                    let progress = 42u8 + sixteenths as u8;
                     if progress > last_progress {
                         last_progress = progress;
                         emit_progress(
@@ -530,6 +531,10 @@ pub(super) fn local_mod_jar_path(
         .join(file_name))
 }
 
+// Otto input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_cached_mod_jars(
     app_handle: &tauri::AppHandle,
     selected_mods: &[SelectedMod],

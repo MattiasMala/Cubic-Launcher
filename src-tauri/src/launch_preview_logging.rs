@@ -312,7 +312,7 @@ impl LogUiThrottleState {
         if is_forge_installer_patch_line(&event.line) {
             self.flush_repeated_line(&mut events);
             self.suppressed_forge_patch_count += 1;
-            if self.suppressed_forge_patch_count % 1000 == 0 {
+            if self.suppressed_forge_patch_count.is_multiple_of(1000) {
                 events.push(ProcessLogEvent {
                     stream: ProcessLogStream::Stdout,
                     line: format!(

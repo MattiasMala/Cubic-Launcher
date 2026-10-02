@@ -333,7 +333,6 @@ impl<'connection> AccountsRepository<'connection> {
             )
             .map_err(Into::into)
     }
-
 }
 
 pub fn build_authorization_url(
@@ -569,11 +568,15 @@ pub struct MinecraftProfile {
 
 impl MinecraftProfile {
     pub fn active_skin(&self) -> Option<&ProfileSkin> {
-        self.skins.iter().find(|skin| skin.state == TextureState::Active)
+        self.skins
+            .iter()
+            .find(|skin| skin.state == TextureState::Active)
     }
 
     pub fn active_cape(&self) -> Option<&ProfileCape> {
-        self.capes.iter().find(|cape| cape.state == TextureState::Active)
+        self.capes
+            .iter()
+            .find(|cape| cape.state == TextureState::Active)
     }
 }
 
@@ -607,6 +610,12 @@ pub struct MinecraftLoginResult {
     pub minecraft_username: String,
     pub minecraft_access_token: String,
     pub microsoft_refresh_token: Option<String>,
+}
+
+impl Default for MinecraftAuthChain {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MinecraftAuthChain {
@@ -1214,7 +1223,11 @@ mod tests {
         )
         .expect("unknown values must not fail the profile");
 
-        assert_eq!(profile.skins.len(), 1, "an element that is not a skin is dropped, the rest kept");
+        assert_eq!(
+            profile.skins.len(),
+            1,
+            "an element that is not a skin is dropped, the rest kept"
+        );
         assert_eq!(profile.skins[0].variant, SkinVariant::Unknown);
         assert_eq!(profile.skins[0].state, TextureState::Unknown);
         assert_eq!(
@@ -1223,7 +1236,10 @@ mod tests {
             "without `textureKey` the key is the texture URL's last segment"
         );
         assert!(profile.capes.is_empty());
-        assert!(profile.active_skin().is_none(), "an unknown state is not `ACTIVE`");
+        assert!(
+            profile.active_skin().is_none(),
+            "an unknown state is not `ACTIVE`"
+        );
     }
 
     #[test]
@@ -1245,7 +1261,8 @@ mod tests {
             r#""slim""#
         );
         assert_eq!(
-            serde_json::from_str::<SkinVariant>(r#""slim""#).expect("our own spelling must read back"),
+            serde_json::from_str::<SkinVariant>(r#""slim""#)
+                .expect("our own spelling must read back"),
             SkinVariant::Slim
         );
     }

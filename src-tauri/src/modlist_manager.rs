@@ -220,7 +220,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         };
         validate_path_component(&base_name)?;
 
-        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_name = unique_modlist_name(modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
         std::fs::create_dir_all(&modlist_dir)
             .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;
@@ -279,7 +279,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
             .unwrap_or("Imported")
             .to_string();
         validate_path_component(&base_name)?;
-        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_name = unique_modlist_name(modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
         std::fs::create_dir_all(&modlist_dir)
             .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;
@@ -399,9 +399,9 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
 mod tests {
     use std::env;
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use std::io::Write;
 
     use zip::write::FileOptions;
 
@@ -425,9 +425,7 @@ mod tests {
         let file = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
         for (name, contents) in entries {
-            archive
-                .start_file(*name, FileOptions::default())
-                .unwrap();
+            archive.start_file(*name, FileOptions::default()).unwrap();
             archive.write_all(contents).unwrap();
         }
         archive.finish().unwrap();
@@ -583,18 +581,13 @@ mod tests {
             ],
         );
 
-        let result =
-            import_modlist_from_root(&root, malicious_zip.to_str().unwrap());
+        let result = import_modlist_from_root(&root, malicious_zip.to_str().unwrap());
         assert!(result.is_err());
         assert!(!root.join("mod-lists").join("outside.txt").exists());
 
         let valid_zip = root.join("valid.zip");
-        write_test_zip(
-            &valid_zip,
-            &[("Valid Pack/note.txt", b"valid" as &[u8])],
-        );
-        let imported_name =
-            import_modlist_from_root(&root, valid_zip.to_str().unwrap()).unwrap();
+        write_test_zip(&valid_zip, &[("Valid Pack/note.txt", b"valid" as &[u8])]);
+        let imported_name = import_modlist_from_root(&root, valid_zip.to_str().unwrap()).unwrap();
         assert_eq!(imported_name, "Valid Pack");
         assert!(root
             .join("mod-lists")
@@ -612,8 +605,7 @@ mod tests {
         let archive_path = root.join("...zip");
         write_test_zip(&archive_path, &[]);
 
-        let result =
-            import_modlist_from_root(&root, archive_path.to_str().unwrap());
+        let result = import_modlist_from_root(&root, archive_path.to_str().unwrap());
         assert!(result.is_err());
 
         fs::remove_dir_all(&root).unwrap();

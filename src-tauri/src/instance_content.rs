@@ -326,9 +326,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        carry_forward, link_content_file, manifest_path, plan_stale_removals,
-        read_manifest_files, sync_managed_content_dir, write_manifest, ContentLinkOutcome,
-        ManagedContentManifest, PresentEntry,
+        carry_forward, link_content_file, manifest_path, plan_stale_removals, read_manifest_files,
+        sync_managed_content_dir, write_manifest, ContentLinkOutcome, ManagedContentManifest,
+        PresentEntry,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -690,7 +690,10 @@ mod tests {
             b"the user's own edit",
             "byte for byte what the user put there"
         );
-        assert!(!is_symlink(&target), "the user's file must not have become a link");
+        assert!(
+            !is_symlink(&target),
+            "the user's file must not have become a link"
+        );
         assert_eq!(
             outcome.expect("a foreign file is not an error"),
             ContentLinkOutcome::SkippedForeignFile
@@ -725,7 +728,10 @@ mod tests {
 
         assert_eq!(outcome, ContentLinkOutcome::Linked);
         assert_eq!(fs::read_link(&target).expect("still a link"), new);
-        assert_eq!(fs::read(&old).expect("the old cache entry is untouched"), b"v1");
+        assert_eq!(
+            fs::read(&old).expect("the old cache entry is untouched"),
+            b"v1"
+        );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
@@ -769,7 +775,10 @@ mod tests {
         let new = cached_pack(&root_dir, "NewVer02", "data.zip", b"v2");
         let target = instance_dir.join("data.zip");
         fs::hard_link(&old, &target).expect("the fallback's hard link");
-        assert!(!is_symlink(&target), "precondition: a real file, not a link");
+        assert!(
+            !is_symlink(&target),
+            "precondition: a real file, not a link"
+        );
         write_manifest(
             &manifest_path(&root_dir, "datapacks"),
             "datapacks",

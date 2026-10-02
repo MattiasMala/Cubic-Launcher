@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::token_storage::{AccountTokenCipher, SecretStore};
 use anyhow::Result;
 use rusqlite::Connection;
-use crate::token_storage::{AccountTokenCipher, SecretStore};
 
 pub const DATABASE_FILENAME: &str = "launcher_data.db";
 
@@ -246,8 +246,7 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
     let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = {
         let mut statement = connection
             .prepare("SELECT microsoft_id, refresh_token_enc, profile_data FROM accounts")?;
-        let mapped =
-            statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
@@ -297,15 +296,12 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
                 // is authoritative: re-encrypt it into refresh_token_enc, then
                 // strip the plaintext so the launch path (which reads enc)
                 // recovers the fresh token.
-                match cipher.encrypt_token(plaintext) {
-                    Ok(ciphertext) => {
-                        new_refresh_enc = Some(ciphertext);
-                        map.remove("ms_refresh_token");
-                        removed_refresh = true;
-                    }
-                    // Cipher/keyring unavailable: DEFER — never destroy the only
-                    // copy. The plaintext stays until it can be re-encrypted.
-                    Err(_) => {}
+                // On Err (cipher/keyring unavailable): DEFER — never destroy the
+                // only copy. The plaintext stays until it can be re-encrypted.
+                if let Ok(ciphertext) = cipher.encrypt_token(plaintext) {
+                    new_refresh_enc = Some(ciphertext);
+                    map.remove("ms_refresh_token");
+                    removed_refresh = true;
                 }
             }
         }
@@ -340,9 +336,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{
-        initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME,
-    };
+    use super::{initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME};
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     #[derive(Clone, Default)]

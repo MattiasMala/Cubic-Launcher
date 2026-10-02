@@ -980,9 +980,7 @@ mod tests {
         assert!(metadata
             .game_arguments
             .contains(&"--fml.mcVersion".to_string()));
-        assert!(metadata
-            .game_arguments
-            .contains(&"1.21.1".to_string()));
+        assert!(metadata.game_arguments.contains(&"1.21.1".to_string()));
     }
 
     fn prism_legacy_forge_detail_json() -> &'static str {

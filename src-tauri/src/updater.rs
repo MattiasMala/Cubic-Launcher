@@ -27,10 +27,7 @@ enum CheckOutcome {
     Failed,
 }
 
-fn payload_from_outcome(
-    current_version: &str,
-    outcome: CheckOutcome,
-) -> UpdateCheckPayload {
+fn payload_from_outcome(current_version: &str, outcome: CheckOutcome) -> UpdateCheckPayload {
     let current_version = current_version.to_owned();
 
     match outcome {

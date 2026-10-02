@@ -67,7 +67,9 @@ fn write_level_dat(directory: &Path, level_name: &str, game_type: i32, last_play
     .expect("failed to serialize the test level.dat");
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(&nbt).expect("failed to gzip the level.dat");
+    encoder
+        .write_all(&nbt)
+        .expect("failed to gzip the level.dat");
     let gzipped = encoder.finish().expect("failed to finish the gzip stream");
     fs::write(directory.join(LEVEL_DAT_FILE_NAME), gzipped).expect("failed to write the level.dat");
 }
@@ -258,7 +260,15 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
         1,
         1_000,
     );
-    write_world(&root, "test2", "26.3-fabric", "New World", "New World", 1, 2_000);
+    write_world(
+        &root,
+        "test2",
+        "26.3-fabric",
+        "New World",
+        "New World",
+        1,
+        2_000,
+    );
 
     let hidden = vec![HiddenWorld {
         id: instance_id("test2", "26.3-fabric", "New World"),
@@ -269,7 +279,12 @@ fn the_hidden_list_matches_the_triple_and_not_the_folder_name() {
 
     let flags: Vec<(String, bool)> = entries
         .iter()
-        .map(|entry| (entry.id.modlist_name().unwrap_or_default().to_string(), entry.hidden))
+        .map(|entry| {
+            (
+                entry.id.modlist_name().unwrap_or_default().to_string(),
+                entry.hidden,
+            )
+        })
         .collect();
     assert_eq!(
         flags,
@@ -290,7 +305,15 @@ fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
     // behaves like anything hidden today. (The id is in today's shape: what
     // this test is about is the missing baseline, not the id.)
     let root = unique_root("old-hidden-row");
-    let directory = write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_000);
+    let directory = write_world(
+        &root,
+        "pack",
+        "1.20.1-forge",
+        "Old World",
+        "Old World",
+        0,
+        9_000,
+    );
     let connection = open_test_database(&root);
     let old_value = r#"[{"scope":"instance","modlistName":"pack","instanceName":"1.20.1-forge","folderName":"Old World"}]"#;
     connection
@@ -308,8 +331,8 @@ fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
         }]
     );
 
-    let entries = list_worlds_with_baseline_backfill(&root, &connection)
-        .expect("listing must not fail");
+    let entries =
+        list_worlds_with_baseline_backfill(&root, &connection).expect("listing must not fail");
     assert!(entries[0].hidden, "the world stays where the user left it");
     assert_eq!(
         load_hidden_worlds(&connection).expect("the row must read back"),
@@ -322,9 +345,17 @@ fn an_old_hidden_row_hides_today_and_comes_back_after_the_next_play() {
 
     // He plays it again: it comes back on its own.
     drop(directory);
-    write_world(&root, "pack", "1.20.1-forge", "Old World", "Old World", 0, 9_500);
-    let after_play = list_worlds_with_baseline_backfill(&root, &connection)
-        .expect("listing must not fail");
+    write_world(
+        &root,
+        "pack",
+        "1.20.1-forge",
+        "Old World",
+        "Old World",
+        0,
+        9_500,
+    );
+    let after_play =
+        list_worlds_with_baseline_backfill(&root, &connection).expect("listing must not fail");
     assert!(!after_play[0].hidden);
 
     let _ = fs::remove_dir_all(&root);
@@ -345,11 +376,12 @@ fn a_backfill_leaves_a_hidden_world_that_is_no_longer_on_disk_alone() {
         )
         .expect("the old-format row should write");
 
-    let entries = list_worlds_with_baseline_backfill(&root, &connection)
-        .expect("listing must not fail");
+    let entries =
+        list_worlds_with_baseline_backfill(&root, &connection).expect("listing must not fail");
     assert!(entries.is_empty());
     assert_eq!(
-        load_hidden_worlds(&connection).expect("the row must read back")[0].hidden_at_last_played_ms,
+        load_hidden_worlds(&connection).expect("the row must read back")[0]
+            .hidden_at_last_played_ms,
         None
     );
 
@@ -494,7 +526,15 @@ fn saving_the_settings_form_leaves_the_hidden_worlds_alone() {
 #[test]
 fn quick_play_is_offered_only_when_the_version_declares_it() {
     let root = unique_root("quickplay");
-    write_world(&root, "pack", "1.20.1-forge", "New World", "New World", 0, 1_000);
+    write_world(
+        &root,
+        "pack",
+        "1.20.1-forge",
+        "New World",
+        "New World",
+        0,
+        1_000,
+    );
     let instance_root = root
         .join("mod-lists")
         .join("pack")
@@ -551,7 +591,11 @@ fn a_link_that_stays_inside_the_mod_lists_directory_is_listed() {
     let entries = list_worlds(&root, &[]).expect("listing must not fail");
 
     // One world, not two: the two instances are two ways onto the same bytes.
-    assert_eq!(entries.len(), 1, "one world is one card, not one per path to it");
+    assert_eq!(
+        entries.len(),
+        1,
+        "one world is one card, not one per path to it"
+    );
     assert_eq!(entries[0].id, instance_id("pack", "1.20.1-forge", "Shared"));
     let instances: Vec<&str> = entries[0]
         .instances
@@ -620,8 +664,11 @@ fn a_world_shared_across_mod_lists_lists_every_instance_that_links_it() {
     let shared = root.join(WORLDS_DIR_NAME).join("Shared");
     write_level_dat(&shared, "Shared", 0, 4_000);
 
-    std::os::unix::fs::symlink(&shared, saves_of(&root, "test2", "26.3-fabric").join("Shared"))
-        .expect("failed to link");
+    std::os::unix::fs::symlink(
+        &shared,
+        saves_of(&root, "test2", "26.3-fabric").join("Shared"),
+    )
+    .expect("failed to link");
     std::os::unix::fs::symlink(
         &shared,
         saves_of(&root, "Drehmal APOTHEOSIS", "1.20.1-forge").join("Shared (2)"),
@@ -720,15 +767,21 @@ fn a_link_into_another_folder_of_the_launcher_is_not_listed() {
     // Inside the launcher root, but in neither of the two places a world may be.
     let decoy = root.join("cache").join("Decoy");
     write_level_dat(&decoy, "Decoy", 0, 9_000);
-    std::os::unix::fs::symlink(&decoy, saves_of(&root, "pack", "1.20.1-forge").join("Decoy"))
-        .expect("failed to link");
+    std::os::unix::fs::symlink(
+        &decoy,
+        saves_of(&root, "pack", "1.20.1-forge").join("Decoy"),
+    )
+    .expect("failed to link");
 
     // And one level too deep inside the shared folder: a directory of a
     // world is not a world.
     let nested = root.join(WORLDS_DIR_NAME).join("Real").join("DIM1");
     write_level_dat(&nested, "Nested", 0, 8_000);
-    std::os::unix::fs::symlink(&nested, saves_of(&root, "pack", "1.20.1-forge").join("Nested"))
-        .expect("failed to link");
+    std::os::unix::fs::symlink(
+        &nested,
+        saves_of(&root, "pack", "1.20.1-forge").join("Nested"),
+    )
+    .expect("failed to link");
 
     let entries = list_worlds(&root, &[]).expect("listing must not fail");
     let names: Vec<&str> = entries

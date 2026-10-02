@@ -216,10 +216,11 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
 
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("failed to read {}", source.display()))?
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
     {
-        let entry = entry.with_context(|| format!("failed to read an entry of {}", source.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read an entry of {}", source.display()))?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
         let file_type = fs::symlink_metadata(&from)
@@ -231,10 +232,14 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
         } else if file_type.is_symlink() {
             // A world with a link inside it is not a shape Minecraft writes,
             // and copying it would silently change what the world contains.
-            bail!("{} is a link, which a world folder should not contain", from.display());
+            bail!(
+                "{} is a link, which a world folder should not contain",
+                from.display()
+            );
         } else {
-            fs::copy(&from, &to)
-                .with_context(|| format!("failed to copy {} to {}", from.display(), to.display()))?;
+            fs::copy(&from, &to).with_context(|| {
+                format!("failed to copy {} to {}", from.display(), to.display())
+            })?;
         }
     }
     Ok(())
@@ -456,8 +461,8 @@ pub fn share_world_with_instance(
                 .with_context(|| format!("invalid mod list name '{modlist_name}'"))?;
             validate_path_component(instance_name)
                 .with_context(|| format!("invalid instance name '{instance_name}'"))?;
-            let source = instance_saves_dir(root_dir, modlist_name, instance_name)
-                .join(&world.folder_name);
+            let source =
+                instance_saves_dir(root_dir, modlist_name, instance_name).join(&world.folder_name);
             let metadata = fs::symlink_metadata(&source)
                 .with_context(|| format!("no world at {}", source.display()))?;
             if metadata.file_type().is_symlink() {
@@ -484,7 +489,8 @@ pub fn share_world_with_instance(
 
             // The instance the world came from is an instance like the others
             // now: it gets a link back, under the shared name where it is free.
-            if let Err(error) = link_into_instance(root_dir, modlist_name, instance_name, &world_dir)
+            if let Err(error) =
+                link_into_instance(root_dir, modlist_name, instance_name, &world_dir)
             {
                 // The world is whole in `<root>/worlds/`, so nothing is lost;
                 // putting it back is still the state the user asked for least.
@@ -505,7 +511,12 @@ pub fn share_world_with_instance(
     };
 
     let world_dir = worlds_dir.join(&shared_folder_name);
-    link_into_instance(root_dir, target_modlist_name, target_instance_name, &world_dir)?;
+    link_into_instance(
+        root_dir,
+        target_modlist_name,
+        target_instance_name,
+        &world_dir,
+    )?;
 
     Ok(WorldId {
         home: WorldHome::Shared,
@@ -572,8 +583,8 @@ pub fn unshare_world_from_instance(
             link.display()
         );
     }
-    let resolved_link = fs::canonicalize(&link)
-        .with_context(|| format!("failed to resolve {}", link.display()))?;
+    let resolved_link =
+        fs::canonicalize(&link).with_context(|| format!("failed to resolve {}", link.display()))?;
     let roots = WorldRoots::resolve(&LauncherPaths::new(root_dir.to_path_buf()));
     if roots.place(&resolved_link) != Some(WorldPlace::SharedWorlds) {
         bail!(
@@ -583,8 +594,7 @@ pub fn unshare_world_from_instance(
         );
     }
 
-    remove_directory_link(&link)
-        .with_context(|| format!("failed to remove {}", link.display()))
+    remove_directory_link(&link).with_context(|| format!("failed to remove {}", link.display()))
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────

@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::launcher_paths::LauncherPaths;
-use crate::path_safety::validate_path_component;
 use crate::mod_cache::{CacheProbe, ModCacheRecord};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
+use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
     resolve_modlist, version_rules_conflict, FailureReason, ModLoader, ResolutionResult,
@@ -91,13 +91,10 @@ pub(super) struct DownloadArtifact {
 pub(in crate::launch_preview) fn extract_artifact_name(filename: &str) -> String {
     let stem = filename.strip_suffix(".jar").unwrap_or(filename);
     // Find the last '-' followed by a digit — everything before it is the artifact name
-    if let Some(pos) = stem.rfind(|c: char| c == '-').and_then(|i| {
-        if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
-            Some(i)
-        } else {
-            None
-        }
-    }) {
+    if let Some(pos) = stem
+        .rfind('-')
+        .filter(|&i| stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+    {
         stem[..pos].to_string()
     } else {
         stem.to_string()
@@ -914,7 +911,9 @@ fn report_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &Ca
     let _ = emit_launcher_issue(
         app_handle,
         "Mod left out of the launch",
-        &format!("'{mod_id}' is not in this launch: its jar is not in the cache and cannot be fetched."),
+        &format!(
+            "'{mod_id}' is not in this launch: its jar is not in the cache and cannot be fetched."
+        ),
         &detail,
         "warning",
         "launch",
@@ -1285,7 +1284,11 @@ fn dropped_reason_clause(reason: DropReason, target: &ResolutionTarget, many: bo
 
 /// The long half of the notice: the cause, then what it costs.
 fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
-    let (it, its) = if many { ("them", "their") } else { ("it", "its") };
+    let (it, its) = if many {
+        ("them", "their")
+    } else {
+        ("it", "its")
+    };
 
     let cause = match reason {
         DropReason::NoVersionAndNoCachedJar => {
@@ -1781,13 +1784,8 @@ mod tests {
 
     #[test]
     fn select_preferred_version_uses_release_before_newer_beta() {
-        let release = test_version_with_channel(
-            "iris-release",
-            "2025-02-20T00:00:00Z",
-            "release",
-        );
-        let beta =
-            test_version_with_channel("iris-beta", "2026-06-13T00:00:00Z", "beta");
+        let release = test_version_with_channel("iris-release", "2025-02-20T00:00:00Z", "release");
+        let beta = test_version_with_channel("iris-beta", "2026-06-13T00:00:00Z", "beta");
 
         assert_eq!(
             select_preferred_version(vec![beta, release.clone()]),
@@ -1798,8 +1796,7 @@ mod tests {
     #[test]
     fn select_preferred_version_uses_newest_alpha_when_only_alphas_exist() {
         let older = test_version_with_channel("c2me-older", "2025-01-01T00:00:00Z", "alpha");
-        let newest =
-            test_version_with_channel("c2me-newest", "2026-06-13T00:00:00Z", "alpha");
+        let newest = test_version_with_channel("c2me-newest", "2026-06-13T00:00:00Z", "alpha");
 
         assert_eq!(
             select_preferred_version(vec![newest.clone(), older]),
@@ -1824,8 +1821,7 @@ mod tests {
         let june = test_version("june", "2024-06-01T00:00:00Z");
         let march = test_version("march", "2024-03-01T00:00:00Z");
 
-        let first =
-            select_preferred_version(vec![january.clone(), june.clone(), march.clone()]);
+        let first = select_preferred_version(vec![january.clone(), june.clone(), march.clone()]);
         let second = select_preferred_version(vec![march, january, june.clone()]);
 
         assert_eq!(first, Some(june.clone()));
@@ -1888,10 +1884,12 @@ mod tests {
             modrinth_mod("polytone"),
             modrinth_mod("sodium"),
         ];
-        let split =
-            split_selected_by_cached_hash(&selected, &cached_hashes(&[("sodium", "aaa1")]));
+        let split = split_selected_by_cached_hash(&selected, &cached_hashes(&[("sodium", "aaa1")]));
 
-        assert_eq!(split.hashed, vec![("sodium".to_string(), "aaa1".to_string())]);
+        assert_eq!(
+            split.hashed,
+            vec![("sodium".to_string(), "aaa1".to_string())]
+        );
         assert_eq!(split.unhashed, vec!["polytone"]);
     }
 
@@ -2083,10 +2081,7 @@ mod tests {
         let (covered, uncovered) = split_selected_by_preresolved(&selected, &HashMap::new());
 
         assert!(covered.is_empty());
-        assert_eq!(
-            uncovered,
-            vec!["sodium".to_string(), "lithium".to_string()]
-        );
+        assert_eq!(uncovered, vec!["sodium".to_string(), "lithium".to_string()]);
     }
 
     #[test]
@@ -2100,11 +2095,8 @@ mod tests {
             test_version("sodium-v2", "2026-01-01T00:00:00Z"),
         )]);
 
-        let (all, dropped) = mod_ids_needing_resolution(
-            &covered,
-            &resolved,
-            &["polytone".to_string()],
-        );
+        let (all, dropped) =
+            mod_ids_needing_resolution(&covered, &resolved, &["polytone".to_string()]);
 
         assert_eq!(dropped, vec!["lithium".to_string()]);
         assert_eq!(all, vec!["lithium".to_string(), "polytone".to_string()]);
@@ -2363,7 +2355,10 @@ mod tests {
 
     #[test]
     fn a_mod_nothing_can_install_and_nothing_replaces_is_named() {
-        let modlist = a5_modlist(vec![a5_rule("modernfix", vec![]), a5_rule("sodium", vec![])]);
+        let modlist = a5_modlist(vec![
+            a5_rule("modernfix", vec![]),
+            a5_rule("sodium", vec![]),
+        ]);
 
         let (dropped, loaded) = a5_pass(&modlist, &["modernfix"]);
 

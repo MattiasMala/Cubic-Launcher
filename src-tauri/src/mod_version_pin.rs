@@ -315,7 +315,7 @@ async fn verify_version_belongs_to_mod(
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let database_path = launcher_paths.database_path();
     if database_path.exists() {
-        let connection = Connection::open(&database_path).with_context(|| {
+        let connection = Connection::open(database_path).with_context(|| {
             format!("failed to open the database at {}", database_path.display())
         })?;
         let repository = SqliteModCacheRepository::new(
@@ -332,7 +332,12 @@ async fn verify_version_belongs_to_mod(
     let belongs = client
         .fetch_project_versions(mod_id, target)
         .await
-        .with_context(|| format!("failed to check that version '{}' belongs to '{mod_id}'", version.id))?
+        .with_context(|| {
+            format!(
+                "failed to check that version '{}' belongs to '{mod_id}'",
+                version.id
+            )
+        })?
         .iter()
         .any(|candidate| candidate.id == version.id);
 
@@ -552,7 +557,8 @@ fn apply_pin_plan(
     // The jar of the pin being replaced moves aside before anything else: a
     // rename is undoable, a delete is not.
     if let Some(replaced) = &plan.replaced_pin {
-        snapshot.stash_jar(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
+        snapshot
+            .stash_jar(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
     }
 
     let applied = (|| -> Result<()> {
@@ -727,7 +733,7 @@ impl PinSnapshot {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::resolver::{resolve_modlist, ModLoader, ResolutionTarget, RuleOutcome};
@@ -765,7 +771,7 @@ mod tests {
     }
 
     /// A mod list with the pin target in the middle, so a lost position shows.
-    fn seed_modlist(root: &PathBuf, rules: Vec<Rule>) -> PathBuf {
+    fn seed_modlist(root: &Path, rules: Vec<Rule>) -> PathBuf {
         let modlist_dir = root.join("mod-lists").join("Test Pack");
         fs::create_dir_all(modlist_dir.join("local-jars")).unwrap();
 
@@ -781,7 +787,7 @@ mod tests {
         modlist_dir
     }
 
-    fn source_jar(root: &PathBuf) -> PathBuf {
+    fn source_jar(root: &Path) -> PathBuf {
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let jar = staging.join(PINNED_JAR);
@@ -789,7 +795,7 @@ mod tests {
         jar
     }
 
-    fn pin_input(root: &PathBuf, remove_dynamic: bool) -> ApplyPinInput {
+    fn pin_input(root: &Path, remove_dynamic: bool) -> ApplyPinInput {
         ApplyPinInput {
             modlist_name: "Test Pack".into(),
             dynamic_mod_id: "modernfix".into(),
@@ -854,10 +860,7 @@ mod tests {
         assert_eq!(alternatives, vec!["modernfix"]);
         assert_eq!(pinned.alternatives[0].source, ModSource::Modrinth);
 
-        assert!(modlist_dir
-            .join("local-jars")
-            .join(PINNED_JAR)
-            .exists());
+        assert!(modlist_dir.join("local-jars").join(PINNED_JAR).exists());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1029,7 +1032,7 @@ mod tests {
     const OTHER_JAR: &str = "modernfix-forge-5.27.66+mc1.20.1.jar";
     const OTHER_ID: &str = "modernfix-forge-5.27.66+mc1.20.1";
 
-    fn other_source_jar(root: &PathBuf) -> PathBuf {
+    fn other_source_jar(root: &Path) -> PathBuf {
         let staging = root.join("staging-2");
         fs::create_dir_all(&staging).unwrap();
         let jar = staging.join(OTHER_JAR);

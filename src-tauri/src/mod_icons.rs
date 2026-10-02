@@ -68,7 +68,13 @@ pub fn local_mod_icon_data_url(modlist_dir: &Path, mod_id: &str) -> Option<Strin
     }
 
     let bytes = read_icon_from_jar(&jar).ok().flatten()?;
-    write_icon(modlist_dir, LOCAL_JARS_DIR, &format!("{mod_id}.jar"), &bytes).ok()?;
+    write_icon(
+        modlist_dir,
+        LOCAL_JARS_DIR,
+        &format!("{mod_id}.jar"),
+        &bytes,
+    )
+    .ok()?;
     read_icon_data_url(modlist_dir, &relative)
 }
 
@@ -272,7 +278,10 @@ mod tests {
         let icon = jar_icon(
             "fabric",
             &[
-                ("fabric.mod.json", br#"{"id":"m","icon":"assets/m/icon.png"}"#),
+                (
+                    "fabric.mod.json",
+                    br#"{"id":"m","icon":"assets/m/icon.png"}"#,
+                ),
                 ("assets/m/icon.png", PNG),
             ],
         );
@@ -362,7 +371,10 @@ mod tests {
     fn a_jar_without_loader_metadata_has_no_icon() {
         let icon = jar_icon(
             "no-metadata",
-            &[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"), ("icon.png", PNG)],
+            &[
+                ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+                ("icon.png", PNG),
+            ],
         );
 
         assert_eq!(icon, None);
@@ -458,8 +470,14 @@ mod tests {
         let second = local_mod_icon_data_url(&modlist, "my-mod");
         fs::remove_dir_all(&modlist).ok();
 
-        assert!(cached_exists, "the icon should have been cached on first read");
-        assert!(first.as_deref().unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            cached_exists,
+            "the icon should have been cached on first read"
+        );
+        assert!(first
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
         assert_eq!(first, second);
     }
 
@@ -488,10 +506,7 @@ mod tests {
         );
         let cache = modlist.join(icon_cache_relative_path("my-mod"));
         let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(&cache)
-            .unwrap()
-            .set_modified(older)
-            .unwrap();
+        fs::File::open(&cache).unwrap().set_modified(older).unwrap();
 
         let second = local_mod_icon_data_url(&modlist, "my-mod");
         let cached_bytes = fs::read(&cache).unwrap();
@@ -511,6 +526,9 @@ mod tests {
         fs::remove_dir_all(&modlist).ok();
 
         assert_eq!(url, None);
-        assert!(!wrote_anything, "a missing jar must not create a cache tree");
+        assert!(
+            !wrote_anything,
+            "a missing jar must not create a cache tree"
+        );
     }
 }

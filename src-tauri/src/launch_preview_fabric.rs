@@ -74,9 +74,9 @@ pub(super) fn fabric_issue_reason_priority(reason_code: &str) -> u8 {
     }
 }
 
-pub(super) fn choose_primary_fabric_issue<'a>(
-    issues: &'a HashMap<String, FabricValidationIssue>,
-) -> Option<(&'a String, &'a FabricValidationIssue)> {
+pub(super) fn choose_primary_fabric_issue(
+    issues: &HashMap<String, FabricValidationIssue>,
+) -> Option<(&String, &FabricValidationIssue)> {
     let mut entries = issues.iter().collect::<Vec<_>>();
     entries.sort_by(
         |(left_project_id, left_issue), (right_project_id, right_issue)| {

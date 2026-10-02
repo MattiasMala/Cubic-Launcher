@@ -283,7 +283,11 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
     /// is set to NULL (the account rows, names and UUIDs stay) and a new key
     /// is born. Without that gesture the refusal of `upsert_account` stands.
     /// A keyring that cannot be asked discards nothing: it is an error.
-    pub fn save_login(&self, account: &PlaintextAccountRecord, replace_unreadable: bool) -> Result<()> {
+    pub fn save_login(
+        &self,
+        account: &PlaintextAccountRecord,
+        replace_unreadable: bool,
+    ) -> Result<()> {
         match self.login_save_plan(replace_unreadable)? {
             LoginSavePlan::Upsert => self.upsert_account(account),
             LoginSavePlan::ReplaceUnreadable => {
@@ -586,8 +590,7 @@ mod tests {
         initialize_database(&database_path).expect("database should initialize");
         let connection = Connection::open(&database_path).expect("database should open");
         let secret_store = MemorySecretStore::default();
-        let repository =
-            EncryptedAccountsRepository::new(&connection, secret_store.clone());
+        let repository = EncryptedAccountsRepository::new(&connection, secret_store.clone());
         let account = PlaintextAccountRecord {
             microsoft_id: "account-a".into(),
             xbox_gamertag: Some("PlayerA".into()),
@@ -757,7 +760,10 @@ mod tests {
         }
     }
 
-    fn blobs(connection: &Connection) -> Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    /// `(microsoft_id, access_token_enc, refresh_token_enc)` of one `accounts` row.
+    type AccountBlobs = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+
+    fn blobs(connection: &Connection) -> Vec<AccountBlobs> {
         let mut statement = connection
             .prepare(
                 "SELECT microsoft_id, access_token_enc, refresh_token_enc FROM accounts ORDER BY microsoft_id",
@@ -838,7 +844,10 @@ mod tests {
             .save_login(&player("account-b", "later", false), true)
             .expect("second sign in should save");
         assert_eq!(
-            *secret_store.values.lock().expect("secret store mutex poisoned"),
+            *secret_store
+                .values
+                .lock()
+                .expect("secret store mutex poisoned"),
             key_after_replace
         );
         assert_eq!(reload().refresh_token.as_deref(), Some("refresh-after"));
@@ -855,16 +864,27 @@ mod tests {
     fn a_lone_unreadable_access_blob_is_not_signed_out() {
         let secret_store = MemorySecretStore::default();
         let cipher = AccountTokenCipher::new(secret_store.clone());
-        let access = cipher.encrypt_token("access").expect("token should encrypt");
+        let access = cipher
+            .encrypt_token("access")
+            .expect("token should encrypt");
 
-        assert_eq!(cipher.credential_state(None, Some(&access)), CredentialState::SignedOut);
+        assert_eq!(
+            cipher.credential_state(None, Some(&access)),
+            CredentialState::SignedOut
+        );
         secret_store
             .values
             .lock()
             .expect("secret store mutex poisoned")
             .clear();
-        assert_eq!(cipher.credential_state(None, Some(&access)), CredentialState::Unreadable);
-        assert_eq!(cipher.credential_state(None, None), CredentialState::SignedOut);
+        assert_eq!(
+            cipher.credential_state(None, Some(&access)),
+            CredentialState::Unreadable
+        );
+        assert_eq!(
+            cipher.credential_state(None, None),
+            CredentialState::SignedOut
+        );
     }
 
     /// F1: a keyring that cannot be asked says nothing about the blobs, so
@@ -903,5 +923,4 @@ mod tests {
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
-
 }

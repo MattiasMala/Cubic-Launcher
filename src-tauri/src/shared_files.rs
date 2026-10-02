@@ -380,11 +380,7 @@ pub const SHARED_FILE_OPTIONS_KEY: &str = "shared_file_options";
 /// senza chiedere. Spegnerne uno di nascosto adesso sarebbe un cambio di
 /// comportamento silenzioso; l'interruttore esiste proprio perché chi non vuole
 /// condividere la cronologia possa dirlo.
-pub fn shared_file_enabled(
-    connection: &Connection,
-    modlist_name: &str,
-    file: SharedFile,
-) -> bool {
+pub fn shared_file_enabled(connection: &Connection, modlist_name: &str, file: SharedFile) -> bool {
     load_file_options(connection)
         .get(modlist_name)
         .and_then(|per_file| per_file.get(file.key()).copied())
@@ -515,10 +511,15 @@ pub const BACKUP_SUFFIX: &str = ".bak";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum SharedFileAction {
-    Copied { bytes: u64 },
+    Copied {
+        bytes: u64,
+    },
     /// Come `Copied`, ma il file che stava lì aveva byte diversi e non era mai
     /// stato condiviso: prima di sovrascriverlo se n'è tenuta una copia (D80).
-    CopiedAfterBackup { bytes: u64, backup: String },
+    CopiedAfterBackup {
+        bytes: u64,
+        backup: String,
+    },
     /// La copia canonica non c'è ed è questa istanza a non avere niente da
     /// darle: non c'è niente da fare, e il file dell'istanza resta suo.
     NothingToCopy,
@@ -530,10 +531,14 @@ pub enum SharedFileAction {
     Disabled,
     /// Copiare sarebbe stato peggio che non copiare (D79). Non è un errore: il
     /// lancio continua e l'istanza tiene quello che ha.
-    Refused { reason: String },
+    Refused {
+        reason: String,
+    },
     /// Copiare non è riuscito. Non ferma il lancio: un file condiviso che non
     /// arriva è una lista vuota, un lancio che non parte è un pomeriggio perso.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -71,7 +71,11 @@ const MAX_LEVEL_DAT_BYTES: u64 = 16 * 1024 * 1024;
 /// The tag is in the JSON (`scope`), so the frontend gets a discriminated
 /// union rather than a pair of nullable fields it has to correlate by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "scope", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "scope",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WorldHome {
     /// In one instance's `saves/`, and nowhere else. It is that instance's
     /// world and the mod list is part of its name.
@@ -527,7 +531,8 @@ fn saves_entries(dir: &Path, roots: &WorldRoots) -> Result<Vec<SavesEntry>> {
 
     let mut entries = Vec::new();
     for entry in read_dir {
-        let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -639,7 +644,8 @@ fn child_directories(dir: &Path) -> Result<Vec<PathBuf>> {
 
     let mut directories = Vec::new();
     for entry in read_dir {
-        let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
         if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             directories.push(entry.path());
         }
@@ -860,14 +866,9 @@ pub fn set_world_hidden_command(
     let connection =
         Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
 
-    set_world_hidden(
-        &connection,
-        &world,
-        hidden,
-        hidden_at_last_played_ms,
-    )
-    .map(|worlds| worlds.into_iter().map(|stored| stored.id).collect())
-    .map_err(|error| error.to_string())
+    set_world_hidden(&connection, &world, hidden, hidden_at_last_played_ms)
+        .map(|worlds| worlds.into_iter().map(|stored| stored.id).collect())
+        .map_err(|error| error.to_string())
 }
 
 /// Open the world's folder in the system file manager.
