@@ -423,9 +423,9 @@ mod tests {
         candidates_from_java_home_root, candidates_from_path_entries,
         inspect_java_binary_candidates, parse_java_architecture, parse_java_major_version,
         persist_java_installations, required_java_version_for_minecraft,
-        select_exact_java_for_requirement, select_java_for_minecraft,
-        select_java_for_requirement, JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation,
-        JavaInstallationSource, JavaProbe,
+        select_exact_java_for_requirement, select_java_for_minecraft, select_java_for_requirement,
+        JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation, JavaInstallationSource,
+        JavaProbe,
     };
 
     fn unique_test_root() -> PathBuf {

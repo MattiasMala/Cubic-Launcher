@@ -422,12 +422,15 @@ impl ModrinthClient {
                 )
             })?;
 
-        response.json::<Vec<ModrinthVersion>>().await.with_context(|| {
-            format!(
-                "failed to deserialize Modrinth metadata for {} versions",
-                version_ids.len()
-            )
-        })
+        response
+            .json::<Vec<ModrinthVersion>>()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to deserialize Modrinth metadata for {} versions",
+                    version_ids.len()
+                )
+            })
     }
 
     /// Latest version per sha1 hash for a whole modlist, in **three** requests
@@ -495,16 +498,12 @@ impl ModrinthClient {
                 )
             })?
             .error_for_status()
-            .with_context(|| {
-                "Modrinth returned an error for a bulk compatible-version lookup"
-            })?;
+            .with_context(|| "Modrinth returned an error for a bulk compatible-version lookup")?;
 
         response
             .json::<HashMap<String, ModrinthVersion>>()
             .await
-            .with_context(|| {
-                "failed to deserialize Modrinth bulk compatible-version lookup"
-            })
+            .with_context(|| "failed to deserialize Modrinth bulk compatible-version lookup")
     }
 
     async fn post_version_files_update(
@@ -548,9 +547,7 @@ fn default_version_type() -> String {
     "alpha".to_string()
 }
 
-fn deserialize_version_type<'de, D>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error>
+fn deserialize_version_type<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1316,8 +1313,14 @@ mod tests {
                 "game_versions": ["1.21.1"]
             })
         );
-        assert!(!lookup.as_object().expect("body should be an object").contains_key("version_types"));
-        assert!(update.as_object().expect("body should be an object").contains_key("version_types"));
+        assert!(!lookup
+            .as_object()
+            .expect("body should be an object")
+            .contains_key("version_types"));
+        assert!(update
+            .as_object()
+            .expect("body should be an object")
+            .contains_key("version_types"));
     }
 
     #[tokio::test]
@@ -1402,10 +1405,7 @@ mod tests {
         .await
         .expect("lookup should succeed");
 
-        assert_eq!(
-            request_sizes,
-            vec![MAX_HASHES_PER_UPDATE_REQUEST, 7]
-        );
+        assert_eq!(request_sizes, vec![MAX_HASHES_PER_UPDATE_REQUEST, 7]);
     }
 
     #[tokio::test]
@@ -1414,8 +1414,14 @@ mod tests {
         let recorder = StageRecorder::new(vec![(
             "release",
             vec![
-                ("aaa".to_string(), bulk_version("a-rel", "release", "2025-01-01")),
-                ("bbb".to_string(), bulk_version("b-rel", "release", "2025-01-02")),
+                (
+                    "aaa".to_string(),
+                    bulk_version("a-rel", "release", "2025-01-01"),
+                ),
+                (
+                    "bbb".to_string(),
+                    bulk_version("b-rel", "release", "2025-01-02"),
+                ),
             ],
         )]);
 
@@ -1465,7 +1471,10 @@ mod tests {
             ),
             (
                 "beta",
-                vec![("bbb".to_string(), bulk_version("b-beta", "beta", "2025-02-01"))],
+                vec![(
+                    "bbb".to_string(),
+                    bulk_version("b-beta", "beta", "2025-02-01"),
+                )],
             ),
             (
                 "alpha",
@@ -1582,7 +1591,10 @@ mod tests {
         let version: ModrinthVersion =
             serde_json::from_value(value).expect("version should deserialize");
 
-        assert_eq!(version.dependencies[0].dependency_type, DependencyType::Unknown);
+        assert_eq!(
+            version.dependencies[0].dependency_type,
+            DependencyType::Unknown
+        );
         assert_eq!(
             version.dependencies[1].dependency_type,
             DependencyType::Required

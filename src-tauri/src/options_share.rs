@@ -117,13 +117,8 @@ pub fn instance_options_path(instance_root: &Path) -> PathBuf {
 #[serde(tag = "level", rename_all = "camelCase")]
 pub enum OptionsScope {
     Global,
-    Modlist {
-        modlist: String,
-    },
-    Instance {
-        modlist: String,
-        instance: String,
-    },
+    Modlist { modlist: String },
+    Instance { modlist: String, instance: String },
 }
 
 impl OptionsScope {
@@ -192,12 +187,20 @@ pub struct SeedReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum SeedStatus {
-    Seeded { report: SeedReport },
-    SkippedTargetExists { target: String },
-    SkippedNoSource { source: String },
+    Seeded {
+        report: SeedReport,
+    },
+    SkippedTargetExists {
+        target: String,
+    },
+    SkippedNoSource {
+        source: String,
+    },
     /// La semina non si poteva fare in sicurezza. Non seminare è sempre la
     /// direzione giusta: l'istanza tiene i suoi valori e non si rompe niente.
-    Refused { reason: String },
+    Refused {
+        reason: String,
+    },
 }
 
 impl SeedStatus {
@@ -845,13 +848,19 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "fov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true, &BTreeSet::new());
+        let status = seed_into(
+            &launcher_paths,
+            &source,
+            &root.join("target.txt"),
+            false,
+            true,
+            &BTreeSet::new(),
+        );
 
         match status {
-            SeedStatus::Refused { reason } => assert!(
-                reason.contains("version"),
-                "unexpected refusal: {reason}"
-            ),
+            SeedStatus::Refused { reason } => {
+                assert!(reason.contains("version"), "unexpected refusal: {reason}")
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(!root.join("target.txt").exists());
@@ -865,7 +874,14 @@ mod tests {
         let source = root.join("source.txt");
         std::fs::write(&source, "version:999999\nfov:0.5\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &root.join("target.txt"), false, true, &BTreeSet::new());
+        let status = seed_into(
+            &launcher_paths,
+            &source,
+            &root.join("target.txt"),
+            false,
+            true,
+            &BTreeSet::new(),
+        );
 
         match status {
             SeedStatus::Refused { reason } => {
@@ -885,7 +901,14 @@ mod tests {
         std::fs::write(&source, "version:3465\nfov:0.5\n").unwrap();
         std::fs::write(&target, "fov:0.9\n").unwrap();
 
-        let status = seed_into(&launcher_paths, &source, &target, false, true, &BTreeSet::new());
+        let status = seed_into(
+            &launcher_paths,
+            &source,
+            &target,
+            false,
+            true,
+            &BTreeSet::new(),
+        );
 
         assert!(matches!(status, SeedStatus::SkippedTargetExists { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fov:0.9\n");
@@ -916,7 +939,9 @@ mod tests {
         let instance_root = root.join("mod-lists/Drehmal/instances/1.20.1-fabric");
         std::fs::create_dir_all(&instance_root).unwrap();
         let path = instance_options_path(&instance_root);
-        OptionsFile::parse("version:3465\nfov:0.5\n").write(&path).unwrap();
+        OptionsFile::parse("version:3465\nfov:0.5\n")
+            .write(&path)
+            .unwrap();
 
         let error = save_shared_options(
             &launcher_paths,
@@ -1007,8 +1032,7 @@ mod tests {
         assert_eq!(report.data_version, 3465);
         assert_eq!(report.seeded, 3);
 
-        let seeded_text =
-            std::fs::read_to_string(instance_options_path(&instance_root)).unwrap();
+        let seeded_text = std::fs::read_to_string(instance_options_path(&instance_root)).unwrap();
         assert_eq!(
             seeded_text,
             "version:3465\nfov:0.75\nrenderDistance:16\nkey_key.attack:key.mouse.left\n"
@@ -1065,7 +1089,8 @@ mod tests {
             return;
         }
         let launcher_paths = LauncherPaths::new(root.clone());
-        let packs = "version:3465\nfov:0.5\nresourcePacks:[\"vanilla\"]\nincompatibleResourcePacks:[]\n";
+        let packs =
+            "version:3465\nfov:0.5\nresourcePacks:[\"vanilla\"]\nincompatibleResourcePacks:[]\n";
 
         OptionsFile::parse(packs)
             .write(&global_options_path(&launcher_paths))
@@ -1204,7 +1229,10 @@ mod tests {
 
         match status {
             SeedStatus::Refused { reason } => {
-                assert!(reason.contains("the same file"), "unexpected refusal: {reason}")
+                assert!(
+                    reason.contains("the same file"),
+                    "unexpected refusal: {reason}"
+                )
             }
             other => panic!("expected a refusal, got {other:?}"),
         }

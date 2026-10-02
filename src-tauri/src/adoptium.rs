@@ -399,9 +399,8 @@ mod tests {
             size: 42,
         };
 
-        let plan =
-            plan_runtime_download(Path::new("java-runtimes"), 17, package, "windows", "x64")
-                .expect("valid package name should produce a download plan");
+        let plan = plan_runtime_download(Path::new("java-runtimes"), 17, package, "windows", "x64")
+            .expect("valid package name should produce a download plan");
 
         assert_eq!(plan.install_dir, Path::new("java-runtimes").join("java-17"));
         assert_eq!(

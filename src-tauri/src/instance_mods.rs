@@ -123,9 +123,8 @@ pub fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
                 target_path.display()
             );
         }
-        fs::remove_file(target_path).with_context(|| {
-            format!("failed to remove existing link {}", target_path.display())
-        })?;
+        fs::remove_file(target_path)
+            .with_context(|| format!("failed to remove existing link {}", target_path.display()))?;
     }
 
     create_symlink_file(source_path, target_path).or_else(|symlink_error| {
@@ -370,7 +369,10 @@ mod tests {
 
         let result = create_file_link(&source_path, &occupied);
 
-        assert!(result.is_err(), "a directory must not be replaced by a link");
+        assert!(
+            result.is_err(),
+            "a directory must not be replaced by a link"
+        );
         assert_eq!(
             fs::read(occupied.join("inside.txt")).expect("the directory should be intact"),
             b"mine"
@@ -408,7 +410,10 @@ mod tests {
                 .is_symlink(),
             "the user's file must not have become a link"
         );
-        assert!(result.is_err(), "a real file must not be replaced by a link");
+        assert!(
+            result.is_err(),
+            "a real file must not be replaced by a link"
+        );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

@@ -275,8 +275,7 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
         .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
-    let active_account =
-        load_active_account_summary_with_secret_store(&connection, secret_store)?;
+    let active_account = load_active_account_summary_with_secret_store(&connection, secret_store)?;
     let global_settings = load_global_settings(&connection)?;
     let selected_modlist_overrides =
         load_modlist_overrides(&connection, selected_modlist_name.as_deref())?;
@@ -714,7 +713,10 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("profile data should be valid json");
 
-        assert_eq!(parsed.get("username").and_then(|v| v.as_str()), Some("PlayerOne"));
+        assert_eq!(
+            parsed.get("username").and_then(|v| v.as_str()),
+            Some("PlayerOne")
+        );
         assert_eq!(parsed.get("uuid").and_then(|v| v.as_str()), Some("uuid-1"));
         assert!(parsed.get("mc_access_token").is_none());
         assert!(parsed.get("ms_refresh_token").is_none());
@@ -755,10 +757,9 @@ mod tests {
                 params![vec![1_u8, 2, 3], "account-a"],
             )
             .expect("refresh token should corrupt");
-        let disconnected =
-            load_active_account_summary_with_secret_store(&connection, secret_store)
-                .expect("summary should load")
-                .expect("active account should exist");
+        let disconnected = load_active_account_summary_with_secret_store(&connection, secret_store)
+            .expect("summary should load")
+            .expect("active account should exist");
         assert_eq!(disconnected.status, "offline");
         assert_eq!(disconnected.last_mode, "offline");
 
@@ -774,9 +775,8 @@ mod tests {
             .expect("database should initialize");
         fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
 
-        let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
-                .expect("snapshot should load");
+        let snapshot = load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+            .expect("snapshot should load");
 
         assert!(snapshot.modlists.is_empty());
         assert!(snapshot.active_account.is_none());
@@ -872,9 +872,8 @@ mod tests {
             .expect("account should insert");
         drop(connection);
 
-        let snapshot =
-            load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
-                .expect("snapshot should load");
+        let snapshot = load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+            .expect("snapshot should load");
 
         assert_eq!(snapshot.modlists.len(), 1);
         assert_eq!(snapshot.modlists[0].name, "Cubic Vanilla+");

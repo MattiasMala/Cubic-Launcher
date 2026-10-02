@@ -19,11 +19,7 @@ use crate::modrinth::ModrinthVersion;
 use crate::path_safety::validate_path_component;
 use crate::resolver::ResolutionTarget;
 
-pub fn validate_cache_key(
-    mod_loader: &str,
-    version_id: &str,
-    jar_filename: &str,
-) -> Result<()> {
+pub fn validate_cache_key(mod_loader: &str, version_id: &str, jar_filename: &str) -> Result<()> {
     validate_path_component(mod_loader)?;
     validate_path_component(version_id)?;
     validate_path_component(jar_filename)?;
@@ -462,7 +458,8 @@ impl<'connection> SqliteModCacheRepository<'connection> {
         project_id_or_alias: &str,
         target: &ResolutionTarget,
     ) -> Result<Option<String>> {
-        if let Some(version_id) = self.find_cached_version_id_by_project(project_id_or_alias, target)?
+        if let Some(version_id) =
+            self.find_cached_version_id_by_project(project_id_or_alias, target)?
         {
             return Ok(Some(version_id));
         }
@@ -592,7 +589,8 @@ impl<'connection> SqliteModCacheRepository<'connection> {
         project_id_or_alias: &str,
         target: &ResolutionTarget,
     ) -> Result<CacheProbe> {
-        if let Some(record) = self.find_compatible_by_project_or_alias(project_id_or_alias, target)?
+        if let Some(record) =
+            self.find_compatible_by_project_or_alias(project_id_or_alias, target)?
         {
             return Ok(CacheProbe::Ready(record));
         }
@@ -605,11 +603,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
     /// Same three answers for one exact version id — the version a pre-check
     /// handed down, which must not be traded for another one.
-    pub fn probe_version(
-        &self,
-        version_id: &str,
-        target: &ResolutionTarget,
-    ) -> Result<CacheProbe> {
+    pub fn probe_version(&self, version_id: &str, target: &ResolutionTarget) -> Result<CacheProbe> {
         if let Some(record) = self.find_by_version_id(version_id, target)? {
             return Ok(CacheProbe::Ready(record));
         }
@@ -1092,7 +1086,10 @@ mod tests {
         let connection = Connection::open(&database_path).expect("database should open");
         let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
         repository
-            .upsert_modrinth_version(&version("canonical-sodium", "version-1", "sodium.jar"), &target())
+            .upsert_modrinth_version(
+                &version("canonical-sodium", "version-1", "sodium.jar"),
+                &target(),
+            )
             .expect("cache record should insert");
         repository
             .upsert_project_alias("sodium", "canonical-sodium")
@@ -1245,7 +1242,10 @@ mod tests {
         let connection = Connection::open(&database_path).expect("database should open");
         let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
         repository
-            .upsert_modrinth_version(&version("sodium", "local-sodium-1", "sodium.jar"), &target())
+            .upsert_modrinth_version(
+                &version("sodium", "local-sodium-1", "sodium.jar"),
+                &target(),
+            )
             .expect("cache record should insert");
         connection
             .execute(
@@ -1285,7 +1285,10 @@ mod tests {
         // too, or the reported "current" version would not be the one the
         // candidate hash came from.
         repository
-            .upsert_modrinth_version(&version("sodium", "unhashed-row", "sodium-b.jar"), &target())
+            .upsert_modrinth_version(
+                &version("sodium", "unhashed-row", "sodium-b.jar"),
+                &target(),
+            )
             .expect("second row should insert");
         connection
             .execute(

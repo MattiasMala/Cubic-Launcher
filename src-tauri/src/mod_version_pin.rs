@@ -332,7 +332,12 @@ async fn verify_version_belongs_to_mod(
     let belongs = client
         .fetch_project_versions(mod_id, target)
         .await
-        .with_context(|| format!("failed to check that version '{}' belongs to '{mod_id}'", version.id))?
+        .with_context(|| {
+            format!(
+                "failed to check that version '{}' belongs to '{mod_id}'",
+                version.id
+            )
+        })?
         .iter()
         .any(|candidate| candidate.id == version.id);
 
@@ -552,7 +557,8 @@ fn apply_pin_plan(
     // The jar of the pin being replaced moves aside before anything else: a
     // rename is undoable, a delete is not.
     if let Some(replaced) = &plan.replaced_pin {
-        snapshot.stash_jar(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
+        snapshot
+            .stash_jar(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
     }
 
     let applied = (|| -> Result<()> {
@@ -854,10 +860,7 @@ mod tests {
         assert_eq!(alternatives, vec!["modernfix"]);
         assert_eq!(pinned.alternatives[0].source, ModSource::Modrinth);
 
-        assert!(modlist_dir
-            .join("local-jars")
-            .join(PINNED_JAR)
-            .exists());
+        assert!(modlist_dir.join("local-jars").join(PINNED_JAR).exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

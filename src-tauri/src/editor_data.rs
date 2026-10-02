@@ -517,7 +517,6 @@ pub fn save_incompatibilities_from_root(
         }
     }
 
-
     for rule in &mut modlist.rules {
         clear_exclude_if_tree(rule);
     }

@@ -23,8 +23,8 @@ use crate::mod_cache::{
     ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
-use crate::process_streaming::ProcessLogStream;
 use crate::path_safety::validate_path_component;
+use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 

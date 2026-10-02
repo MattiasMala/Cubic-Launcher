@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::token_storage::{AccountTokenCipher, SecretStore};
 use anyhow::Result;
 use rusqlite::Connection;
-use crate::token_storage::{AccountTokenCipher, SecretStore};
 
 pub const DATABASE_FILENAME: &str = "launcher_data.db";
 
@@ -246,8 +246,7 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
     let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = {
         let mut statement = connection
             .prepare("SELECT microsoft_id, refresh_token_enc, profile_data FROM accounts")?;
-        let mapped =
-            statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         mapped.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
@@ -340,9 +339,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{
-        initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME,
-    };
+    use super::{initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME};
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     #[derive(Clone, Default)]

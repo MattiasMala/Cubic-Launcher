@@ -130,7 +130,8 @@ fn child_directories(dir: &Path) -> Result<Vec<PathBuf>> {
 
     let mut directories = Vec::new();
     for entry in read_dir {
-        let entry = entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
+        let entry =
+            entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
         if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             directories.push(entry.path());
         }
@@ -155,10 +156,13 @@ fn collect_screenshots(
     };
 
     for entry in read_dir {
-        let entry = entry.with_context(|| {
-            format!("failed to read an entry of {}", screenshots_dir.display())
-        })?;
-        if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
+        let entry = entry
+            .with_context(|| format!("failed to read an entry of {}", screenshots_dir.display()))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
             continue;
         }
         let path = entry.path();
@@ -473,7 +477,13 @@ mod tests {
 
     /// Write a screenshot with an exact mtime, so the ordering test measures
     /// the filesystem date and not the order of creation.
-    fn write_screenshot(root: &Path, modlist: &str, instance: &str, name: &str, mtime_secs: u64) -> PathBuf {
+    fn write_screenshot(
+        root: &Path,
+        modlist: &str,
+        instance: &str,
+        name: &str,
+        mtime_secs: u64,
+    ) -> PathBuf {
         let directory = screenshots_dir(root, modlist, instance);
         fs::create_dir_all(&directory).expect("failed to create the screenshots directory");
         let path = directory.join(name);
@@ -493,9 +503,27 @@ mod tests {
     #[test]
     fn lists_every_instance_and_ignores_instances_without_a_screenshots_folder() {
         let root = unique_root("listing");
-        write_screenshot(&root, "Drehmal", "1.20.1-forge", "2026-08-18_22.08.58.png", 1_000);
-        write_screenshot(&root, "Drehmal", "1.20.1-forge", "2026-09-19_22.47.09.png", 3_000);
-        write_screenshot(&root, "test2", "26.3-fabric", "2026-09-19_22.50.44.png", 4_000);
+        write_screenshot(
+            &root,
+            "Drehmal",
+            "1.20.1-forge",
+            "2026-08-18_22.08.58.png",
+            1_000,
+        );
+        write_screenshot(
+            &root,
+            "Drehmal",
+            "1.20.1-forge",
+            "2026-09-19_22.47.09.png",
+            3_000,
+        );
+        write_screenshot(
+            &root,
+            "test2",
+            "26.3-fabric",
+            "2026-09-19_22.50.44.png",
+            4_000,
+        );
         // The 1.20.1-fabric case on the real disk: an instance directory that
         // exists and has no screenshots folder at all.
         fs::create_dir_all(
@@ -522,9 +550,21 @@ mod tests {
         assert_eq!(
             described,
             vec![
-                ("test2".into(), "26.3-fabric".into(), "2026-09-19_22.50.44.png".into()),
-                ("Drehmal".into(), "1.20.1-forge".into(), "2026-09-19_22.47.09.png".into()),
-                ("Drehmal".into(), "1.20.1-forge".into(), "2026-08-18_22.08.58.png".into()),
+                (
+                    "test2".into(),
+                    "26.3-fabric".into(),
+                    "2026-09-19_22.50.44.png".into()
+                ),
+                (
+                    "Drehmal".into(),
+                    "1.20.1-forge".into(),
+                    "2026-09-19_22.47.09.png".into()
+                ),
+                (
+                    "Drehmal".into(),
+                    "1.20.1-forge".into(),
+                    "2026-08-18_22.08.58.png".into()
+                ),
             ]
         );
         assert_eq!(entries[0].modified_ms, 4_000_000);
@@ -542,8 +582,14 @@ mod tests {
         write_screenshot(&root, "pack", "instance", "2026-09-19_22.47.09.png", 5_000);
 
         let entries = list_screenshots(&root).expect("listing must not fail");
-        let names: Vec<&str> = entries.iter().map(|entry| entry.file_name.as_str()).collect();
-        assert_eq!(names, vec!["2024-01-01_00.00.00.png", "2026-09-19_22.47.09.png"]);
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.file_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["2024-01-01_00.00.00.png", "2026-09-19_22.47.09.png"]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -586,7 +632,12 @@ mod tests {
         // that stops protecting anything the day the reason changes.
         for (modlist, instance, file_name, reason) in [
             // Climbing out of the folder, the directory, and the root.
-            ("pack", "instance", "../options.txt.png", "must not contain a path separator"),
+            (
+                "pack",
+                "instance",
+                "../options.txt.png",
+                "must not contain a path separator",
+            ),
             (
                 "pack",
                 "instance",
@@ -597,9 +648,19 @@ mod tests {
             ("pack", "..", "shot.png", "invalid instance name"),
             ("..", "instance", "shot.png", "invalid mod list name"),
             // An absolute path is not a component either.
-            ("pack", "instance", "/etc/passwd.png", "must not contain a path separator"),
+            (
+                "pack",
+                "instance",
+                "/etc/passwd.png",
+                "must not contain a path separator",
+            ),
             // A subfolder of screenshots/ is one level too deep.
-            ("pack", "instance", "nested/shot.png", "must not contain a path separator"),
+            (
+                "pack",
+                "instance",
+                "nested/shot.png",
+                "must not contain a path separator",
+            ),
             // Empty names, and a file that is not an image.
             ("pack", "instance", "", "cannot be empty"),
             ("", "instance", "shot.png", "cannot be empty"),
@@ -607,9 +668,10 @@ mod tests {
             // A folder that does not exist at all.
             ("pack", "ghost", "shot.png", "no screenshots folder at"),
         ] {
-            let error =
-                delete_screenshot_with(&root, modlist, instance, file_name, true, None)
-                    .expect_err(&format!("'{modlist}/{instance}/{file_name}' must be refused"));
+            let error = delete_screenshot_with(&root, modlist, instance, file_name, true, None)
+                .expect_err(&format!(
+                    "'{modlist}/{instance}/{file_name}' must be refused"
+                ));
             let reported = format!("{error:#}");
             assert!(
                 reported.contains(reason),
@@ -647,11 +709,12 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, instance_dir.join(SCREENSHOTS_DIR_NAME))
             .expect("failed to link");
 
-        let error =
-            delete_screenshot_with(&root, "pack", "instance", "secret.png", true, None)
-                .expect_err("a linked screenshots folder must be refused");
+        let error = delete_screenshot_with(&root, "pack", "instance", "secret.png", true, None)
+            .expect_err("a linked screenshots folder must be refused");
         assert!(
-            error.to_string().contains("outside the mod lists directory"),
+            error
+                .to_string()
+                .contains("outside the mod lists directory"),
             "unexpected refusal: {error}"
         );
         assert!(victim.exists(), "the linked-to file must survive");
@@ -690,7 +753,10 @@ mod tests {
 
         assert_eq!(outcome.disposal, ScreenshotDisposal::Trashed);
         assert!(!screenshot.exists(), "the screenshot must leave its folder");
-        assert!(bin.join("shot.png").exists(), "the trash must have received it");
+        assert!(
+            bin.join("shot.png").exists(),
+            "the trash must have received it"
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&bin);
@@ -712,7 +778,10 @@ mod tests {
         )
         .expect_err("a failed trashing must not become a deletion");
         let reported = format!("{error:#}");
-        assert!(reported.contains(TRASH_UNAVAILABLE), "unexpected refusal: {reported}");
+        assert!(
+            reported.contains(TRASH_UNAVAILABLE),
+            "unexpected refusal: {reported}"
+        );
         assert!(
             reported.contains("no trash on this machine"),
             "the refusal must carry why the trash failed: {reported}"
@@ -743,7 +812,10 @@ mod tests {
         let error = delete_screenshot_with(&root, "pack", "instance", "shot.png", false, None)
             .expect_err("a deletion with no trash and no confirmation must be refused");
         let reported = format!("{error:#}");
-        assert!(reported.contains(TRASH_UNAVAILABLE), "unexpected refusal: {reported}");
+        assert!(
+            reported.contains(TRASH_UNAVAILABLE),
+            "unexpected refusal: {reported}"
+        );
         assert!(
             reported.contains("no system trash"),
             "unexpected refusal: {reported}"

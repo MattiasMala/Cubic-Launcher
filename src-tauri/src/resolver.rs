@@ -151,16 +151,13 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
 }
 
 /// Collect all mod IDs, their requires, and enabled states across the entire rule tree.
-fn collect_all_requires(
-    rules: &[Rule],
-) -> (Vec<(String, Vec<String>)>, HashMap<String, bool>) {
+fn collect_all_requires(rules: &[Rule]) -> (Vec<(String, Vec<String>)>, HashMap<String, bool>) {
     let mut requires = Vec::new();
     let mut enabled = HashMap::new();
     for rule in rules {
         requires.push((rule.mod_id.clone(), rule.requires.clone()));
         enabled.insert(rule.mod_id.clone(), rule.enabled);
-        let (alternative_requires, alternative_enabled) =
-            collect_all_requires(&rule.alternatives);
+        let (alternative_requires, alternative_enabled) = collect_all_requires(&rule.alternatives);
         requires.extend(alternative_requires);
         enabled.extend(alternative_enabled);
     }
@@ -550,10 +547,7 @@ fn load_cached_hashes_for_backfill(
     Ok(hash_by_mod_id)
 }
 
-fn split_ids_by_cached_hash(
-    ids: &[String],
-    hash_by_mod_id: &HashMap<String, String>,
-) -> HashSplit {
+fn split_ids_by_cached_hash(ids: &[String], hash_by_mod_id: &HashMap<String, String>) -> HashSplit {
     let mut split = HashSplit::default();
     let mut seen = HashSet::new();
 
@@ -746,8 +740,7 @@ pub async fn backfill_availability(
     };
     // Opening or querying mod_cache may fail; fall back to per-project requests.
     let hash_by_mod_id =
-        load_cached_hashes_for_backfill(launcher_paths, &ids_to_check, &target)
-            .unwrap_or_default();
+        load_cached_hashes_for_backfill(launcher_paths, &ids_to_check, &target).unwrap_or_default();
     let split = split_ids_by_cached_hash(&ids_to_check, &hash_by_mod_id);
     let bulk_hash_count = split.hashed.len();
     // Availability only asks whether a compatible version exists, so the
@@ -780,10 +773,8 @@ pub async fn backfill_availability(
     let check_client = client.clone();
     let check_target = target.clone();
     // Match resolve_modlist_command's limit so both paths share the same API pressure.
-    let per_project = check_availability_concurrently(
-        bulk_outcome.per_project_mod_ids,
-        10,
-        move |mod_id| {
+    let per_project =
+        check_availability_concurrently(bulk_outcome.per_project_mod_ids, 10, move |mod_id| {
             let client = check_client.clone();
             let target = check_target.clone();
             async move {
@@ -792,9 +783,8 @@ pub async fn backfill_availability(
                     .await
                     .map(|versions| !versions.is_empty())
             }
-        },
-    )
-    .await;
+        })
+        .await;
     let persisted = merge_backfill_entries(&bulk_outcome.available_mod_ids, &per_project);
     let entries = persisted
         .iter()
@@ -959,18 +949,15 @@ mod tests {
 
         let per_project_calls = Arc::new(AtomicUsize::new(0));
         let recorded_per_project_calls = per_project_calls.clone();
-        let per_project = check_availability_concurrently(
-            bulk.per_project_mod_ids.clone(),
-            10,
-            move |_mod_id| {
+        let per_project =
+            check_availability_concurrently(bulk.per_project_mod_ids.clone(), 10, move |_mod_id| {
                 let calls = recorded_per_project_calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(true)
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         let persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
 
         assert_eq!(bulk_calls.load(Ordering::SeqCst), 1);
@@ -998,18 +985,15 @@ mod tests {
 
         let per_project_calls = Arc::new(AtomicUsize::new(0));
         let recorded_per_project_calls = per_project_calls.clone();
-        let per_project = check_availability_concurrently(
-            bulk.per_project_mod_ids.clone(),
-            10,
-            move |_mod_id| {
+        let per_project =
+            check_availability_concurrently(bulk.per_project_mod_ids.clone(), 10, move |_mod_id| {
                 let calls = recorded_per_project_calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(true)
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         let mut persisted = merge_backfill_entries(&bulk.available_mod_ids, &per_project);
         persisted.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -1111,8 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn network_errors_are_not_persisted_and_bulk_errors_fall_back_per_project() {
         let ids = vec!["sodium".to_string(), "broken-mod".to_string()];
-        let split =
-            split_ids_by_cached_hash(&ids, &cached_hashes(&[("sodium", "hash-a")]));
+        let split = split_ids_by_cached_hash(&ids, &cached_hashes(&[("sodium", "hash-a")]));
         let bulk = resolve_bulk_availability(&split, |_hashes| async {
             Err::<HashMap<String, ModrinthVersion>, _>(anyhow::anyhow!("connection reset"))
         })
@@ -1148,7 +1131,9 @@ mod tests {
     /// in flight against a 300-per-minute limit.
     #[tokio::test]
     async fn per_project_checks_never_exceed_the_permitted_concurrency() {
-        let mod_ids = (0..24).map(|index| format!("mod-{index}")).collect::<Vec<_>>();
+        let mod_ids = (0..24)
+            .map(|index| format!("mod-{index}"))
+            .collect::<Vec<_>>();
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak_in_flight = Arc::new(AtomicUsize::new(0));
         let observed_in_flight = in_flight.clone();

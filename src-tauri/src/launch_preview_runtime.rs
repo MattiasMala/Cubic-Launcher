@@ -606,7 +606,9 @@ pub(super) fn build_instance_root(
         )))
 }
 
-pub(super) fn load_active_account_for_launch_with_diagnostics<S: crate::token_storage::SecretStore>(
+pub(super) fn load_active_account_for_launch_with_diagnostics<
+    S: crate::token_storage::SecretStore,
+>(
     connection: &Connection,
     secret_store: S,
 ) -> Result<(
@@ -696,9 +698,7 @@ pub(super) async fn load_player_identity(
     if let Some(error) = refresh_token_error.as_ref() {
         emit_auth_log(
             app_handle,
-            format!(
-                "Refresh-token decryption failed: {error:#}; launch continues in offline mode"
-            ),
+            format!("Refresh-token decryption failed: {error:#}; launch continues in offline mode"),
         );
     }
     let db_path = launcher_paths.database_path().to_path_buf();
@@ -732,38 +732,39 @@ pub(super) async fn load_player_identity(
                 eprintln!("[Auth] Has refresh token, attempting refresh...");
 
                 let env_path = launcher_paths.root_dir().join(".env");
-                let client_id =
-                    match crate::microsoft_auth::configured_microsoft_client_id(&env_path) {
-                        Ok(Some(client_id)) => client_id,
-                        Ok(None) => {
-                            emit_auth_log(
+                let client_id = match crate::microsoft_auth::configured_microsoft_client_id(
+                    &env_path,
+                ) {
+                    Ok(Some(client_id)) => client_id,
+                    Ok(None) => {
+                        emit_auth_log(
                                 app_handle,
                                 "Microsoft token refresh failed because MICROSOFT_CLIENT_ID is not configured; launch continues in offline mode",
                             );
-                            return Ok(PlayerIdentity {
-                                username,
-                                uuid,
-                                access_token: "0".to_string(),
-                                user_type: "offline".to_string(),
-                                version_type: "Cubic".to_string(),
-                            });
-                        }
-                        Err(error) => {
-                            emit_auth_log(
+                        return Ok(PlayerIdentity {
+                            username,
+                            uuid,
+                            access_token: "0".to_string(),
+                            user_type: "offline".to_string(),
+                            version_type: "Cubic".to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        emit_auth_log(
                                 app_handle,
                                 format!(
                                     "Microsoft token refresh configuration failed: {error:#}; launch continues in offline mode"
                                 ),
                             );
-                            return Ok(PlayerIdentity {
-                                username,
-                                uuid,
-                                access_token: "0".to_string(),
-                                user_type: "offline".to_string(),
-                                version_type: "Cubic".to_string(),
-                            });
-                        }
-                    };
+                        return Ok(PlayerIdentity {
+                            username,
+                            uuid,
+                            access_token: "0".to_string(),
+                            user_type: "offline".to_string(),
+                            version_type: "Cubic".to_string(),
+                        });
+                    }
+                };
 
                 let config = crate::microsoft_auth::MicrosoftOAuthConfig {
                     client_id,
@@ -1258,13 +1259,11 @@ mod tests {
     use zip::write::FileOptions;
 
     use crate::database::initialize_database;
-    use crate::token_storage::{
-        EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore,
-    };
+    use crate::token_storage::{EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore};
 
     use super::{
-        extract_java_archive, forge_profile_libraries_from_json,
-        persist_rotated_refresh_token, read_forge_installer_profile_libraries,
+        extract_java_archive, forge_profile_libraries_from_json, persist_rotated_refresh_token,
+        read_forge_installer_profile_libraries,
     };
 
     #[derive(Clone, Default)]
@@ -1304,8 +1303,7 @@ mod tests {
         initialize_database(&database_path).expect("database should initialize");
         let connection = Connection::open(&database_path).expect("database should open");
         let secret_store = MemorySecretStore::default();
-        let repository =
-            EncryptedAccountsRepository::new(&connection, secret_store.clone());
+        let repository = EncryptedAccountsRepository::new(&connection, secret_store.clone());
         repository
             .upsert_account(&PlaintextAccountRecord {
                 microsoft_id: "account-a".into(),
@@ -1345,11 +1343,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("new refresh blob should load");
-        let subsequently_loaded =
-            EncryptedAccountsRepository::new(&connection, secret_store)
-                .load_active_account()
-                .expect("account should reload")
-                .expect("active account should exist");
+        let subsequently_loaded = EncryptedAccountsRepository::new(&connection, secret_store)
+            .load_active_account()
+            .expect("account should reload")
+            .expect("active account should exist");
         assert_ne!(new_blob, old_blob);
         assert_eq!(
             subsequently_loaded.refresh_token.as_deref(),
