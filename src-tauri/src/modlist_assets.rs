@@ -1494,7 +1494,9 @@ mod tests {
                     selected_other_paths: Vec::new(),
                 },
             )
-            .unwrap_or_else(|error| panic!("export with {case} local-jars should succeed: {error:#}"));
+            .unwrap_or_else(|error| {
+                panic!("export with {case} local-jars should succeed: {error:#}")
+            });
 
             let names = archive_names(&export_path);
             assert_eq!(
