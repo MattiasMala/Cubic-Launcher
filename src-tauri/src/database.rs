@@ -296,15 +296,12 @@ pub(crate) fn migrate_account_tokens_from_profile_data<S: SecretStore>(
                 // is authoritative: re-encrypt it into refresh_token_enc, then
                 // strip the plaintext so the launch path (which reads enc)
                 // recovers the fresh token.
-                match cipher.encrypt_token(plaintext) {
-                    Ok(ciphertext) => {
-                        new_refresh_enc = Some(ciphertext);
-                        map.remove("ms_refresh_token");
-                        removed_refresh = true;
-                    }
-                    // Cipher/keyring unavailable: DEFER — never destroy the only
-                    // copy. The plaintext stays until it can be re-encrypted.
-                    Err(_) => {}
+                // On Err (cipher/keyring unavailable): DEFER — never destroy the
+                // only copy. The plaintext stays until it can be re-encrypted.
+                if let Ok(ciphertext) = cipher.encrypt_token(plaintext) {
+                    new_refresh_enc = Some(ciphertext);
+                    map.remove("ms_refresh_token");
+                    removed_refresh = true;
                 }
             }
         }
