@@ -30,6 +30,9 @@ pub struct AccountSummary {
     /// Display metadata only, never a token (`account_profile_data_json`).
     pub profile_data: Option<String>,
     pub is_active: bool,
+    /// The user's choice to play this account offline (D115), independent of
+    /// `credentials`: a working sign-in can be set to play offline.
+    pub plays_offline: bool,
     pub credentials: CredentialState,
 }
 
@@ -112,6 +115,7 @@ fn account_summary((account, credentials): (AccountRecord, CredentialState)) -> 
         minecraft_uuid: account.minecraft_uuid,
         profile_data: account.profile_data,
         is_active: account.is_active,
+        plays_offline: account.plays_offline,
         credentials,
     }
 }
@@ -231,6 +235,7 @@ mod tests {
                 minecraft_uuid: Some("uuid-a".into()),
                 profile_data: Some("{\"name\":\"PlayerA\"}".into()),
                 is_active: true,
+                plays_offline: false,
                 credentials: CredentialState::Usable,
             }));
             assert!(summaries.contains(&AccountSummary {
@@ -239,6 +244,7 @@ mod tests {
                 minecraft_uuid: Some("uuid-b".into()),
                 profile_data: Some("{\"name\":\"PlayerB\"}".into()),
                 is_active: false,
+                plays_offline: false,
                 credentials: CredentialState::SignedOut,
             }));
         });

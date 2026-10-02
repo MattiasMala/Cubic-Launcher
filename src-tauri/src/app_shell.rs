@@ -52,6 +52,10 @@ pub struct ShellAccount {
     pub credentials: String,
     /// The keyring's own error, only for `keyring_unavailable`.
     pub credentials_detail: Option<String>,
+    /// The user's choice to play this account offline (D115): every launch
+    /// with it is offline, whatever `credentials` says. A second sign apart
+    /// from `status` on purpose: choosing offline is not a broken sign-in.
+    pub plays_offline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -152,6 +156,21 @@ pub fn list_accounts_command(
     let connection =
         Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
     load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
+        .map_err(|error| error.to_string())
+}
+
+/// Saves the choice to play one account offline (D115). The launch and the
+/// update pre-check read it back from the database, never from the frontend.
+#[tauri::command]
+pub fn set_account_plays_offline_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    microsoft_id: String,
+    plays_offline: bool,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
+    AccountsRepository::new(&connection)
+        .set_plays_offline(&microsoft_id, plays_offline)
         .map_err(|error| error.to_string())
 }
 
@@ -411,7 +430,9 @@ fn load_account_list_with_secret_store<S: SecretStore>(
 }
 
 /// The one place where a saved account becomes what the interface shows:
-/// `status` and `last_mode` follow from `credentials` here and nowhere else.
+/// `status` and `last_mode` follow from `credentials` here and nowhere else,
+/// and `plays_offline` passes through untouched — the choice never writes
+/// `status`.
 fn shell_account(summary: AccountSummary) -> ShellAccount {
     // Try to get the Minecraft username from profile_data.
     let mc_username = summary.profile_data.as_deref().and_then(|pd| {
@@ -447,6 +468,7 @@ fn shell_account(summary: AccountSummary) -> ShellAccount {
         },
         credentials: summary.credentials.as_str().to_string(),
         credentials_detail,
+        plays_offline: summary.plays_offline,
     }
 }
 
@@ -772,6 +794,7 @@ mod tests {
                 refresh_token_enc: Some(refresh_token_enc),
                 profile_data: None,
                 is_active: true,
+                plays_offline: false,
             })
             .expect("account should insert");
 
@@ -827,6 +850,7 @@ mod tests {
                     }),
                     profile_data: None,
                     is_active,
+                    plays_offline: false,
                 })
                 .expect("account should insert");
         }
@@ -962,6 +986,7 @@ mod tests {
                 refresh_token_enc: Some(vec![4, 5, 6]),
                 profile_data: Some("{}".into()),
                 is_active: true,
+                plays_offline: false,
             })
             .expect("account should insert");
         drop(connection);

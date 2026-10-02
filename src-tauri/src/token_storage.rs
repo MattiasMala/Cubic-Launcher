@@ -298,6 +298,8 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
                 .transpose()?,
             profile_data: account.profile_data.clone(),
             is_active: account.is_active,
+            // Not written by `upsert_account`: the choice survives a sign-in.
+            plays_offline: false,
         })
     }
 
@@ -345,6 +347,7 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
                     refresh_token_enc,
                     profile_data: account.profile_data.clone(),
                     is_active: account.is_active,
+                    plays_offline: false,
                 })
             }
         }

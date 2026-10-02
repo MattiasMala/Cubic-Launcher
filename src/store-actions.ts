@@ -7,7 +7,6 @@
 import { createSignal } from "solid-js";
 import type { CustomConfig, LauncherUiError, VersionRule } from "./lib/types";
 import {
-  activeAccountId,
   aestheticGroups,
   draftLinks,
   editingGroupId,
@@ -18,7 +17,6 @@ import {
   savedIncompatibilities,
   savedLinks,
   selectedIds,
-  setAccounts,
   setAestheticGroups,
   setAlternativesPanelParentId,
   setCustomConfigs,
@@ -350,18 +348,6 @@ export function setPairWinner(baseId: string, otherId: string, winnerId: string)
     );
     return [...without, { winnerId, loserId: winnerId === baseId ? otherId : baseId }];
   });
-}
-
-export function toggleActiveAccountConnection() {
-  setAccounts(current => current.map(account =>
-    account.id === activeAccountId()
-      ? {
-          ...account,
-          status: account.status === "online" ? "offline" : "online",
-          lastMode: account.status === "online" ? "offline" : "microsoft",
-        }
-      : account
-  ));
 }
 
 export function dismissError(id: string) {

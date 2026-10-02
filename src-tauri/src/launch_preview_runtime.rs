@@ -643,6 +643,23 @@ pub(super) fn load_active_account_for_launch_with_diagnostics<
     ))
 }
 
+/// Whether the active account plays offline (D115), from its database row.
+/// The launch reads it once, before it chooses anything, and the update
+/// pre-check reads it to know it must not run: both decisions come from the
+/// row, never from an argument the frontend passes. No active account plays
+/// online, as before.
+pub(super) fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    Ok(crate::microsoft_auth::AccountsRepository::new(&connection)
+        .load_active_account()?
+        .is_some_and(|account| account.plays_offline))
+}
+
 fn persist_rotated_refresh_token<S: crate::token_storage::SecretStore>(
     connection: &Connection,
     secret_store: S,
@@ -664,9 +681,14 @@ fn emit_auth_log(app_handle: &tauri::AppHandle, detail: impl AsRef<str>) {
     }
 }
 
+/// `plays_offline` is the active account's choice, read once by the launch
+/// (`active_account_plays_offline`): with it the identity is offline even
+/// when the saved sign-in works, and no token refresh is attempted, because a
+/// refresh is network.
 pub(super) async fn load_player_identity(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
+    plays_offline: bool,
 ) -> Result<PlayerIdentity> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -722,6 +744,20 @@ pub(super) async fn load_player_identity(
         );
 
         let microsoft_id = raw.microsoft_id.clone();
+
+        if plays_offline {
+            emit_auth_log(
+                app_handle,
+                "The active account is set to play offline; no token refresh, launching in offline mode",
+            );
+            return Ok(PlayerIdentity {
+                username,
+                uuid,
+                access_token: "0".to_string(),
+                user_type: "offline".to_string(),
+                version_type: "Cubic".to_string(),
+            });
+        }
 
         // Refresh the Minecraft access token using the decrypted MS refresh token.
         let ms_refresh = raw.refresh_token.clone();

@@ -161,13 +161,14 @@ pub(super) struct StartedLaunch {
     pub(super) launch_log_dir: PathBuf,
 }
 
-/// Which of the two resolution paths a launch takes.
+/// Which of the three resolution paths a launch takes.
 ///
-/// The question is "do I have a version map?", not "what setting has the
-/// user": the update notification setting decides whether the popup appears,
-/// never what the launch installs.
+/// The question is "does the active account play offline?" first, then "do I
+/// have a version map?" — never "what setting has the user": the update
+/// notification setting decides whether the popup appears, never what the
+/// launch installs.
 ///
-/// The two paths are not interchangeable and must not be merged. `Resolve`
+/// The paths are not interchangeable and must not be merged. `Resolve`
 /// exists for the degraded case — the pre-check failed (D19) or never ran —
 /// where a mod that was just added and never downloaded has no cached jar to
 /// launch from and would otherwise never be installed.
@@ -179,6 +180,11 @@ pub(super) enum LaunchResolutionPath<'a> {
     /// Resolve versions the way a launch without a pre-check always has, and
     /// download what is missing.
     Resolve,
+    /// The active account plays offline (D115): the cache alone answers which
+    /// mods load and at which version, and no version is looked up on
+    /// Modrinth (`resolve_offline_selection` with no map). There is no
+    /// pre-check map to follow either: the pre-check does not run.
+    Offline,
 }
 
 impl<'a> LaunchResolutionPath<'a> {
@@ -191,11 +197,26 @@ impl<'a> LaunchResolutionPath<'a> {
         }
     }
 
+    /// The path of a launch with the active account's choice (D115), read
+    /// from its database row. An account that plays offline takes `Offline`
+    /// whatever map arrives: the map came from the network, and the path that
+    /// follows it asks Modrinth for the versions the cache does not hold.
+    pub(super) fn for_active_account(
+        plays_offline: bool,
+        resolved_versions: Option<&'a HashMap<String, String>>,
+    ) -> Self {
+        if plays_offline {
+            Self::Offline
+        } else {
+            Self::for_launch(resolved_versions)
+        }
+    }
+
     /// The map, for the stages that pass it down unchanged.
     pub(super) fn preresolved(&self) -> Option<&'a HashMap<String, String>> {
         match self {
             Self::Preresolved(versions) => Some(versions),
-            Self::Resolve => None,
+            Self::Resolve | Self::Offline => None,
         }
     }
 
@@ -204,6 +225,7 @@ impl<'a> LaunchResolutionPath<'a> {
         match self {
             Self::Preresolved(_) => "preresolved_versions",
             Self::Resolve => "resolve",
+            Self::Offline => "offline",
         }
     }
 }

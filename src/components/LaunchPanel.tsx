@@ -21,8 +21,11 @@ interface LaunchPanelProps {
 }
 
 // What the account under the Play button can actually do (F1). Before this it
-// said "Microsoft Account" even when every launch fell back to offline.
+// said "Microsoft Account" even when every launch fell back to offline. An
+// account set to play offline (D115) launches offline whatever its sign-in
+// says, and that is a choice, not a warning.
 function accountSubtitle(account: AccountSummary | undefined): { text: string; warn: boolean } {
+  if (account?.playsOffline) return { text: "Offline · by choice", warn: false };
   switch (account?.credentials) {
     case "unreadable":
     case "signed_out":

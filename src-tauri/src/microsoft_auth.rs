@@ -161,6 +161,10 @@ pub struct AccountRecord {
     pub refresh_token_enc: Option<Vec<u8>>,
     pub profile_data: Option<String>,
     pub is_active: bool,
+    /// The user's choice to play this account offline (D115). Read from the
+    /// row; written only by `set_plays_offline`: `upsert_account` saves a
+    /// sign-in and leaves the choice as it was, so this field is ignored there.
+    pub plays_offline: bool,
 }
 
 pub struct AccountsRepository<'connection> {
@@ -228,6 +232,19 @@ impl<'connection> AccountsRepository<'connection> {
         Ok(())
     }
 
+    /// Saves the user's choice for one account (D115). Nothing else about the
+    /// row changes: the sign-in and its tokens stay as they are.
+    pub fn set_plays_offline(&self, microsoft_id: &str, plays_offline: bool) -> Result<()> {
+        let updated_rows = self.connection.execute(
+            "UPDATE accounts SET plays_offline = ?1 WHERE microsoft_id = ?2",
+            params![plays_offline, microsoft_id],
+        )?;
+        if updated_rows == 0 {
+            bail!("account '{}' does not exist", microsoft_id);
+        }
+        Ok(())
+    }
+
     pub fn delete_account(&self, microsoft_id: &str) -> Result<()> {
         let deleted = self.connection.execute(
             "DELETE FROM accounts WHERE microsoft_id = ?1",
@@ -249,7 +266,8 @@ impl<'connection> AccountsRepository<'connection> {
                 access_token_enc,
                 refresh_token_enc,
                 profile_data,
-                is_active
+                is_active,
+                plays_offline
             FROM accounts
             WHERE is_active = TRUE
             LIMIT 1
@@ -266,6 +284,7 @@ impl<'connection> AccountsRepository<'connection> {
                     refresh_token_enc: row.get(4)?,
                     profile_data: row.get(5)?,
                     is_active: row.get(6)?,
+                    plays_offline: row.get(7)?,
                 })
             })
             .optional()
@@ -282,7 +301,8 @@ impl<'connection> AccountsRepository<'connection> {
                 access_token_enc,
                 refresh_token_enc,
                 profile_data,
-                is_active
+                is_active,
+                plays_offline
             FROM accounts
             ORDER BY last_login DESC, id DESC
             "#,
@@ -298,6 +318,7 @@ impl<'connection> AccountsRepository<'connection> {
                     refresh_token_enc: row.get(4)?,
                     profile_data: row.get(5)?,
                     is_active: row.get(6)?,
+                    plays_offline: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1100,6 +1121,7 @@ mod tests {
                 refresh_token_enc: Some(vec![4, 5, 6]),
                 profile_data: Some("{\"name\":\"PlayerA\"}".into()),
                 is_active: true,
+                plays_offline: false,
             })
             .expect("first account should insert");
         repository
@@ -1111,6 +1133,7 @@ mod tests {
                 refresh_token_enc: Some(vec![10, 11, 12]),
                 profile_data: Some("{\"name\":\"PlayerB\"}".into()),
                 is_active: false,
+                plays_offline: false,
             })
             .expect("second account should insert");
 

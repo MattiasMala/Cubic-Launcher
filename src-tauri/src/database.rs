@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     refresh_token_enc   BLOB,
     last_login          DATETIME,
     profile_data        TEXT,
-    is_active           BOOLEAN DEFAULT FALSE
+    is_active           BOOLEAN DEFAULT FALSE,
+    plays_offline       BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS java_installations (
@@ -92,7 +93,29 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     connection.execute_batch(SCHEMA_SQL)?;
     migrate_mod_cache_schema(&connection)?;
     migrate_mod_cache_target_key(&connection)?;
+    migrate_accounts_plays_offline(&connection)?;
 
+    Ok(())
+}
+
+/// D115: the user's choice to play an account offline. `SCHEMA_SQL` declares
+/// the column, but on a database that already exists its `CREATE TABLE IF
+/// NOT EXISTS` does nothing, so every `accounts` table created before needs
+/// it added here. Idempotent: it asks the table first and only adds a column
+/// that is missing. The default keeps every existing account online, as it
+/// was.
+fn migrate_accounts_plays_offline(connection: &Connection) -> Result<()> {
+    let has_column: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'plays_offline')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE accounts ADD COLUMN plays_offline BOOLEAN NOT NULL DEFAULT FALSE",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -484,6 +507,76 @@ mod tests {
                 params!["mod-b", "version-b", "shared.jar", "1.21.6", "fabric", Option::<String>::None, Option::<String>::None, false],
             )
             .expect("second insert with same filename should succeed after migration");
+
+        drop(connection);
+        fs::remove_file(&database_path).expect("database file should be removable");
+        fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
+    }
+
+    /// The `accounts` table as every database created before D115 has it,
+    /// nine columns: `CREATE TABLE IF NOT EXISTS` never touches it again, so
+    /// only a migration can give it the column of the offline choice.
+    #[test]
+    fn initialize_database_adds_plays_offline_to_a_nine_column_accounts_table() {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("parent directory should exist");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE accounts (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    microsoft_id        TEXT NOT NULL UNIQUE,
+                    xbox_gamertag       TEXT,
+                    minecraft_uuid      TEXT,
+                    access_token_enc    BLOB,
+                    refresh_token_enc   BLOB,
+                    last_login          DATETIME,
+                    profile_data        TEXT,
+                    is_active           BOOLEAN DEFAULT FALSE
+                );
+                INSERT INTO accounts (microsoft_id, xbox_gamertag, is_active)
+                VALUES ('account-before-d115', 'Player', TRUE);
+                "#,
+            )
+            .expect("nine-column accounts table should create");
+        drop(connection);
+
+        initialize_database(&database_path).expect("first start should migrate");
+        initialize_database(&database_path).expect("second start should find nothing to do");
+
+        let connection = Connection::open(&database_path).expect("database should reopen");
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_info('accounts')")
+            .expect("table info should prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("table info should query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("table info should collect");
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|name| *name == "plays_offline")
+                .count(),
+            1,
+            "columns after two starts: {columns:?}"
+        );
+
+        // The row that was there keeps today's behaviour: online, and active.
+        let (plays_offline, is_active): (bool, bool) = connection
+            .query_row(
+                "SELECT plays_offline, is_active FROM accounts WHERE microsoft_id = 'account-before-d115'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the existing account should still be there");
+        assert!(!plays_offline);
+        assert!(is_active);
 
         drop(connection);
         fs::remove_file(&database_path).expect("database file should be removable");

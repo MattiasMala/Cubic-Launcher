@@ -117,6 +117,8 @@ export type AccountSummary = {
   /** Every account the backend lists carries it (D113); absent only on placeholder rows. */
   credentials?: AccountCredentials;
   credentialsDetail?: string | null;
+  /** The user's choice to play this account offline (D115): a separate sign from `status`, which says whether the saved sign-in works. */
+  playsOffline: boolean;
 };
 
 export type LaunchResolutionStage = {
@@ -136,6 +138,7 @@ export type ShellAccount = {
   last_mode: "microsoft" | "offline";
   credentials: AccountCredentials;
   credentials_detail?: string | null;
+  plays_offline: boolean;
 };
 
 export type ShellSnapshot = {

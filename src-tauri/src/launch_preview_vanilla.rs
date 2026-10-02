@@ -20,7 +20,7 @@ use super::{
     EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
 };
 
-// Otto input distinti di un passo del lancio. Una struct di parametri
+// Nove input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
 #[allow(clippy::too_many_arguments)]
@@ -33,6 +33,8 @@ pub(super) async fn run_vanilla_launch_pipeline(
     effective_settings: EffectiveLaunchSettings,
     http_client: reqwest::Client,
     quick_play_singleplayer: Option<String>,
+    // The active account's choice (D115), read once by the caller.
+    plays_offline: bool,
 ) -> Result<StartedLaunch> {
     emit_log(
         &app_handle,
@@ -130,7 +132,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths).await?;
+    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,

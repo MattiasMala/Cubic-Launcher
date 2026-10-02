@@ -7,8 +7,8 @@ use crate::modrinth::{ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
-    automation_exit_code, build_instance_root, build_modded_classpath_entries,
-    contained_loader_library_path, embedded_min_java_requirement,
+    active_account_plays_offline, automation_exit_code, build_instance_root,
+    build_modded_classpath_entries, contained_loader_library_path, embedded_min_java_requirement,
     fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
     forge_wrapper_installer_artifact, load_active_account_for_launch_with_diagnostics,
     load_modlist, local_mod_jar_path, maven_artifact_relative_path,
@@ -54,6 +54,7 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
             refresh_token_enc: Some(vec![1, 2, 3]),
             profile_data: Some(r#"{"username":"ProfilePlayer"}"#.into()),
             is_active: true,
+            plays_offline: false,
         })
         .expect("insert active account");
 
@@ -76,6 +77,67 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
     assert!(refresh_token_error.is_some());
     drop(connection);
     std::fs::remove_file(database_path).expect("remove database");
+}
+
+/// D115: the choice is read from the database row of the active account, and
+/// it decides the path by itself — no map from the pre-check is needed, and a
+/// map that arrives anyway is not followed, because the preresolved path asks
+/// Modrinth for the versions it does not have.
+#[test]
+fn an_active_account_that_plays_offline_launches_on_the_zero_request_path() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root_dir = std::env::temp_dir().join(format!(
+        "cubic-launch-offline-account-{}-{timestamp}",
+        std::process::id()
+    ));
+    let launcher_paths = crate::launcher_paths::LauncherPaths::new(&root_dir);
+    crate::database::initialize_database(launcher_paths.database_path())
+        .expect("initialize database");
+    let connection =
+        rusqlite::Connection::open(launcher_paths.database_path()).expect("open database");
+    let accounts = crate::microsoft_auth::AccountsRepository::new(&connection);
+    accounts
+        .upsert_account(&crate::microsoft_auth::AccountRecord {
+            microsoft_id: "microsoft-id".into(),
+            xbox_gamertag: Some("StoredPlayer".into()),
+            minecraft_uuid: Some("123456781234123412341234567890ab".into()),
+            access_token_enc: Some(vec![1, 2, 3]),
+            refresh_token_enc: Some(vec![1, 2, 3]),
+            profile_data: None,
+            is_active: true,
+            plays_offline: false,
+        })
+        .expect("insert active account");
+
+    // Before the choice: today's path, chosen by the map.
+    let plays_offline = active_account_plays_offline(&launcher_paths).expect("read the choice");
+    assert!(!plays_offline);
+    assert_eq!(
+        LaunchResolutionPath::for_active_account(plays_offline, None),
+        LaunchResolutionPath::Resolve
+    );
+
+    accounts
+        .set_plays_offline("microsoft-id", true)
+        .expect("save the choice");
+    let plays_offline = active_account_plays_offline(&launcher_paths).expect("read the choice");
+    assert!(plays_offline);
+    let path = LaunchResolutionPath::for_active_account(plays_offline, None);
+    assert_eq!(path, LaunchResolutionPath::Offline);
+    assert_eq!(path.preresolved(), None);
+    assert_eq!(path.summary_label(), "offline");
+
+    let map = HashMap::from([("sodium".to_string(), "version-id".to_string())]);
+    assert_eq!(
+        LaunchResolutionPath::for_active_account(plays_offline, Some(&map)),
+        LaunchResolutionPath::Offline
+    );
+
+    drop(connection);
+    std::fs::remove_dir_all(root_dir).expect("remove root");
 }
 
 fn global_settings() -> ShellGlobalSettings {
