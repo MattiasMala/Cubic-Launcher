@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
 use crate::java_runtime::required_java_version_for_minecraft;
-use crate::launch_command::{build_launch_command, JavaLaunchRequest, JavaLaunchSettings};
+use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::LoaderMetadataClient;
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
@@ -15,9 +15,9 @@ use crate::worlds::quick_play_arguments;
 
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
-    load_player_identity, merge_minecraft_and_loader_jvm_arguments, select_or_download_java,
-    spawn_minecraft_process, substitute_loader_placeholders, EffectiveLaunchSettings,
-    LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
+    launch_profiler, load_player_identity, merge_minecraft_and_loader_jvm_arguments,
+    select_or_download_java, spawn_minecraft_process, substitute_loader_placeholders,
+    EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
 };
 
 pub(super) async fn run_vanilla_launch_pipeline(
@@ -185,18 +185,18 @@ pub(super) async fn run_vanilla_launch_pipeline(
 
     let mut classpath_entries = mc_data.library_paths.clone();
     classpath_entries.push(mc_data.client_jar_path.clone());
+    let profiler = launch_profiler(
+        &app_handle,
+        &effective_settings,
+        effective_required_java,
+        launch_log_session.dir(),
+    )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
         java_binary_path: java_binary_path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries,
         loader_metadata,
-        launch_settings: JavaLaunchSettings {
-            min_ram_mb: effective_settings.min_ram_mb,
-            max_ram_mb: effective_settings.max_ram_mb,
-            custom_jvm_args: effective_settings.custom_jvm_args.clone(),
-            profiler: None,
-            wrapper_command: effective_settings.wrapper_command.clone(),
-        },
+        launch_settings: effective_settings.java_launch_settings(profiler),
         additional_game_arguments: quick_play_arguments(
             &instance_root,
             quick_play_singleplayer.as_deref(),

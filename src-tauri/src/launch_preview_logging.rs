@@ -11,13 +11,14 @@ use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{ModAcquisitionPlan, ModCacheRecord};
 use crate::modrinth::ModrinthVersion;
+use crate::launch_command::FlightRecording;
 use crate::process_streaming::{
     ProcessEventSink, ProcessExitEvent, ProcessLogEvent, ProcessLogStream, TauriProcessEventSink,
     MINECRAFT_LOG_EVENT,
 };
 use crate::resolver::ResolutionTarget;
 
-use super::{LaunchProgressEvent, LauncherErrorEvent, SelectedMod};
+use super::{EffectiveLaunchSettings, LaunchProgressEvent, LauncherErrorEvent, SelectedMod};
 
 const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
 
@@ -396,6 +397,20 @@ pub(super) fn set_active_launch_log_session(session: Option<Arc<LaunchLogSession
 
 pub(super) fn current_launch_log_session() -> Option<Arc<LaunchLogSession>> {
     ACTIVE_LAUNCH_LOG_SESSION.lock().unwrap().clone()
+}
+
+/// Decide il profiler del lancio e lo scrive nel log del lancio.
+pub(super) fn launch_profiler(
+    app_handle: &tauri::AppHandle,
+    settings: &EffectiveLaunchSettings,
+    java_major: u32,
+    launch_log_dir: &Path,
+) -> Result<Option<FlightRecording>> {
+    let decision = settings.profiler_decision(java_major, launch_log_dir);
+    if let Some(line) = decision.launch_log_line() {
+        emit_log(app_handle, ProcessLogStream::Stdout, line)?;
+    }
+    Ok(decision.into_recording())
 }
 
 pub(super) fn emit_progress(

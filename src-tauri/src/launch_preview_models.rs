@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
+use crate::launch_command::{decide_profiler, FlightRecording, JavaLaunchSettings, ProfilerDecision};
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
@@ -109,6 +110,7 @@ pub(super) struct EffectiveLaunchSettings {
     pub(super) max_ram_mb: u32,
     pub(super) custom_jvm_args: String,
     pub(super) wrapper_command: Option<String>,
+    pub(super) profiler_enabled: bool,
     pub(super) java_path_override: Option<PathBuf>,
 }
 
@@ -253,11 +255,42 @@ impl EffectiveLaunchSettings {
             } else {
                 Some(wrapper_command)
             },
+            profiler_enabled: overrides
+                .profiler_enabled
+                .unwrap_or(global.profiler_enabled),
             java_path_override: if java_path_override.is_empty() {
                 None
             } else {
                 Some(PathBuf::from(java_path_override))
             },
+        }
+    }
+
+    /// Il profiler di questo lancio: `java_major` è la Java che il lancio richiede, e il file
+    /// finisce nella cartella del lancio (D109).
+    pub(super) fn profiler_decision(
+        &self,
+        java_major: u32,
+        launch_log_dir: &Path,
+    ) -> ProfilerDecision {
+        decide_profiler(
+            self.profiler_enabled,
+            &self.custom_jvm_args,
+            java_major,
+            launch_log_dir,
+        )
+    }
+
+    pub(super) fn java_launch_settings(
+        &self,
+        profiler: Option<FlightRecording>,
+    ) -> JavaLaunchSettings {
+        JavaLaunchSettings {
+            min_ram_mb: self.min_ram_mb,
+            max_ram_mb: self.max_ram_mb,
+            custom_jvm_args: self.custom_jvm_args.clone(),
+            profiler,
+            wrapper_command: self.wrapper_command.clone(),
         }
     }
 }
