@@ -390,6 +390,7 @@ fn save_rule_advanced_updates_fields() {
                 loader: "forge".into(),
             }],
             custom_configs: vec![SaveCustomConfigInput {
+                id: "cc-sodium".into(),
                 mc_versions: vec!["1.21.1".into()],
                 loader: "fabric".into(),
                 target_path: "config/sodium.json".into(),
@@ -419,6 +420,7 @@ fn advanced_batch_with_unknown_id_preserves_config() {
         loader: "fabric".into(),
     }];
     rule.custom_configs = vec![CustomConfig {
+        id: "cc-sodium".into(),
         mc_versions: vec!["1.21.1".into()],
         loader: "fabric".into(),
         target_path: "config/sodium.json".into(),
@@ -472,6 +474,193 @@ fn save_rule_advanced_persists_exclude_if() {
         reloaded.find_rule("sodium").unwrap().exclude_if,
         vec!["optifine"]
     );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// D130: un `rules.json` scritto prima che il custom config avesse un `id` ha
+/// questa forma esatta. Deve caricarsi, e chi lo carica gli dà un id e lo salva:
+/// senza un'identità stabile i file copiati non hanno una cartella.
+#[test]
+fn legacy_custom_config_without_id_loads_and_gets_a_persisted_id() {
+    let root = unique_test_root();
+    let modlist_dir = root.join("mod-lists").join("Pack");
+    fs::create_dir_all(&modlist_dir).unwrap();
+    fs::write(
+        modlist_dir.join("rules.json"),
+        r#"{
+  "schema_version": 4,
+  "modlist_name": "Pack",
+  "author": "Author",
+  "description": "",
+  "rules": [
+    {
+      "mod_id": "sodium",
+      "source": "modrinth",
+      "custom_configs": [
+        {
+          "mc_versions": ["1.21.1"],
+          "loader": "fabric",
+          "target_path": "config",
+          "files": ["sodium-options.json"]
+        }
+      ]
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+
+    let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
+    let assigned = snapshot.rows[0].custom_configs[0].id.clone();
+    assert!(
+        !assigned.is_empty(),
+        "a legacy custom config must get an id"
+    );
+    validate_path_component(&assigned).expect("the id names a directory");
+
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        on_disk.find_rule("sodium").unwrap().custom_configs[0].id,
+        assigned,
+        "the assigned id must be saved, not regenerated at every load"
+    );
+    let reloaded = load_editor_snapshot_from_root(&root, "Pack").unwrap();
+    assert_eq!(reloaded.rows[0].custom_configs[0].id, assigned);
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn custom_config_keeps_its_id_through_save_and_reload() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    save_advanced_batch_from_root(
+        &root,
+        &SaveAdvancedBatchInput {
+            modlist_name: "Pack".into(),
+            requires_entries: vec![],
+            version_rules_entries: vec![],
+            custom_configs_entries: vec![CustomConfigsEntry {
+                mod_id: "sodium".into(),
+                custom_configs: vec![SaveCustomConfigInput {
+                    id: "cc-1727890000000".into(),
+                    mc_versions: vec![],
+                    loader: "any".into(),
+                    target_path: String::new(),
+                    files: vec!["sodium-options.json".into()],
+                }],
+            }],
+        },
+    )
+    .unwrap();
+
+    let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
+    assert_eq!(snapshot.rows[0].custom_configs[0].id, "cc-1727890000000");
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        on_disk.find_rule("sodium").unwrap().custom_configs[0].id,
+        "cc-1727890000000"
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn import_input(sources: &[&Path], current_files: &[&str]) -> ImportCustomConfigFilesInput {
+    ImportCustomConfigFilesInput {
+        modlist_name: "Pack".into(),
+        mod_id: "sodium".into(),
+        config_id: "cc-1".into(),
+        source_paths: sources
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        current_files: current_files.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// D112: il file scelto viene copiato dentro la mod list; l'originale resta
+/// dov'era, con i suoi byte.
+#[test]
+fn import_custom_config_files_copies_into_the_modlist_and_leaves_the_source() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+    let outside = root.join("user-disk");
+    fs::create_dir_all(&outside).unwrap();
+    let source = outside.join("sodium-options.json");
+    fs::write(&source, b"{\"quality\":\"fancy\"}").unwrap();
+
+    let names = import_custom_config_files_from_root(&root, &import_input(&[&source], &[]))
+        .expect("import should succeed");
+
+    assert_eq!(names, vec!["sodium-options.json".to_string()]);
+    let copied = root
+        .join("mod-lists")
+        .join("Pack")
+        .join("config-files")
+        .join("sodium")
+        .join("cc-1")
+        .join("sodium-options.json");
+    assert_eq!(fs::read(&copied).unwrap(), b"{\"quality\":\"fancy\"}");
+    assert_eq!(
+        fs::read(&source).expect("the source must still be there"),
+        b"{\"quality\":\"fancy\"}"
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Due file diversi con lo stesso nome nella stessa scelta: nessuno dei due
+/// viene copiato, e l'errore nomina il file.
+#[test]
+fn import_custom_config_files_rejects_two_different_files_with_one_name() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+    let first = root.join("a").join("options.json");
+    let second = root.join("b").join("options.json");
+    fs::create_dir_all(first.parent().unwrap()).unwrap();
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::write(&first, b"first").unwrap();
+    fs::write(&second, b"second").unwrap();
+
+    let error = import_custom_config_files_from_root(&root, &import_input(&[&first, &second], &[]))
+        .expect_err("two different files with one name must be rejected");
+
+    assert!(error.to_string().contains("options.json"), "{error:#}");
+    assert!(!root
+        .join("mod-lists/Pack/config-files/sodium/cc-1/options.json")
+        .exists());
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Un nome già nel custom config con byte diversi: il file del launcher non
+/// viene sostituito in silenzio. Gli stessi byte invece non sono un conflitto.
+#[test]
+fn import_custom_config_files_does_not_replace_a_listed_file_with_different_bytes() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+    let original = root.join("a").join("options.json");
+    let other = root.join("b").join("options.json");
+    fs::create_dir_all(original.parent().unwrap()).unwrap();
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&original, b"original").unwrap();
+    fs::write(&other, b"other").unwrap();
+    import_custom_config_files_from_root(&root, &import_input(&[&original], &[])).unwrap();
+
+    let error =
+        import_custom_config_files_from_root(&root, &import_input(&[&other], &["options.json"]))
+            .expect_err("a different file under a listed name must be rejected");
+    assert!(error.to_string().contains("options.json"), "{error:#}");
+    let stored = root.join("mod-lists/Pack/config-files/sodium/cc-1/options.json");
+    assert_eq!(fs::read(&stored).unwrap(), b"original");
+
+    let again =
+        import_custom_config_files_from_root(&root, &import_input(&[&original], &["options.json"]))
+            .expect("the same bytes again are not a conflict");
+    assert_eq!(again, vec!["options.json".to_string()]);
 
     fs::remove_dir_all(&root).unwrap();
 }

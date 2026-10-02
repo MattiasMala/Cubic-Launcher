@@ -502,40 +502,53 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
             launcher_paths.configs_cache_dir(),
             &format!("{archive_root}/cache/configs"),
         )?;
-        // Collect config files referenced in rules.json custom_configs
+        // Collect config files referenced in rules.json custom_configs. Since
+        // D112 `files` holds names, resolved in the mod list's own
+        // `config-files/<mod_id>/<id>/`; a name that does not resolve there (a
+        // pre-D112 absolute path, an empty id) is never read as a path.
         let rules_path = modlist_dir.join(RULES_FILENAME);
         if rules_path.exists() {
             if let Ok(modlist) = ModList::read_from_file(&rules_path) {
-                fn collect_config_files(rule: &Rule, out: &mut Vec<(String, String)>) {
+                fn collect_config_files(
+                    modlist_dir: &Path,
+                    rule: &Rule,
+                    out: &mut Vec<(PathBuf, String)>,
+                ) {
                     for cc in &rule.custom_configs {
-                        for file_path in &cc.files {
+                        let Ok(files_dir) = crate::rules::custom_config_files_dir(
+                            modlist_dir,
+                            &rule.mod_id,
+                            &cc.id,
+                        ) else {
+                            continue;
+                        };
+                        for file_name in &cc.files {
+                            if validate_path_component(file_name).is_err() {
+                                continue;
+                            }
                             // Use target_path + filename as archive path
-                            let file_name = Path::new(file_path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown");
                             let archive_rel = if cc.target_path.is_empty() {
                                 format!("config/{file_name}")
                             } else {
                                 let base = cc.target_path.trim_end_matches('/');
                                 format!("{base}/{file_name}")
                             };
-                            out.push((file_path.clone(), archive_rel));
+                            out.push((files_dir.join(file_name), archive_rel));
                         }
                     }
                     for alt in &rule.alternatives {
-                        collect_config_files(alt, out);
+                        collect_config_files(modlist_dir, alt, out);
                     }
                 }
-                let mut config_entries: Vec<(String, String)> = Vec::new();
+                let mut config_entries: Vec<(PathBuf, String)> = Vec::new();
                 for rule in &modlist.rules {
-                    collect_config_files(rule, &mut config_entries);
+                    collect_config_files(&modlist_dir, rule, &mut config_entries);
                 }
                 for (source, rel_path) in &config_entries {
                     add_file_if_exists(
                         &mut archive,
                         &mut added_paths,
-                        Path::new(source),
+                        source,
                         &format!("{archive_root}/{rel_path}"),
                     )?;
                 }
@@ -1419,6 +1432,86 @@ mod tests {
             .read_to_end(&mut exported)
             .expect("local jar entry should read");
         assert_eq!(exported, jar_bytes);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Onda 4, tappa C: dopo D112 `files` contiene nomi, e i byte stanno in
+    /// `config-files/<mod_id>/<id>/`. L'export li cerca lì e li mette nello
+    /// zip allo stesso percorso di prima: `<target_path o config>/<nome>`.
+    #[test]
+    fn export_archive_carries_the_custom_config_files_from_the_modlist() {
+        use crate::rules::{CustomConfig, ModList, ModSource, Rule};
+
+        let root_dir = unique_test_root();
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        let files_dir = modlist_dir.join("config-files").join("sodium").join("cc-1");
+        fs::create_dir_all(&files_dir).expect("config-files dir should exist");
+        fs::write(files_dir.join("sodium-options.json"), b"{\"fancy\":true}")
+            .expect("config file should exist");
+        let shader_dir = modlist_dir.join("config-files").join("sodium").join("cc-2");
+        fs::create_dir_all(&shader_dir).expect("config-files dir should exist");
+        fs::write(shader_dir.join("shader.txt"), b"shader").expect("config file should exist");
+        let config = |id: &str, target_path: &str, file: &str| CustomConfig {
+            id: id.into(),
+            mc_versions: vec![],
+            loader: "any".into(),
+            target_path: target_path.into(),
+            files: vec![file.into()],
+        };
+        ModList {
+            modlist_name: "Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: vec![Rule {
+                mod_id: "sodium".into(),
+                source: ModSource::Modrinth,
+                enabled: true,
+                exclude_if: vec![],
+                requires: vec![],
+                version_rules: vec![],
+                custom_configs: vec![
+                    config("cc-1", "", "sodium-options.json"),
+                    config("cc-2", "shaderpacks", "shader.txt"),
+                ],
+                alternatives: vec![],
+            }],
+        }
+        .write_to_file(&modlist_dir.join(RULES_FILENAME))
+        .expect("rules file should exist");
+        let export_path = root_dir.join("pack.zip");
+
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Pack".into(),
+                destination_path: export_path.display().to_string(),
+                rules_json: true,
+                config_files: true,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: false,
+                selected_other_paths: Vec::new(),
+            },
+        )
+        .expect("export should succeed");
+
+        let names = archive_names(&export_path);
+        let archive_file = fs::File::open(&export_path).expect("archive should open");
+        let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+        for (entry, bytes) in [
+            ("Pack/config/sodium-options.json", &b"{\"fancy\":true}"[..]),
+            ("Pack/shaderpacks/shader.txt", &b"shader"[..]),
+        ] {
+            let mut exported = Vec::new();
+            archive
+                .by_name(entry)
+                .unwrap_or_else(|_| panic!("{entry} must travel; the archive held {names:?}"))
+                .read_to_end(&mut exported)
+                .expect("config entry should read");
+            assert_eq!(exported, bytes);
+        }
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

@@ -1,6 +1,7 @@
 import { For } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { customConfigs, addCustomConfig, removeCustomConfig, updateCustomConfig } from "../../store";
+import { customConfigs, addCustomConfig, removeCustomConfig, updateCustomConfig, pushUiError, rowMap, selectedModListName } from "../../store";
 import { minecraftVersions } from "../../store";
 import { MaterialIcon, XIcon } from "../icons";
 import { Select } from "../Select";
@@ -9,16 +10,38 @@ import { ALL_LOADERS, isTauri } from "./shared";
 export function CustomConfigsSection(props: { modId: string }) {
   const myConfigs = () => customConfigs().filter(config => config.modId === props.modId);
 
+  // D112: the picked files are copied into the mod list by the backend, and
+  // `files` keeps the names it returns — never a path on the user's disk.
   const pickFiles = async (configId: string) => {
     if (!isTauri()) return;
+    const modlistName = selectedModListName();
+    if (!modlistName) return;
+    let result: string | string[] | null;
     try {
-      const result = await openFileDialog({ multiple: true, directory: false });
-      if (!result) return;
-      const paths = Array.isArray(result) ? result : [result];
-      const cfg = customConfigs().find(config => config.id === configId);
-      if (cfg) updateCustomConfig(configId, { files: [...cfg.files, ...paths] });
+      result = await openFileDialog({ multiple: true, directory: false });
     } catch {
-      // dialog cancelled
+      return; // dialog cancelled
+    }
+    if (!result) return;
+    const sourcePaths = Array.isArray(result) ? result : [result];
+    const cfg = customConfigs().find(config => config.id === configId);
+    if (!cfg) return;
+    try {
+      const names = await invoke<string[]>("import_custom_config_files_command", {
+        input: {
+          modlistName,
+          modId: rowMap().get(cfg.modId)?.primaryModId ?? cfg.modId,
+          configId,
+          sourcePaths,
+          currentFiles: cfg.files,
+        },
+      });
+      const current = customConfigs().find(config => config.id === configId);
+      if (!current) return;
+      const added = names.filter(name => !current.files.includes(name));
+      if (added.length > 0) updateCustomConfig(configId, { files: [...current.files, ...added] });
+    } catch (error) {
+      pushUiError({ title: "Could not add config files", message: "The selected files were not copied into the mod list.", detail: String(error), severity: "error", scope: "launch" });
     }
   };
 
@@ -66,7 +89,7 @@ export function CustomConfigsSection(props: { modId: string }) {
                 type="text"
                 value={cfg.targetPath}
                 onInput={e => updateCustomConfig(cfg.id, { targetPath: e.currentTarget.value })}
-                placeholder="e.g. config/sodium.json"
+                placeholder="e.g. config or shaderpacks"
                 class="flex-1 rounded border border-border bg-input px-2 py-1 text-xs text-foreground placeholder-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>
@@ -77,7 +100,7 @@ export function CustomConfigsSection(props: { modId: string }) {
                 <For each={cfg.files}>
                   {(file, idx) => (
                     <div class="flex items-center gap-2 rounded bg-muted/30 px-2 py-1">
-                      <span class="flex-1 truncate text-xs text-foreground" title={file}>{file.split(/[\\/]/).pop()}</span>
+                      <span class="flex-1 truncate text-xs text-foreground" title={file}>{file}</span>
                       <button
                         onClick={() => updateCustomConfig(cfg.id, { files: cfg.files.filter((_, index) => index !== idx()) })}
                         class="shrink-0 text-muted-foreground hover:text-destructive transition-colors"

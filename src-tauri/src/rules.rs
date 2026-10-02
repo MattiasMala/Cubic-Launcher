@@ -1,11 +1,45 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::path_safety::validate_path_component;
+
 pub const RULES_FILENAME: &str = "rules.json";
+
+/// Where the files the user picked for a custom config live, inside the mod
+/// list (D128): `mod-lists/<name>/config-files/<mod_id>/<id>/<file>`. Not under
+/// `cache/`: a cache is material that can be downloaded again, a file picked
+/// from the user's disk is not.
+pub const CUSTOM_CONFIG_FILES_DIRNAME: &str = "config-files";
+
+/// The directory that holds the copied files of one custom config.
+///
+/// `mod_id` and `config_id` become directory names, so both must be a single
+/// path component; an empty id (a `rules.json` nobody has opened in the editor
+/// since D130) has no directory and is an error here.
+pub fn custom_config_files_dir(
+    modlist_dir: &Path,
+    mod_id: &str,
+    config_id: &str,
+) -> Result<PathBuf> {
+    validate_path_component(mod_id)
+        .with_context(|| format!("invalid mod id '{mod_id}' for a custom config"))?;
+    validate_path_component(config_id)
+        .with_context(|| format!("invalid custom config id '{config_id}'"))?;
+    Ok(modlist_dir
+        .join(CUSTOM_CONFIG_FILES_DIRNAME)
+        .join(mod_id)
+        .join(config_id))
+}
+
+/// A fresh custom config id: the frontend makes its own (`cc-<millis>`), this
+/// is for the ones a `rules.json` written before D130 does not have.
+pub fn new_custom_config_id() -> String {
+    format!("cc-{:016x}", rand::random::<u64>())
+}
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -32,9 +66,16 @@ pub struct VersionRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomConfig {
+    /// Stable identity (D130): it names the directory of the copied files.
+    /// `default` because every `rules.json` written before it has no `id`,
+    /// and those must keep loading; the editor fills an empty one and saves it.
+    #[serde(default)]
+    pub id: String,
     pub mc_versions: Vec<String>,
     pub loader: String,
+    /// A directory relative to the instance root (D129); empty means `config`.
     pub target_path: String,
+    /// File names inside [`custom_config_files_dir`], not paths.
     pub files: Vec<String>,
 }
 
@@ -182,6 +223,29 @@ impl ModList {
     pub fn contains_mod_id(&self, mod_id: &str) -> bool {
         self.find_rule(mod_id).is_some()
     }
+
+    /// Give an id to every custom config that has none (a `rules.json` written
+    /// before D130). Returns whether anything changed, so the caller saves.
+    pub fn assign_missing_custom_config_ids(&mut self) -> bool {
+        fn assign(rule: &mut Rule) -> bool {
+            let mut changed = false;
+            for config in &mut rule.custom_configs {
+                if config.id.is_empty() {
+                    config.id = new_custom_config_id();
+                    changed = true;
+                }
+            }
+            for alt in &mut rule.alternatives {
+                changed |= assign(alt);
+            }
+            changed
+        }
+        let mut changed = false;
+        for rule in &mut self.rules {
+            changed |= assign(rule);
+        }
+        changed
+    }
 }
 
 fn validate_rule(rule: &Rule, seen_ids: &mut HashSet<String>) -> Result<()> {
@@ -269,6 +333,7 @@ mod tests {
                         loader: "forge".into(),
                     }],
                     custom_configs: vec![CustomConfig {
+                        id: "cc-sodium".into(),
                         mc_versions: vec!["1.21.1".into()],
                         loader: "fabric".into(),
                         target_path: "config/sodium.json".into(),

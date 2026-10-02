@@ -160,6 +160,7 @@ export function useAppPersistence() {
     const customConfigsEntries = [...ccByMod.entries()].map(([modId, configs]) => ({
       modId,
       customConfigs: configs.map(config => ({
+        id: config.id,
         mcVersions: config.mcVersions,
         loader: config.loader,
         targetPath: config.targetPath,
