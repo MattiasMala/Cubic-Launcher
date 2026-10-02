@@ -760,7 +760,10 @@ mod tests {
         }
     }
 
-    fn blobs(connection: &Connection) -> Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    /// `(microsoft_id, access_token_enc, refresh_token_enc)` of one `accounts` row.
+    type AccountBlobs = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+
+    fn blobs(connection: &Connection) -> Vec<AccountBlobs> {
         let mut statement = connection
             .prepare(
                 "SELECT microsoft_id, access_token_enc, refresh_token_enc FROM accounts ORDER BY microsoft_id",

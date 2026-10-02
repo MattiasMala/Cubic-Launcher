@@ -300,9 +300,10 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
     })
 }
 
-fn load_all_modlist_version_loaders(
-    connection: &Connection,
-) -> Result<HashMap<String, (Option<String>, Option<String>)>> {
+/// `modlist_name` → (`minecraft_version`, `mod_loader`) as stored in `modlist_settings`.
+type VersionLoaderByModlist = HashMap<String, (Option<String>, Option<String>)>;
+
+fn load_all_modlist_version_loaders(connection: &Connection) -> Result<VersionLoaderByModlist> {
     let mut stmt = connection.prepare(
         "SELECT modlist_name, key, value FROM modlist_settings \
          WHERE key IN ('minecraft_version', 'mod_loader')",
@@ -314,7 +315,7 @@ fn load_all_modlist_version_loaders(
             row.get::<_, String>(2)?,
         ))
     })?;
-    let mut map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    let mut map: VersionLoaderByModlist = HashMap::new();
     for row in rows {
         let (name, key, value) = row?;
         let entry = map.entry(name).or_default();

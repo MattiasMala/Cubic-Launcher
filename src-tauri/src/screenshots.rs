@@ -309,6 +309,10 @@ fn resolve_screenshot(
 /// wording instead of showing a bare failure.
 pub const TRASH_UNAVAILABLE: &str = "trash-unavailable:";
 
+/// The injected "put this in the trash" step of `delete_screenshot_with`; `None`
+/// is a platform with no trash. Same lifetimes `Option<&dyn Fn(..)>` elides to.
+type SendToTrash<'a> = Option<&'a (dyn Fn(&Path) -> Result<()> + 'a)>;
+
 pub fn delete_screenshot(
     root_dir: &Path,
     modlist_name: &str,
@@ -317,7 +321,7 @@ pub fn delete_screenshot(
     allow_permanent: bool,
 ) -> Result<DeleteScreenshotOutcome> {
     let send_to_trash = |path: &Path| trash::delete(path).map_err(anyhow::Error::from);
-    let send_to_trash: Option<&dyn Fn(&Path) -> Result<()>> = if trash_supported() {
+    let send_to_trash: SendToTrash<'_> = if trash_supported() {
         Some(&send_to_trash)
     } else {
         None
@@ -342,7 +346,7 @@ fn delete_screenshot_with(
     instance_name: &str,
     file_name: &str,
     allow_permanent: bool,
-    send_to_trash: Option<&dyn Fn(&Path) -> Result<()>>,
+    send_to_trash: SendToTrash<'_>,
 ) -> Result<DeleteScreenshotOutcome> {
     let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
     let resolved_text = resolved.display().to_string();

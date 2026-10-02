@@ -150,8 +150,11 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     })
 }
 
+/// Every `(mod_id, requires)` pair of the rule tree, plus each mod's enabled state.
+type CollectedRequires = (Vec<(String, Vec<String>)>, HashMap<String, bool>);
+
 /// Collect all mod IDs, their requires, and enabled states across the entire rule tree.
-fn collect_all_requires(rules: &[Rule]) -> (Vec<(String, Vec<String>)>, HashMap<String, bool>) {
+fn collect_all_requires(rules: &[Rule]) -> CollectedRequires {
     let mut requires = Vec::new();
     let mut enabled = HashMap::new();
     for rule in rules {
