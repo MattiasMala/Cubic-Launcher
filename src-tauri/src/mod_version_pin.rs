@@ -315,7 +315,7 @@ async fn verify_version_belongs_to_mod(
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let database_path = launcher_paths.database_path();
     if database_path.exists() {
-        let connection = Connection::open(&database_path).with_context(|| {
+        let connection = Connection::open(database_path).with_context(|| {
             format!("failed to open the database at {}", database_path.display())
         })?;
         let repository = SqliteModCacheRepository::new(
