@@ -91,7 +91,7 @@ pub(super) struct DownloadArtifact {
 pub(in crate::launch_preview) fn extract_artifact_name(filename: &str) -> String {
     let stem = filename.strip_suffix(".jar").unwrap_or(filename);
     // Find the last '-' followed by a digit — everything before it is the artifact name
-    if let Some(pos) = stem.rfind(|c: char| c == '-').and_then(|i| {
+    if let Some(pos) = stem.rfind('-').and_then(|i| {
         if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
             Some(i)
         } else {
