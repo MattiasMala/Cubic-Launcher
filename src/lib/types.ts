@@ -243,7 +243,18 @@ export type ContentLookupFailure = {
   error: string;
 };
 
-/** `update_precheck_command`'s payload (`launch_preview_precheck.rs:70-108`). */
+/**
+ * The mods a launch will leave out for one reason (D116), in the banner's
+ * words: `reason` is a clause, `detail` the cause and its cost.
+ */
+export type DroppedModGroup = {
+  /** Mod-list rule ids; nothing local knows a readable name for a mod never downloaded. */
+  modIds: string[];
+  reason: string;
+  detail: string;
+};
+
+/** `update_precheck_command`'s payload (`UpdatePrecheckResult` in `launch_preview_precheck.rs`). */
 export type UpdatePrecheckResult = {
   updates: ModUpdateRow[];
   /** `mod_id → version_id` for every selected Modrinth mod, updated or not (D16, D17). */
@@ -255,6 +266,8 @@ export type UpdatePrecheckResult = {
   resolvedContent: Record<string, Record<string, string>>;
   contentWithoutVersions: ContentEntryWithoutVersions[];
   contentLookupFailures: ContentLookupFailure[];
+  /** Mods the launch will leave out; filled on the offline branch only (D116). */
+  droppedMods: DroppedModGroup[];
 };
 
 /** One screenshot found under an instance's `screenshots/` folder. */
