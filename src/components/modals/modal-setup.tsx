@@ -306,6 +306,27 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
   const [savingOffline, setSavingOffline] = createSignal(false);
+  // D134: "Remove" asks before deleting, one row at a time: the id of the row
+  // waiting for confirmation, or null. Opening or closing the modal drops it.
+  const [confirmRemoveId, setConfirmRemoveId] = createSignal<string | null>(null);
+  const [removing, setRemoving] = createSignal(false);
+
+  createEffect(on(accountsModalOpen, () => setConfirmRemoveId(null)));
+
+  const removeAccount = async (microsoftId: string) => {
+    if (removing()) return;
+    setRemoving(true);
+    try {
+      await invoke("delete_account_command", { microsoftId });
+      if (activeAccountId() === microsoftId) setActiveAccountId("");
+      await loadAccounts();
+    } catch (err) {
+      setLoginError(String(err));
+    } finally {
+      setRemoving(false);
+      setConfirmRemoveId(null);
+    }
+  };
 
   // D115: the choice is saved on the account's row and the list is reloaded
   // from the backend, so what the switch shows is what the next launch reads.
@@ -410,21 +431,40 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                         />
                       </button>
                     </div>
-                    <button
-                      onClick={async e => {
-                        e.stopPropagation();
-                        try {
-                          await invoke("delete_account_command", { microsoftId: acc.id });
-                          if (activeAccountId() === acc.id) setActiveAccountId("");
-                          await loadAccounts();
-                        } catch (err) {
-                          setLoginError(String(err));
-                        }
-                      }}
-                      class="rounded-full px-2 py-0.5 text-[10px] text-destructive hover:bg-destructive/15 transition-colors"
-                    >
-                      Remove
-                    </button>
+                    <Show when={confirmRemoveId() === acc.id} fallback={
+                      <button
+                        onClick={e => {
+                          e.stopPropagation();
+                          setConfirmRemoveId(acc.id);
+                        }}
+                        class="rounded-full px-2 py-0.5 text-[10px] text-destructive hover:bg-destructive/15 transition-colors"
+                      >
+                        Remove
+                      </button>
+                    }>
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-[10px] text-red-400">Are you sure?</span>
+                        <button
+                          onClick={e => {
+                            e.stopPropagation();
+                            void removeAccount(acc.id);
+                          }}
+                          disabled={removing()}
+                          class="rounded-full bg-red-600 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                        >
+                          {removing() ? "Removing..." : "Yes, remove"}
+                        </button>
+                        <button
+                          onClick={e => {
+                            e.stopPropagation();
+                            setConfirmRemoveId(null);
+                          }}
+                          class="rounded-full bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground hover:bg-secondary/80"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </Show>
                   </div>
                 </div>
                 <Show when={acc.credentials && acc.credentials !== "usable" ? acc.credentials : undefined}>
