@@ -7,7 +7,6 @@ import {
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
   accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, setActiveAccountId, activeAccount,
-  toggleActiveAccountConnection,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
   createModlistModalOpen, setCreateModlistModalOpen,
@@ -295,6 +294,21 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
 export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<void> }) {
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
+  const [savingOffline, setSavingOffline] = createSignal(false);
+
+  // D115: the choice is saved on the account's row and the list is reloaded
+  // from the backend, so what the switch shows is what the next launch reads.
+  const setPlaysOffline = async (microsoftId: string, playsOffline: boolean) => {
+    setSavingOffline(true);
+    try {
+      await invoke("set_account_plays_offline_command", { microsoftId, playsOffline });
+      await loadAccounts();
+    } catch (err) {
+      setLoginError(String(err));
+    } finally {
+      setSavingOffline(false);
+    }
+  };
 
   // `replaceUnreadable` is the explicit "Sign in again" (F1): only that button
   // lets the backend discard saved sign-ins the keyring says nobody can read.
@@ -362,6 +376,29 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     <Show when={acc.id === activeAccountId()}>
                       <span class="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] text-primary">Active</span>
                     </Show>
+                    <div class="flex items-center gap-1.5">
+                      <span class="text-[10px] text-muted-foreground">Play offline</span>
+                      <button
+                        role="switch"
+                        aria-checked={acc.playsOffline}
+                        aria-label={`Play ${acc.gamertag} offline`}
+                        disabled={savingOffline()}
+                        data-testid={`account-plays-offline-switch-${acc.id}`}
+                        onClick={e => {
+                          e.stopPropagation();
+                          void setPlaysOffline(acc.id, !acc.playsOffline);
+                        }}
+                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
+                          acc.playsOffline ? "border-primary bg-primary" : "border-border bg-muted"
+                        }`}
+                      >
+                        <span
+                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
+                            acc.playsOffline ? "translate-x-6" : "translate-x-1"
+                          }`}
+                        />
+                      </button>
+                    </div>
                     <button
                       onClick={async e => {
                         e.stopPropagation();
@@ -434,7 +471,6 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
           </For>
         </div>
         <div class="flex justify-end border-t border-border px-6 py-4">
-          <button onClick={toggleActiveAccountConnection} class="mr-auto rounded-md bg-secondary px-3 py-1.5 text-sm text-secondary-foreground hover:bg-secondary/80">Toggle Online/Offline</button>
           <button onClick={() => setAccountsModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Close</button>
         </div>
       </Modal>

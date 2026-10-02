@@ -58,6 +58,7 @@ function toAccountSummary(account: ShellAccount): AccountSummary {
     lastMode: account.last_mode,
     credentials: account.credentials,
     credentialsDetail: account.credentials_detail,
+    playsOffline: account.plays_offline,
   };
 }
 

@@ -41,7 +41,7 @@ export const DEMO_MOD_LISTS: ModListCard[] = [
 ];
 
 export const DEMO_ACCOUNTS: AccountSummary[] = [
-  { id: "demo", gamertag: "Not logged in", email: "", status: "offline", lastMode: "offline" },
+  { id: "demo", gamertag: "Not logged in", email: "", status: "offline", lastMode: "offline", playsOffline: false },
 ];
 
 export const MOCK_MODRINTH: ModrinthResult[] = [
