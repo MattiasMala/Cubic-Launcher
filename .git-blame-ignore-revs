@@ -1,0 +1,6 @@
+# Commit di solo riformattamento, da saltare in `git blame`.
+# Uso locale: git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub legge questo file da solo.)
+
+# style: cargo fmt su tutto src-tauri (gate fmt/clippy, D120)
+a5942a70909194d492cc4d82cf14048e51c35916
