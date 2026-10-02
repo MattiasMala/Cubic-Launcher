@@ -20,6 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Il numero di versione vive in due posti: rust-toolchain.toml e i ref
+      # dell'action in tre workflow. Il file vince sul `rustup default` che
+      # l'action imposta, quindi un ref rimasto indietro non cambia la toolchain
+      # che si usa: la CI resta corretta e si scarica una seconda toolchain in
+      # silenzio. Per lo stesso motivo questo passo non può chiedere a `rustc`
+      # quale versione è attiva — `rustc` risponderebbe leggendo il file, cioè
+      # confrontando il file con se stesso (D136, corretto dopo CUB-12).
+      #
+      # Il pattern è ancorato a inizio riga perché questo file è uno dei file
+      # che `grep -r` legge: senza l'ancora trova se stesso e il passo fallisce
+      # a ogni run. La lineetta è opzionale perché launch-harness.yml scrive
+      # `uses:` sotto un `- name:`. Non togliere né l'ancora né il `-?`.
+      - name: Toolchain pin matches the action refs
+        run: |
+          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          refs=$(grep -rhoP '^\s*-?\s*uses:\s*dtolnay/rust-toolchain@\K\S+' .github/workflows/ | sort -u)
+          echo "pinned=$pinned"
+          echo "refs=$refs"
+          test "$refs" = "$pinned"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -72,17 +92,6 @@ jobs:
           # A missing jar fails the test instead of skipping it.
           CUBIC_REQUIRE_CLIENT_JARS: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      # Il numero di versione vive in due posti: rust-toolchain.toml e i ref
-      # dell'action. Se uno si alza e l'altro no la CI resta corretta ma installa
-      # due toolchain, e nessuno se ne accorge. Questo passo rende la divergenza
-      # rumorosa invece che silenziosa (D136).
-      - name: Toolchain pin matches
-        run: |
-          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
-          active=$(rustc --version | cut -d' ' -f2)
-          echo "pinned=$pinned active=$active"
-          test "$pinned" = "$active"
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
