@@ -916,7 +916,6 @@ export default function App() {
           modlistName: selectedModListName(),
           destinationPath: destination,
           rulesJson: options.rulesJson,
-          modJars: options.modJars,
           configFiles: options.configFiles,
           resourcePacks: options.resourcePacks,
           dataPacks: options.dataPacks,

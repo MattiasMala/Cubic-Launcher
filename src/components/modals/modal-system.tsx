@@ -232,11 +232,6 @@ export function ExportModal(props: { onExport: () => Promise<void> }) {
           </label>
 
           <label class="flex items-center gap-3 text-sm">
-            <input type="checkbox" checked={exportOptions().modJars} onChange={e => setExportOptions(options => ({ ...options, modJars: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
-            <span class="text-foreground">Mod JAR files from cache</span>
-          </label>
-
-          <label class="flex items-center gap-3 text-sm">
             <input type="checkbox" checked={exportOptions().configFiles} onChange={e => setExportOptions(options => ({ ...options, configFiles: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
             <span class="text-foreground">Config files</span>
           </label>
@@ -319,9 +314,7 @@ export function ExportModal(props: { onExport: () => Promise<void> }) {
           </div>
 
           <p class="pt-2 text-xs text-muted-foreground">
-            {exportOptions().rulesJson && !exportOptions().modJars
-              ? "Rules-only export is tiny - the recipient's Cubic Launcher will download dependencies automatically."
-              : "Expanded export bundles more content for portable sharing."}
+            Exports the mod list and the jars that cannot be re-downloaded. Everything else the recipient's Cubic Launcher downloads automatically.
           </p>
         </div>
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">

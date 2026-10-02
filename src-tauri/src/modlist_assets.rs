@@ -11,6 +11,7 @@ use zip::write::FileOptions;
 
 use crate::atomic_write::write_atomically;
 use crate::launcher_paths::LauncherPaths;
+use crate::mod_icons::LOCAL_JARS_DIR;
 use crate::path_safety::{contained_join, validate_path_component};
 use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
 
@@ -76,7 +77,6 @@ pub struct ExportModlistInput {
     pub modlist_name: String,
     pub destination_path: String,
     pub rules_json: bool,
-    pub mod_jars: bool,
     pub config_files: bool,
     pub resource_packs: bool,
     #[serde(default)]
@@ -482,14 +482,18 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         &format!("{archive_root}/{MODLIST_GROUP_LAYOUT_FILENAME}"),
     )?;
 
-    if input.mod_jars {
-        add_directory_contents(
-            &mut archive,
-            &mut added_paths,
-            launcher_paths.mods_cache_dir(),
-            &format!("{archive_root}/cache/mods"),
-        )?;
-    }
+    // D107: i jar di `local-jars/` sono gli unici che chi importa non può
+    // riscaricare (un mod pinnato è un mod locale, D14), quindi viaggiano
+    // sempre, come presentation e group layout. La cache globale dei mod no:
+    // è la metà riscaricabile, e l'import scarta comunque tutto `cache/`.
+    // Una cartella vuota o assente non aggiunge voci: `add_directory_contents`
+    // scrive solo file e salta una radice che non esiste.
+    add_directory_contents(
+        &mut archive,
+        &mut added_paths,
+        &modlist_dir.join(LOCAL_JARS_DIR),
+        &format!("{archive_root}/{LOCAL_JARS_DIR}"),
+    )?;
 
     if input.config_files {
         add_directory_contents(
@@ -1024,7 +1028,6 @@ mod tests {
                 modlist_name: "Safe Pack".into(),
                 destination_path: root_dir.join("traversal.zip").display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1045,7 +1048,6 @@ mod tests {
                 modlist_name: "Safe Pack".into(),
                 destination_path: valid_archive_path.display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1105,7 +1107,6 @@ mod tests {
                     modlist_name: "Safe Pack".into(),
                     destination_path: archive_path.display().to_string(),
                     rules_json: false,
-                    mod_jars: false,
                     config_files: false,
                     resource_packs: false,
                     data_packs: false,
@@ -1153,7 +1154,6 @@ mod tests {
                 modlist_name: "../Unsafe Pack".into(),
                 destination_path: root_dir.join("unsafe.zip").display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1264,7 +1264,6 @@ mod tests {
     fn export_archive_includes_rules_presentation_and_selected_assets() {
         let root_dir = unique_test_root();
         let modlist_dir = root_dir.join("mod-lists").join("Sky Pack");
-        let cache_mods_dir = root_dir.join("cache").join("mods");
         let cache_configs_dir = root_dir.join("cache").join("configs");
         let resourcepacks_dir = modlist_dir
             .join("instances")
@@ -1274,7 +1273,6 @@ mod tests {
         let groups_path = modlist_dir.join(MODLIST_GROUP_LAYOUT_FILENAME);
         let export_path = root_dir.join("sky-pack.zip");
 
-        fs::create_dir_all(&cache_mods_dir).expect("mods cache dir should exist");
         fs::create_dir_all(cache_configs_dir.join("sodium"))
             .expect("configs cache dir should exist");
         fs::create_dir_all(&resourcepacks_dir).expect("resourcepacks dir should exist");
@@ -1284,7 +1282,6 @@ mod tests {
             .expect("presentation file should exist");
         fs::write(&groups_path, b"{\n  \"aestheticGroups\": [{\"id\": \"ag-1\", \"name\": \"Visuals\", \"collapsed\": false}],\n  \"tags\": []\n}\n")
             .expect("group layout file should exist");
-        fs::write(cache_mods_dir.join("sodium.jar"), b"jar").expect("jar should exist");
         fs::write(
             cache_configs_dir.join("sodium").join("options.json"),
             b"config",
@@ -1298,7 +1295,6 @@ mod tests {
                 modlist_name: "Sky Pack".into(),
                 destination_path: export_path.display().to_string(),
                 rules_json: true,
-                mod_jars: true,
                 config_files: true,
                 resource_packs: true,
                 other_files: false,
@@ -1325,7 +1321,6 @@ mod tests {
         assert!(names.contains(&"Sky Pack/rules.json".to_string()));
         assert!(names.contains(&format!("Sky Pack/{MODLIST_PRESENTATION_FILENAME}")));
         assert!(names.contains(&format!("Sky Pack/{MODLIST_GROUP_LAYOUT_FILENAME}")));
-        assert!(names.contains(&"Sky Pack/cache/mods/sodium.jar".to_string()));
         assert!(names.contains(&"Sky Pack/cache/configs/sodium/options.json".to_string()));
         assert!(
             names.contains(&"Sky Pack/instances/1.21.1-fabric/resourcepacks/sky.zip".to_string())
@@ -1346,6 +1341,170 @@ mod tests {
             .read_to_string(&mut config)
             .expect("config should read");
         assert_eq!(config, "config");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Mod list «Pack» con una regola locale e il suo jar in `local-jars/`.
+    /// Ritorna i byte del jar, che sono l'unica copia: nessuno li può
+    /// riscaricare.
+    fn write_modlist_with_local_mod(root_dir: &std::path::Path) -> Vec<u8> {
+        use crate::rules::{ModList, ModSource, Rule};
+
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        let local_jars_dir = modlist_dir.join("local-jars");
+        fs::create_dir_all(&local_jars_dir).expect("local-jars dir should exist");
+        ModList {
+            modlist_name: "Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: vec![Rule {
+                mod_id: "custom-patch".into(),
+                source: ModSource::Local,
+                enabled: true,
+                exclude_if: vec![],
+                requires: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
+                alternatives: vec![],
+            }],
+        }
+        .write_to_file(&modlist_dir.join(RULES_FILENAME))
+        .expect("rules file should exist");
+        let jar_bytes = b"PK\x03\x04 the user's only copy".to_vec();
+        fs::write(local_jars_dir.join("custom-patch.jar"), &jar_bytes)
+            .expect("local jar should exist");
+        jar_bytes
+    }
+
+    fn archive_names(path: &std::path::Path) -> Vec<String> {
+        let archive_file = fs::File::open(path).expect("archive should open");
+        let archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+        archive.file_names().map(str::to_string).collect()
+    }
+
+    /// D107: il jar di un mod locale (o pinnato, D14) non si può riscaricare,
+    /// quindi viaggia sempre con la mod list, senza casella.
+    #[test]
+    fn export_archive_carries_the_local_jars_of_the_modlist() {
+        let root_dir = unique_test_root();
+        let jar_bytes = write_modlist_with_local_mod(&root_dir);
+        let export_path = root_dir.join("pack.zip");
+
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Pack".into(),
+                destination_path: export_path.display().to_string(),
+                rules_json: true,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: false,
+                selected_other_paths: Vec::new(),
+            },
+        )
+        .expect("export should succeed");
+
+        let archive_file = fs::File::open(&export_path).expect("archive should open");
+        let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        let mut exported = Vec::new();
+        archive
+            .by_name("Pack/local-jars/custom-patch.jar")
+            .unwrap_or_else(|_| {
+                panic!("the local jar cited by rules.json must travel; the archive held {names:?}")
+            })
+            .read_to_end(&mut exported)
+            .expect("local jar entry should read");
+        assert_eq!(exported, jar_bytes);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D107: la cache globale dei mod è la metà riscaricabile, e l'import la
+    /// scarta (`modlist_manager.rs`, `cache/`). Non deve finire nello zip.
+    #[test]
+    fn export_archive_never_carries_the_global_mods_cache() {
+        let root_dir = unique_test_root();
+        write_modlist_with_local_mod(&root_dir);
+        let cached_jar = crate::launcher_paths::LauncherPaths::new(root_dir.clone())
+            .mods_cache_dir()
+            .join("fabric")
+            .join("AbCdEf12")
+            .join("sodium.jar");
+        fs::create_dir_all(cached_jar.parent().expect("cached jar has a parent"))
+            .expect("mods cache dir should exist");
+        fs::write(&cached_jar, b"downloadable again").expect("cached jar should exist");
+        let export_path = root_dir.join("pack.zip");
+
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Pack".into(),
+                destination_path: export_path.display().to_string(),
+                rules_json: true,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: false,
+                selected_other_paths: Vec::new(),
+            },
+        )
+        .expect("export should succeed");
+
+        let names = archive_names(&export_path);
+        assert!(
+            !names.iter().any(|name| name.starts_with("Pack/cache/mods")),
+            "the global mods cache must not be exported; the archive held {names:?}"
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Una mod list senza mod locali ha `local-jars/` vuota, e una importata
+    /// da un `rules.json` nudo non ce l'ha proprio: l'export di entrambe deve
+    /// riuscire senza voci per quella cartella.
+    #[test]
+    fn export_without_local_jars_succeeds_and_adds_no_entry_for_them() {
+        let root_dir = unique_test_root();
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        fs::create_dir_all(modlist_dir.join("local-jars")).expect("local-jars dir should exist");
+        fs::write(modlist_dir.join(RULES_FILENAME), b"{}\n").expect("rules file should exist");
+
+        for case in ["empty", "absent"] {
+            if case == "absent" {
+                fs::remove_dir(modlist_dir.join("local-jars"))
+                    .expect("empty local-jars dir should be removable");
+            }
+            let export_path = root_dir.join(format!("pack-{case}.zip"));
+            export_modlist_from_root(
+                &root_dir,
+                &ExportModlistInput {
+                    modlist_name: "Pack".into(),
+                    destination_path: export_path.display().to_string(),
+                    rules_json: true,
+                    config_files: false,
+                    resource_packs: false,
+                    data_packs: false,
+                    shaders: false,
+                    other_files: false,
+                    selected_other_paths: Vec::new(),
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("export with {case} local-jars should succeed: {error:#}")
+            });
+
+            let names = archive_names(&export_path);
+            assert_eq!(
+                names,
+                vec!["Pack/rules.json".to_string()],
+                "{case} local-jars must add no entry"
+            );
+        }
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

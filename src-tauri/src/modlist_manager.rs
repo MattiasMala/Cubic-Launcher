@@ -776,4 +776,74 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// D107, il caso che interessa a chi riceve la mod list: un mod locale
+    /// (o pinnato, D14) esportato da una root e importato in un'altra arriva
+    /// con il suo jar, byte per byte. Senza, l'import produce una voce locale
+    /// senza jar, cioè `CacheProbe::JarMissingUnrecoverable`.
+    #[test]
+    fn local_jar_survives_export_and_import_into_another_root() {
+        use crate::modlist_assets::{export_modlist_from_root, ExportModlistInput};
+
+        let sender = unique_test_root();
+        fs::create_dir_all(sender.join("mod-lists")).unwrap();
+        create_modlist_from_root(
+            &sender,
+            &CreateModlistInput {
+                name: "Shared Pack".into(),
+                author: "Author".into(),
+                description: String::new(),
+            },
+        )
+        .unwrap();
+        let source_jar = sender.join("source").join("custom-patch-1.0.jar");
+        fs::create_dir_all(source_jar.parent().unwrap()).unwrap();
+        let jar_bytes = b"PK\x03\x04 the sender's only copy".to_vec();
+        fs::write(&source_jar, &jar_bytes).unwrap();
+        copy_local_jar_from_root(
+            &sender,
+            &CopyLocalJarInput {
+                source_path: source_jar.to_string_lossy().into_owned(),
+                modlist_name: "Shared Pack".into(),
+            },
+        )
+        .unwrap();
+
+        let archive_path = sender.join("shared-pack.zip");
+        export_modlist_from_root(
+            &sender,
+            &ExportModlistInput {
+                modlist_name: "Shared Pack".into(),
+                destination_path: archive_path.display().to_string(),
+                rules_json: true,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: false,
+                selected_other_paths: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let recipient = unique_test_root();
+        fs::create_dir_all(recipient.join("mod-lists")).unwrap();
+        let imported_name =
+            import_modlist_from_root(&recipient, archive_path.to_str().unwrap()).unwrap();
+
+        let imported_jar = recipient
+            .join("mod-lists")
+            .join(&imported_name)
+            .join("local-jars")
+            .join("custom-patch-1.0.jar");
+        assert!(
+            imported_jar.exists(),
+            "the imported mod list must carry its local jar at {}",
+            imported_jar.display()
+        );
+        assert_eq!(fs::read(&imported_jar).unwrap(), jar_bytes);
+
+        fs::remove_dir_all(&sender).unwrap();
+        fs::remove_dir_all(&recipient).unwrap();
+    }
 }
