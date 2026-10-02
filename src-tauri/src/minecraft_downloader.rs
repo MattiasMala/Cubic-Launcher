@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use tauri::{Emitter, State};
 use tokio::task::JoinSet;
 
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::{contained_join, validate_path_component};
-use crate::process_streaming::{ProcessLogEvent, ProcessLogStream, MINECRAFT_LOG_EVENT};
 
 const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -333,22 +331,6 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
 
 // ── Version list ──────────────────────────────────────────────────────────────
 
-/// Returns all Minecraft version IDs from the Mojang manifest, newest first.
-pub async fn fetch_all_versions(http_client: &reqwest::Client) -> Result<Vec<String>> {
-    let manifest: VersionManifest = http_client
-        .get(VERSION_MANIFEST_URL)
-        .send()
-        .await
-        .context("failed to fetch Minecraft version manifest")?
-        .error_for_status()
-        .context("Minecraft version manifest returned HTTP error")?
-        .json()
-        .await
-        .context("failed to deserialize Minecraft version manifest")?;
-
-    Ok(manifest.versions.into_iter().map(|v| v.id).collect())
-}
-
 /// Returns `true` if `client.jar` for the given version is already in the cache.
 pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool {
     launcher_paths
@@ -400,91 +382,6 @@ pub async fn fetch_minecraft_versions_command() -> Result<MinecraftVersionsPaylo
         releases,
         with_snapshots,
     })
-}
-
-/// Spawns a background task that pre-downloads every missing Minecraft release version.
-/// Returns immediately; the download runs concurrently with normal launcher use.
-#[tauri::command]
-pub fn start_minecraft_predownload_command(
-    app_handle: tauri::AppHandle,
-    launcher_paths: State<'_, LauncherPaths>,
-) -> Result<(), String> {
-    let launcher_paths = launcher_paths.inner().clone();
-
-    tauri::async_runtime::spawn(async move {
-        let http_client = reqwest::Client::new();
-
-        let versions = match fetch_all_versions(&http_client).await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = app_handle.emit(
-                    MINECRAFT_LOG_EVENT,
-                    ProcessLogEvent {
-                        stream: ProcessLogStream::Stderr,
-                        line: format!("[MC Sync] Failed to fetch version list: {e}"),
-                    },
-                );
-                return;
-            }
-        };
-
-        let missing: Vec<&str> = versions
-            .iter()
-            .map(|v| v.as_str())
-            .filter(|v| !is_version_cached(&launcher_paths, v))
-            .collect();
-
-        if missing.is_empty() {
-            return;
-        }
-
-        let total = missing.len();
-        let _ = app_handle.emit(
-            MINECRAFT_LOG_EVENT,
-            ProcessLogEvent {
-                stream: ProcessLogStream::Stdout,
-                line: format!("[MC Sync] {total} version(s) to pre-download."),
-            },
-        );
-
-        let mut completed = 0usize;
-        for version in missing {
-            let _ = app_handle.emit(
-                MINECRAFT_LOG_EVENT,
-                ProcessLogEvent {
-                    stream: ProcessLogStream::Stdout,
-                    line: format!(
-                        "[MC Sync] Downloading {version} ({}/{total})…",
-                        completed + 1
-                    ),
-                },
-            );
-
-            match ensure_minecraft_version(&http_client, version, &launcher_paths, |_, _| {}).await
-            {
-                Ok(_) => completed += 1,
-                Err(e) => {
-                    let _ = app_handle.emit(
-                        MINECRAFT_LOG_EVENT,
-                        ProcessLogEvent {
-                            stream: ProcessLogStream::Stderr,
-                            line: format!("[MC Sync] Failed to download {version}: {e}"),
-                        },
-                    );
-                }
-            }
-        }
-
-        let _ = app_handle.emit(
-            MINECRAFT_LOG_EVENT,
-            ProcessLogEvent {
-                stream: ProcessLogStream::Stdout,
-                line: format!("[MC Sync] Pre-download done. {completed}/{total} succeeded."),
-            },
-        );
-    });
-
-    Ok(())
 }
 
 // ── Main public function ──────────────────────────────────────────────────────

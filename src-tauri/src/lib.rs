@@ -133,7 +133,6 @@ pub fn run() {
             resolver::resolve_modlist_command,
             resolver::backfill_availability_command,
             minecraft_downloader::fetch_minecraft_versions_command,
-            minecraft_downloader::start_minecraft_predownload_command,
             content_packs::load_content_list_command,
             content_packs::add_content_command,
             content_packs::remove_content_command,
