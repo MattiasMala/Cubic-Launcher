@@ -1027,19 +1027,27 @@ export default function App() {
 
       // D30: with notifications off the pre-check still ran — a mod that was
       // never downloaded has to be resolved or it would never be installed —
-      // but nothing is shown and nothing is updated. `resolved` carries the
+      // but no update is shown and nothing is updated. `resolved` carries the
       // **candidate** versions, so handing it over as it is would update
       // every mod in silence, which is the opposite of what switching the
       // notifications off asks for. An empty accepted set is the same code
       // path as the popup's "Skip".
-      if (!globalSettings().updateNotificationsEnabled) {
+      //
+      // D116: mods the launch will leave out are not updates, so that setting
+      // does not silence them. With some, the popup opens anyway and shows
+      // only them (the render below hides the update rows), and its answer
+      // refuses every update exactly like this branch does.
+      if (!globalSettings().updateNotificationsEnabled && precheck.droppedMods.length === 0) {
         await startLaunch(
           buildResolvedVersions(precheck.resolved, precheck.updates, new Set()),
           buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
         );
         return;
       }
-      if (precheck.updates.length === 0 && shownContentUpdates.length === 0) {
+      // An offline launch has no updates by construction (D115), so "nothing
+      // to show" has to count the mods it will leave out too, or the popup
+      // that asks about them would never open (D116).
+      if (precheck.updates.length === 0 && shownContentUpdates.length === 0 && precheck.droppedMods.length === 0) {
         // Not `precheck.resolvedContent` as it stands: the rows of a category
         // that is switched off are updates nobody accepted, and handing over
         // their candidates would install them behind the checkbox's back.
