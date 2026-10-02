@@ -169,7 +169,7 @@ fn collect_all_requires(rules: &[Rule]) -> CollectedRequires {
 
 /// Detect mutual requires (A requires B AND B requires A) and remove both
 /// directions so the resolver doesn't deadlock.
-fn strip_mutual_requires(rules: &mut Vec<Rule>) {
+fn strip_mutual_requires(rules: &mut [Rule]) {
     // Build a set of all mutual pairs.
     let (all_reqs, enabled_map) = collect_all_requires(rules);
     let req_set: HashSet<(&str, &str)> = all_reqs
@@ -192,7 +192,7 @@ fn strip_mutual_requires(rules: &mut Vec<Rule>) {
     }
 
     // Recursively remove mutual requires from all rules.
-    fn remove_mutual(rules: &mut Vec<Rule>, pairs: &HashSet<(String, String)>) {
+    fn remove_mutual(rules: &mut [Rule], pairs: &HashSet<(String, String)>) {
         for rule in rules.iter_mut() {
             rule.requires
                 .retain(|req| !pairs.contains(&(rule.mod_id.clone(), req.clone())));

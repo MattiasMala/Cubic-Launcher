@@ -733,7 +733,7 @@ impl PinSnapshot {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::resolver::{resolve_modlist, ModLoader, ResolutionTarget, RuleOutcome};
@@ -771,7 +771,7 @@ mod tests {
     }
 
     /// A mod list with the pin target in the middle, so a lost position shows.
-    fn seed_modlist(root: &PathBuf, rules: Vec<Rule>) -> PathBuf {
+    fn seed_modlist(root: &Path, rules: Vec<Rule>) -> PathBuf {
         let modlist_dir = root.join("mod-lists").join("Test Pack");
         fs::create_dir_all(modlist_dir.join("local-jars")).unwrap();
 
@@ -787,7 +787,7 @@ mod tests {
         modlist_dir
     }
 
-    fn source_jar(root: &PathBuf) -> PathBuf {
+    fn source_jar(root: &Path) -> PathBuf {
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let jar = staging.join(PINNED_JAR);
@@ -795,7 +795,7 @@ mod tests {
         jar
     }
 
-    fn pin_input(root: &PathBuf, remove_dynamic: bool) -> ApplyPinInput {
+    fn pin_input(root: &Path, remove_dynamic: bool) -> ApplyPinInput {
         ApplyPinInput {
             modlist_name: "Test Pack".into(),
             dynamic_mod_id: "modernfix".into(),
@@ -1032,7 +1032,7 @@ mod tests {
     const OTHER_JAR: &str = "modernfix-forge-5.27.66+mc1.20.1.jar";
     const OTHER_ID: &str = "modernfix-forge-5.27.66+mc1.20.1";
 
-    fn other_source_jar(root: &PathBuf) -> PathBuf {
+    fn other_source_jar(root: &Path) -> PathBuf {
         let staging = root.join("staging-2");
         fs::create_dir_all(&staging).unwrap();
         let jar = staging.join(OTHER_JAR);

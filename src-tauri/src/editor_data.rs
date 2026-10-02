@@ -485,7 +485,7 @@ fn extract_alternative(
     Ok(parent.alternatives.remove(pos))
 }
 
-fn insert_as_sibling(rules: &mut Vec<Rule>, sibling_mod_id: &str, new_rule: Rule) -> Result<()> {
+fn insert_as_sibling(rules: &mut [Rule], sibling_mod_id: &str, new_rule: Rule) -> Result<()> {
     for rule in rules.iter_mut() {
         if let Some(pos) = rule
             .alternatives
