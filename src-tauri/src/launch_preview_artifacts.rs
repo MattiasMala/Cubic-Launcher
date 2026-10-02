@@ -1254,7 +1254,11 @@ pub(super) fn mods_dropped_without_replacement(
 /// Two pronouns, not one: some reasons need the mods as the object ("no
 /// version of them"), others as the subject ("a mod they need"), and reusing
 /// the object form for both produces "a mod them need".
-fn dropped_reason_clause(reason: DropReason, target: &ResolutionTarget, many: bool) -> String {
+pub(super) fn dropped_reason_clause(
+    reason: DropReason,
+    target: &ResolutionTarget,
+    many: bool,
+) -> String {
     let object = if many { "them" } else { "it" };
     let subject = if many { "they" } else { "it" };
     let verb_s = if many { "" } else { "s" };
@@ -1283,7 +1287,7 @@ fn dropped_reason_clause(reason: DropReason, target: &ResolutionTarget, many: bo
 }
 
 /// The long half of the notice: the cause, then what it costs.
-fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
+pub(super) fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
     let (it, its) = if many {
         ("them", "their")
     } else {

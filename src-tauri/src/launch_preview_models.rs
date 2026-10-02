@@ -183,7 +183,9 @@ pub(super) enum LaunchResolutionPath<'a> {
     /// The active account plays offline (D115): the cache alone answers which
     /// mods load and at which version, and no version is looked up on
     /// Modrinth (`resolve_offline_selection` with no map). There is no
-    /// pre-check map to follow either: the pre-check does not run.
+    /// pre-check map to follow either: the pre-check of an offline account
+    /// runs the same selection with no requests, only to name the mods this
+    /// launch will leave out (D116), and returns no map.
     Offline,
 }
 

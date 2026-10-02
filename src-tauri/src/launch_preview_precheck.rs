@@ -21,10 +21,11 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
 use super::{
-    active_account_plays_offline, emit_log, load_cached_version_ids_for_selected, load_modlist,
-    parse_mod_loader, resolve_compatible_versions_hybrid, resolve_online_selection,
+    active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
+    load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
+    resolve_compatible_versions_hybrid, resolve_offline_selection, resolve_online_selection,
     run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
-    ResolvedContentVersions, SelectedMod,
+    DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -57,6 +58,58 @@ pub struct ModUpdateRow {
     pub current_version_number: Option<String>,
     pub candidate_version_id: String,
     pub candidate_version_number: String,
+}
+
+/// The mods a launch will leave out for one reason, said the way the launch
+/// banner says it (`dropped_reason_clause`, `dropped_reason_detail`), so that
+/// the question before the launch and the record after it cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedModGroup {
+    /// The ids as the mod-list rules write them. Nothing local knows a
+    /// readable name for a mod that was never downloaded (D116): the frontend
+    /// names what its in-memory metadata already holds and shows the id for
+    /// the rest.
+    pub mod_ids: Vec<String>,
+    /// Why they are out, as a clause: "this launch had no version chosen for
+    /// them and …".
+    pub reason: String,
+    /// The cause, then what it costs.
+    pub detail: String,
+}
+
+/// One group per reason, in the order the reasons first appear in `dropped`.
+///
+/// Shared by every branch that has a selection: the offline branch fills the
+/// field today, and the online one would be one assignment from
+/// `selection.dropped`.
+pub(super) fn dropped_mod_groups(
+    dropped: &[DroppedMod],
+    target: &ResolutionTarget,
+) -> Vec<DroppedModGroup> {
+    let mut reasons = Vec::new();
+    for lost in dropped {
+        if !reasons.contains(&lost.reason) {
+            reasons.push(lost.reason);
+        }
+    }
+
+    reasons
+        .into_iter()
+        .map(|reason| {
+            let mod_ids = dropped
+                .iter()
+                .filter(|lost| lost.reason == reason)
+                .map(|lost| lost.mod_id.clone())
+                .collect::<Vec<_>>();
+            let many = mod_ids.len() > 1;
+            DroppedModGroup {
+                reason: dropped_reason_clause(reason, target, many),
+                detail: dropped_reason_detail(reason, many),
+                mod_ids,
+            }
+        })
+        .collect()
 }
 
 /// The sets the popup and the launch need, and the distinction between them
@@ -106,6 +159,12 @@ pub struct UpdatePrecheckResult {
     /// above and not the same sentence: the launch will resolve these the
     /// usual way, and until it does nothing is known about them.
     pub content_lookup_failures: Vec<ContentLookupFailure>,
+    /// The mods the launch will leave out, with nothing in their place (D116):
+    /// said here so the user hears it **before** the game starts and chooses
+    /// whether to start it. Filled on the offline branch only; the launch
+    /// still reports them on its banner (`report_dropped_mods`), which is the
+    /// only channel left when this pre-check fails.
+    pub dropped_mods: Vec<DroppedModGroup>,
 }
 
 /// A vanilla target loads no mods: an empty payload, not an error, and no
@@ -237,6 +296,33 @@ pub(super) fn build_precheck_result(
     result
 }
 
+/// The pre-check of an account that plays offline, or `None` when the active
+/// account plays online.
+///
+/// D115, D116: the same zero-request selection the offline launch makes
+/// (`resolve_offline_selection` with no map), read for what it leaves out.
+/// Everything else stays empty, `resolved` above all: the version map comes
+/// from the network by construction, and an offline launch does not follow
+/// one (`LaunchResolutionPath::for_active_account`). Synchronous and handed
+/// no client, on purpose: the shape is half of the zero-request guarantee.
+pub(super) fn offline_precheck_for_active_account(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<Option<UpdatePrecheckResult>> {
+    if !active_account_plays_offline(launcher_paths)? {
+        return Ok(None);
+    }
+
+    let modlist = load_modlist(launcher_paths, modlist_name)?;
+    let selection = resolve_offline_selection(launcher_paths, &modlist, target, None)?;
+
+    Ok(Some(UpdatePrecheckResult {
+        dropped_mods: dropped_mod_groups(&selection.dropped, target),
+        ..UpdatePrecheckResult::default()
+    }))
+}
+
 /// What a launch of this mod-list on this target would change.
 ///
 /// Reads the database and Modrinth, writes nothing: no launch log session, no
@@ -260,18 +346,21 @@ pub(super) async fn run_update_precheck(
         return Ok(empty);
     }
 
-    // D115, D114: an account that plays offline launches with zero requests,
-    // and the pre-check is requests. It does not run: the empty payload shows
-    // no popup and hands the launch no map, and the launch reads the same row
-    // and takes the offline path by itself.
-    if active_account_plays_offline(launcher_paths)? {
+    // D115, D116: an account that plays offline launches with zero requests,
+    // so its pre-check makes none either. It reads the cache for the mods the
+    // launch will leave out, and that is all it returns: no updates and no
+    // map, and the launch reads the same row and takes the offline path by
+    // itself.
+    if let Some(offline) =
+        offline_precheck_for_active_account(launcher_paths, &modlist_name, &target)?
+    {
         let _ = emit_log(
             app_handle,
             ProcessLogStream::Stdout,
-            "[Launcher] The active account is set to play offline; the update check does not run"
+            "[Launcher] The active account is set to play offline; the pre-check reads the local cache only: no requests, no update check"
                 .to_string(),
         );
-        return Ok(UpdatePrecheckResult::default());
+        return Ok(offline);
     }
 
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
@@ -747,6 +836,11 @@ mod tests {
                 entry_id: "complementary-reimagined".into(),
                 error: "Modrinth returned an error".into(),
             }],
+            dropped_mods: vec![DroppedModGroup {
+                mod_ids: vec!["lithium".into()],
+                reason: "your cache has no jar".into(),
+                detail: "Nothing took its place.".into(),
+            }],
         };
 
         assert_eq!(
@@ -783,7 +877,151 @@ mod tests {
                     "entryId": "complementary-reimagined",
                     "error": "Modrinth returned an error",
                 }],
+                "droppedMods": [{
+                    "modIds": ["lithium"],
+                    "reason": "your cache has no jar",
+                    "detail": "Nothing took its place.",
+                }],
             })
         );
+    }
+
+    /// A launcher root with an active account, a two-mod list and a cache that
+    /// holds a row for `sodium` only: `lithium` has no row and no jar for the
+    /// target, which is exactly what the offline selection leaves out.
+    fn offline_root(label: &str, plays_offline: bool) -> LauncherPaths {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let launcher_paths = LauncherPaths::new(std::env::temp_dir().join(format!(
+            "cubic-offline-precheck-{label}-{}-{timestamp}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(launcher_paths.mods_cache_dir()).expect("mods cache directory");
+        crate::database::initialize_database(launcher_paths.database_path())
+            .expect("initialize database");
+
+        let connection =
+            rusqlite::Connection::open(launcher_paths.database_path()).expect("open database");
+        let accounts = crate::microsoft_auth::AccountsRepository::new(&connection);
+        accounts
+            .upsert_account(&crate::microsoft_auth::AccountRecord {
+                microsoft_id: "microsoft-id".into(),
+                xbox_gamertag: Some("StoredPlayer".into()),
+                minecraft_uuid: Some("123456781234123412341234567890ab".into()),
+                access_token_enc: None,
+                refresh_token_enc: None,
+                profile_data: None,
+                is_active: true,
+                plays_offline: false,
+            })
+            .expect("insert active account");
+        accounts
+            .set_plays_offline("microsoft-id", plays_offline)
+            .expect("save the choice");
+
+        let mut cached = candidate("sodium", "sodium-v2", "0.6.0");
+        cached.project_id = "sodium".into();
+        cached.files = vec![crate::modrinth::ModrinthFile {
+            hashes: HashMap::from([("sha1".to_string(), "sodium-v2-sha1".to_string())]),
+            url: "https://cdn.modrinth.com/data/sodium/sodium.jar".into(),
+            filename: "sodium.jar".into(),
+            primary: true,
+            size: 100,
+        }];
+        crate::mod_cache::SqliteModCacheRepository::new(
+            &connection,
+            launcher_paths.mods_cache_dir(),
+        )
+        .upsert_modrinth_version(&cached, &target())
+        .expect("register sodium for the target");
+
+        let rule = |mod_id: &str| Rule {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives: vec![],
+        };
+        let modlist_dir = launcher_paths.modlists_dir().join("Offline Pack");
+        std::fs::create_dir_all(&modlist_dir).expect("mod-list directory");
+        ModList {
+            modlist_name: "Offline Pack".into(),
+            author: "Author".into(),
+            description: "Test".into(),
+            rules: vec![rule("sodium"), rule("lithium")],
+        }
+        .write_to_file(&modlist_dir.join(crate::rules::RULES_FILENAME))
+        .expect("write the mod-list");
+
+        launcher_paths
+    }
+
+    /// D116: with the active account offline, the pre-check names the mods
+    /// the launch will leave out — and carries no version map, because the
+    /// map comes from the network and an offline launch does not follow one.
+    #[test]
+    fn an_offline_precheck_names_the_mods_left_out_and_carries_no_version_map() {
+        let launcher_paths = offline_root("dropped", true);
+
+        let result =
+            offline_precheck_for_active_account(&launcher_paths, "Offline Pack", &target())
+                .expect("the offline pre-check should run")
+                .expect("an offline account takes the offline pre-check");
+
+        assert_eq!(
+            result
+                .dropped_mods
+                .iter()
+                .map(|group| group.mod_ids.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["lithium".to_string()]]
+        );
+        assert!(result.resolved.is_empty());
+        assert!(result.updates.is_empty());
+        assert!(result.resolved_content.is_empty());
+
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
+    }
+
+    /// An account that plays online is not this branch's business: the
+    /// online pre-check runs as it did before.
+    #[test]
+    fn an_online_account_does_not_take_the_offline_precheck() {
+        let launcher_paths = offline_root("online", false);
+
+        assert_eq!(
+            offline_precheck_for_active_account(&launcher_paths, "Offline Pack", &target())
+                .expect("reading the choice should succeed"),
+            None
+        );
+
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
+    }
+
+    /// D115, and what this test does **not** prove. It pins the shape that
+    /// makes the offline branch request-free in this crate: a synchronous
+    /// function that receives no HTTP or Modrinth client. Making it `async` or
+    /// handing it a client stops this from compiling. It does not observe the
+    /// socket layer: a synchronous body could still build a runtime and a
+    /// client of its own, and only a trace of the running process sees that.
+    #[test]
+    fn the_offline_precheck_is_synchronous_and_receives_no_client() {
+        let offline_branch: fn(
+            &LauncherPaths,
+            &str,
+            &ResolutionTarget,
+        ) -> Result<Option<UpdatePrecheckResult>> = offline_precheck_for_active_account;
+        let launcher_paths = offline_root("shape", true);
+
+        assert!(offline_branch(&launcher_paths, "Offline Pack", &target())
+            .expect("the offline pre-check should run")
+            .is_some());
+
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
     }
 }

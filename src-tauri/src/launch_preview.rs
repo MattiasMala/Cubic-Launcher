@@ -43,7 +43,7 @@ use cache::*;
 #[path = "launch_preview_precheck.rs"]
 mod precheck;
 use precheck::*;
-pub use precheck::{ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
+pub use precheck::{DroppedModGroup, ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
 
 #[path = "launch_preview_precheck_content.rs"]
 mod precheck_content;

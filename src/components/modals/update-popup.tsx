@@ -9,6 +9,7 @@ import type {
   ContentEntryWithoutVersions,
   ContentLookupFailure,
   ContentUpdateRow,
+  DroppedModGroup,
   ModUpdateRow,
 } from "../../lib/types";
 
@@ -31,6 +32,11 @@ import type {
  * `category/entryId` keys — the two sets the launch turns into its two version
  * maps. "Skip" is that callback with both empty, so "skip" and "nothing
  * checked" are one code path instead of two that have to agree.
+ *
+ * `droppedMods` (D116) are the mods the launch will leave out. They are not a
+ * choice per row — a mod that is not there cannot be accepted — so they get
+ * no checkbox: the only decision is whether to start, and with no update rows
+ * the two buttons say exactly that, "Cancel" and "Play".
  */
 export function UpdatePopup(props: {
   updates: ModUpdateRow[];
@@ -38,6 +44,7 @@ export function UpdatePopup(props: {
   contentWithoutVersions?: ContentEntryWithoutVersions[];
   contentLookupFailures?: ContentLookupFailure[];
   versionNumberLookupError?: string | null;
+  droppedMods?: DroppedModGroup[];
   onChoose: (accepted: ReadonlySet<string>, acceptedContent: ReadonlySet<string>) => void;
   onCancel: () => void;
 }) {
@@ -59,7 +66,8 @@ export function UpdatePopup(props: {
     return ["resourcepack", "shader", "datapack"].filter(category => present.has(category));
   });
 
-  const allAccepted = () => allKeys().length > 0 && accepted().size === allKeys().length;
+  const hasUpdates = () => allKeys().length > 0;
+  const allAccepted = () => hasUpdates() && accepted().size === allKeys().length;
   const someAccepted = () => accepted().size > 0;
   const displayName = (row: ModUpdateRow) => modNames().get(row.projectId) ?? row.modId;
   const iconUrl = (row: ModUpdateRow) => modIcons().get(row.projectId);
@@ -81,19 +89,21 @@ export function UpdatePopup(props: {
   return (
     <Modal onClose={props.onCancel}>
       <ModalHeader
-        title="Updates available"
+        title={hasUpdates() ? "Updates available" : "Mods left out of this launch"}
         onClose={props.onCancel}
         actions={
-          <label class="flex items-center gap-2 text-sm text-foreground">
-            <input
-              type="checkbox"
-              checked={allAccepted()}
-              ref={el => { createEffect(() => { el.indeterminate = someAccepted() && !allAccepted(); }); }}
-              onChange={e => setAccepted(e.currentTarget.checked ? new Set(allKeys()) : new Set())}
-              class="h-4 w-4 rounded text-primary"
-            />
-            <span>Select all</span>
-          </label>
+          <Show when={hasUpdates()}>
+            <label class="flex items-center gap-2 text-sm text-foreground">
+              <input
+                type="checkbox"
+                checked={allAccepted()}
+                ref={el => { createEffect(() => { el.indeterminate = someAccepted() && !allAccepted(); }); }}
+                onChange={e => setAccepted(e.currentTarget.checked ? new Set(allKeys()) : new Set())}
+                class="h-4 w-4 rounded text-primary"
+              />
+              <span>Select all</span>
+            </label>
+          </Show>
         }
       />
 
@@ -132,6 +142,42 @@ export function UpdatePopup(props: {
       </Show>
 
       <div class="flex-1 space-y-1 overflow-y-auto px-6 py-3">
+        {/* D116: grouped by reason, as the launch banner groups them, and
+            first, because they decide whether to play at all. Names and icons
+            come only from what is already in memory: a dropped mod with no
+            name there shows its id, and nothing is fetched for it — the
+            launch it warns about promises zero requests (D115). */}
+        <For each={props.droppedMods ?? []}>
+          {group => (
+            <div class="mb-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2">
+              <div class="flex items-start gap-2">
+                <AlertTriangleIcon class="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+                <p class="text-sm text-warning">Not in this launch: {group.reason}.</p>
+              </div>
+              <p class="mt-1 pl-6 text-xs text-muted-foreground">{group.detail}</p>
+              <For each={group.modIds}>
+                {modId => (
+                  <div class="flex items-center gap-3 px-2 py-1.5 pl-6">
+                    <div class="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded bg-muted">
+                      <Show when={modIcons().get(modId)} fallback={<PackageIcon class="h-3.5 w-3.5 text-muted-foreground" />}>
+                        {icon => (
+                          <img
+                            src={icon()}
+                            alt=""
+                            class="h-6 w-6 object-cover"
+                            onError={e => { e.currentTarget.style.display = "none"; }}
+                          />
+                        )}
+                      </Show>
+                    </div>
+                    <span class="min-w-0 flex-1 truncate text-sm text-foreground">{modNames().get(modId) ?? modId}</span>
+                  </div>
+                )}
+              </For>
+            </div>
+          )}
+        </For>
+
         <Show when={props.updates.length > 0 && props.contentUpdates.length > 0}>
           <p class="px-2 pt-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Mods</p>
         </Show>
@@ -211,18 +257,40 @@ export function UpdatePopup(props: {
       </div>
 
       <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
-        <button
-          onClick={() => choose(new Set())}
-          class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80"
+        <Show
+          when={hasUpdates()}
+          fallback={
+            <>
+              {/* No update rows: "Skip" and "Update & play" would name
+                  updates that do not exist. Cancel is the X's D26. */}
+              <button
+                onClick={() => props.onCancel()}
+                class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => choose(new Set())}
+                class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-brandPurpleHover"
+              >
+                Play
+              </button>
+            </>
+          }
         >
-          Skip
-        </button>
-        <button
-          onClick={() => choose(accepted())}
-          class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-brandPurpleHover"
-        >
-          Update &amp; play
-        </button>
+          <button
+            onClick={() => choose(new Set())}
+            class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80"
+          >
+            Skip
+          </button>
+          <button
+            onClick={() => choose(accepted())}
+            class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-brandPurpleHover"
+          >
+            Update &amp; play
+          </button>
+        </Show>
       </div>
     </Modal>
   );
