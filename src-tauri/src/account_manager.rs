@@ -1,7 +1,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::token_storage::{EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore};
+use crate::microsoft_auth::AccountRecord;
+use crate::token_storage::{
+    CredentialState, EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedAccountProfile {
@@ -17,13 +20,17 @@ pub struct ManagedAccountTokens {
     pub refresh_token: Option<String>,
 }
 
+/// A saved account as the interface lists it: no token, only what the row
+/// says about itself and whether its sign-in still works.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSummary {
     pub microsoft_id: String,
     pub xbox_gamertag: Option<String>,
     pub minecraft_uuid: Option<String>,
+    /// Display metadata only, never a token (`account_profile_data_json`).
+    pub profile_data: Option<String>,
     pub is_active: bool,
-    pub has_refresh_token: bool,
+    pub credentials: CredentialState,
 }
 
 pub struct AccountManager<'connection, S> {
@@ -71,19 +78,23 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
         self.encrypted_accounts.set_active_account(microsoft_id)
     }
 
+    /// Every saved account, including those whose tokens no longer decrypt:
+    /// a summary needs no token, so it reads the rows as stored and does not
+    /// go through `list_accounts`, which can only return what it decrypted.
     pub fn list_account_summaries(&self) -> Result<Vec<AccountSummary>> {
-        self.encrypted_accounts
-            .list_accounts()?
+        Ok(self
+            .encrypted_accounts
+            .list_accounts_with_credentials()?
             .into_iter()
-            .map(account_summary_from_plaintext)
-            .collect()
+            .map(account_summary)
+            .collect())
     }
 
     pub fn active_account_summary(&self) -> Result<Option<AccountSummary>> {
-        self.encrypted_accounts
-            .load_active_account()?
-            .map(account_summary_from_plaintext)
-            .transpose()
+        Ok(self
+            .encrypted_accounts
+            .load_active_account_with_credentials()?
+            .map(account_summary))
     }
 
     pub fn active_author_name(&self) -> Result<Option<String>> {
@@ -94,18 +105,15 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
     }
 }
 
-fn account_summary_from_plaintext(account: PlaintextAccountRecord) -> Result<AccountSummary> {
-    Ok(AccountSummary {
+fn account_summary((account, credentials): (AccountRecord, CredentialState)) -> AccountSummary {
+    AccountSummary {
         microsoft_id: account.microsoft_id,
         xbox_gamertag: account.xbox_gamertag,
         minecraft_uuid: account.minecraft_uuid,
+        profile_data: account.profile_data,
         is_active: account.is_active,
-        has_refresh_token: account
-            .refresh_token
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|token| !token.is_empty()),
-    })
+        credentials,
+    }
 }
 
 #[cfg(test)]
@@ -120,7 +128,7 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::database::initialize_database;
-    use crate::token_storage::SecretStore;
+    use crate::token_storage::{CredentialState, SecretStore};
 
     use super::{AccountManager, AccountSummary, ManagedAccountProfile, ManagedAccountTokens};
 
@@ -221,15 +229,17 @@ mod tests {
                 microsoft_id: "account-a".into(),
                 xbox_gamertag: Some("PlayerA".into()),
                 minecraft_uuid: Some("uuid-a".into()),
+                profile_data: Some("{\"name\":\"PlayerA\"}".into()),
                 is_active: true,
-                has_refresh_token: true,
+                credentials: CredentialState::Usable,
             }));
             assert!(summaries.contains(&AccountSummary {
                 microsoft_id: "account-b".into(),
                 xbox_gamertag: Some("PlayerB".into()),
                 minecraft_uuid: Some("uuid-b".into()),
+                profile_data: Some("{\"name\":\"PlayerB\"}".into()),
                 is_active: false,
-                has_refresh_token: false,
+                credentials: CredentialState::SignedOut,
             }));
         });
     }
@@ -299,6 +309,115 @@ mod tests {
                 .active_author_name()
                 .expect("author lookup should succeed")
                 .is_none());
+        });
+    }
+
+    /// A row whose token blob does not decrypt is still a saved account: the
+    /// list must show it, not lose it (D117).
+    #[test]
+    fn list_account_summaries_keeps_a_row_whose_blob_does_not_decrypt() {
+        with_manager(|manager, root_dir| {
+            manager
+                .save_account_login(
+                    ManagedAccountProfile {
+                        microsoft_id: "account-valid".into(),
+                        xbox_gamertag: Some("ValidPlayer".into()),
+                        minecraft_uuid: Some("valid-uuid".into()),
+                        profile_data: None,
+                    },
+                    ManagedAccountTokens {
+                        access_token: "valid-access".into(),
+                        refresh_token: Some("valid-refresh".into()),
+                    },
+                    true,
+                    false,
+                )
+                .expect("valid account should save");
+
+            // Version byte, then a zero nonce and a zero ciphertext: the
+            // shape of a blob, which no key opens.
+            let mut corrupted_payload = vec![1_u8];
+            corrupted_payload.extend_from_slice(&[0; 12 + 16]);
+            Connection::open(root_dir.join("launcher_data.db"))
+                .expect("database should open")
+                .execute(
+                    "INSERT INTO accounts (microsoft_id, refresh_token_enc, last_login, is_active) \
+                     VALUES (?1, ?2, CURRENT_TIMESTAMP, FALSE)",
+                    rusqlite::params!["account-corrupted", corrupted_payload],
+                )
+                .expect("corrupted account should store");
+
+            let summaries = manager
+                .list_account_summaries()
+                .expect("summaries should load");
+            let listed: Vec<(&str, &CredentialState)> = summaries
+                .iter()
+                .map(|summary| (summary.microsoft_id.as_str(), &summary.credentials))
+                .collect();
+
+            assert_eq!(summaries.len(), 2, "listed: {listed:?}");
+            assert!(
+                listed.contains(&("account-corrupted", &CredentialState::Unreadable)),
+                "listed: {listed:?}"
+            );
+            assert!(
+                listed.contains(&("account-valid", &CredentialState::Usable)),
+                "listed: {listed:?}"
+            );
+        });
+    }
+
+    /// With the token key gone from the keyring no blob decrypts, which is
+    /// this machine's normal state (wiki trap 15): every saved account, active
+    /// or not, must still be listed so it can be chosen.
+    #[test]
+    fn list_account_summaries_lists_every_account_when_the_key_is_gone() {
+        with_manager(|manager, root_dir| {
+            for (microsoft_id, make_active) in [("account-a", true), ("account-b", false)] {
+                manager
+                    .save_account_login(
+                        ManagedAccountProfile {
+                            microsoft_id: microsoft_id.into(),
+                            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+                            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+                            profile_data: None,
+                        },
+                        ManagedAccountTokens {
+                            access_token: format!("access-{microsoft_id}"),
+                            refresh_token: Some(format!("refresh-{microsoft_id}")),
+                        },
+                        make_active,
+                        false,
+                    )
+                    .expect("account should save");
+            }
+
+            let connection =
+                Connection::open(root_dir.join("launcher_data.db")).expect("database should open");
+            let keyless = AccountManager::new(&connection, MemorySecretStore::default());
+            let summaries = keyless
+                .list_account_summaries()
+                .expect("summaries should load");
+            let listed: Vec<(&str, bool, &CredentialState)> = summaries
+                .iter()
+                .map(|summary| {
+                    (
+                        summary.microsoft_id.as_str(),
+                        summary.is_active,
+                        &summary.credentials,
+                    )
+                })
+                .collect();
+
+            assert_eq!(summaries.len(), 2, "listed: {listed:?}");
+            assert!(
+                listed.contains(&("account-a", true, &CredentialState::Unreadable)),
+                "listed: {listed:?}"
+            );
+            assert!(
+                listed.contains(&("account-b", false, &CredentialState::Unreadable)),
+                "listed: {listed:?}"
+            );
         });
     }
 }

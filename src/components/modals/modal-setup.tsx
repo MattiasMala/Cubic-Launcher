@@ -1,13 +1,12 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
-import type { ShellSnapshot } from "../../lib/types";
-import { applyActiveAccountFromSnapshot } from "../../app/backend-loaders";
+import { loadAccounts, loadShellSnapshot } from "../../app/backend-loaders";
 import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
-  accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId, activeAccount,
+  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, setActiveAccountId, activeAccount,
   toggleActiveAccountConnection,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
@@ -170,7 +169,23 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                   <div class="flex gap-3">
                     <input type="checkbox" checked={modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
                     <label class={`flex flex-1 items-center gap-2 text-sm text-foreground ${modlistDraft().profilerEnabled ? "" : "opacity-40"}`}>
-                      <input type="checkbox" checked={modlistDraft().profilerActive} disabled={!modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerActive: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={modlistDraft().profilerActive}
+                        disabled={!modlistDraft().profilerEnabled}
+                        data-testid="modlist-profiler-switch"
+                        onClick={() => setModlistDraft(c => ({ ...c, profilerActive: !c.profilerActive }))}
+                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
+                          modlistDraft().profilerActive ? "border-primary bg-primary" : "border-border bg-muted"
+                        }`}
+                      >
+                        <span
+                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
+                            modlistDraft().profilerActive ? "translate-x-6" : "translate-x-1"
+                          }`}
+                        />
+                      </button>
                       Record a JFR profile for this mod list
                     </label>
                   </div>
@@ -222,7 +237,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <input type="checkbox" checked={globalDraft().updateNotificationsEnabled} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Notify me when updates are available</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. When this is on, it checks Modrinth before launch and lets you choose what to update.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. It checks Modrinth before every launch either way; when this is on and something can be updated, it stops and lets you choose what to update.</p>
                   <div class="mt-2">
                     <div class="flex items-center gap-2">
                       <span class="flex-1 text-sm text-muted-foreground ml-7">Advanced</span>
@@ -289,8 +304,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
     try {
       await invoke("microsoft_login_command", { replaceUnreadable });
       setAccountsModalOpen(false);
-      const snap = await invoke<ShellSnapshot>("load_shell_snapshot_command", { preferredModlistName: null });
-      if (snap.active_account) applyActiveAccountFromSnapshot(snap.active_account);
+      await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
       setLoginError(String(err));
     } finally {
@@ -353,8 +367,8 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                         e.stopPropagation();
                         try {
                           await invoke("delete_account_command", { microsoftId: acc.id });
-                          setAccounts(cur => cur.filter(account => account.id !== acc.id));
                           if (activeAccountId() === acc.id) setActiveAccountId("");
+                          await loadAccounts();
                         } catch (err) {
                           setLoginError(String(err));
                         }

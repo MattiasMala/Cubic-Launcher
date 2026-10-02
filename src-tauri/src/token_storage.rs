@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -175,17 +175,48 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         refresh_token_enc: Option<&[u8]>,
         access_token_enc: Option<&[u8]>,
     ) -> CredentialState {
+        self.classify_credentials(refresh_token_enc, access_token_enc, &OnceCell::new())
+    }
+
+    /// `credential_state` for many accounts, with at most one keyring round
+    /// trip for all of them: every blob is encrypted under the same key id.
+    pub fn credential_states<'blob>(
+        &self,
+        accounts: impl IntoIterator<Item = (Option<&'blob [u8]>, Option<&'blob [u8]>)>,
+    ) -> Vec<CredentialState> {
+        let key_lookup = OnceCell::new();
+        accounts
+            .into_iter()
+            .map(|(refresh_token_enc, access_token_enc)| {
+                self.classify_credentials(refresh_token_enc, access_token_enc, &key_lookup)
+            })
+            .collect()
+    }
+
+    /// `key_lookup` holds the keyring's answer once asked; an account with no
+    /// blob never asks.
+    fn classify_credentials(
+        &self,
+        refresh_token_enc: Option<&[u8]>,
+        access_token_enc: Option<&[u8]>,
+        key_lookup: &OnceCell<Result<Option<String>, String>>,
+    ) -> CredentialState {
         let refresh = refresh_token_enc.filter(|payload| !payload.is_empty());
         let Some(payload) = refresh.or(access_token_enc.filter(|payload| !payload.is_empty()))
         else {
             return CredentialState::SignedOut;
         };
-        let encoded_key = match self.secret_store.get_secret(&self.key_id) {
+        let lookup = key_lookup.get_or_init(|| {
+            self.secret_store
+                .get_secret(&self.key_id)
+                .map_err(|error| format!("{error:#}"))
+        });
+        let encoded_key = match lookup {
             Ok(Some(encoded_key)) => encoded_key,
             Ok(None) => return CredentialState::Unreadable,
-            Err(error) => return CredentialState::KeyringUnavailable(format!("{error:#}")),
+            Err(detail) => return CredentialState::KeyringUnavailable(detail.clone()),
         };
-        let readable = decode_key_bytes(&encoded_key)
+        let readable = decode_key_bytes(encoded_key)
             .and_then(|key_bytes| decrypt_payload(&cipher_from_key(&key_bytes), payload))
             .is_ok();
         match (readable, refresh.is_some()) {
@@ -352,6 +383,40 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
             .into_iter()
             .filter_map(|account| self.decrypt_account(account).ok())
             .collect())
+    }
+
+    /// Every saved row as stored, blobs still encrypted, each with the state
+    /// of its credentials. Nothing is decrypted, so unlike `list_accounts` a
+    /// row whose tokens no longer open is kept, and reported as such. Same
+    /// order as `AccountsRepository::list_accounts`; the keyring is asked at
+    /// most once.
+    pub fn list_accounts_with_credentials(&self) -> Result<Vec<(AccountRecord, CredentialState)>> {
+        let accounts = self.accounts_repository.list_accounts()?;
+        let states = self
+            .token_cipher
+            .credential_states(accounts.iter().map(|account| {
+                (
+                    account.refresh_token_enc.as_deref(),
+                    account.access_token_enc.as_deref(),
+                )
+            }));
+        Ok(accounts.into_iter().zip(states).collect())
+    }
+
+    /// The active row, like `list_accounts_with_credentials`.
+    pub fn load_active_account_with_credentials(
+        &self,
+    ) -> Result<Option<(AccountRecord, CredentialState)>> {
+        Ok(self
+            .accounts_repository
+            .load_active_account()?
+            .map(|account| {
+                let credentials = self.token_cipher.credential_state(
+                    account.refresh_token_enc.as_deref(),
+                    account.access_token_enc.as_deref(),
+                );
+                (account, credentials)
+            }))
     }
 
     pub fn set_active_account(&self, microsoft_id: &str) -> Result<()> {
@@ -884,6 +949,64 @@ mod tests {
         assert_eq!(
             cipher.credential_state(None, None),
             CredentialState::SignedOut
+        );
+    }
+
+    /// The account list classifies every row with one keyring round trip,
+    /// not one per row, and each row as `credential_state` would alone.
+    #[test]
+    fn credential_states_asks_the_keyring_once_for_the_whole_list() {
+        #[derive(Clone, Default)]
+        struct CountingSecretStore {
+            inner: MemorySecretStore,
+            lookups: Arc<Mutex<usize>>,
+        }
+
+        impl SecretStore for CountingSecretStore {
+            fn get_secret(&self, key: &str) -> anyhow::Result<Option<String>> {
+                *self.lookups.lock().expect("lookup counter mutex poisoned") += 1;
+                self.inner.get_secret(key)
+            }
+
+            fn set_secret(&self, key: &str, secret: &str) -> anyhow::Result<()> {
+                self.inner.set_secret(key, secret)
+            }
+        }
+
+        let secret_store = CountingSecretStore::default();
+        let cipher = AccountTokenCipher::new(secret_store.clone());
+        let refresh = cipher
+            .encrypt_token("refresh")
+            .expect("token should encrypt");
+        let mut damaged = vec![TOKEN_ENCRYPTION_VERSION];
+        damaged.extend_from_slice(&[0; TOKEN_NONCE_LENGTH + 16]);
+        *secret_store
+            .lookups
+            .lock()
+            .expect("lookup counter mutex poisoned") = 0;
+
+        let states = cipher.credential_states([
+            (Some(refresh.as_slice()), None),
+            (None, None),
+            (Some(damaged.as_slice()), None),
+            (Some(refresh.as_slice()), None),
+        ]);
+
+        assert_eq!(
+            states,
+            vec![
+                CredentialState::Usable,
+                CredentialState::SignedOut,
+                CredentialState::Unreadable,
+                CredentialState::Usable,
+            ]
+        );
+        assert_eq!(
+            *secret_store
+                .lookups
+                .lock()
+                .expect("lookup counter mutex poisoned"),
+            1
         );
     }
 

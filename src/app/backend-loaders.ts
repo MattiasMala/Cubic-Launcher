@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
 import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
-import { normalizeModLoader, type ActiveAccountSnapshot, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
+import { normalizeModLoader, type AccountSummary, type ShellAccount, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   setModRowsState, setAccounts, setActiveAccountId,
@@ -48,26 +48,33 @@ export async function runResolution(modlistName?: string, mcVersion?: string, mo
   }
 }
 
+function toAccountSummary(account: ShellAccount): AccountSummary {
+  return {
+    id: account.microsoft_id,
+    gamertag: account.xbox_gamertag?.trim() || account.microsoft_id,
+    email: account.microsoft_id,
+    avatarUrl: account.avatar_url ?? undefined,
+    status: account.status,
+    lastMode: account.last_mode,
+    credentials: account.credentials,
+    credentialsDetail: account.credentials_detail,
+  };
+}
+
 /**
- * Puts the snapshot's active account at the head of the list. Status and
- * credentials are the backend's word, never assumed: after a sign-in too (F1).
+ * The saved accounts as the backend lists them (D113): every row in the
+ * database, the active one first, and those whose sign-in can't be read too
+ * (D117). The list replaces what the session had instead of being merged
+ * with it; status and credentials are the backend's word, never assumed (F1).
  */
-export function applyActiveAccountFromSnapshot(active: ActiveAccountSnapshot) {
-  const gamertag = active.xbox_gamertag?.trim() || active.microsoft_id;
-  setAccounts(current => {
-    const rest = current.filter(account => account.id !== active.microsoft_id);
-    return [{
-      id: active.microsoft_id,
-      gamertag,
-      email: active.microsoft_id,
-      avatarUrl: active.avatar_url ?? undefined,
-      status: active.status,
-      lastMode: active.last_mode,
-      credentials: active.credentials,
-      credentialsDetail: active.credentials_detail,
-    }, ...rest];
-  });
-  setActiveAccountId(active.microsoft_id);
+export async function loadAccounts() {
+  try {
+    const list = await invoke<ShellAccount[]>("list_accounts_command");
+    setAccounts(list.map(toAccountSummary));
+  } catch (error) {
+    logger.error("App", "loadAccounts failed", error);
+    pushUiError({ title: "Could not load saved accounts", message: "The backend could not list the saved accounts.", detail: String(error), severity: "error", scope: "account" });
+  }
 }
 
 export async function loadShellSnapshot(preferredName?: string | null) {
@@ -106,7 +113,8 @@ export async function loadShellSnapshot(preferredName?: string | null) {
       setSelectedModListName("");
     }
 
-    if (snap.active_account) applyActiveAccountFromSnapshot(snap.active_account);
+    setActiveAccountId(snap.active_account?.microsoft_id ?? "");
+    await loadAccounts();
 
     const gs = snap.global_settings;
     if (gs) {
