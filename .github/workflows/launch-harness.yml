@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
 
       # Tauri + Xvfb system dependencies (webkit2gtk 4.1, gtk, xvfb, mesa sw GL).
       - name: Install system deps

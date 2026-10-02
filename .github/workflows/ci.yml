@@ -20,6 +20,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Il numero di versione vive in due posti: rust-toolchain.toml e i ref
+      # dell'action in tre workflow. Il file vince sul `rustup default` che
+      # l'action imposta, quindi un ref rimasto indietro non cambia la toolchain
+      # che si usa: la CI resta corretta e si scarica una seconda toolchain in
+      # silenzio. Per lo stesso motivo questo passo non può chiedere a `rustc`
+      # quale versione è attiva — `rustc` risponderebbe leggendo il file, cioè
+      # confrontando il file con se stesso (D136, corretto dopo CUB-12).
+      #
+      # Il pattern è ancorato a inizio riga perché questo file è uno dei file
+      # che `grep -r` legge: senza l'ancora trova se stesso e il passo fallisce
+      # a ogni run. La lineetta è opzionale perché launch-harness.yml scrive
+      # `uses:` sotto un `- name:`. Non togliere né l'ancora né il `-?`.
+      - name: Toolchain pin matches the action refs
+        run: |
+          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          refs=$(grep -rhoP '^\s*-?\s*uses:\s*dtolnay/rust-toolchain@\K\S+' .github/workflows/ | sort -u)
+          echo "pinned=$pinned"
+          echo "refs=$refs"
+          test "$refs" = "$pinned"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -27,7 +47,7 @@ jobs:
 
       # rustfmt e clippy nominati esplicitamente: l'action installa con
       # `--profile minimal`, che non garantisce né l'uno né l'altro.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 
@@ -96,7 +116,7 @@ jobs:
           node-version: 20
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - uses: Swatinem/rust-cache@v2
         with:
