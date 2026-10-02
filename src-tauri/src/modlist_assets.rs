@@ -11,6 +11,7 @@ use zip::write::FileOptions;
 
 use crate::atomic_write::write_atomically;
 use crate::launcher_paths::LauncherPaths;
+use crate::mod_icons::LOCAL_JARS_DIR;
 use crate::path_safety::{contained_join, validate_path_component};
 use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
 
@@ -76,7 +77,6 @@ pub struct ExportModlistInput {
     pub modlist_name: String,
     pub destination_path: String,
     pub rules_json: bool,
-    pub mod_jars: bool,
     pub config_files: bool,
     pub resource_packs: bool,
     #[serde(default)]
@@ -482,14 +482,18 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         &format!("{archive_root}/{MODLIST_GROUP_LAYOUT_FILENAME}"),
     )?;
 
-    if input.mod_jars {
-        add_directory_contents(
-            &mut archive,
-            &mut added_paths,
-            launcher_paths.mods_cache_dir(),
-            &format!("{archive_root}/cache/mods"),
-        )?;
-    }
+    // D107: i jar di `local-jars/` sono gli unici che chi importa non può
+    // riscaricare (un mod pinnato è un mod locale, D14), quindi viaggiano
+    // sempre, come presentation e group layout. La cache globale dei mod no:
+    // è la metà riscaricabile, e l'import scarta comunque tutto `cache/`.
+    // Una cartella vuota o assente non aggiunge voci: `add_directory_contents`
+    // scrive solo file e salta una radice che non esiste.
+    add_directory_contents(
+        &mut archive,
+        &mut added_paths,
+        &modlist_dir.join(LOCAL_JARS_DIR),
+        &format!("{archive_root}/{LOCAL_JARS_DIR}"),
+    )?;
 
     if input.config_files {
         add_directory_contents(
@@ -1024,7 +1028,6 @@ mod tests {
                 modlist_name: "Safe Pack".into(),
                 destination_path: root_dir.join("traversal.zip").display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1045,7 +1048,6 @@ mod tests {
                 modlist_name: "Safe Pack".into(),
                 destination_path: valid_archive_path.display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1105,7 +1107,6 @@ mod tests {
                     modlist_name: "Safe Pack".into(),
                     destination_path: archive_path.display().to_string(),
                     rules_json: false,
-                    mod_jars: false,
                     config_files: false,
                     resource_packs: false,
                     data_packs: false,
@@ -1153,7 +1154,6 @@ mod tests {
                 modlist_name: "../Unsafe Pack".into(),
                 destination_path: root_dir.join("unsafe.zip").display().to_string(),
                 rules_json: false,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1264,7 +1264,6 @@ mod tests {
     fn export_archive_includes_rules_presentation_and_selected_assets() {
         let root_dir = unique_test_root();
         let modlist_dir = root_dir.join("mod-lists").join("Sky Pack");
-        let cache_mods_dir = root_dir.join("cache").join("mods");
         let cache_configs_dir = root_dir.join("cache").join("configs");
         let resourcepacks_dir = modlist_dir
             .join("instances")
@@ -1274,7 +1273,6 @@ mod tests {
         let groups_path = modlist_dir.join(MODLIST_GROUP_LAYOUT_FILENAME);
         let export_path = root_dir.join("sky-pack.zip");
 
-        fs::create_dir_all(&cache_mods_dir).expect("mods cache dir should exist");
         fs::create_dir_all(cache_configs_dir.join("sodium"))
             .expect("configs cache dir should exist");
         fs::create_dir_all(&resourcepacks_dir).expect("resourcepacks dir should exist");
@@ -1284,7 +1282,6 @@ mod tests {
             .expect("presentation file should exist");
         fs::write(&groups_path, b"{\n  \"aestheticGroups\": [{\"id\": \"ag-1\", \"name\": \"Visuals\", \"collapsed\": false}],\n  \"tags\": []\n}\n")
             .expect("group layout file should exist");
-        fs::write(cache_mods_dir.join("sodium.jar"), b"jar").expect("jar should exist");
         fs::write(
             cache_configs_dir.join("sodium").join("options.json"),
             b"config",
@@ -1298,7 +1295,6 @@ mod tests {
                 modlist_name: "Sky Pack".into(),
                 destination_path: export_path.display().to_string(),
                 rules_json: true,
-                mod_jars: true,
                 config_files: true,
                 resource_packs: true,
                 other_files: false,
@@ -1325,7 +1321,6 @@ mod tests {
         assert!(names.contains(&"Sky Pack/rules.json".to_string()));
         assert!(names.contains(&format!("Sky Pack/{MODLIST_PRESENTATION_FILENAME}")));
         assert!(names.contains(&format!("Sky Pack/{MODLIST_GROUP_LAYOUT_FILENAME}")));
-        assert!(names.contains(&"Sky Pack/cache/mods/sodium.jar".to_string()));
         assert!(names.contains(&"Sky Pack/cache/configs/sodium/options.json".to_string()));
         assert!(
             names.contains(&"Sky Pack/instances/1.21.1-fabric/resourcepacks/sky.zip".to_string())
@@ -1402,7 +1397,6 @@ mod tests {
                 modlist_name: "Pack".into(),
                 destination_path: export_path.display().to_string(),
                 rules_json: true,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1451,7 +1445,6 @@ mod tests {
                 modlist_name: "Pack".into(),
                 destination_path: export_path.display().to_string(),
                 rules_json: true,
-                mod_jars: true,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
@@ -1493,7 +1486,6 @@ mod tests {
                     modlist_name: "Pack".into(),
                     destination_path: export_path.display().to_string(),
                     rules_json: true,
-                    mod_jars: false,
                     config_files: false,
                     resource_packs: false,
                     data_packs: false,

@@ -816,7 +816,6 @@ mod tests {
                 modlist_name: "Shared Pack".into(),
                 destination_path: archive_path.display().to_string(),
                 rules_json: true,
-                mod_jars: false,
                 config_files: false,
                 resource_packs: false,
                 data_packs: false,
