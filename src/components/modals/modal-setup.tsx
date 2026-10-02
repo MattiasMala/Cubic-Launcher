@@ -1,6 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
+import type { AccountCredentials } from "../../lib/types";
 import { loadAccounts, loadShellSnapshot } from "../../app/backend-loaders";
 import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
@@ -291,6 +292,16 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
   );
 }
 
+// D131: the pill names the credential state with the short form of the yellow
+// box's title below the row. "offline" stays only where it means the play mode
+// (the "Play offline" switch and the box texts).
+const CREDENTIALS_PILL: Record<AccountCredentials, string> = {
+  usable: "online",
+  signed_out: "signed out",
+  unreadable: "sign-in unreadable",
+  keyring_unavailable: "keyring unavailable",
+};
+
 export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<void> }) {
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
@@ -371,7 +382,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                   </button>
                   <div class="flex flex-col items-end gap-1 shrink-0 ml-2">
                     <span class={`rounded-full px-2 py-0.5 text-[10px] ${acc.status === "online" ? "bg-success/15 text-success" : "bg-warning/15 text-warning"}`}>
-                      {acc.status}
+                      {acc.credentials ? CREDENTIALS_PILL[acc.credentials] : acc.status}
                     </span>
                     <Show when={acc.id === activeAccountId()}>
                       <span class="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] text-primary">Active</span>
