@@ -7,18 +7,20 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::account_manager::{AccountManager, ManagedAccountProfile, ManagedAccountTokens};
+use crate::account_manager::{
+    AccountManager, AccountSummary, ManagedAccountProfile, ManagedAccountTokens,
+};
 use crate::launcher_paths::LauncherPaths;
 use crate::microsoft_auth::{
     configured_microsoft_client_id, run_microsoft_login, AccountsRepository,
 };
 use crate::rules::{ModList, RULES_FILENAME};
-use crate::token_storage::{AccountTokenCipher, CredentialState, KeyringSecretStore, SecretStore};
+use crate::token_storage::{CredentialState, KeyringSecretStore, SecretStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
     pub modlists: Vec<ShellModListSummary>,
-    pub active_account: Option<ShellActiveAccount>,
+    pub active_account: Option<ShellAccount>,
     pub global_settings: ShellGlobalSettings,
     pub selected_modlist_overrides: ShellModListOverrides,
 }
@@ -33,8 +35,11 @@ pub struct ShellModListSummary {
     pub mod_loader: Option<String>,
 }
 
+/// One saved account as the interface shows it: the snapshot's active
+/// account and every row of the account list. Both are built by
+/// `shell_account`, so the same account cannot read differently in the two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ShellActiveAccount {
+pub struct ShellAccount {
     pub microsoft_id: String,
     pub xbox_gamertag: Option<String>,
     pub minecraft_uuid: Option<String>,
@@ -135,6 +140,18 @@ pub fn switch_active_account_command(
 
     AccountsRepository::new(&connection)
         .set_active_account(&microsoft_id)
+        .map_err(|error| error.to_string())
+}
+
+/// Every saved account, the active one first (D113): the list the Accounts
+/// window shows and switches between.
+#[tauri::command]
+pub fn list_accounts_command(
+    launcher_paths: State<'_, LauncherPaths>,
+) -> Result<Vec<ShellAccount>, String> {
+    let connection =
+        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
+    load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
         .map_err(|error| error.to_string())
 }
 
@@ -374,51 +391,63 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
 fn load_active_account_summary_with_secret_store<S: SecretStore>(
     connection: &Connection,
     secret_store: S,
-) -> Result<Option<ShellActiveAccount>> {
-    let account = AccountsRepository::new(connection).load_active_account()?;
-    let token_cipher = AccountTokenCipher::new(secret_store);
+) -> Result<Option<ShellAccount>> {
+    Ok(AccountManager::new(connection, secret_store)
+        .active_account_summary()?
+        .map(shell_account))
+}
 
-    Ok(account.map(|account| {
-        // Try to get the Minecraft username from profile_data.
-        let mc_username = account.profile_data.as_deref().and_then(|pd| {
-            serde_json::from_str::<serde_json::Value>(pd)
-                .ok()
-                .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
-        });
+/// Every row of the `accounts` table, including those whose sign-in can no
+/// longer be read: they show with their way out instead of disappearing
+/// (D117). The active account comes first, the rest by last sign-in.
+fn load_account_list_with_secret_store<S: SecretStore>(
+    connection: &Connection,
+    secret_store: S,
+) -> Result<Vec<ShellAccount>> {
+    let mut summaries = AccountManager::new(connection, secret_store).list_account_summaries()?;
+    // Stable: the rows keep the repository's `last_login DESC` order.
+    summaries.sort_by_key(|summary| !summary.is_active);
+    Ok(summaries.into_iter().map(shell_account).collect())
+}
 
-        let avatar_url = account.minecraft_uuid.as_ref().map(|uuid| {
-            let clean_uuid = uuid.replace('-', "");
-            format!("https://mc-heads.net/avatar/{clean_uuid}/32")
-        });
-        let credentials = token_cipher.credential_state(
-            account.refresh_token_enc.as_deref(),
-            account.access_token_enc.as_deref(),
-        );
-        let connected = credentials == CredentialState::Usable;
-        let credentials_detail = match &credentials {
-            CredentialState::KeyringUnavailable(detail) => Some(detail.clone()),
-            _ => None,
-        };
+/// The one place where a saved account becomes what the interface shows:
+/// `status` and `last_mode` follow from `credentials` here and nowhere else.
+fn shell_account(summary: AccountSummary) -> ShellAccount {
+    // Try to get the Minecraft username from profile_data.
+    let mc_username = summary.profile_data.as_deref().and_then(|pd| {
+        serde_json::from_str::<serde_json::Value>(pd)
+            .ok()
+            .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
+    });
 
-        ShellActiveAccount {
-            microsoft_id: account.microsoft_id,
-            xbox_gamertag: mc_username.or(account.xbox_gamertag),
-            minecraft_uuid: account.minecraft_uuid,
-            avatar_url,
-            status: if connected {
-                "online".to_string()
-            } else {
-                "offline".to_string()
-            },
-            last_mode: if connected {
-                "microsoft".to_string()
-            } else {
-                "offline".to_string()
-            },
-            credentials: credentials.as_str().to_string(),
-            credentials_detail,
-        }
-    }))
+    let avatar_url = summary.minecraft_uuid.as_ref().map(|uuid| {
+        let clean_uuid = uuid.replace('-', "");
+        format!("https://mc-heads.net/avatar/{clean_uuid}/32")
+    });
+    let connected = summary.credentials == CredentialState::Usable;
+    let credentials_detail = match &summary.credentials {
+        CredentialState::KeyringUnavailable(detail) => Some(detail.clone()),
+        _ => None,
+    };
+
+    ShellAccount {
+        microsoft_id: summary.microsoft_id,
+        xbox_gamertag: mc_username.or(summary.xbox_gamertag),
+        minecraft_uuid: summary.minecraft_uuid,
+        avatar_url,
+        status: if connected {
+            "online".to_string()
+        } else {
+            "offline".to_string()
+        },
+        last_mode: if connected {
+            "microsoft".to_string()
+        } else {
+            "offline".to_string()
+        },
+        credentials: summary.credentials.as_str().to_string(),
+        credentials_detail,
+    }
 }
 
 fn load_global_settings(connection: &Connection) -> Result<ShellGlobalSettings> {
@@ -670,9 +699,10 @@ mod tests {
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     use super::{
-        account_profile_data_json, load_active_account_summary_with_secret_store,
-        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
-        ShellGlobalSettingsInput, ShellModListOverridesInput,
+        account_profile_data_json, load_account_list_with_secret_store,
+        load_active_account_summary_with_secret_store, load_shell_snapshot_from_root,
+        save_global_settings, save_modlist_overrides, ShellGlobalSettingsInput,
+        ShellModListOverridesInput,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -763,6 +793,69 @@ mod tests {
             .expect("active account should exist");
         assert_eq!(disconnected.status, "offline");
         assert_eq!(disconnected.last_mode, "offline");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn account_list_puts_the_active_account_first_and_matches_the_snapshot() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        let cipher = AccountTokenCipher::new(secret_store.clone());
+        let repository = AccountsRepository::new(&connection);
+        // Inserted active first: with equal `last_login` the repository
+        // orders by `id DESC`, so the active row comes last before sorting.
+        for (microsoft_id, signed_in, is_active) in [
+            ("account-active", true, true),
+            ("account-other", true, false),
+            ("account-signed-out", false, false),
+        ] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+                    minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+                    access_token_enc: None,
+                    refresh_token_enc: signed_in.then(|| {
+                        cipher
+                            .encrypt_token("refresh-token")
+                            .expect("refresh token should encrypt")
+                    }),
+                    profile_data: None,
+                    is_active,
+                })
+                .expect("account should insert");
+        }
+
+        let list = load_account_list_with_secret_store(&connection, secret_store.clone())
+            .expect("account list should load");
+        let active = load_active_account_summary_with_secret_store(&connection, secret_store)
+            .expect("active account should load")
+            .expect("active account should exist");
+
+        let rows: Vec<(&str, &str, &str)> = list
+            .iter()
+            .map(|account| {
+                (
+                    account.microsoft_id.as_str(),
+                    account.status.as_str(),
+                    account.credentials.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("account-active", "online", "usable"),
+                ("account-signed-out", "offline", "signed_out"),
+                ("account-other", "online", "usable"),
+            ]
+        );
+        assert_eq!(list[0], active);
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
