@@ -20,6 +20,10 @@ use super::{
     EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
 };
 
+// Otto input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_vanilla_launch_pipeline(
     app_handle: tauri::AppHandle,
     launcher_paths: LauncherPaths,

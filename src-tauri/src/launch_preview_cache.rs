@@ -530,6 +530,10 @@ pub(super) fn local_mod_jar_path(
         .join(file_name))
 }
 
+// Otto input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_cached_mod_jars(
     app_handle: &tauri::AppHandle,
     selected_mods: &[SelectedMod],

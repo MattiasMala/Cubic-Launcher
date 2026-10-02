@@ -412,6 +412,10 @@ fn install_local_content_packs(
 /// re-resolves from scratch, which is what it always did — and which is also
 /// how a popup's answer used to be ignored in silence, since nothing carried
 /// it here.
+// Otto input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn resolve_and_install_content_packs(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
@@ -652,6 +656,10 @@ pub(super) async fn resolve_and_install_content_packs(
     .await
 }
 
+// Nove input distinti di un passo del lancio. Una struct di parametri
+// cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
+// solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
+#[allow(clippy::too_many_arguments)]
 async fn install_datapacks(
     app_handle: &tauri::AppHandle,
     modlist_dir: &Path,
