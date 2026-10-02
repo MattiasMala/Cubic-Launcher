@@ -27,7 +27,6 @@ import {
   search,
   selectedIds,
   selectedModListName,
-  sortOrder,
   tagFilter,
   advancedPanelModId,
   versionRules,
@@ -74,12 +73,10 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
 
   const query = search().trim().toLowerCase();
   const tags = tagFilter();
-  const order = sortOrder();
   const fGroups = functionalGroups();
 
   const addedGroups = new Set<string>();
   const items: TopLevelItem[] = [];
-  const ungroupedRows: ModRow[] = [];
 
   for (const row of modRowsState()) {
     const groupId = groupByRow.get(row.id);
@@ -88,13 +85,11 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
       addedGroups.add(groupId);
       const group = topGroups.find(candidate => candidate.id === groupId);
       if (!group) continue;
-      let blocks = group.blockIds
+      const blocks = group.blockIds
         .map(id => modRowsState().find(candidate => candidate.id === id))
         .filter((candidate): candidate is ModRow => Boolean(candidate))
         .filter(candidate => !query || rowMatchesQuery(candidate, query))
         .filter(candidate => tags.size === 0 || rowOrDescendantMatchesTag(candidate, fGroups, tags));
-      if (order === "name-az") blocks = [...blocks].sort((a, b) => a.name.localeCompare(b.name));
-      if (order === "name-za") blocks = [...blocks].sort((a, b) => b.name.localeCompare(a.name));
       if (blocks.length > 0 || (!query && tags.size === 0)) {
         items.push({ kind: "group", id: groupId, name: group.name, collapsed: group.collapsed, blocks });
       }
@@ -103,16 +98,7 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
 
     if (query && !rowMatchesQuery(row, query)) continue;
     if (tags.size > 0 && !rowOrDescendantMatchesTag(row, fGroups, tags)) continue;
-    ungroupedRows.push(row);
     items.push({ kind: "row", row });
-  }
-
-  if (order !== "default") {
-    const sorted = [...ungroupedRows].sort((a, b) =>
-      order === "name-az" ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name)
-    );
-    let index = 0;
-    return items.map(item => item.kind === "row" ? ({ kind: "row", row: sorted[index++] } as TopLevelItem) : item);
   }
 
   return items;
@@ -121,13 +107,10 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
 export const filteredRows = createMemo(() => {
   const query = search().trim().toLowerCase();
   const tags = tagFilter();
-  const order = sortOrder();
   const fGroups = functionalGroups();
   let rows = modRowsState();
   if (query) rows = rows.filter(row => rowMatchesQuery(row, query));
   if (tags.size > 0) rows = rows.filter(row => rowOrDescendantMatchesTag(row, fGroups, tags));
-  if (order === "name-az") rows = [...rows].sort((a, b) => a.name.localeCompare(b.name));
-  if (order === "name-za") rows = [...rows].sort((a, b) => b.name.localeCompare(a.name));
   return rows;
 });
 
@@ -263,16 +246,13 @@ export function findDirectParentId(rows: ModRow[], targetId: string): string | n
 export const filteredGroupSections = createMemo(() => {
   const query = search().trim().toLowerCase();
   const tags = tagFilter();
-  const order = sortOrder();
   const fGroups = functionalGroups();
   return aestheticGroups().filter(group => !group.scopeRowId).map(group => {
-    let blocks = group.blockIds
+    const blocks = group.blockIds
       .map(id => rowMap().get(id))
       .filter((row): row is ModRow => Boolean(row))
       .filter(row => !query || rowMatchesQuery(row, query))
       .filter(row => tags.size === 0 || rowOrDescendantMatchesTag(row, fGroups, tags));
-    if (order === "name-az") blocks = [...blocks].sort((a, b) => a.name.localeCompare(b.name));
-    if (order === "name-za") blocks = [...blocks].sort((a, b) => b.name.localeCompare(a.name));
     return { ...group, blocks };
   });
 });
