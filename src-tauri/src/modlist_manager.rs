@@ -220,7 +220,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         };
         validate_path_component(&base_name)?;
 
-        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_name = unique_modlist_name(modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
         std::fs::create_dir_all(&modlist_dir)
             .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;
@@ -279,7 +279,7 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
             .unwrap_or("Imported")
             .to_string();
         validate_path_component(&base_name)?;
-        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_name = unique_modlist_name(modlists_dir, &base_name);
         let modlist_dir = modlists_dir.join(&modlist_name);
         std::fs::create_dir_all(&modlist_dir)
             .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;

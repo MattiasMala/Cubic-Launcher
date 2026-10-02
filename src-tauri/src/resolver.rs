@@ -372,7 +372,7 @@ pub async fn resolve_modlist_command(
 
         // Check database cache first
         let cached = db_availability_get(
-            &db_path,
+            db_path,
             &modrinth_ids,
             &target.minecraft_version,
             &loader_str,
@@ -426,7 +426,7 @@ pub async fn resolve_modlist_command(
 
             // Persist API results to database for future lookups
             if !to_persist.is_empty() {
-                db_availability_set(&db_path, &to_persist);
+                db_availability_set(db_path, &to_persist);
             }
         }
     }
@@ -478,7 +478,7 @@ pub async fn resolve_modlist_command(
         if !new_alt_modrinth_ids.is_empty() {
             let db_path = launcher_paths.database_path();
             let cached = db_availability_get(
-                &db_path,
+                db_path,
                 &new_alt_modrinth_ids,
                 &target.minecraft_version,
                 &mod_loader,
@@ -716,7 +716,7 @@ pub async fn backfill_availability(
     }
 
     let db_path = launcher_paths.database_path();
-    let cached = db_availability_get(&db_path, &all_modrinth_ids, mc_version, mod_loader);
+    let cached = db_availability_get(db_path, &all_modrinth_ids, mc_version, mod_loader);
     // Only skip mods that are cached as *available*. Mods cached as
     // unavailable are re-checked because mod authors frequently add
     // version support after initial release.
@@ -798,7 +798,7 @@ pub async fn backfill_availability(
         })
         .collect::<Vec<_>>();
     if !entries.is_empty() {
-        db_availability_set(&db_path, &entries);
+        db_availability_set(db_path, &entries);
     }
 
     Ok(BackfillOutcome {
