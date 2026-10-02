@@ -298,9 +298,10 @@ pub(super) async fn download_pending_artifacts(
         tokio::select! {
             Some(delta) = progress_rx.recv() => {
                 downloaded_bytes = downloaded_bytes.saturating_add(delta);
-                if total_bytes > 0 {
-                    let progress = 42u8
-                        + ((16u64 * downloaded_bytes.min(total_bytes)) / total_bytes) as u8;
+                if let Some(sixteenths) =
+                    (16u64 * downloaded_bytes.min(total_bytes)).checked_div(total_bytes)
+                {
+                    let progress = 42u8 + sixteenths as u8;
                     if progress > last_progress {
                         last_progress = progress;
                         emit_progress(
