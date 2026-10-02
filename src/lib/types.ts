@@ -114,7 +114,7 @@ export type AccountSummary = {
   avatarUrl?: string;
   status: "online" | "offline";
   lastMode: "microsoft" | "offline";
-  /** Absent for accounts the backend has not described (only the active one is). */
+  /** Every account the backend lists carries it (D113); absent only on placeholder rows. */
   credentials?: AccountCredentials;
   credentialsDetail?: string | null;
 };
@@ -127,7 +127,8 @@ export type LaunchResolutionStage = {
 
 // ── Tauri IPC payloads ────────────────────────────────────────────────────────
 
-export type ActiveAccountSnapshot = {
+/** One saved account, as `ShellAccount` in `app_shell.rs`: the snapshot's active account and every row of `list_accounts_command`. */
+export type ShellAccount = {
   microsoft_id: string;
   xbox_gamertag?: string | null;
   avatar_url?: string | null;
@@ -144,7 +145,7 @@ export type ShellSnapshot = {
     author?: string | null;
     rule_count: number;
   }>;
-  active_account?: ActiveAccountSnapshot | null;
+  active_account?: ShellAccount | null;
   global_settings: {
     min_ram_mb: number;
     max_ram_mb: number;

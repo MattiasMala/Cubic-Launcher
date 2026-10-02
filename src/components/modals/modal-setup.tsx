@@ -1,13 +1,12 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
-import type { ShellSnapshot } from "../../lib/types";
-import { applyActiveAccountFromSnapshot } from "../../app/backend-loaders";
+import { loadAccounts, loadShellSnapshot } from "../../app/backend-loaders";
 import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
-  accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId, activeAccount,
+  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, setActiveAccountId, activeAccount,
   toggleActiveAccountConnection,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
@@ -289,8 +288,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
     try {
       await invoke("microsoft_login_command", { replaceUnreadable });
       setAccountsModalOpen(false);
-      const snap = await invoke<ShellSnapshot>("load_shell_snapshot_command", { preferredModlistName: null });
-      if (snap.active_account) applyActiveAccountFromSnapshot(snap.active_account);
+      await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
       setLoginError(String(err));
     } finally {
@@ -353,8 +351,8 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                         e.stopPropagation();
                         try {
                           await invoke("delete_account_command", { microsoftId: acc.id });
-                          setAccounts(cur => cur.filter(account => account.id !== acc.id));
                           if (activeAccountId() === acc.id) setActiveAccountId("");
+                          await loadAccounts();
                         } catch (err) {
                           setLoginError(String(err));
                         }
