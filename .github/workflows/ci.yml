@@ -27,7 +27,7 @@ jobs:
 
       # rustfmt e clippy nominati esplicitamente: l'action installa con
       # `--profile minimal`, che non garantisce né l'uno né l'altro.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
 
@@ -73,6 +73,17 @@ jobs:
           CUBIC_REQUIRE_CLIENT_JARS: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # Il numero di versione vive in due posti: rust-toolchain.toml e i ref
+      # dell'action. Se uno si alza e l'altro no la CI resta corretta ma installa
+      # due toolchain, e nessuno se ne accorge. Questo passo rende la divergenza
+      # rumorosa invece che silenziosa (D136).
+      - name: Toolchain pin matches
+        run: |
+          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          active=$(rustc --version | cut -d' ' -f2)
+          echo "pinned=$pinned active=$active"
+          test "$pinned" = "$active"
+
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
 
@@ -96,7 +107,7 @@ jobs:
           node-version: 20
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - uses: Swatinem/rust-cache@v2
         with:
