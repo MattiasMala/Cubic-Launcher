@@ -361,7 +361,7 @@ pub async fn resolve_modlist_command(
         .filter(|id| {
             modlist
                 .find_rule(id)
-                .map_or(false, |rule| rule.source == ModSource::Modrinth)
+                .is_some_and(|rule| rule.source == ModSource::Modrinth)
         })
         .cloned()
         .collect();
@@ -470,7 +470,7 @@ pub async fn resolve_modlist_command(
             .filter(|id| {
                 modlist
                     .find_rule(id)
-                    .map_or(false, |r| r.source == ModSource::Modrinth)
+                    .is_some_and(|r| r.source == ModSource::Modrinth)
             })
             .cloned()
             .collect();

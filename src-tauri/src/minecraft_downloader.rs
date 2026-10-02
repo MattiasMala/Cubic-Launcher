@@ -218,7 +218,7 @@ fn library_allowed_on_current_os(rules: &[OsRule]) -> bool {
             .os
             .as_ref()
             .and_then(|f| f.name.as_deref())
-            .map_or(true, |name| name == os);
+            .is_none_or(|name| name == os);
 
         if matches_os {
             allowed = rule.action == "allow";
