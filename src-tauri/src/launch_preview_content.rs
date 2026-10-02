@@ -202,10 +202,10 @@ impl<'a> ContentPackPlan<'a> {
         let mut dropped = named
             .iter()
             .flat_map(|(category, entries)| {
-                entries.iter().filter_map(move |(entry_id, version_id)| {
-                    (!self.metadata.contains_key(version_id))
-                        .then(|| format!("{category}/{entry_id}"))
-                })
+                entries
+                    .iter()
+                    .filter(move |&(_, version_id)| !self.metadata.contains_key(version_id))
+                    .map(move |(entry_id, _)| format!("{category}/{entry_id}"))
             })
             .collect::<Vec<_>>();
 
