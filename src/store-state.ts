@@ -89,6 +89,8 @@ export const [pendingUpdatePrecheck, setPendingUpdatePrecheck] = createSignal<Up
 export const [launchProgress, setLaunchProgress] = createSignal(0);
 export const [launchStageLabel, setLaunchStageLabel] = createSignal(LAUNCH_STAGES[0].label);
 export const [launchStageDetail, setLaunchStageDetail] = createSignal(LAUNCH_STAGES[0].detail);
+/** Il file JFR dell'ultimo lancio, solo se il backend l'ha trovato sul disco a gioco chiuso (D109). */
+export const [profileRecordingPath, setProfileRecordingPath] = createSignal<string | null>(null);
 export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
 export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);

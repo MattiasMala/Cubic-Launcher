@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
@@ -10,14 +10,105 @@ pub struct JavaLaunchSettings {
     pub min_ram_mb: u32,
     pub max_ram_mb: u32,
     pub custom_jvm_args: String,
-    pub profiler: Option<ProfilerConfig>,
+    pub profiler: Option<FlightRecording>,
     pub wrapper_command: Option<String>,
 }
 
+/// Il profiler è JFR, dentro la JVM (D108): non serve una libreria né un agente, quindi
+/// porta solo quello che JFR deve sapere, cioè dove scrivere il file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfilerConfig {
-    pub agent_library_path: PathBuf,
-    pub options: Option<String>,
+pub struct FlightRecording {
+    pub output_file: PathBuf,
+}
+
+/// Il nome del file nella cartella del lancio: la cartella è già unica per lancio (D109).
+const FLIGHT_RECORDING_FILE_NAME: &str = "profile.jfr";
+
+/// `-XX:StartFlightRecording` non esiste in Java 8 prima della 8u262, e un flag JVM non
+/// riconosciuto non fa partire la JVM: sotto questa major il profiler non si aggiunge (V3).
+const FLIGHT_RECORDING_MIN_JAVA: u32 = 11;
+
+/// Gli inizi di argomento che dicono «l'utente sta già profilando» (V2). Insieme chiuso, che
+/// sbaglia nella direzione voluta: un flag che non riconosce porta ad aggiungere JFR, mai a
+/// toccare un argomento scritto dall'utente.
+const USER_PROFILING_ARGUMENT_PREFIXES: [&str; 6] = [
+    "-XX:StartFlightRecording",
+    "-XX:FlightRecorderOptions",
+    "-XX:+FlightRecorder",
+    "-agentpath:",
+    "-agentlib:",
+    "-javaagent:",
+];
+
+/// Cosa fa il profiler in un lancio, con il motivo quando non registra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfilerDecision {
+    Off,
+    Record(FlightRecording),
+    /// D111: i JVM args dell'utente contengono già `argument`, e vincono loro.
+    UserArgumentsProfile {
+        argument: String,
+    },
+    /// V3: il lancio usa una Java sotto `FLIGHT_RECORDING_MIN_JAVA`.
+    JavaTooOld {
+        java_major: u32,
+    },
+}
+
+pub fn decide_profiler(
+    enabled: bool,
+    custom_jvm_args: &str,
+    java_major: u32,
+    launch_log_dir: &Path,
+) -> ProfilerDecision {
+    if !enabled {
+        return ProfilerDecision::Off;
+    }
+
+    if let Some(argument) = split_argument_string(custom_jvm_args)
+        .into_iter()
+        .find(|argument| {
+            USER_PROFILING_ARGUMENT_PREFIXES
+                .iter()
+                .any(|prefix| argument.starts_with(prefix))
+        })
+    {
+        return ProfilerDecision::UserArgumentsProfile { argument };
+    }
+
+    if java_major < FLIGHT_RECORDING_MIN_JAVA {
+        return ProfilerDecision::JavaTooOld { java_major };
+    }
+
+    ProfilerDecision::Record(FlightRecording {
+        output_file: launch_log_dir.join(FLIGHT_RECORDING_FILE_NAME),
+    })
+}
+
+impl ProfilerDecision {
+    pub fn into_recording(self) -> Option<FlightRecording> {
+        match self {
+            Self::Record(recording) => Some(recording),
+            Self::Off | Self::UserArgumentsProfile { .. } | Self::JavaTooOld { .. } => None,
+        }
+    }
+
+    /// La riga per il log del lancio: un profiler chiesto e non aggiunto lo dice sempre.
+    pub fn launch_log_line(&self) -> Option<String> {
+        match self {
+            Self::Off => None,
+            Self::Record(recording) => Some(format!(
+                "[Profiler] Recording with JFR to {}",
+                recording.output_file.display()
+            )),
+            Self::UserArgumentsProfile { argument } => Some(format!(
+                "[Profiler] Not added: your JVM arguments already contain {argument}, and they win."
+            )),
+            Self::JavaTooOld { java_major } => Some(format!(
+                "[Profiler] Skipped: JFR needs Java {FLIGHT_RECORDING_MIN_JAVA}, this launch uses Java {java_major}."
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,21 +200,14 @@ fn build_java_invocation_args(request: &JavaLaunchRequest) -> Vec<String> {
     args
 }
 
-impl ProfilerConfig {
+impl FlightRecording {
+    /// V1: `settings=profile` per il dettaglio; `dumponexit=true` perché senza di lui una
+    /// chiusura normale del gioco può non lasciare niente sul disco.
     pub fn to_jvm_arg(&self) -> String {
-        match self
-            .options
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(options) => format!(
-                "-agentpath:{}={}",
-                self.agent_library_path.display(),
-                options
-            ),
-            None => format!("-agentpath:{}", self.agent_library_path.display()),
-        }
+        format!(
+            "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename={}",
+            self.output_file.display()
+        )
     }
 }
 
@@ -186,8 +270,8 @@ mod tests {
     use crate::resolver::ModLoader;
 
     use super::{
-        build_launch_command, join_classpath_entries, split_argument_string, JavaLaunchRequest,
-        JavaLaunchSettings, PreparedLaunchCommand, ProfilerConfig,
+        build_launch_command, join_classpath_entries, split_argument_string, FlightRecording,
+        JavaLaunchRequest, JavaLaunchSettings, PreparedLaunchCommand,
     };
 
     fn sample_loader_metadata() -> LoaderMetadata {
@@ -217,9 +301,8 @@ mod tests {
                 min_ram_mb: 2048,
                 max_ram_mb: 4096,
                 custom_jvm_args: "-XX:+UseG1GC -Dcustom=true".into(),
-                profiler: Some(ProfilerConfig {
-                    agent_library_path: PathBuf::from("profilers/jprofiler.dll"),
-                    options: Some("port=8849".into()),
+                profiler: Some(FlightRecording {
+                    output_file: PathBuf::from("launch-logs/1-pack/profile.jfr"),
                 }),
                 wrapper_command: None,
             },
@@ -242,10 +325,7 @@ mod tests {
 
     #[test]
     fn split_argument_string_preserves_quoted_spaces() {
-        assert_eq!(
-            split_argument_string("-Dfoo=\"a b\""),
-            vec!["-Dfoo=a b"]
-        );
+        assert_eq!(split_argument_string("-Dfoo=\"a b\""), vec!["-Dfoo=a b"]);
         assert_eq!(
             split_argument_string("-Xmx2G -Dbar=baz"),
             vec!["-Xmx2G", "-Dbar=baz"]
@@ -254,10 +334,7 @@ mod tests {
             split_argument_string("--arg 'x y z'"),
             vec!["--arg", "x y z"]
         );
-        assert_eq!(
-            split_argument_string("   "),
-            Vec::<String>::new()
-        );
+        assert_eq!(split_argument_string("   "), Vec::<String>::new());
         assert_eq!(split_argument_string(""), Vec::<String>::new());
     }
 
@@ -289,9 +366,10 @@ mod tests {
         assert!(command.args.contains(&"-Dfabric.example=true".to_string()));
         assert!(command.args.contains(&"-Xms2048M".to_string()));
         assert!(command.args.contains(&"-Xmx4096M".to_string()));
-        assert!(command
-            .args
-            .contains(&"-agentpath:profilers/jprofiler.dll=port=8849".to_string()));
+        assert!(command.args.contains(
+            &"-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=launch-logs/1-pack/profile.jfr"
+                .to_string()
+        ));
         assert!(command
             .args
             .contains(&"-javaagent:java-agent/build/libs/config-agent.jar".to_string()));

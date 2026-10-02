@@ -12,7 +12,7 @@ use crate::app_shell::load_shell_snapshot_from_root;
 use crate::instance_configs::{prepare_instance_config_directory, CachedConfigPlacement};
 use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_version_for_minecraft;
-use crate::launch_command::{build_launch_command, JavaLaunchRequest, JavaLaunchSettings};
+use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::cached_artifact_path_for_pending_download;
@@ -49,7 +49,6 @@ pub use precheck::{ModUpdateRow, UpdatePrecheckRequest, UpdatePrecheckResult};
 mod precheck_content;
 use precheck_content::*;
 pub use precheck_content::{ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow};
-
 
 #[path = "launch_preview_models.rs"]
 mod models;
@@ -137,6 +136,14 @@ pub fn stop_minecraft_command() -> Result<(), String> {
     } else {
         Err("No Minecraft process is running.".into())
     }
+}
+
+/// Il file JFR dell'ultimo lancio, se esiste sul disco (D109). Il frontend lo chiede quando
+/// arriva `minecraft-exit`: il valore è messo da parte prima dello spawn, quindi non dipende
+/// dalla sessione attiva che l'uscita del gioco azzera.
+#[tauri::command]
+pub fn last_profile_recording_command() -> Option<String> {
+    last_profile_recording_on_disk().map(|output_file| output_file.to_string_lossy().into_owned())
 }
 
 pub(super) fn current_minecraft_pid() -> Option<u32> {
@@ -366,9 +373,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         let project_aliases = parent_artifacts
             .iter()
             .filter_map(|(mod_id, artifact)| match artifact {
-                RemoteArtifact::Live(version) => {
-                    Some((mod_id.clone(), version.project_id.clone()))
-                }
+                RemoteArtifact::Live(version) => Some((mod_id.clone(), version.project_id.clone())),
                 RemoteArtifact::Cached(_) | RemoteArtifact::MissingJar(_) => None,
             })
             .collect::<Vec<_>>();
@@ -773,6 +778,12 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         format!("[Java] Using {}", java_binary_path.display()),
     )?;
 
+    let profiler = launch_profiler(
+        &app_handle,
+        &effective_settings,
+        effective_required_java,
+        launch_log_session.dir(),
+    )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
         java_binary_path: java_binary_path.clone(),
         working_directory: instance_root.clone(),
@@ -782,13 +793,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             mc_data.client_jar_path.clone(),
         ),
         loader_metadata,
-        launch_settings: JavaLaunchSettings {
-            min_ram_mb: effective_settings.min_ram_mb,
-            max_ram_mb: effective_settings.max_ram_mb,
-            custom_jvm_args: effective_settings.custom_jvm_args.clone(),
-            profiler: None,
-            wrapper_command: effective_settings.wrapper_command.clone(),
-        },
+        launch_settings: effective_settings.java_launch_settings(profiler),
         additional_game_arguments: quick_play_arguments(
             &instance_root,
             request.quick_play_singleplayer.as_deref(),

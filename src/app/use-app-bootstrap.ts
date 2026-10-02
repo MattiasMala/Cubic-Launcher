@@ -15,6 +15,7 @@ import {
   setLaunchState,
   setMcWithSnapshots,
   setMinecraftVersions,
+  setProfileRecordingPath,
 } from "../store";
 import {
   fetchModMetadata,
@@ -81,6 +82,8 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
             setLaunchProgress(progress);
             setLaunchStageLabel(stage);
             setLaunchStageDetail(detail);
+            // Un lancio nuovo: il profilo del precedente non è più quello da mostrare.
+            if (state !== "idle") setProfileRecordingPath(null);
           }));
 
           unlisteners.push(await listen<{ stream: string; line: string }>("minecraft-log", (event) => {
@@ -106,6 +109,10 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
                 ? "Minecraft exited normally."
                 : `Minecraft exited with code ${event.payload.exitCode ?? "unknown"}.`
             );
+            // Il backend ha messo da parte il file prima dello spawn e risponde solo se esiste.
+            invoke<string | null>("last_profile_recording_command")
+              .then(setProfileRecordingPath)
+              .catch((error) => logger.warn("App", "last_profile_recording_command failed", error));
           }));
         }
       } catch (error) {
