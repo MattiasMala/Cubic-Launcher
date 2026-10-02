@@ -21,10 +21,10 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
 use super::{
-    emit_log, load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
-    resolve_compatible_versions_hybrid, resolve_online_selection, run_content_precheck,
-    ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow, ResolvedContentVersions,
-    SelectedMod,
+    active_account_plays_offline, emit_log, load_cached_version_ids_for_selected, load_modlist,
+    parse_mod_loader, resolve_compatible_versions_hybrid, resolve_online_selection,
+    run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
+    ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -258,6 +258,20 @@ pub(super) async fn run_update_precheck(
 
     if let Some(empty) = empty_precheck_for_loaderless_target(&target) {
         return Ok(empty);
+    }
+
+    // D115, D114: an account that plays offline launches with zero requests,
+    // and the pre-check is requests. It does not run: the empty payload shows
+    // no popup and hands the launch no map, and the launch reads the same row
+    // and takes the offline path by itself.
+    if active_account_plays_offline(launcher_paths)? {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            "[Launcher] The active account is set to play offline; the update check does not run"
+                .to_string(),
+        );
+        return Ok(UpdatePrecheckResult::default());
     }
 
     let modlist = load_modlist(launcher_paths, &modlist_name)?;

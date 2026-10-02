@@ -260,6 +260,17 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &shell_snapshot.global_settings,
         &shell_snapshot.selected_modlist_overrides,
     );
+    // D115: read once, before anything is chosen, so that the identity and
+    // the resolution path of this launch come from the same reading of the
+    // active account's row. The vanilla pipeline needs it for the identity.
+    let plays_offline = active_account_plays_offline(&launcher_paths)?;
+    if plays_offline {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            "[Launcher] The active account is set to play offline: no update check, no version lookups, offline identity".to_string(),
+        )?;
+    }
 
     let http_client = crate::modrinth::build_download_client();
     if target.mod_loader == ModLoader::Vanilla {
@@ -272,6 +283,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             effective_settings,
             http_client,
             request.quick_play_singleplayer.clone(),
+            plays_offline,
         )
         .await;
     }
@@ -287,7 +299,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // Both branches live in `launch_preview_artifacts.rs` because the update
     // pre-check runs the online one too: it has to name exactly the mods this
     // launch will install.
-    let resolution_path = LaunchResolutionPath::for_launch(request.resolved_versions.as_ref());
+    let resolution_path =
+        LaunchResolutionPath::for_active_account(plays_offline, request.resolved_versions.as_ref());
     // `None` on the `Resolve` path, always — the path is chosen by the map's
     // presence. The online branch below keeps reading it so that "no map" is
     // literally today's path, unchanged: whether that branch should still
@@ -297,6 +310,10 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     let selection = match resolution_path {
         LaunchResolutionPath::Preresolved(preresolved) => {
             resolve_offline_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
+        }
+        // No map, and none wanted: the cache alone answers (D115).
+        LaunchResolutionPath::Offline => {
+            resolve_offline_selection(&launcher_paths, &modlist, &target, None)?
         }
         LaunchResolutionPath::Resolve => {
             resolve_online_selection(
@@ -330,6 +347,9 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             LaunchResolutionPath::Resolve => {
                 "You have more than 300 mods and this launch has no pre-checked versions to start from, so every version is resolved against Modrinth: it may take 1-2 minutes due to API rate limits."
             }
+            LaunchResolutionPath::Offline => {
+                "You have more than 300 mods. The active account plays offline, so every mod comes from the jars you already have."
+            }
         };
         emit_launcher_issue(
             &app_handle,
@@ -347,15 +367,20 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         missing_jar_records,
         effective_required_java,
         project_aliases,
-    ) = if let LaunchResolutionPath::Preresolved(preresolved) = resolution_path {
-        emit_log(
-            &app_handle,
-            ProcessLogStream::Stdout,
-            format!(
+    ) = if matches!(
+        resolution_path,
+        LaunchResolutionPath::Preresolved(_) | LaunchResolutionPath::Offline
+    ) {
+        let cache_message = match resolution_path.preresolved() {
+            Some(preresolved) => format!(
                 "[Cache] Launching from the {} versions chosen before launch; the cache answers first and only what is missing is fetched.",
                 preresolved.len()
             ),
-        )?;
+            // With no map nothing is covered and no version is fetched: every
+            // mod takes the cached artifact of its project.
+            None => "[Cache] Launching from the cached versions; no version is looked up on Modrinth.".to_string(),
+        };
+        emit_log(&app_handle, ProcessLogStream::Stdout, cache_message)?;
 
         let parent_artifacts = resolve_selected_remote_artifacts(
             &app_handle,
@@ -363,7 +388,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &selected_mods,
             &modrinth_client,
             &target,
-            Some(preresolved),
+            resolution_path.preresolved(),
         )
         .await?;
         // The rows for the versions fetched here are written at the end of the
@@ -720,7 +745,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths).await?;
+    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
