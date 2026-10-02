@@ -39,9 +39,6 @@ import {
   setLinkModalModIds,
   setLinkModalOpen,
   setNewFunctionalGroupName,
-  setRenameRuleDraft,
-  setRenameRuleModalOpen,
-  setRenameRuleTargetId,
   setSavedIncompatibilities,
   setSavedLinks,
   setSelectedIds,
@@ -359,12 +356,6 @@ export function openAlternativesPanel(rowId: string) {
 }
 
 export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: string | string[], enabled: boolean) => void) | null>(null);
-
-export function openRenameRule(id: string, name: string) {
-  setRenameRuleTargetId(id);
-  setRenameRuleDraft(name);
-  setRenameRuleModalOpen(true);
-}
 
 export function resetLaunchUiState() {
   setLaunchState("idle");

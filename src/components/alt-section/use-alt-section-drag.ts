@@ -13,7 +13,6 @@ import {
   setAestheticGroups,
   setGroupNameDraft,
   setModRowsState,
-  sortOrder,
   startGroupRename,
   commitGroupRename,
   tagFilter,
@@ -58,16 +57,13 @@ export function useAltSectionDrag(props: AltSectionProps) {
   };
 
   const scopedAltGroups = () => {
-    const so = sortOrder();
     return aestheticGroups()
       .filter(g => g.scopeRowId === props.parentRow.id)
       .map(g => {
-        let blocks = g.blockIds
+        const blocks = g.blockIds
           .map(id => (props.parentRow.alternatives ?? []).find(a => a.id === id))
           .filter((a): a is ModRow => Boolean(a))
           .filter(altMatchesFilter);
-        if (so === "name-az") blocks = [...blocks].sort((a, b) => a.name.localeCompare(b.name));
-        if (so === "name-za") blocks = [...blocks].sort((a, b) => b.name.localeCompare(a.name));
         return { ...g, blocks };
       })
       .filter(g => g.blocks.length > 0);

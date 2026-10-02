@@ -9,10 +9,6 @@ import {
   createFunctionalGroup,
   toneToHue,
   huePreviewColor,
-  renameRuleModalOpen,
-  setRenameRuleModalOpen,
-  renameRuleDraft,
-  setRenameRuleDraft,
 } from "../../store";
 import { Modal, ModalHeader } from "./modal-base";
 
@@ -58,30 +54,6 @@ export function FunctionalGroupModal() {
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
           <button onClick={() => setFunctionalGroupModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
           <button onClick={createFunctionalGroup} disabled={!newFunctionalGroupName().trim()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Create</button>
-        </div>
-      </Modal>
-    </Show>
-  );
-}
-
-export function RenameRuleModal(props: { onRename: () => Promise<void> }) {
-  return (
-    <Show when={renameRuleModalOpen()}>
-      <Modal onClose={() => setRenameRuleModalOpen(false)}>
-        <ModalHeader title="Rename Rule" onClose={() => setRenameRuleModalOpen(false)} />
-        <div class="p-6">
-          <input
-            type="text"
-            value={renameRuleDraft()}
-            onInput={e => setRenameRuleDraft(e.currentTarget.value)}
-            onKeyDown={e => e.key === "Enter" && void props.onRename()}
-            class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-            autofocus
-          />
-        </div>
-        <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
-          <button onClick={() => setRenameRuleModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
-          <button onClick={() => void props.onRename()} disabled={!renameRuleDraft().trim()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Rename</button>
         </div>
       </Modal>
     </Show>

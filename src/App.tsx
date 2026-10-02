@@ -23,7 +23,6 @@ import {
   modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
-  renameRuleDraft, renameRuleTargetId, setRenameRuleModalOpen,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   globalSettings, setGlobalSettings, setModlistOverrides,
@@ -55,7 +54,6 @@ import {
   remapAestheticGroups,
   remapFunctionalGroups,
   remapIds,
-  renameRowId,
   reorderAlternativesInRows,
 } from "./app/row-state";
 import {
@@ -92,7 +90,6 @@ import {
   LinkModal,
   LinksOverviewModal,
   InstancePresentationModal,
-  RenameRuleModal,
   IncompatibilitiesModal,
   AlternativesPanel,
   ErrorCenter,
@@ -637,35 +634,6 @@ export default function App() {
     }
   };
 
-  const handleRenameRule = async () => {
-    const id = renameRuleTargetId();
-    const name = renameRuleDraft().trim();
-    if (!id || !name) return;
-    logger.info("App", "handleRenameRule started", { id, name });
-    const nextId = renameRowId(id, name);
-    const idRemap = new Map([[id, nextId]]);
-    const currentRows = modRowsState().map(r => r.id === id ? { ...r, id: nextId, name } : r);
-    const validIds = collectRowIds(currentRows);
-    batch(() => {
-      setModRowsState(currentRows);
-      setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-      setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-      setSelectedIds(ids => remapIds(ids, idRemap, validIds));
-      setAdvancedPanelModId(aid => (aid && idRemap.has(aid) ? idRemap.get(aid)! : aid));
-    });
-    setRenameRuleModalOpen(false);
-    if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleRenameRule skipped — no backend"); return; }
-    try {
-      await invoke("rename_rule_command", { input: { modlistName: selectedModListName(), modId: rowMap().get(id)?.primaryModId ?? id, newModId: name } });
-      void runResolution();
-      logger.debug("App", "handleRenameRule completed");
-    } catch (err) {
-      logger.error("App", "handleRenameRule failed", err);
-      pushUiError({ title: "Rename failed", message: "The rule name could not be saved.", detail: String(err), severity: "error", scope: "launch" });
-      await loadEditorSnapshot(selectedModListName()); // restore on failure
-    }
-  };
-
   const handleSaveSettings = async (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => {
     logger.info("App", "handleSaveSettings started");
     if (!isTauri()) {
@@ -1190,7 +1158,6 @@ export default function App() {
       <AdvancedModPanel onDelete={id => { setSelectedIds([id]); void handleDeleteSelected(); }} />
       <PinVersionDialog />
       <InstancePresentationModal onSave={handleSavePresentation} onDelete={handleDeleteModList} />
-      <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />
       <AlternativesPanel onSave={handleSaveAlternativeOrder} onAddAlternative={handleAddAlternative} onRemoveAlternative={handleRemoveAlternative} />
       <ErrorCenter />

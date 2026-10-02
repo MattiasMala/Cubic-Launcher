@@ -99,13 +99,6 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
             .load_active_account_with_credentials()?
             .map(account_summary))
     }
-
-    pub fn active_author_name(&self) -> Result<Option<String>> {
-        Ok(self
-            .encrypted_accounts
-            .load_active_account()?
-            .and_then(|account| account.xbox_gamertag))
-    }
 }
 
 fn account_summary((account, credentials): (AccountRecord, CredentialState)) -> AccountSummary {
@@ -297,10 +290,6 @@ mod tests {
 
             assert_eq!(active_summary.microsoft_id, "account-b");
             assert_eq!(active_summary.xbox_gamertag.as_deref(), Some("PlayerB"));
-            assert_eq!(
-                manager.active_author_name().expect("author should load"),
-                Some("PlayerB".into())
-            );
         });
     }
 
@@ -310,10 +299,6 @@ mod tests {
             assert!(manager
                 .active_account_summary()
                 .expect("summary lookup should succeed")
-                .is_none());
-            assert!(manager
-                .active_author_name()
-                .expect("author lookup should succeed")
                 .is_none());
         });
     }
