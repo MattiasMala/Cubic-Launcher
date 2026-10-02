@@ -301,4 +301,95 @@ mod tests {
                 .is_none());
         });
     }
+
+    /// A row whose token blob does not decrypt is still a saved account: the
+    /// list must show it, not lose it (D117).
+    #[test]
+    fn list_account_summaries_keeps_a_row_whose_blob_does_not_decrypt() {
+        with_manager(|manager, root_dir| {
+            manager
+                .save_account_login(
+                    ManagedAccountProfile {
+                        microsoft_id: "account-valid".into(),
+                        xbox_gamertag: Some("ValidPlayer".into()),
+                        minecraft_uuid: Some("valid-uuid".into()),
+                        profile_data: None,
+                    },
+                    ManagedAccountTokens {
+                        access_token: "valid-access".into(),
+                        refresh_token: Some("valid-refresh".into()),
+                    },
+                    true,
+                    false,
+                )
+                .expect("valid account should save");
+
+            // Version byte, then a zero nonce and a zero ciphertext: the
+            // shape of a blob, which no key opens.
+            let mut corrupted_payload = vec![1_u8];
+            corrupted_payload.extend_from_slice(&[0; 12 + 16]);
+            Connection::open(root_dir.join("launcher_data.db"))
+                .expect("database should open")
+                .execute(
+                    "INSERT INTO accounts (microsoft_id, refresh_token_enc, last_login, is_active) \
+                     VALUES (?1, ?2, CURRENT_TIMESTAMP, FALSE)",
+                    rusqlite::params!["account-corrupted", corrupted_payload],
+                )
+                .expect("corrupted account should store");
+
+            let summaries = manager
+                .list_account_summaries()
+                .expect("summaries should load");
+            let ids: Vec<&str> = summaries
+                .iter()
+                .map(|summary| summary.microsoft_id.as_str())
+                .collect();
+
+            assert_eq!(summaries.len(), 2, "listed: {ids:?}");
+            assert!(ids.contains(&"account-corrupted"), "listed: {ids:?}");
+            assert!(ids.contains(&"account-valid"), "listed: {ids:?}");
+        });
+    }
+
+    /// With the token key gone from the keyring no blob decrypts, which is
+    /// this machine's normal state (wiki trap 15): every saved account, active
+    /// or not, must still be listed so it can be chosen.
+    #[test]
+    fn list_account_summaries_lists_every_account_when_the_key_is_gone() {
+        with_manager(|manager, root_dir| {
+            for (microsoft_id, make_active) in [("account-a", true), ("account-b", false)] {
+                manager
+                    .save_account_login(
+                        ManagedAccountProfile {
+                            microsoft_id: microsoft_id.into(),
+                            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+                            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+                            profile_data: None,
+                        },
+                        ManagedAccountTokens {
+                            access_token: format!("access-{microsoft_id}"),
+                            refresh_token: Some(format!("refresh-{microsoft_id}")),
+                        },
+                        make_active,
+                        false,
+                    )
+                    .expect("account should save");
+            }
+
+            let connection =
+                Connection::open(root_dir.join("launcher_data.db")).expect("database should open");
+            let keyless = AccountManager::new(&connection, MemorySecretStore::default());
+            let summaries = keyless
+                .list_account_summaries()
+                .expect("summaries should load");
+            let listed: Vec<(&str, bool)> = summaries
+                .iter()
+                .map(|summary| (summary.microsoft_id.as_str(), summary.is_active))
+                .collect();
+
+            assert_eq!(summaries.len(), 2, "listed: {listed:?}");
+            assert!(listed.contains(&("account-a", true)), "listed: {listed:?}");
+            assert!(listed.contains(&("account-b", false)), "listed: {listed:?}");
+        });
+    }
 }
