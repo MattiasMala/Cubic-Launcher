@@ -69,14 +69,6 @@ pub struct DeleteRulesInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RenameRuleInput {
-    pub modlist_name: String,
-    pub mod_id: String,
-    pub new_mod_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReorderRulesInput {
     pub modlist_name: String,
     pub ordered_mod_ids: Vec<String>,

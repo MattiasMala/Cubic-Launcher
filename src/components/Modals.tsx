@@ -9,7 +9,6 @@ export {
   FunctionalGroupModal,
   LinkModal,
   LinksOverviewModal,
-  RenameRuleModal,
   IncompatibilitiesModal,
   AlternativesPanel,
 } from "./modals/modal-rules";

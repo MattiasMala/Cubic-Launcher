@@ -50,14 +50,6 @@ pub fn delete_rules_command(
 }
 
 #[tauri::command]
-pub fn rename_rule_command(
-    launcher_paths: State<'_, LauncherPaths>,
-    input: RenameRuleInput,
-) -> Result<(), String> {
-    rename_rule_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn reorder_rules_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: ReorderRulesInput,
@@ -280,47 +272,6 @@ fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&st
         .retain(|alt| !ids.contains(alt.mod_id.as_str()));
     for alt in &mut rule.alternatives {
         remove_from_alternatives(alt, ids);
-    }
-}
-
-pub fn rename_rule_from_root(root_dir: &Path, input: &RenameRuleInput) -> Result<()> {
-    let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
-
-    if input.new_mod_id.trim().is_empty() {
-        bail!("new mod_id cannot be empty");
-    }
-
-    if input.mod_id != input.new_mod_id && modlist.contains_mod_id(&input.new_mod_id) {
-        bail!("a rule with mod_id '{}' already exists", input.new_mod_id);
-    }
-
-    let rule = modlist
-        .find_rule_mut(&input.mod_id)
-        .with_context(|| format!("rule '{}' not found", input.mod_id))?;
-    rule.mod_id = input.new_mod_id.clone();
-
-    let old_id = input.mod_id.clone();
-    let new_id = input.new_mod_id.clone();
-    for rule in &mut modlist.rules {
-        rename_references_in_tree(rule, &old_id, &new_id);
-    }
-
-    save_modlist(root_dir, &input.modlist_name, &modlist)
-}
-
-fn rename_references_in_tree(rule: &mut Rule, old_id: &str, new_id: &str) {
-    for entry in &mut rule.exclude_if {
-        if entry == old_id {
-            *entry = new_id.to_string();
-        }
-    }
-    for entry in &mut rule.requires {
-        if entry == old_id {
-            *entry = new_id.to_string();
-        }
-    }
-    for alt in &mut rule.alternatives {
-        rename_references_in_tree(alt, old_id, new_id);
     }
 }
 

@@ -247,44 +247,6 @@ fn delete_rules_removes_from_tree() {
 }
 
 #[test]
-fn rename_rule_updates_all_references() {
-    let root = unique_test_root();
-    setup_modlist(
-        &root,
-        "Pack",
-        vec![
-            simple_rule("sodium"),
-            Rule {
-                mod_id: "embeddium".into(),
-                source: ModSource::Modrinth,
-                enabled: true,
-                exclude_if: vec!["sodium".into()],
-                requires: vec![],
-                version_rules: vec![],
-                custom_configs: vec![],
-                alternatives: vec![],
-            },
-        ],
-    );
-
-    rename_rule_from_root(
-        &root,
-        &RenameRuleInput {
-            modlist_name: "Pack".into(),
-            mod_id: "sodium".into(),
-            new_mod_id: "sodium-extra".into(),
-        },
-    )
-    .unwrap();
-
-    let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-    assert_eq!(snapshot.rows[0].mod_id, "sodium-extra");
-    assert_eq!(snapshot.rows[1].exclude_if, vec!["sodium-extra"]);
-
-    fs::remove_dir_all(&root).unwrap();
-}
-
-#[test]
 fn reorder_rules_changes_order() {
     let root = unique_test_root();
     setup_modlist(

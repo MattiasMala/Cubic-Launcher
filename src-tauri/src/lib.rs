@@ -103,7 +103,6 @@ pub fn run() {
             editor_data::load_modlist_editor_command,
             editor_data::add_mod_rule_command,
             editor_data::delete_rules_command,
-            editor_data::rename_rule_command,
             editor_data::reorder_rules_command,
             editor_data::save_alternative_order_command,
             editor_data::add_alternative_command,
