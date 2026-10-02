@@ -1,13 +1,14 @@
 import { For, Show, createSignal, createEffect } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { MOD_LOADERS, type AccountSummary } from "../lib/types";
 import {
   selectedMcVersion, setSelectedMcVersion,
   selectedModLoader, setSelectedModLoader,
   minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
-  launchLogs, logViewerOpen, setLogViewerOpen,
-  activeAccount, accounts, setAccountsModalOpen,
+  launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath,
+  activeAccount, accounts, setAccountsModalOpen, pushUiError,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
 import { Select } from "./Select";
@@ -76,6 +77,14 @@ export function LaunchPanel(props: LaunchPanelProps) {
     try {
       await invoke("stop_minecraft_command");
     } catch { /* already exited */ }
+  };
+
+  const handleRevealProfile = async (path: string) => {
+    try {
+      await revealItemInDir(path);
+    } catch (error) {
+      pushUiError({ title: "Profile folder not opened", message: "The launcher could not show the profile file in its folder.", detail: String(error), severity: "warning", scope: "launch" });
+    }
   };
 
   return (
@@ -289,6 +298,19 @@ export function LaunchPanel(props: LaunchPanelProps) {
 
         {/* Right side: Log button + Play button */}
         <div class="flex items-center gap-4">
+          {/* Profilo JFR dell'ultimo lancio: solo se il file è davvero sul disco (D109) */}
+          <Show when={!isLaunching() && profileRecordingPath()}>
+            {path => (
+              <button
+                onClick={() => void handleRevealProfile(path())}
+                class="h-10 rounded-full bg-bgDark border border-borderColor px-4 flex items-center gap-2 text-sm text-textMuted transition-colors duration-75 hover:text-white hover:bg-bgHover"
+                title={path()}
+              >
+                <MaterialIcon name="folder_open" size="md" />
+                Profile
+              </button>
+            )}
+          </Show>
           {/* Log toggle */}
           <button
             onClick={() => setLogViewerOpen(v => !v)}

@@ -144,6 +144,7 @@ pub fn run() {
             launch_preview::update_precheck_command,
             launch_preview::verify_launch_command,
             launch_preview::stop_minecraft_command,
+            launch_preview::last_profile_recording_command,
             screenshots::list_screenshots_command,
             screenshots::delete_screenshot_command,
             screenshots::open_screenshot_folder_command,

@@ -215,7 +215,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <input type="checkbox" checked={globalDraft().profilerEnabled} onChange={e => setGlobalDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Enable profiler globally</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Records a Java Flight Recorder profile (profile.jfr) into the launch's log folder. Needs Java 11 or newer. If your Custom JVM Args already contain a profiling flag, yours win and nothing is added.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Records a Java Flight Recorder profile (profile.jfr) into the launch's log folder, and a Profile button shows it there once the game closes. Needs Java 11 or newer. If your Custom JVM Args already contain a profiling flag, yours win and nothing is added.</p>
                 </div>
                 <div>
                   <label class="flex items-center gap-3 text-sm">

@@ -139,6 +139,14 @@ pub fn stop_minecraft_command() -> Result<(), String> {
     }
 }
 
+/// Il file JFR dell'ultimo lancio, se esiste sul disco (D109). Il frontend lo chiede quando
+/// arriva `minecraft-exit`: il valore è messo da parte prima dello spawn, quindi non dipende
+/// dalla sessione attiva che l'uscita del gioco azzera.
+#[tauri::command]
+pub fn last_profile_recording_command() -> Option<String> {
+    last_profile_recording_on_disk().map(|output_file| output_file.to_string_lossy().into_owned())
+}
+
 pub(super) fn current_minecraft_pid() -> Option<u32> {
     *ACTIVE_MC_PID.lock().unwrap()
 }

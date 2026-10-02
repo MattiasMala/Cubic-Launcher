@@ -24,6 +24,11 @@ const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
 
 static ACTIVE_LAUNCH_LOG_SESSION: Mutex<Option<Arc<LaunchLogSession>>> = Mutex::new(None);
 
+/// Il file JFR che l'ultimo lancio ha chiesto alla JVM (D109). Si scrive prima dello spawn e
+/// l'uscita del gioco non lo azzera: chi lo chiede dopo `minecraft-exit` non corre contro
+/// `set_active_launch_log_session(None)`, che invece azzera la sessione proprio lì.
+static LAST_PROFILE_RECORDING: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
+
 /// Monotonic counter guaranteeing distinct launch log directories even for two
 /// launches of the same (modlist, mc version, loader) triple within one second.
 static LAUNCH_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -399,7 +404,8 @@ pub(super) fn current_launch_log_session() -> Option<Arc<LaunchLogSession>> {
     ACTIVE_LAUNCH_LOG_SESSION.lock().unwrap().clone()
 }
 
-/// Decide il profiler del lancio e lo scrive nel log del lancio.
+/// Decide il profiler del lancio, lo scrive nel log del lancio e mette da parte il file per
+/// il bottone di fine lancio. Ogni lancio sovrascrive il valore del precedente.
 pub(super) fn launch_profiler(
     app_handle: &tauri::AppHandle,
     settings: &EffectiveLaunchSettings,
@@ -410,7 +416,22 @@ pub(super) fn launch_profiler(
     if let Some(line) = decision.launch_log_line() {
         emit_log(app_handle, ProcessLogStream::Stdout, line)?;
     }
-    Ok(decision.into_recording())
+    let recording = decision.into_recording();
+    remember_profile_recording(recording.as_ref().map(|recording| recording.output_file.clone()));
+    Ok(recording)
+}
+
+fn remember_profile_recording(output_file: Option<PathBuf>) {
+    *LAST_PROFILE_RECORDING.lock() = output_file;
+}
+
+/// Il file JFR dell'ultimo lancio, solo se esiste davvero: una JVM uccisa senza chiudersi
+/// può non averlo scritto, e allora il bottone non deve comparire.
+pub(super) fn last_profile_recording_on_disk() -> Option<PathBuf> {
+    LAST_PROFILE_RECORDING
+        .lock()
+        .clone()
+        .filter(|output_file| output_file.is_file())
 }
 
 pub(super) fn emit_progress(
