@@ -37,6 +37,7 @@ pub struct EditorVersionRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorCustomConfig {
+    pub id: String,
     pub mc_versions: Vec<String>,
     pub loader: String,
     pub target_path: String,
@@ -181,6 +182,7 @@ pub struct SaveVersionRuleInput {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveCustomConfigInput {
+    pub id: String,
     pub mc_versions: Vec<String>,
     pub loader: String,
     pub target_path: String,
@@ -193,4 +195,17 @@ pub struct ToggleRuleEnabledInput {
     pub modlist_name: String,
     pub mod_id: String,
     pub enabled: bool,
+}
+
+/// The files picked for one custom config, to be copied into the mod list
+/// (D112). `current_files` are the names the config already lists, so a pick
+/// cannot replace one of them with different bytes without saying so.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCustomConfigFilesInput {
+    pub modlist_name: String,
+    pub mod_id: String,
+    pub config_id: String,
+    pub source_paths: Vec<String>,
+    pub current_files: Vec<String>,
 }

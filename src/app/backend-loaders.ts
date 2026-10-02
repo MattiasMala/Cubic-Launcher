@@ -243,8 +243,8 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
         for (const [index, rule] of (row.versionRules ?? []).entries()) {
           extractedVersionRules.push({ id: `vr-${backendModId}-${index}`, modId: rowId, kind: rule.kind as "exclude" | "only", mcVersions: rule.mcVersions ?? [], loader: rule.loader ?? "any" });
         }
-        for (const [index, config] of (row.customConfigs ?? []).entries()) {
-          extractedCustomConfigs.push({ id: `cc-${backendModId}-${index}`, modId: rowId, mcVersions: config.mcVersions ?? [], loader: config.loader ?? "any", targetPath: config.targetPath ?? "", files: config.files ?? [] });
+        for (const config of row.customConfigs ?? []) {
+          extractedCustomConfigs.push({ id: config.id, modId: rowId, mcVersions: config.mcVersions ?? [], loader: config.loader ?? "any", targetPath: config.targetPath ?? "", files: config.files ?? [] });
         }
         if (row.alternatives?.length) collectAdvanced(row.alternatives);
       }

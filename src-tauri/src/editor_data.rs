@@ -122,6 +122,15 @@ pub fn save_advanced_batch_command(
 }
 
 #[tauri::command]
+pub fn import_custom_config_files_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ImportCustomConfigFilesInput,
+) -> Result<Vec<String>, String> {
+    import_custom_config_files_from_root(launcher_paths.root_dir(), &input)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn toggle_rule_enabled_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: ToggleRuleEnabledInput,
@@ -175,7 +184,12 @@ pub fn load_editor_snapshot_from_root(
     root_dir: &Path,
     modlist_name: &str,
 ) -> Result<EditorSnapshot> {
-    let modlist = load_modlist(root_dir, modlist_name)?;
+    let mut modlist = load_modlist(root_dir, modlist_name)?;
+    // D130: a `rules.json` written before custom configs had an id gets one
+    // here, and it is saved at once, so the next load sees the same id.
+    if modlist.assign_missing_custom_config_ids() {
+        save_modlist(root_dir, modlist_name, &modlist)?;
+    }
 
     let modlist_dir = LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
@@ -564,13 +578,8 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
     rule.custom_configs = input
         .custom_configs
         .iter()
-        .map(|cc| CustomConfig {
-            mc_versions: cc.mc_versions.clone(),
-            loader: cc.loader.clone(),
-            target_path: cc.target_path.clone(),
-            files: cc.files.clone(),
-        })
-        .collect();
+        .map(custom_config_from_input)
+        .collect::<Result<_>>()?;
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
@@ -643,17 +652,116 @@ pub fn save_advanced_batch_from_root(
             rule.custom_configs = entry
                 .custom_configs
                 .iter()
-                .map(|cc| CustomConfig {
-                    mc_versions: cc.mc_versions.clone(),
-                    loader: cc.loader.clone(),
-                    target_path: cc.target_path.clone(),
-                    files: cc.files.clone(),
-                })
-                .collect();
+                .map(custom_config_from_input)
+                .collect::<Result<_>>()?;
         }
     }
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
+}
+
+/// The saved custom config keeps the id the frontend sends (D130). An empty
+/// one gets a fresh id; one that is not a single path component is refused,
+/// because it becomes the directory of the copied files.
+fn custom_config_from_input(input: &SaveCustomConfigInput) -> Result<CustomConfig> {
+    let id = if input.id.is_empty() {
+        crate::rules::new_custom_config_id()
+    } else {
+        validate_path_component(&input.id)
+            .with_context(|| format!("invalid custom config id '{}'", input.id))?;
+        input.id.clone()
+    };
+    Ok(CustomConfig {
+        id,
+        mc_versions: input.mc_versions.clone(),
+        loader: input.loader.clone(),
+        target_path: input.target_path.clone(),
+        files: input.files.clone(),
+    })
+}
+
+/// Copy the files picked for a custom config into the mod list (D112) and
+/// return the names to list in its `files`, one per distinct name.
+///
+/// Same job as the jar of a local mod in [`add_mod_rule_from_root`]: the mod
+/// list directory, a plain `fs::copy`, and the source is only read — never
+/// moved, never removed. The destination is
+/// [`custom_config_files_dir`](crate::rules::custom_config_files_dir).
+///
+/// A name never starts pointing at other bytes in silence. Every file of a
+/// custom config lands in the instance under its own name, so two of them
+/// cannot share one: two picked files with one name and different bytes, or a
+/// picked file whose name the config already lists with different bytes,
+/// refuse the whole pick before anything is copied, naming the file. The same
+/// bytes again are not a conflict.
+pub fn import_custom_config_files_from_root(
+    root_dir: &Path,
+    input: &ImportCustomConfigFilesInput,
+) -> Result<Vec<String>> {
+    let modlist = load_modlist(root_dir, &input.modlist_name)?;
+    if !modlist.contains_mod_id(&input.mod_id) {
+        bail!(
+            "rule '{}' not found in modlist '{}'",
+            input.mod_id,
+            input.modlist_name
+        );
+    }
+    let modlist_dir = LauncherPaths::new(root_dir.to_path_buf())
+        .modlists_dir()
+        .join(&input.modlist_name);
+    let files_dir =
+        crate::rules::custom_config_files_dir(&modlist_dir, &input.mod_id, &input.config_id)?;
+
+    let mut picked: Vec<(String, &Path, Vec<u8>)> = Vec::new();
+    for source in &input.source_paths {
+        let source_path = Path::new(source);
+        let name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("'{source}' has no usable file name"))?;
+        validate_path_component(name)?;
+        let bytes = std::fs::read(source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+
+        if let Some((_, first, first_bytes)) = picked.iter().find(|(seen, _, _)| seen == name) {
+            if *first_bytes != bytes {
+                bail!(
+                    "two different files named '{name}' were picked ({} and {}): \
+                     a custom config places each file under its own name, so pick one",
+                    first.display(),
+                    source_path.display()
+                );
+            }
+            continue;
+        }
+        if input.current_files.iter().any(|listed| listed == name) {
+            if let Ok(stored) = std::fs::read(files_dir.join(name)) {
+                if stored != bytes {
+                    bail!(
+                        "this custom config already has a different file named '{name}': \
+                         remove it from the list first to replace it"
+                    );
+                }
+            }
+        }
+        picked.push((name.to_string(), source_path, bytes));
+    }
+
+    std::fs::create_dir_all(&files_dir)
+        .with_context(|| format!("failed to create {}", files_dir.display()))?;
+    let mut names = Vec::with_capacity(picked.len());
+    for (name, source_path, _) in picked {
+        let dest = files_dir.join(&name);
+        std::fs::copy(source_path, &dest).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source_path.display(),
+                dest.display()
+            )
+        })?;
+        names.push(name);
+    }
+    Ok(names)
 }
 
 /// One row of the editor snapshot.
@@ -694,6 +802,7 @@ fn build_editor_row(rule: &Rule, modlist_dir: &Path) -> EditorRow {
             .custom_configs
             .iter()
             .map(|cc| EditorCustomConfig {
+                id: cc.id.clone(),
                 mc_versions: cc.mc_versions.clone(),
                 loader: cc.loader.clone(),
                 target_path: cc.target_path.clone(),
