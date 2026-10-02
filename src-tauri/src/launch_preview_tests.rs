@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
+use crate::launch_command::{build_launch_command, split_argument_string, JavaLaunchRequest};
 use crate::modrinth::{ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -129,6 +130,173 @@ fn effective_launch_settings_prefer_modlist_overrides() {
     assert_eq!(
         settings.java_path_override,
         Some(PathBuf::from("/custom/java"))
+    );
+}
+
+#[test]
+fn effective_launch_settings_prefer_the_modlist_profiler_override() {
+    // L'override vince in tutte e due le direzioni; senza override vale il globale.
+    let mut global = global_settings();
+    let mut overrides = modlist_overrides();
+
+    global.profiler_enabled = true;
+    overrides.profiler_enabled = Some(false);
+    assert!(!EffectiveLaunchSettings::from_shell_settings(&global, &overrides).profiler_enabled);
+
+    overrides.profiler_enabled = None;
+    assert!(EffectiveLaunchSettings::from_shell_settings(&global, &overrides).profiler_enabled);
+
+    global.profiler_enabled = false;
+    overrides.profiler_enabled = Some(true);
+    assert!(EffectiveLaunchSettings::from_shell_settings(&global, &overrides).profiler_enabled);
+}
+
+fn profiler_launch_dir() -> PathBuf {
+    PathBuf::from("/launcher/launch-logs/1-pack-1-21-1-fabric-0-0")
+}
+
+/// Impostazioni col profiler globale acceso o spento, i JVM args dati e nessun override
+/// per mod list: il profiler arriva agli argomenti per la strada vera, `from_shell_settings`.
+fn settings_with_profiler(enabled: bool, custom_jvm_args: &str) -> EffectiveLaunchSettings {
+    let mut global = global_settings();
+    global.profiler_enabled = enabled;
+    global.custom_jvm_args = custom_jvm_args.into();
+    global.wrapper_command = String::new();
+    let overrides = ShellModListOverrides {
+        modlist_name: Some("Pack".into()),
+        min_ram_mb: None,
+        max_ram_mb: None,
+        custom_jvm_args: None,
+        profiler_enabled: None,
+        wrapper_command: None,
+        minecraft_version: None,
+        mod_loader: None,
+    };
+    EffectiveLaunchSettings::from_shell_settings(&global, &overrides)
+}
+
+/// Gli argomenti che il lancio passa alla JVM con queste impostazioni e questa major di Java.
+fn jvm_args_for(settings: &EffectiveLaunchSettings, java_major: u32) -> Vec<String> {
+    let decision = settings.profiler_decision(java_major, &profiler_launch_dir());
+    let request = JavaLaunchRequest {
+        java_binary_path: PathBuf::from("/java/bin/java"),
+        working_directory: PathBuf::from("/instance"),
+        classpath_entries: vec![PathBuf::from("client.jar")],
+        loader_metadata: LoaderMetadata {
+            mod_loader: ModLoader::Fabric,
+            minecraft_version: "1.21.1".into(),
+            loader_version: "0.16.14".into(),
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".into(),
+            libraries: Vec::new(),
+            maven_files: Vec::new(),
+            jvm_arguments: vec!["-Dloader=true".into()],
+            game_arguments: Vec::new(),
+            min_java_version: None,
+        },
+        launch_settings: settings.java_launch_settings(decision.into_recording()),
+        additional_game_arguments: Vec::new(),
+        config_attribution: None,
+    };
+    build_launch_command(&request)
+        .expect("launch command should build")
+        .args
+}
+
+fn is_profiling_flag(argument: &str) -> bool {
+    argument.starts_with("-XX:StartFlightRecording") || argument.starts_with("-javaagent:")
+}
+
+#[test]
+fn an_enabled_profiler_records_jfr_into_the_launch_log_dir() {
+    let args = jvm_args_for(&settings_with_profiler(true, "-XX:+UseG1GC"), 21);
+
+    let recordings = args
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("-XX:StartFlightRecording="))
+        .collect::<Vec<_>>();
+    assert_eq!(recordings.len(), 1, "{args:?}");
+    let options = recordings[0].split(',').collect::<Vec<_>>();
+    let filename = options
+        .iter()
+        .find_map(|option| option.strip_prefix("filename="))
+        .expect("the recording names its file");
+    assert_eq!(
+        Path::new(filename).parent(),
+        Some(profiler_launch_dir().as_path())
+    );
+    // Senza `dumponexit=true` una chiusura normale del gioco può non lasciare niente.
+    assert!(options.contains(&"dumponexit=true"), "{options:?}");
+    assert!(options.contains(&"settings=profile"), "{options:?}");
+}
+
+#[test]
+fn a_profiling_flag_in_the_user_jvm_args_wins_over_the_toggle() {
+    for user_args in [
+        "-XX:+UseG1GC -XX:StartFlightRecording=filename=/home/me/mine.jfr -Dkeep=true",
+        "-javaagent:qualcosa.jar -Dkeep=true",
+    ] {
+        let args = jvm_args_for(&settings_with_profiler(true, user_args), 21);
+
+        let profiling_flags = args.iter().filter(|argument| is_profiling_flag(argument));
+        assert_eq!(profiling_flags.count(), 1, "{args:?}");
+        let user_tokens = split_argument_string(user_args);
+        assert!(
+            args.windows(user_tokens.len())
+                .any(|window| window == user_tokens.as_slice()),
+            "{args:?}"
+        );
+        assert_eq!(
+            args,
+            jvm_args_for(&settings_with_profiler(false, user_args), 21)
+        );
+    }
+}
+
+#[test]
+fn jfr_is_left_out_below_java_11_and_the_launch_log_says_so() {
+    let settings = settings_with_profiler(true, "-XX:+UseG1GC");
+
+    let args = jvm_args_for(&settings, 8);
+    assert!(
+        !args
+            .iter()
+            .any(|argument| argument.contains("StartFlightRecording")),
+        "{args:?}"
+    );
+    assert_eq!(
+        args,
+        jvm_args_for(&settings_with_profiler(false, "-XX:+UseG1GC"), 8)
+    );
+    let line = settings
+        .profiler_decision(8, &profiler_launch_dir())
+        .launch_log_line()
+        .expect("a skipped profiler is said in the launch log");
+    assert!(line.contains("Java 11") && line.contains("Java 8"), "{line}");
+
+    assert!(jvm_args_for(&settings, 11)
+        .iter()
+        .any(|argument| argument.starts_with("-XX:StartFlightRecording=")));
+}
+
+#[test]
+fn a_disabled_profiler_leaves_the_jvm_args_as_they_were() {
+    let args = jvm_args_for(
+        &settings_with_profiler(false, "-XX:+UseG1GC -Dcustom=\"a b\""),
+        21,
+    );
+
+    assert_eq!(
+        args,
+        vec![
+            "-Dloader=true",
+            "-Xms2048M",
+            "-Xmx4096M",
+            "-XX:+UseG1GC",
+            "-Dcustom=a b",
+            "-cp",
+            "client.jar",
+            "net.fabricmc.loader.impl.launch.knot.KnotClient",
+        ]
     );
 }
 
