@@ -21,10 +21,11 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
 use super::{
-    active_account_plays_offline, emit_log, load_cached_version_ids_for_selected, load_modlist,
-    parse_mod_loader, resolve_compatible_versions_hybrid, resolve_online_selection,
+    active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
+    load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
+    resolve_compatible_versions_hybrid, resolve_offline_selection, resolve_online_selection,
     run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
-    ResolvedContentVersions, SelectedMod,
+    DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -57,6 +58,58 @@ pub struct ModUpdateRow {
     pub current_version_number: Option<String>,
     pub candidate_version_id: String,
     pub candidate_version_number: String,
+}
+
+/// The mods a launch will leave out for one reason, said the way the launch
+/// banner says it (`dropped_reason_clause`, `dropped_reason_detail`), so that
+/// the question before the launch and the record after it cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedModGroup {
+    /// The ids as the mod-list rules write them. Nothing local knows a
+    /// readable name for a mod that was never downloaded (D116): the frontend
+    /// names what its in-memory metadata already holds and shows the id for
+    /// the rest.
+    pub mod_ids: Vec<String>,
+    /// Why they are out, as a clause: "this launch had no version chosen for
+    /// them and …".
+    pub reason: String,
+    /// The cause, then what it costs.
+    pub detail: String,
+}
+
+/// One group per reason, in the order the reasons first appear in `dropped`.
+///
+/// Shared by every branch that has a selection: the offline branch fills the
+/// field today, and the online one would be one assignment from
+/// `selection.dropped`.
+pub(super) fn dropped_mod_groups(
+    dropped: &[DroppedMod],
+    target: &ResolutionTarget,
+) -> Vec<DroppedModGroup> {
+    let mut reasons = Vec::new();
+    for lost in dropped {
+        if !reasons.contains(&lost.reason) {
+            reasons.push(lost.reason);
+        }
+    }
+
+    reasons
+        .into_iter()
+        .map(|reason| {
+            let mod_ids = dropped
+                .iter()
+                .filter(|lost| lost.reason == reason)
+                .map(|lost| lost.mod_id.clone())
+                .collect::<Vec<_>>();
+            let many = mod_ids.len() > 1;
+            DroppedModGroup {
+                reason: dropped_reason_clause(reason, target, many),
+                detail: dropped_reason_detail(reason, many),
+                mod_ids,
+            }
+        })
+        .collect()
 }
 
 /// The sets the popup and the launch need, and the distinction between them
@@ -106,6 +159,12 @@ pub struct UpdatePrecheckResult {
     /// above and not the same sentence: the launch will resolve these the
     /// usual way, and until it does nothing is known about them.
     pub content_lookup_failures: Vec<ContentLookupFailure>,
+    /// The mods the launch will leave out, with nothing in their place (D116):
+    /// said here so the user hears it **before** the game starts and chooses
+    /// whether to start it. Filled on the offline branch only; the launch
+    /// still reports them on its banner (`report_dropped_mods`), which is the
+    /// only channel left when this pre-check fails.
+    pub dropped_mods: Vec<DroppedModGroup>,
 }
 
 /// A vanilla target loads no mods: an empty payload, not an error, and no
@@ -237,6 +296,33 @@ pub(super) fn build_precheck_result(
     result
 }
 
+/// The pre-check of an account that plays offline, or `None` when the active
+/// account plays online.
+///
+/// D115, D116: the same zero-request selection the offline launch makes
+/// (`resolve_offline_selection` with no map), read for what it leaves out.
+/// Everything else stays empty, `resolved` above all: the version map comes
+/// from the network by construction, and an offline launch does not follow
+/// one (`LaunchResolutionPath::for_active_account`). Synchronous and handed
+/// no client, on purpose: the shape is half of the zero-request guarantee.
+pub(super) fn offline_precheck_for_active_account(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<Option<UpdatePrecheckResult>> {
+    if !active_account_plays_offline(launcher_paths)? {
+        return Ok(None);
+    }
+
+    let modlist = load_modlist(launcher_paths, modlist_name)?;
+    let selection = resolve_offline_selection(launcher_paths, &modlist, target, None)?;
+
+    Ok(Some(UpdatePrecheckResult {
+        dropped_mods: dropped_mod_groups(&selection.dropped, target),
+        ..UpdatePrecheckResult::default()
+    }))
+}
+
 /// What a launch of this mod-list on this target would change.
 ///
 /// Reads the database and Modrinth, writes nothing: no launch log session, no
@@ -260,18 +346,21 @@ pub(super) async fn run_update_precheck(
         return Ok(empty);
     }
 
-    // D115, D114: an account that plays offline launches with zero requests,
-    // and the pre-check is requests. It does not run: the empty payload shows
-    // no popup and hands the launch no map, and the launch reads the same row
-    // and takes the offline path by itself.
-    if active_account_plays_offline(launcher_paths)? {
+    // D115, D116: an account that plays offline launches with zero requests,
+    // so its pre-check makes none either. It reads the cache for the mods the
+    // launch will leave out, and that is all it returns: no updates and no
+    // map, and the launch reads the same row and takes the offline path by
+    // itself.
+    if let Some(offline) =
+        offline_precheck_for_active_account(launcher_paths, &modlist_name, &target)?
+    {
         let _ = emit_log(
             app_handle,
             ProcessLogStream::Stdout,
-            "[Launcher] The active account is set to play offline; the update check does not run"
+            "[Launcher] The active account is set to play offline; the pre-check reads the local cache only: no requests, no update check"
                 .to_string(),
         );
-        return Ok(UpdatePrecheckResult::default());
+        return Ok(offline);
     }
 
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
@@ -747,6 +836,11 @@ mod tests {
                 entry_id: "complementary-reimagined".into(),
                 error: "Modrinth returned an error".into(),
             }],
+            dropped_mods: vec![DroppedModGroup {
+                mod_ids: vec!["lithium".into()],
+                reason: "your cache has no jar".into(),
+                detail: "Nothing took its place.".into(),
+            }],
         };
 
         assert_eq!(
@@ -782,6 +876,11 @@ mod tests {
                     "category": "shader",
                     "entryId": "complementary-reimagined",
                     "error": "Modrinth returned an error",
+                }],
+                "droppedMods": [{
+                    "modIds": ["lithium"],
+                    "reason": "your cache has no jar",
+                    "detail": "Nothing took its place.",
                 }],
             })
         );
@@ -869,9 +968,10 @@ mod tests {
     fn an_offline_precheck_names_the_mods_left_out_and_carries_no_version_map() {
         let launcher_paths = offline_root("dropped", true);
 
-        let result = offline_precheck_for_active_account(&launcher_paths, "Offline Pack", &target())
-            .expect("the offline pre-check should run")
-            .expect("an offline account takes the offline pre-check");
+        let result =
+            offline_precheck_for_active_account(&launcher_paths, "Offline Pack", &target())
+                .expect("the offline pre-check should run")
+                .expect("an offline account takes the offline pre-check");
 
         assert_eq!(
             result
