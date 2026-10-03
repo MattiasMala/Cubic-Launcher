@@ -181,6 +181,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &effective_settings,
         &target,
         effective_required_java,
+        plays_offline,
     )
     .await?;
     emit_log(

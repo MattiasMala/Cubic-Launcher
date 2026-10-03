@@ -13,7 +13,7 @@ use crate::adoptium::{
 };
 use crate::java_runtime::{
     discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
-    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector,
+    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
 };
 use crate::launch_command::PreparedLaunchCommand;
 use crate::launcher_paths::LauncherPaths;
@@ -972,6 +972,8 @@ pub(super) async fn select_or_download_java(
     settings: &EffectiveLaunchSettings,
     target: &ResolutionTarget,
     required_version: u32,
+    // The active account's choice (D115), read once by the caller.
+    plays_offline: bool,
 ) -> Result<PathBuf> {
     if let Some(path) = &settings.java_path_override {
         let inspector = CommandJavaBinaryInspector;
@@ -1001,11 +1003,13 @@ pub(super) async fn select_or_download_java(
     })?;
     persist_java_installations(&connection, &installations)?;
 
-    // Exact installed match wins: preserves legacy exact-major behavior and
-    // avoids substituting when the precise runtime is already present.
-    if let Some(installation) = select_exact_java_for_requirement(&installations, required_version)
-    {
-        return Ok(installation.path);
+    if let Some(path) = installed_java_for_launch(
+        &installations,
+        required_version,
+        plays_offline,
+        launcher_paths.java_runtimes_dir(),
+    )? {
+        return Ok(path);
     }
 
     let adoptium = AdoptiumClient::new();
@@ -1083,6 +1087,34 @@ pub(super) async fn select_or_download_java(
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// La Java già installata per questo lancio, oppure `None` quando va scaricata.
+///
+/// Exact installed match wins: preserves legacy exact-major behavior and
+/// avoids substituting when the precise runtime is already present.
+///
+/// D-d (onda 8a): con l'account offline non si chiede Adoptium. «Offline» per
+/// un account è una scelta di zero richieste (D115), e la rete giù darebbe
+/// comunque un fallimento, solo più lento e con un messaggio che parla di rete
+/// invece di dire quale Java manca. Conseguenza voluta: un account offline con
+/// la rete funzionante non si vede più scaricare Java da solo.
+pub(super) fn installed_java_for_launch(
+    installations: &[JavaInstallation],
+    required_version: u32,
+    plays_offline: bool,
+    java_runtimes_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    if let Some(installation) = select_exact_java_for_requirement(installations, required_version) {
+        return Ok(Some(installation.path));
+    }
+    if plays_offline {
+        bail!(
+            "No Java {required_version} runtime is installed (looked in {} and on the system), and the active account plays offline, so it is not downloaded. Install Java {required_version} there, set a Java path in the settings, or switch the account to online for one launch.",
+            java_runtimes_dir.display()
+        );
+    }
+    Ok(None)
 }
 
 /// Find the nearest major >= `required_version` that Adoptium actually ships a

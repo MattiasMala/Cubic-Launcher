@@ -841,6 +841,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &effective_settings,
         &target,
         effective_required_java,
+        plays_offline,
     )
     .await?;
     emit_log(
