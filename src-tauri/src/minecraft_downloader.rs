@@ -406,13 +406,9 @@ pub async fn ensure_minecraft_version(
     std::fs::create_dir_all(&libraries_dir)
         .with_context(|| format!("failed to create {}", libraries_dir.display()))?;
 
-    // 1. Fetch version manifest and find the URL for this version.
-    on_progress("Fetch version manifest", minecraft_version);
-    let version_url = fetch_version_url(http_client, minecraft_version).await?;
-
-    // 2. Fetch (or load from cache) the version JSON.
+    // 1+2. The version JSON, from the cache when it is there.
     on_progress("Fetch version metadata", minecraft_version);
-    let version_json = fetch_version_json(http_client, &version_url, &version_dir).await?;
+    let version_json = load_version_json(http_client, minecraft_version, &version_dir).await?;
 
     // 3. Ensure client JAR.
     on_progress("Ensure client JAR", minecraft_version);
@@ -458,6 +454,32 @@ pub async fn ensure_minecraft_version(
 
 // ── Internal steps ────────────────────────────────────────────────────────────
 
+/// Il `version.json` di `minecraft_version`, da `version_dir` quando è in cache.
+///
+/// Il manifest si chiede solo se la cache non ha `version.json`: nel lancio il
+/// suo unico prodotto è l'URL di quel file, quindi con il file sul disco la
+/// richiesta veniva fatta e la risposta buttata, e l'unico effetto osservabile
+/// era un lancio che muore quando la rete non risponde — ogni lancio offline,
+/// misurato (report 098, S1). Una strada sola per tutti gli account, non un
+/// ramo offline: il lancio online perde una richiesta di cui non leggeva il
+/// risultato.
+async fn load_version_json(
+    http_client: &reqwest::Client,
+    minecraft_version: &str,
+    version_dir: &Path,
+) -> Result<VersionJson> {
+    let cached_path = version_dir.join("version.json");
+    if cached_path.exists() {
+        let contents = std::fs::read_to_string(&cached_path)
+            .with_context(|| format!("failed to read {}", cached_path.display()))?;
+        return serde_json::from_str::<VersionJson>(&contents)
+            .with_context(|| format!("failed to parse cached {}", cached_path.display()));
+    }
+
+    let version_url = fetch_version_url(http_client, minecraft_version).await?;
+    fetch_version_json(http_client, &version_url, &cached_path).await
+}
+
 async fn fetch_version_url(client: &reqwest::Client, minecraft_version: &str) -> Result<String> {
     let manifest: VersionManifest = client
         .get(VERSION_MANIFEST_URL)
@@ -486,18 +508,8 @@ async fn fetch_version_url(client: &reqwest::Client, minecraft_version: &str) ->
 async fn fetch_version_json(
     client: &reqwest::Client,
     version_url: &str,
-    version_dir: &Path,
+    cached_path: &Path,
 ) -> Result<VersionJson> {
-    let cached_path = version_dir.join("version.json");
-
-    // Use the cached copy if it already exists.
-    if cached_path.exists() {
-        let contents = std::fs::read_to_string(&cached_path)
-            .with_context(|| format!("failed to read {}", cached_path.display()))?;
-        return serde_json::from_str::<VersionJson>(&contents)
-            .with_context(|| format!("failed to parse cached {}", cached_path.display()));
-    }
-
     let bytes = client
         .get(version_url)
         .send()
@@ -509,7 +521,7 @@ async fn fetch_version_json(
         .await
         .context("failed to read version JSON body")?;
 
-    crate::atomic_write::write_atomically(&cached_path, &bytes)
+    crate::atomic_write::write_atomically(cached_path, &bytes)
         .with_context(|| format!("failed to cache version JSON at {}", cached_path.display()))?;
 
     serde_json::from_slice::<VersionJson>(&bytes)
@@ -1018,6 +1030,39 @@ mod tests {
         let missing = missing_asset_hashes(&index, &root).expect("hashes are well formed");
 
         assert_eq!(missing, vec![shared]);
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// D-a (onda 8a): con `version.json` in cache il manifest non si chiede. Il
+    /// client manda `piston-meta.mojang.com` su 127.0.0.1, dove nessuno serve
+    /// quel certificato: qualunque richiesta al manifest fallisce, quindi un
+    /// `Ok` vuol dire che non è stata fatta. Sul codice di prima il manifest
+    /// veniva chiesto prima di guardare la cache, e il lancio moriva lì.
+    #[tokio::test]
+    async fn a_cached_version_json_is_read_without_asking_the_manifest() {
+        let root = scratch_root("cached-version-json");
+        fs::write(
+            root.join("version.json"),
+            r#"{
+                "mainClass": "net.minecraft.client.main.Main",
+                "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "00" } },
+                "libraries": [],
+                "assetIndex": { "id": "5", "url": "https://example.invalid/5.json", "sha1": "00" },
+                "assets": "5"
+            }"#,
+        )
+        .expect("cached version.json");
+        let unreachable_manifest = reqwest::Client::builder()
+            .resolve("piston-meta.mojang.com", ([127, 0, 0, 1], 443).into())
+            .build()
+            .expect("client");
+
+        let version_json = load_version_json(&unreachable_manifest, "1.20.1", &root)
+            .await
+            .expect("the cached version.json must be enough, with no manifest");
+
+        assert_eq!(version_json.main_class, "net.minecraft.client.main.Main");
+        assert_eq!(version_json.assets, "5");
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }

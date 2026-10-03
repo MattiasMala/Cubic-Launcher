@@ -10,15 +10,16 @@ use super::{
     active_account_plays_offline, automation_exit_code, build_instance_root,
     build_modded_classpath_entries, contained_loader_library_path, embedded_min_java_requirement,
     fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, load_active_account_for_launch_with_diagnostics,
-    load_modlist, local_mod_jar_path, maven_artifact_relative_path,
-    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
-    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
-    relative_loader_library_path, substitute_known_placeholders, validate_content_filename,
-    EffectiveLaunchSettings, EmbeddedFabricRequirementSet, EmbeddedFabricRequirements,
-    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath, LaunchVerificationRequest,
-    LaunchVerificationResult, PlayerIdentity,
+    forge_wrapper_installer_artifact, installed_java_for_launch,
+    load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
+    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
+    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
+    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
+    substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
+    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest,
+    LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
 };
+use crate::java_runtime::{JavaInstallation, JavaInstallationSource};
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
 
 #[test]
@@ -1059,5 +1060,38 @@ fn a_launch_request_without_a_version_map_is_the_request_of_today() {
             "sodium".to_string(),
             "abc123".to_string()
         )]))
+    );
+}
+
+/// D-d (onda 8a): offline e nessun runtime della major richiesta è un errore che
+/// nomina la major, la cartella dei runtime e la scelta dell'account — non una
+/// richiesta ad Adoptium. Una Java più nuova installata non basta: la selezione
+/// prima del download è a major esatta (`select_exact_java_for_requirement`).
+/// Online la stessa situazione resta un download (`Ok(None)`).
+#[test]
+fn offline_with_no_runtime_of_the_required_major_is_a_clear_error() {
+    let runtimes_dir = Path::new("/launcher/java-runtimes");
+    let installed = vec![JavaInstallation {
+        path: PathBuf::from("/launcher/java-runtimes/java-21/bin/java"),
+        version: 21,
+        auto_detected: true,
+        architecture: "x64".into(),
+        source: JavaInstallationSource::LauncherManaged,
+    }];
+
+    let error = installed_java_for_launch(&installed, 17, true, runtimes_dir)
+        .expect_err("offline, a missing Java 17 must stop the launch, not reach Adoptium");
+    let message = error.to_string();
+    assert!(message.contains("Java 17"), "{message}");
+    assert!(message.contains("/launcher/java-runtimes"), "{message}");
+    assert!(message.contains("plays offline"), "{message}");
+
+    assert_eq!(
+        installed_java_for_launch(&installed, 17, false, runtimes_dir).expect("online"),
+        None
+    );
+    assert_eq!(
+        installed_java_for_launch(&installed, 21, true, runtimes_dir).expect("offline, installed"),
+        Some(PathBuf::from("/launcher/java-runtimes/java-21/bin/java"))
     );
 }

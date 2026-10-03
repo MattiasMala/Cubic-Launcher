@@ -1129,6 +1129,14 @@ pub(super) enum DropReason {
     /// The pre-checked path: no version was chosen for it before the launch
     /// and the cache cannot produce a jar either.
     NoChosenVersionAndNothingCached,
+    /// D-b (onda 8a): il percorso offline senza mappa, per un mod che ha la
+    /// riga registrata per questo target ma il cui jar non è più sul disco.
+    /// Ripristinarlo è un download, e l'account attivo gioca offline: il mod
+    /// esce dal lancio e dice perché, invece di un lancio che muore su
+    /// `cdn.modrinth.com` (report 098, S2). Un valore suo e non
+    /// `NoChosenVersionAndNothingCached`, perché «la cache non ha un jar» qui
+    /// è falso: ha la riga, non il file.
+    RegisteredJarGoneOffline,
     /// A mod it `requires` was the one nothing could install
     /// (`FailureReason::RequiredModMissing` after the pass). Leaving this one
     /// silent would reopen the hole one rule further down.
@@ -1194,11 +1202,15 @@ pub(super) struct DroppedMod {
 /// top-level rule vector: `reresolve_without_unavailable` clones the mod-list
 /// and only flips `enabled`, and `resolve_modlist` pushes one `resolved_rules`
 /// entry per top-level rule, in order.
+///
+/// `unavailable_reason` dà il motivo **per mod** (D-b): sul percorso offline
+/// senza mappa un mod con la riga e senza il jar non manca per la stessa
+/// ragione di uno che non ha niente in cache.
 pub(super) fn mods_dropped_without_replacement(
     before: &ResolutionResult,
     after: &ResolutionResult,
     unavailable: &[String],
-    unavailable_reason: DropReason,
+    unavailable_reason: &dyn Fn(&str) -> DropReason,
 ) -> Vec<DroppedMod> {
     let mut dropped: Vec<DroppedMod> = Vec::new();
 
@@ -1232,7 +1244,7 @@ pub(super) fn mods_dropped_without_replacement(
         dropped.push(DroppedMod {
             mod_id: resolved_id.clone(),
             reason: if unavailable.iter().any(|mod_id| mod_id == resolved_id) {
-                unavailable_reason
+                unavailable_reason(resolved_id)
             } else {
                 match after_reason {
                     Some(FailureReason::RequiredModMissing) => DropReason::RequiredModLeftOut,
@@ -1274,6 +1286,16 @@ pub(super) fn dropped_reason_clause(
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ),
+        DropReason::RegisteredJarGoneOffline => {
+            let (its, jar_is, it) = if many {
+                ("their", "jars are", "them")
+            } else {
+                ("its", "jar is", "it")
+            };
+            format!(
+                "{its} {jar_is} registered but no longer on disk, and an account that plays offline does not download {it} again"
+            )
+        }
         DropReason::RequiredModLeftOut => {
             format!("a mod {subject} need{verb_s} is not in this launch either")
         }
@@ -1301,6 +1323,16 @@ pub(super) fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
         DropReason::NoChosenVersionAndNothingCached => format!(
             "The versions chosen before this launch do not cover {it}, and the cache has no jar for this Minecraft version and loader."
         ),
+        DropReason::RegisteredJarGoneOffline => {
+            let (jars, files_are, they_are) = if many {
+                ("jars", "files are", "they are")
+            } else {
+                ("jar", "file is", "it is")
+            };
+            format!(
+                "The launcher has {its} {jars} registered for this Minecraft version and loader, but the {files_are} no longer on disk, and the active account plays offline, so {they_are} not downloaded again."
+            )
+        }
         DropReason::RequiredModLeftOut => format!(
             "The mod-list makes {it} require a mod this launch could not install, so the resolver left {it} out too."
         ),
@@ -1356,6 +1388,7 @@ fn dropped_mods_notices(
     for reason in [
         DropReason::NoVersionAndNoCachedJar,
         DropReason::NoChosenVersionAndNothingCached,
+        DropReason::RegisteredJarGoneOffline,
         DropReason::RequiredModLeftOut,
         DropReason::ExcludedByReplacement,
         DropReason::RulesLeftItOut,
@@ -1620,12 +1653,9 @@ pub(super) async fn resolve_online_selection(
     Ok(TargetSelection {
         dropped: before
             .map(|before| {
-                mods_dropped_without_replacement(
-                    &before,
-                    &resolution,
-                    &unavailable,
-                    DropReason::NoVersionAndNoCachedJar,
-                )
+                mods_dropped_without_replacement(&before, &resolution, &unavailable, &|_| {
+                    DropReason::NoVersionAndNoCachedJar
+                })
             })
             .unwrap_or_default(),
         resolution,
@@ -1635,12 +1665,17 @@ pub(super) async fn resolve_online_selection(
 
 /// Same as `resolve_online_selection`, with no network at all.
 ///
-/// "Available" is the cache's answer alone, and it covers a registered row
-/// whose jar disappeared because the launch restores it: a mod is disabled
-/// only when nothing can produce a jar for it. `preresolved` short-circuits
-/// the question exactly as it does online — a version the pre-check chose
-/// exists whether or not this machine has it, and an update accepted a second
-/// ago never does.
+/// "Available" is the cache's answer alone. `preresolved` short-circuits the
+/// question exactly as it does online — a version the pre-check chose exists
+/// whether or not this machine has it, and an update accepted a second ago
+/// never does.
+///
+/// Cosa vuol dire «la cache lo può servire» dipende dalla mappa (D-b, onda
+/// 8a). Con la mappa (`Preresolved`) una riga registrata basta, perché il
+/// lancio ripristina il jar: è il caso in cui la rete c'è appena stata e la
+/// versione è nominata (`CacheBacking`). Senza mappa (`Offline`) l'account
+/// gioca offline, ripristinare è un download, e un mod col jar sparito esce
+/// dal lancio con `DropReason::RegisteredJarGoneOffline`.
 ///
 /// Named for what it guarantees, zero requests, and not for the setting that
 /// used to select it: `cache_only_mode` no longer exists, and a name that
@@ -1654,14 +1689,22 @@ pub(super) fn resolve_offline_selection(
 ) -> Result<TargetSelection> {
     let resolution = resolve_modlist(modlist, target)?;
     let selected = collect_selected_mods(modlist, &resolution, target);
-    let cache_backed = cache_backed_mods(
-        &probe_selected_mods(launcher_paths, &selected, target)?,
-        CacheBacking::RestorableFromRow,
-    );
+    let probes = probe_selected_mods(launcher_paths, &selected, target)?;
+    let backing = if preresolved.is_some() {
+        CacheBacking::RestorableFromRow
+    } else {
+        CacheBacking::JarOnDisk
+    };
+    let cache_backed = cache_backed_mods(&probes, backing);
     let unavailable = unavailable_selected_mods(&selected, |mod_id| {
         cache_backed.contains(mod_id)
             || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
     });
+    let jar_gone = probes
+        .iter()
+        .filter(|(_, probe)| matches!(probe, CacheProbe::JarMissing(_)))
+        .map(|(mod_id, _)| mod_id.as_str())
+        .collect::<HashSet<_>>();
     let before = (!unavailable.is_empty()).then(|| resolution.clone());
     let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
     let selected_mods = collect_selected_mods(modlist, &resolution, target);
@@ -1669,12 +1712,13 @@ pub(super) fn resolve_offline_selection(
     Ok(TargetSelection {
         dropped: before
             .map(|before| {
-                mods_dropped_without_replacement(
-                    &before,
-                    &resolution,
-                    &unavailable,
-                    DropReason::NoChosenVersionAndNothingCached,
-                )
+                mods_dropped_without_replacement(&before, &resolution, &unavailable, &|mod_id| {
+                    if jar_gone.contains(mod_id) {
+                        DropReason::RegisteredJarGoneOffline
+                    } else {
+                        DropReason::NoChosenVersionAndNothingCached
+                    }
+                })
             })
             .unwrap_or_default(),
         resolution,
@@ -2336,12 +2380,9 @@ mod tests {
         let before = resolve_modlist(modlist, &target).expect("first resolution");
         let after = reresolve_without_unavailable(modlist, before.clone(), &unavailable, &target)
             .expect("re-resolution");
-        let dropped = mods_dropped_without_replacement(
-            &before,
-            &after,
-            &unavailable,
-            DropReason::NoVersionAndNoCachedJar,
-        );
+        let dropped = mods_dropped_without_replacement(&before, &after, &unavailable, &|_| {
+            DropReason::NoVersionAndNoCachedJar
+        });
         let loaded = collect_selected_mods(modlist, &after, &target)
             .into_iter()
             .map(|selected| selected.mod_id)
@@ -2606,6 +2647,10 @@ mod tests {
         assert_eq!(
             plural(DropReason::NoVersionAndNoCachedJar),
             "2 mods are not in this launch (one, two): there is no version of them for Minecraft 1.20.1 / forge and no jar for them in your cache."
+        );
+        assert_eq!(
+            plural(DropReason::RegisteredJarGoneOffline),
+            "2 mods are not in this launch (one, two): their jars are registered but no longer on disk, and an account that plays offline does not download them again."
         );
     }
 }
