@@ -136,6 +136,7 @@ def run_combo(
     display: str = "xvfb",
     external_margin_s: int = 120,
     reset_db_before: bool = False,
+    base_env: dict[str, str] | None = None,
 ) -> ComboResult:
     """Launch one combo and return the validated result.
 
@@ -148,6 +149,10 @@ def run_combo(
     mod_cache surviving across launches. Resetting per-launch would wipe both.
     (The launcher still re-runs its token migration at every startup, so the
     token-free security property holds regardless.)
+
+    base_env sostituisce os.environ come ambiente di partenza. La guardia
+    offline ne passa uno minimo: proxy, sessione DBus e display di chi la lancia
+    non devono arrivare a un processo di cui si misura proprio il traffico.
     """
     binary_path = _resolve_binary(binary)
     output_path = workspace.launcher_root / f"verify-{spec.loader}-{spec.mc_version}.json"
@@ -160,7 +165,7 @@ def run_combo(
         workspace.reset_database()
         workspace.seed_offline_account()
 
-    env = dict(os.environ)
+    env = dict(os.environ if base_env is None else base_env)
     env.update(workspace.launcher_env())
     env["CUBIC_AUTOMATION_VERIFY_REQUEST"] = json.dumps(spec.request_json())
     env["CUBIC_AUTOMATION_VERIFY_OUTPUT"] = str(output_path)

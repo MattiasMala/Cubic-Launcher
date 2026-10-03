@@ -28,6 +28,9 @@ DATABASE_FILENAME = "launcher_data.db"
 # EXACT accounts DDL from src-tauri/src/database.rs (CREATE TABLE IF NOT EXISTS).
 # We pre-create + seed the accounts table; initialize_database() at startup
 # creates every OTHER table via IF NOT EXISTS and leaves this one untouched.
+# `plays_offline` (D115) è la decima colonna: la migrazione all'avvio la
+# aggiunge solo se manca, quindi dichiararla qui permette di seminare un
+# account offline prima del primo avvio invece di correggerlo dopo.
 ACCOUNTS_DDL = """
 CREATE TABLE IF NOT EXISTS accounts (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +41,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     refresh_token_enc   BLOB,
     last_login          DATETIME,
     profile_data        TEXT,
-    is_active           BOOLEAN DEFAULT FALSE
+    is_active           BOOLEAN DEFAULT FALSE,
+    plays_offline       BOOLEAN NOT NULL DEFAULT FALSE
 );
 """
 
@@ -165,12 +169,16 @@ class HarnessWorkspace:
         self,
         username: str = "HarnessPlayer",
         microsoft_id: str = "harness-account",
+        plays_offline: bool = False,
     ) -> None:
         """Pre-seed a single active offline account.
 
         Token columns are NULL and profile_data carries ONLY username/uuid — no
         mc_access_token / ms_refresh_token — so the startup token migration
         (KeyringSecretStore) never touches the real keyring.
+
+        `plays_offline` è la scelta dell'account (D115): con `True` il lancio
+        prende il percorso a zero richieste.
         """
         self._assert_under_root(self.database_path)
         # Deterministic offline-style uuid string for display; the launcher
@@ -179,6 +187,16 @@ class HarnessWorkspace:
         connection = sqlite3.connect(self.database_path)
         try:
             connection.executescript(ACCOUNTS_DDL)
+            # Una tabella creata prima che esistesse la colonna (workspace
+            # persistente riusato): la stessa migrazione idempotente di
+            # `database.rs`, così l'INSERT qui sotto vale per entrambe.
+            has_column = connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'plays_offline')"
+            ).fetchone()[0]
+            if not has_column:
+                connection.execute(
+                    "ALTER TABLE accounts ADD COLUMN plays_offline BOOLEAN NOT NULL DEFAULT FALSE"
+                )
             # Idempotent: skip if this account already exists (persistent reuse).
             existing = connection.execute(
                 "SELECT 1 FROM accounts WHERE microsoft_id = ?",
@@ -190,14 +208,101 @@ class HarnessWorkspace:
                     INSERT INTO accounts
                         (microsoft_id, xbox_gamertag, minecraft_uuid,
                          access_token_enc, refresh_token_enc, last_login,
-                         profile_data, is_active)
-                    VALUES (?, ?, NULL, NULL, NULL, NULL, ?, 1)
+                         profile_data, is_active, plays_offline)
+                    VALUES (?, ?, NULL, NULL, NULL, NULL, ?, 1, ?)
                     """,
-                    (microsoft_id, username, profile_data),
+                    (microsoft_id, username, profile_data, 1 if plays_offline else 0),
                 )
                 connection.commit()
         finally:
             connection.close()
+
+    # ---- dati reali (guardia offline) -------------------------------------------
+    #
+    # Regola dei workspace di prova (trappola 9 della wiki): si hard-linka solo
+    # quello che il lancio LEGGE, si copia tutto quello che può RISCRIVERE. Un
+    # hard link condivide l'inode, quindi una scrittura in place nella copia è
+    # una scrittura nei dati veri.
+
+    def adopt_database(self, source: Path) -> None:
+        """Copy a real launcher database and remove every account row from the copy.
+
+        Mai l'account MSA reale, nemmeno su un DB copiato (trappola 8): il lancio
+        rinfresca il token e lo persiste. `VACUUM` toglie anche le pagine libere
+        che conservano i blob dei token cancellati.
+        """
+        self._assert_under_root(self.database_path)
+        if self.database_path.exists():
+            raise RuntimeError(f"REFUSING to overwrite an existing database: {self.database_path}")
+        shutil.copyfile(source, self.database_path)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("DELETE FROM accounts")
+            connection.commit()
+            connection.execute("VACUUM")
+        finally:
+            connection.close()
+
+    def set_global_setting(self, key: str, value: str) -> None:
+        self._assert_under_root(self.database_path)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO global_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def link_tree(self, source: Path, relative: str) -> Path:
+        """Hard-link a read-only real tree into the workspace (`cp -al`).
+
+        Rifiuta filesystem diversi: lì `os.link` fallisce, e un ripiego che copia
+        1,7 GB in silenzio non è quello che chi la chiama si aspetta.
+        """
+        target = self.launcher_root / relative
+        self._assert_under_root(target)
+        if os.stat(source).st_dev != os.stat(self._tmp_root).st_dev:
+            raise RuntimeError(
+                f"REFUSING to hard-link {source}: not on the filesystem of {self._tmp_root}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target, symlinks=True, copy_function=os.link)
+        return target
+
+    def copy_from(self, source: Path, relative: str) -> Path:
+        """Copy a real file or tree into the workspace: private inodes, nlink 1."""
+        target = self.launcher_root / relative
+        self._assert_under_root(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=True)
+        else:
+            shutil.copyfile(source, target)
+        return target
+
+    def privatize(self, relative: str) -> None:
+        """Replace a hard-linked workspace file with a private copy of itself."""
+        target = self.launcher_root / relative
+        self._assert_under_root(target)
+        private = target.with_name(target.name + ".private")
+        shutil.copyfile(target, private)
+        os.replace(private, target)
+
+    def assert_private(self, relative: str) -> None:
+        """Fail unless every file under `relative` has its own inode (nlink 1)."""
+        root = self.launcher_root / relative
+        self._assert_under_root(root)
+        files = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
+        shared = [p for p in files if not p.is_symlink() and p.stat().st_nlink != 1]
+        if shared:
+            raise RuntimeError(
+                f"REFUSING: {len(shared)} file(s) under {root} share an inode, e.g. {shared[0]}"
+            )
 
     def reset_database(self) -> None:
         """Delete only launcher_data.db, preserving cache/ and mod-lists/.
