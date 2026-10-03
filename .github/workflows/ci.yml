@@ -40,6 +40,19 @@ jobs:
           echo "refs=$refs"
           test "$refs" = "$pinned"
 
+      # La guardia offline (scripts/launch-harness/offline_guard.py) vede le
+      # richieste del launcher perché `reqwest` legge HTTP(S)_PROXY e ALL_PROXY
+      # dall'ambiente. Un client che imposta un proxy suo, o lo spegne, rende la
+      # guardia cieca su quel client senza farla diventare rossa: questo passo
+      # fallisce prima (onda 8a). Cerca solo in src-tauri/src/, quindi non trova
+      # se stesso.
+      - name: No launcher HTTP client sets its own proxy
+        run: |
+          if grep -rnE '\.proxy\(|no_proxy' src-tauri/src/; then
+            echo "a client in src-tauri/src/ sets or disables its own proxy: the offline guard cannot see it"
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
