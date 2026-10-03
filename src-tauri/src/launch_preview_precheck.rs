@@ -964,6 +964,9 @@ mod tests {
     /// D116: with the active account offline, the pre-check names the mods
     /// the launch will leave out — and carries no version map, because the
     /// map comes from the network and an offline launch does not follow one.
+    ///
+    /// `sodium` ha la riga e non il jar: dalla D-b (onda 8a) esce anche lui, con
+    /// il suo motivo, perché il popup e il lancio chiamano la stessa funzione.
     #[test]
     fn an_offline_precheck_names_the_mods_left_out_and_carries_no_version_map() {
         let launcher_paths = offline_root("dropped", true);
@@ -979,11 +982,57 @@ mod tests {
                 .iter()
                 .map(|group| group.mod_ids.clone())
                 .collect::<Vec<_>>(),
-            vec![vec!["lithium".to_string()]]
+            vec![vec!["sodium".to_string()], vec!["lithium".to_string()]]
         );
         assert!(result.resolved.is_empty());
         assert!(result.updates.is_empty());
         assert!(result.resolved_content.is_empty());
+
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
+    }
+
+    /// D-b (onda 8a): senza mappa un jar registrato ma sparito dal disco non è
+    /// «disponibile», perché ripristinarlo è un download e l'account gioca
+    /// offline. Il mod esce con un motivo suo, distinto da «niente in cache»; con
+    /// la mappa del pre-check la riga basta ancora e il lancio lo ripristina.
+    #[test]
+    fn offline_without_a_map_a_registered_jar_gone_from_disk_leaves_the_launch() {
+        use super::super::DropReason;
+
+        // `sodium` è registrato per il target, ma il suo jar non è sul disco.
+        let launcher_paths = offline_root("jar-gone", true);
+        let modlist = load_modlist(&launcher_paths, "Offline Pack").expect("mod-list");
+
+        let offline = resolve_offline_selection(&launcher_paths, &modlist, &target(), None)
+            .expect("the offline selection should run");
+        assert_eq!(
+            offline
+                .dropped
+                .iter()
+                .map(|lost| (lost.mod_id.as_str(), lost.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sodium", DropReason::RegisteredJarGoneOffline),
+                ("lithium", DropReason::NoChosenVersionAndNothingCached),
+            ]
+        );
+        assert!(!offline
+            .selected_mods
+            .iter()
+            .any(|selected| selected.mod_id == "sodium"));
+
+        let map = HashMap::from([("sodium".to_string(), "sodium-v2".to_string())]);
+        let preresolved =
+            resolve_offline_selection(&launcher_paths, &modlist, &target(), Some(&map))
+                .expect("the pre-resolved selection should run");
+        assert!(preresolved
+            .selected_mods
+            .iter()
+            .any(|selected| selected.mod_id == "sodium"));
+        assert!(!preresolved
+            .dropped
+            .iter()
+            .any(|lost| lost.mod_id == "sodium"));
 
         std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
     }
