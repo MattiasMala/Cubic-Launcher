@@ -1374,6 +1374,42 @@ fn deleting_a_member_of_a_pair_dissolves_the_group_and_copies_nothing_into_it() 
     assert_eq!(canonical_modlist(&fixture.connection, "A").unwrap(), "A");
 }
 
+/// review-contenuti-12: [A, B, C] lasciato da una build vecchia, con la
+/// cartella di B sparita. Cancellare A passa i byte a C, non a B: la cartella
+/// di B non rinasce, e il gruppo che resta ha in testa una mod list vera.
+#[test]
+fn deleting_the_holder_skips_a_ghost_member() {
+    let fixture = Fixture::new("delete-holder-ghost");
+    fixture.write_canonical("A", SharedFile::Servers, b"lista-di-a");
+    fixture.ensure_modlist("C");
+    fixture.ensure_modlist("D");
+    link_modlists(&fixture.connection, "B", "A").expect("linking should persist");
+    link_modlists(&fixture.connection, "C", "A").expect("linking should persist");
+    link_modlists(&fixture.connection, "D", "A").expect("linking should persist");
+    assert!(!fixture.paths.modlists_dir().join("B").exists());
+
+    hand_over_before_delete(&fixture.paths, &fixture.connection, "A")
+        .expect("the hand-over should work");
+    fs::remove_dir_all(fixture.paths.modlists_dir().join("A")).expect("A goes away");
+    forget_modlist(&fixture.connection, "A").expect("forgetting should persist");
+
+    assert!(
+        !fixture.paths.modlists_dir().join("B").exists(),
+        "nessuna cartella fantasma"
+    );
+    assert_eq!(
+        fs::read(fixture.canonical("C", SharedFile::Servers)).unwrap(),
+        b"lista-di-a"
+    );
+    assert_eq!(
+        load_groups(&fixture.connection).unwrap(),
+        vec![SharedGroup {
+            members: vec!["C".to_string(), "D".to_string()]
+        }]
+    );
+    assert_eq!(canonical_modlist(&fixture.connection, "D").unwrap(), "C");
+}
+
 #[test]
 fn a_group_whose_holder_is_gone_does_not_bring_its_folder_back() {
     // Il caso di `dati-5` con un gruppo lasciato da una build vecchia: A è

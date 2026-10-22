@@ -356,8 +356,37 @@ pub fn hand_over_before_delete(
     if group.canonical() != Some(modlist_name) {
         return Ok(());
     }
-    if let Some(new_canonical) = group.members.iter().find(|name| *name != modlist_name) {
+    // review-contenuti-12: il nuovo portatore è il primo membro che esiste
+    // davvero. Un fantasma lasciato da una build vecchia (la cartella non c'è
+    // più) non riceve i byte — copiarli farebbe rinascere la sua cartella — e
+    // esce dal gruppo, così dopo `forget_modlist` in testa c'è una mod list
+    // vera e non uno che rompe la condivisione degli altri.
+    let (living, ghosts): (Vec<String>, Vec<String>) = group
+        .members
+        .iter()
+        .filter(|name| *name != modlist_name)
+        .cloned()
+        .partition(|name| missing_canonical_owner(launcher_paths, name).is_none());
+    if let Some(new_canonical) = living.first() {
         copy_canonical_files(launcher_paths, modlist_name, new_canonical)?;
+    }
+    if !ghosts.is_empty() {
+        let updated: Vec<SharedGroup> = groups
+            .iter()
+            .map(|other| {
+                if other.contains(modlist_name) {
+                    // Chi viene cancellato resta in testa: lo toglie `forget_modlist`.
+                    SharedGroup {
+                        members: std::iter::once(modlist_name.to_string())
+                            .chain(living.iter().cloned())
+                            .collect(),
+                    }
+                } else {
+                    other.clone()
+                }
+            })
+            .collect();
+        write_groups(connection, &updated)?;
     }
 
     Ok(())
