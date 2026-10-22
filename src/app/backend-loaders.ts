@@ -123,6 +123,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         iconLabel: prev?.iconLabel,
         iconAccent: prev?.iconAccent,
         displayName: prev?.displayName,
+        author: typeof modlist.author === "string" && modlist.author.trim() ? modlist.author.trim() : undefined,
         mcVersion: modlist.minecraft_version ?? undefined,
         modLoader: normalizeModLoader(modlist.mod_loader),
       };

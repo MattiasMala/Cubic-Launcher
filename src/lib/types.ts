@@ -31,6 +31,8 @@ export type ModListCard = {
   iconImage?: string;
   iconLabel?: string;
   iconAccent?: string;
+  /** The `author` of rules.json (`ShellModListSummary.author`): who made the list, not who is signed in. */
+  author?: string;
   mcVersion?: string;
   modLoader?: string;
 };
