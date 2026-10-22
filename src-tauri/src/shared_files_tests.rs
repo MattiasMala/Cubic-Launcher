@@ -921,6 +921,53 @@ fn game_writes(path: &Path, body: &[u8]) {
         .expect("the file's mtime should be settable");
 }
 
+/// review-decisioni-34: spento, giocato, riacceso. Il file dell'istanza è
+/// cambiato mentre non era condiviso: rientrando vince la copia condivisa e il
+/// suo va nel `.bak` (D80), invece di finire sopra la lista del gruppo.
+#[test]
+fn a_file_switched_back_on_joins_the_group_instead_of_overwriting_it() {
+    let fixture = Fixture::new("rejoin");
+    let forge = fixture.instance_root("Drehmal", "1.20.1-forge");
+    fixture.write_canonical("Drehmal", SharedFile::Servers, b"lista-condivisa");
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+
+    set_shared_file_enabled(&fixture.connection, "Drehmal", SharedFile::Servers, false)
+        .expect("the toggle should persist");
+    copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+    game_writes(
+        &instance_path(&forge, SharedFile::Servers),
+        b"lista-privata",
+    );
+    copy_back_from_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge);
+
+    set_shared_file_enabled(&fixture.connection, "Drehmal", SharedFile::Servers, true)
+        .expect("the toggle should persist");
+    let statuses = copy_into_instance(&fixture.paths, &fixture.connection, "Drehmal", &forge, None);
+
+    assert!(
+        !matches!(
+            action_for(&statuses, SharedFile::Servers),
+            SharedFileAction::BroughtBack { .. }
+        ),
+        "{:?}",
+        action_for(&statuses, SharedFile::Servers)
+    );
+    assert_eq!(
+        fs::read(fixture.canonical("Drehmal", SharedFile::Servers)).unwrap(),
+        b"lista-condivisa",
+        "la lista del gruppo resta quella"
+    );
+    assert_eq!(
+        fs::read(instance_path(&forge, SharedFile::Servers)).unwrap(),
+        b"lista-condivisa"
+    );
+    assert_eq!(
+        fs::read(backup_path(&instance_path(&forge, SharedFile::Servers))).unwrap(),
+        b"lista-privata",
+        "la lista privata resta nel .bak dell'istanza"
+    );
+}
+
 #[test]
 fn a_server_added_while_the_launcher_was_closed_comes_back_instead_of_vanishing() {
     // Il caso di `concorrenza-1`: Play, il launcher si chiude col gioco aperto,
@@ -1162,6 +1209,7 @@ fn a_recorded_owner_that_no_longer_exists_is_not_recreated() {
     let record = SyncRecord {
         owner: Some("cancellata".to_string()),
         synced: BTreeMap::new(),
+        ..SyncRecord::default()
     };
     save_sync_record(&forge, &record).unwrap();
     fs::write(instance_path(&forge, SharedFile::Servers), b"lista").unwrap();

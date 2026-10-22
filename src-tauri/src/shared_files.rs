@@ -27,7 +27,7 @@
 //! riconciliazione per voce — leggere l'NBT, riconoscere le voci una per una,
 //! fondere — è esattamente il pezzo che D78 rimanda.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -875,6 +875,20 @@ struct SyncRecord {
     /// canonica avevano in comune all'ultima copia, in un verso o nell'altro.
     #[serde(default)]
     synced: BTreeMap<String, String>,
+    /// I file che erano spenti all'ultima copia (review-decisioni-34). Mentre un
+    /// file è spento il gioco lo riscrive e nessuno ne tiene l'impronta: quando
+    /// lo si riaccende entra nella condivisione come un file nuovo (D80, la
+    /// copia condivisa vince e il suo va nel `.bak`), invece di sembrare una
+    /// copia indietro mancata e finire sopra quella del gruppo.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unshared: BTreeSet<String>,
+}
+
+impl SyncRecord {
+    fn set_unshared(&mut self, file: SharedFile) {
+        self.synced.remove(file.key());
+        self.unshared.insert(file.key().to_string());
+    }
 }
 
 fn sync_record_path(instance_root: &Path) -> PathBuf {
@@ -1103,14 +1117,19 @@ pub fn copy_into_instance(
     // lancio di allora, che può non essere quello di adesso.
     let recover_owner = recorded_owner(launcher_paths, previous.as_ref())
         .unwrap_or_else(|| canonical_owner.clone());
+    let (synced, unshared) = previous
+        .map(|record| (record.synced, record.unshared))
+        .unwrap_or_default();
     let mut record = SyncRecord {
         owner: Some(canonical_owner.clone()),
-        synced: previous.map(|record| record.synced).unwrap_or_default(),
+        synced,
+        unshared,
     };
 
     let mut statuses = Vec::new();
     for file in SharedFile::ALL {
         if !enabled_in(&options, modlist_name, file) {
+            record.set_unshared(file);
             statuses.push(SharedFileStatus {
                 file,
                 action: SharedFileAction::Disabled,
@@ -1169,8 +1188,11 @@ fn copy_one_into(
     let local_bytes = read_if_exists(&local)?;
     let mut actions = Vec::new();
 
-    // 1. La copia indietro che il lancio precedente non ha fatto (D152).
-    if let Some(local_bytes) = local_bytes.as_deref() {
+    // 1. La copia indietro che il lancio precedente non ha fatto (D152). Un
+    // file appena riacceso non ne ha una: era spento, e il suo contenuto è
+    // dell'istanza sola (review-decisioni-34).
+    let rejoining = record.unshared.remove(file.key());
+    if let Some(local_bytes) = local_bytes.as_deref().filter(|_| !rejoining) {
         let recover_to = canonical_path(launcher_paths, recover_owner, file)?;
         if changed_since_last_copy(
             record.synced.get(file.key()),
@@ -1281,6 +1303,7 @@ pub fn copy_back_from_instance(
         .map(|file| {
             let action = (|| -> Result<SharedFileAction> {
                 if !enabled_in(&options, modlist_name, file) {
+                    record.set_unshared(file);
                     return Ok(SharedFileAction::Disabled);
                 }
 
