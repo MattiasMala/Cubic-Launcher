@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { onCleanup, onMount } from "solid-js";
 import { logger } from "../lib/logger";
 import {
+  appendLaunchLog,
   launchState,
   launchStopRequested,
   modRowsState,
@@ -11,7 +12,6 @@ import {
   selectedModLoader,
   setActiveRailView,
   setAppLoading,
-  setLaunchLogs,
   setLaunchStopRequested,
   setLaunchProgress,
   setLaunchStageDetail,
@@ -55,7 +55,7 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
       }),
 
       listen<{ stream: string; line: string }>("minecraft-log", (event) => {
-        setLaunchLogs((current) => [...current, event.payload.line]);
+        appendLaunchLog(event.payload.line);
       }),
 
       listen<{ title: string; message: string; detail: string; severity?: "warning" | "error"; scope?: "launch" | "download" | "account" }>("launcher-error", (event) => {

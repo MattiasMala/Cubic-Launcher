@@ -1,4 +1,4 @@
-import { For, Show, createSignal, createEffect } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { MOD_LOADERS, type AccountSummary } from "../lib/types";
@@ -43,6 +43,26 @@ function accountSubtitle(account: AccountSummary | null | undefined): { text: st
   }
 }
 
+// The lines the launcher writes itself, by their prefix. Anything else is the
+// game's. A prefix missing here made its lines grey and hid them behind the
+// "Game" filter, among them the one that says why the profiler did not record
+// (todo.md:1807).
+const LAUNCHER_LINE_PREFIXES = [
+  "[Launcher]", "[Resolver]", "[Java]", "[Cache]", "[Launch]", "[Cubic]",
+  "[Profiler]", "[Auth]", "[Content]", "[Config]", "[Download]", "[Loader]",
+  "[MC]", "[options]", "[Precheck]", "[Backfill]", "[shared]",
+];
+
+type LogLevel = "error" | "warning" | "info" | "game";
+
+function logLevel(line: string): LogLevel {
+  const lower = line.toLowerCase();
+  if (lower.includes("error") || lower.includes("✗") || lower.includes("exception") || lower.includes("fatal") || line.startsWith("[Launch]") && lower.includes("fail")) return "error";
+  if (lower.includes("warn")) return "warning";
+  if (LAUNCHER_LINE_PREFIXES.some(prefix => line.startsWith(prefix))) return "info";
+  return "game";
+}
+
 export function LaunchPanel(props: LaunchPanelProps) {
   const isLaunching = () => launchState() === "resolving" || launchState() === "running";
   const isRunning = () => launchState() === "running";
@@ -54,28 +74,51 @@ export function LaunchPanel(props: LaunchPanelProps) {
   const [showGame, setShowGame] = createSignal(true);
   let logContainer: HTMLDivElement | undefined;
 
-  const logLevel = (line: string): "error" | "warning" | "info" | "game" => {
-    const lower = line.toLowerCase();
-    if (lower.includes("error") || lower.includes("✗") || lower.includes("exception") || lower.includes("fatal") || line.startsWith("[Launch]") && lower.includes("fail")) return "error";
-    if (lower.includes("warn")) return "warning";
-    if (line.startsWith("[Launcher]") || line.startsWith("[Resolver]") || line.startsWith("[Java]") || line.startsWith("[Cache]") || line.startsWith("[Launch]") || line.startsWith("[Cubic]")) return "info";
-    return "game";
+  // Mounted only while the viewer is open (ui-schermate-7): a closed viewer
+  // filters nothing and scrolls nothing, and the filter runs once per batch
+  // of lines instead of once per read. The items stay the strings themselves,
+  // so `For` keeps the rows it already drew.
+  const LogLines = () => {
+    const visible = (level: LogLevel) =>
+      level === "error" ? showErrors() :
+      level === "warning" ? showWarnings() :
+      level === "info" ? showInfo() :
+      showGame();
+    const filteredLogs = createMemo(() => launchLogs().filter(line => visible(logLevel(line))));
+
+    createEffect(() => {
+      filteredLogs(); // track changes
+      if (autoScroll() && logContainer) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+    });
+
+    return (
+      <div ref={logContainer} class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
+        <Show
+          when={filteredLogs().length > 0}
+          fallback={<p class="text-textMuted">Launch logs will appear here...</p>}
+        >
+          <For each={filteredLogs()}>
+            {(line, i) => {
+              const level = logLevel(line);
+              return (
+                <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
+                  level === "error" ? "text-red-400" :
+                  level === "warning" ? "text-amber-400" :
+                  level === "info" ? "text-primary" :
+                  "text-textMuted"
+                }`}>
+                  <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
+                  <span class="break-all">{line || "\u00A0"}</span>
+                </div>
+              );
+            }}
+          </For>
+        </Show>
+      </div>
+    );
   };
-
-  const filteredLogs = () => launchLogs().filter(line => {
-    const level = logLevel(line);
-    if (level === "error") return showErrors();
-    if (level === "warning") return showWarnings();
-    if (level === "info") return showInfo();
-    return showGame();
-  });
-
-  createEffect(() => {
-    filteredLogs(); // track changes
-    if (autoScroll() && logContainer) {
-      logContainer.scrollTop = logContainer.scrollHeight;
-    }
-  });
 
   const handleStop = async () => {
     // The exit that follows is a choice, not a crash to report (concorrenza-9).
@@ -149,29 +192,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
               Game
             </button>
           </div>
-          <div ref={logContainer} class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
-            <Show
-              when={filteredLogs().length > 0}
-              fallback={<p class="text-textMuted">Launch logs will appear here...</p>}
-            >
-              <For each={filteredLogs()}>
-                {(line, i) => {
-                  const level = logLevel(line);
-                  return (
-                    <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
-                      level === "error" ? "text-red-400" :
-                      level === "warning" ? "text-amber-400" :
-                      level === "info" ? "text-primary" :
-                      "text-textMuted"
-                    }`}>
-                      <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
-                      <span class="break-all">{line || "\u00A0"}</span>
-                    </div>
-                  );
-                }}
-              </For>
-            </Show>
-          </div>
+          <LogLines />
         </div>
       </Show>
 

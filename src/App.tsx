@@ -19,7 +19,7 @@ import {
   activeRailView, setActiveRailView, setQuickPlayWorldFolder, quickPlayWorldFolder,
   modRowsState, setModRowsState, activeAccountId, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
-  setLaunchLogs,
+  appendLaunchLog,
   modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
@@ -971,7 +971,7 @@ export default function App() {
         // start. No map means the launch picks versions exactly as it did
         // before this feature existed.
         pushUiError({ title: "Update check failed", message: "Launching with the versions already in your cache.", detail: String(err), severity: "warning", scope: "launch" });
-        setLaunchLogs(current => [...current, `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`]);
+        appendLaunchLog(`[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`);
         await startLaunch();
         return;
       } finally {
@@ -1047,7 +1047,7 @@ export default function App() {
       setLaunchProgress(stage.progress);
       setLaunchStageLabel(stage.label);
       setLaunchStageDetail(stage.detail);
-      setLaunchLogs(c => [...c, `[Resolver] ${stage.label} — ${stage.detail}`]);
+      appendLaunchLog(`[Resolver] ${stage.label} — ${stage.detail}`);
       await wait(500);
     }
     setLaunchState("ready");
