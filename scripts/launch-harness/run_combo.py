@@ -175,7 +175,7 @@ def run_combo(
     process is always killed.
 
     reset_db_before defaults to False: the DB is seeded ONCE at workspace setup,
-    and the cache pass relies on modlist_settings (cache_only) + accumulated
+    and the cache pass relies on the account's plays_offline flag + accumulated
     mod_cache surviving across launches. Resetting per-launch would wipe both.
     (The launcher still re-runs its token migration at every startup, so the
     token-free security property holds regardless.)

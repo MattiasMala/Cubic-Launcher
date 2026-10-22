@@ -24,6 +24,9 @@ from pathlib import Path
 # Tauri identifier from src-tauri/tauri.conf.json ("com.cubic.launcher").
 APP_IDENTIFIER = "com.cubic.launcher"
 DATABASE_FILENAME = "launcher_data.db"
+# The account `seed_offline_account` creates by default; the matrix cache pass
+# switches it to «Play offline».
+HARNESS_ACCOUNT = "harness-account"
 
 # EXACT accounts DDL from src-tauri/src/database.rs (CREATE TABLE IF NOT EXISTS).
 # We pre-create + seed the accounts table; initialize_database() at startup
@@ -168,7 +171,7 @@ class HarnessWorkspace:
     def seed_offline_account(
         self,
         username: str = "HarnessPlayer",
-        microsoft_id: str = "harness-account",
+        microsoft_id: str = HARNESS_ACCOUNT,
         plays_offline: bool = False,
     ) -> None:
         """Pre-seed a single active offline account.
@@ -327,9 +330,10 @@ class HarnessWorkspace:
     def reset_database(self) -> None:
         """Delete only launcher_data.db, preserving cache/ and mod-lists/.
 
-        Used between the API pass and the cache pass, and before each launch, so
-        the schema+token migration re-runs on a clean, token-free DB while the
-        API-populated cache is reused.
+        Used by `run_combo(reset_db_before=True)`, opt-in, so the schema+token
+        migration re-runs on a clean, token-free DB while the API-populated
+        cache is reused. The re-seeded account plays online: the matrix does
+        not reset, or its cache pass would stop being offline.
         """
         if self.database_path.exists():
             self._assert_under_root(self.database_path)
@@ -346,38 +350,6 @@ class HarnessWorkspace:
         (target / "custom_configs").mkdir(parents=True, exist_ok=True)
         rules_path.write_text(json.dumps(modlist.to_json(), indent=2) + "\n")
         return target
-
-    def set_modlist_cache_only(self, modlist_name: str, cache_only: bool) -> None:
-        """Set the per-modlist "prioritize downloaded jars" (cache_only) override.
-
-        Written to the modlist_settings table the launcher reads via
-        load_shell_snapshot_from_root. Used to flip the whole matrix into the
-        cache pass without changing global settings.
-        """
-        self._assert_under_root(self.database_path)
-        connection = sqlite3.connect(self.database_path)
-        try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS modlist_settings (
-                    modlist_name TEXT NOT NULL,
-                    key          TEXT NOT NULL,
-                    value        TEXT NOT NULL,
-                    PRIMARY KEY (modlist_name, key)
-                )
-                """
-            )
-            connection.execute(
-                """
-                INSERT INTO modlist_settings (modlist_name, key, value)
-                VALUES (?, 'cache_only_mode', ?)
-                ON CONFLICT(modlist_name, key) DO UPDATE SET value = excluded.value
-                """,
-                (modlist_name, "true" if cache_only else "false"),
-            )
-            connection.commit()
-        finally:
-            connection.close()
 
     # ---- env ------------------------------------------------------------------
 
