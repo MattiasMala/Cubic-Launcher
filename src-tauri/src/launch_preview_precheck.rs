@@ -23,9 +23,9 @@ use crate::rules::ModSource;
 use super::{
     active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
     load_cached_version_ids_for_selected, load_modlist, load_modlist_pins, parse_mod_loader,
-    read_instance_jars, resolve_compatible_versions_hybrid, resolve_offline_selection,
-    resolve_online_selection, run_content_precheck, ContentEntryWithoutVersions,
-    ContentLookupFailure, ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
+    read_instance_jars, resolve_offline_selection, resolve_online_selection, run_content_precheck,
+    versions_for_final_selection, ContentEntryWithoutVersions, ContentLookupFailure,
+    ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -364,6 +364,36 @@ pub(super) async fn run_update_precheck(
         return Ok(offline);
     }
 
+    // Precheck-5: a bounded wait. Past it the check fails, and the frontend
+    // launches from the cached versions with its warning (D19), instead of a
+    // PLAY button stuck on "CHECKING".
+    tokio::time::timeout(
+        PRECHECK_TIME_LIMIT,
+        run_online_precheck(app_handle, launcher_paths, &modlist_name, &target),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the update check took longer than {} s",
+            PRECHECK_TIME_LIMIT.as_secs()
+        )
+    })?
+}
+
+/// The longest the online pre-check may take (audit 101, precheck-5). A list
+/// of 300 mods asked one request per mod, ten at a time, takes a few seconds;
+/// this bounds a network that accepts connections and then stays silent.
+const PRECHECK_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The online half of `run_update_precheck`.
+async fn run_online_precheck(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<UpdatePrecheckResult> {
+    let modlist_name = modlist_name.to_string();
+    let target = target.clone();
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
     let pins = load_modlist_pins(launcher_paths, &modlist_name, &modlist);
     let modrinth_client = ModrinthClient::new();
@@ -381,17 +411,25 @@ pub(super) async fn run_update_precheck(
     .await?;
 
     // The second pass, for the same reason the launch runs one: the
-    // authoritative set is the one after the re-resolution, and it can contain
-    // alternatives the first pass never saw.
-    let candidates = resolve_compatible_versions_hybrid(
+    // authoritative set is the one after the re-resolution. It reuses what the
+    // availability pass already asked (audit 101, r2-scala-mod-list-grandi-2).
+    let lookup = versions_for_final_selection(
         app_handle,
         launcher_paths,
         &http_client,
         &selection.selected_mods,
+        &selection.lookups,
         &modrinth_client,
         &target,
     )
     .await?;
+    // Precheck-5: Modrinth out of reach is a failure of the whole check, not
+    // a list of mods with no update. The frontend's D19 branch takes it from
+    // here: a warning, and the launch from the cached versions.
+    if let Some(error) = &lookup.network_error {
+        anyhow::bail!("Modrinth could not be reached: {error}");
+    }
+    let candidates = lookup.versions;
 
     // D147: "current" is what this mod list's instance holds, not the newest
     // row of the target (audit 101, precheck-2).

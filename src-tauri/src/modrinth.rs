@@ -227,6 +227,22 @@ pub(crate) fn build_download_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Whether `error` is the network not reaching the host at all — refused,
+/// unresolved, or silent until the timeout — as opposed to an answer Modrinth
+/// gave (audit 101, precheck-5).
+///
+/// The difference decides what a failure costs. An answer is about one mod; no
+/// connection is about every request that follows, and asking the next three
+/// hundred mods one by one, each with its retries, is how a pre-check without
+/// Wi-Fi stayed on "CHECKING" for minutes.
+pub(crate) fn is_connection_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
+    })
+}
+
 // Retry on HTTP 429 to be polite to Modrinth's rate limiter, and on transient
 // server/transport failures. `build_request` is invoked fresh on every attempt
 // because `RequestBuilder` is not `Clone` once a body is attached, which is the

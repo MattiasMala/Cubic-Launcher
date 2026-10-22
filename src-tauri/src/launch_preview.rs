@@ -337,6 +337,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     report_dropped_mods(&app_handle, &selection.dropped, &target);
 
     let selected_mods = selection.selected_mods;
+    let selection_lookups = selection.lookups;
     launch_log_session.write_selected_mods(&selected_mods)?;
     if selected_mods.len() > 300 {
         let detail = match resolution_path {
@@ -419,24 +420,35 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             project_aliases,
         )
     } else {
-        // DESIGN: deliberately a second pass, not a reuse of the one inside
-        // `resolve_online_selection`. That one throws its version maps away
-        // round by round and keeps only the verdict; this one runs once on the
-        // final `selected_mods`. Two passes still cost ~10 requests against
-        // the 52 of one request per mod per pass.
+        // The versions of the final `selected_mods`: the availability pass
+        // already asked every mod it selected and kept the answers, so only a
+        // mod it never asked goes to Modrinth here (audit 101,
+        // r2-scala-mod-list-grandi-2). Before, this second pass asked the
+        // whole set again.
         //
         // No version map reaches this branch: a map always takes the
         // `Preresolved` path above (`LaunchResolutionPath::for_active_account`),
         // so the old map handling here was unreachable (audit 101, precheck-7).
-        let compatible_versions = resolve_compatible_versions_hybrid(
+        let lookup = versions_for_final_selection(
             &app_handle,
             &launcher_paths,
             &http_client,
             &selected_mods,
+            &selection_lookups,
             &modrinth_client,
             &target,
         )
         .await?;
+        // Precheck-5: without Modrinth the launch does not wait on it mod by
+        // mod; the jars already in the cache answer (D29, the fallback below).
+        if let Some(error) = &lookup.network_error {
+            emit_log(
+                &app_handle,
+                ProcessLogStream::Stderr,
+                format!("[Launch] Modrinth could not be reached; the mods are installed from the jars already in the cache ({error})"),
+            )?;
+        }
+        let compatible_versions = lookup.versions;
         // The mods no version came back for keep the jar the cache already
         // holds (D29): the availability pass kept them, so this is where they
         // are actually acquired.

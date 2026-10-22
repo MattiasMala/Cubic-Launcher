@@ -161,9 +161,87 @@ pub(super) fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -
     })
 }
 
+/// What a version lookup answered, and whether Modrinth could be reached.
+#[derive(Debug, Default, Clone)]
+pub(super) struct VersionLookup {
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// Set when a request could not reach Modrinth at all (audit 101,
+    /// precheck-5). The requests not yet sent were dropped: the mods they were
+    /// for have no answer, which is not the same as "no version".
+    pub(super) network_error: Option<String>,
+}
+
+/// What the per-project stage answered.
+#[derive(Debug, Default)]
+pub(super) struct PerProjectOutcome {
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// `(mod_id, error)` for a request Modrinth answered with an error: that
+    /// mod only, as before.
+    pub(super) failures: Vec<(String, String)>,
+    pub(super) network_error: Option<String>,
+}
+
+/// How many per-project requests run at once. Same pressure as the editor's
+/// availability check (`resolver::check_availability_concurrently`), well
+/// under Modrinth's 300 requests a minute once the answers take ~0.2 s.
+pub(super) const PER_PROJECT_PERMITS: usize = 10;
+
+/// One request per mod id, `permits` at a time (audit 101,
+/// r2-scala-mod-list-grandi-2: in a row, 300 mods took ~106 s of "CHECKING").
+///
+/// A request that cannot reach Modrinth stops the stage: the requests still
+/// queued are dropped instead of each paying its own retries against a
+/// network that is down (precheck-5). Generic over the request so both
+/// behaviours are testable without network.
+pub(super) async fn fetch_per_project_concurrently<Fetch, Fut>(
+    mod_ids: Vec<String>,
+    permits: usize,
+    fetch: Fetch,
+) -> PerProjectOutcome
+where
+    Fetch: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Option<ModrinthVersion>>> + Send + 'static,
+{
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for mod_id in mod_ids {
+        let fetch = fetch.clone();
+        let permit_source = semaphore.clone();
+        tasks.spawn(async move {
+            // Held through the request, so concurrency stays bounded.
+            let _permit = permit_source.acquire_owned().await;
+            let answer = fetch(mod_id.clone()).await;
+            (mod_id, answer)
+        });
+    }
+
+    let mut outcome = PerProjectOutcome::default();
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((mod_id, answer)) = joined else {
+            // Aborted below, after the network failed: no answer to keep.
+            continue;
+        };
+        match answer {
+            Ok(Some(version)) => {
+                outcome.versions.insert(mod_id, version);
+            }
+            Ok(None) => {}
+            Err(error) if crate::modrinth::is_connection_failure(&error) => {
+                if outcome.network_error.is_none() {
+                    outcome.network_error = Some(format!("{error:#}"));
+                    tasks.abort_all();
+                }
+            }
+            Err(error) => outcome.failures.push((mod_id, format!("{error:#}"))),
+        }
+    }
+    outcome
+}
+
 /// Fetch compatible versions only for the mods that were actually selected by resolution.
-/// Network/API errors for individual mods are treated as "no compatible version"
-/// so that the re-resolution pass can disable them and try alternatives.
+/// An error Modrinth answers for one mod is treated as "no compatible version"
+/// so that the re-resolution pass can disable it and try alternatives; a
+/// network that does not answer stops the stage (`VersionLookup::network_error`).
 pub(super) async fn prefetch_compatible_versions_for_selected(
     app_handle: &tauri::AppHandle,
     _launcher_paths: &LauncherPaths,
@@ -171,39 +249,39 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
-) -> Result<HashMap<String, ModrinthVersion>> {
-    let mut versions = HashMap::new();
+) -> Result<VersionLookup> {
+    let mut seen = HashSet::new();
+    let mod_ids = selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| seen.insert(selected.mod_id.as_str()))
+        .map(|selected| selected.mod_id.clone())
+        .collect::<Vec<_>>();
 
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth) {
-            continue;
+    let client = client.clone();
+    let fetch_target = target.clone();
+    let outcome = fetch_per_project_concurrently(mod_ids, PER_PROJECT_PERMITS, move |mod_id| {
+        let client = client.clone();
+        let target = fetch_target.clone();
+        async move {
+            let versions = client.fetch_project_versions(&mod_id, &target).await?;
+            Ok(select_preferred_mod_version(versions, &target))
         }
-        if versions.contains_key(&selected.mod_id) {
-            continue;
-        }
-        match client
-            .fetch_project_versions(&selected.mod_id, target)
-            .await
-        {
-            Ok(candidate_versions) => {
-                if let Some(version) = select_preferred_mod_version(candidate_versions, target) {
-                    versions.insert(selected.mod_id.clone(), version);
-                }
-            }
-            Err(err) => {
-                let _ = emit_log(
-                    app_handle,
-                    ProcessLogStream::Stderr,
-                    format!(
-                        "[Launch] skipping mod '{}': failed to query Modrinth ({:#})",
-                        selected.mod_id, err
-                    ),
-                );
-            }
-        }
+    })
+    .await;
+
+    for (mod_id, error) in &outcome.failures {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Launch] skipping mod '{mod_id}': failed to query Modrinth ({error})"),
+        );
     }
 
-    Ok(versions)
+    Ok(VersionLookup {
+        versions: outcome.versions,
+        network_error: outcome.network_error,
+    })
 }
 
 /// Selected Modrinth mods split by whether `mod_cache` knows a sha1 for them on
@@ -226,6 +304,10 @@ pub(super) struct HashStageOutcome {
     pub(super) omitted_mod_ids: Vec<String>,
     /// Set when the bulk call itself failed and its whole set fell back.
     pub(super) bulk_error: Option<String>,
+    /// The bulk call failed because Modrinth could not be reached: falling
+    /// back to one request per mod would only fail again, once per mod
+    /// (audit 101, precheck-5).
+    pub(super) bulk_unreachable: bool,
 }
 
 pub(super) fn split_selected_by_cached_hash(
@@ -316,6 +398,7 @@ where
             per_project_mod_ids: split.unhashed.clone(),
             omitted_mod_ids: Vec::new(),
             bulk_error: None,
+            bulk_unreachable: false,
         };
     }
 
@@ -344,6 +427,7 @@ where
                 per_project_mod_ids,
                 omitted_mod_ids,
                 bulk_error: None,
+                bulk_unreachable: false,
             }
         }
         Err(error) => {
@@ -358,6 +442,7 @@ where
                 resolved: HashMap::new(),
                 per_project_mod_ids,
                 omitted_mod_ids: Vec::new(),
+                bulk_unreachable: crate::modrinth::is_connection_failure(&error),
                 bulk_error: Some(format!("{error:#}")),
             }
         }
@@ -375,7 +460,7 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
-) -> Result<HashMap<String, ModrinthVersion>> {
+) -> Result<VersionLookup> {
     let hash_by_mod_id =
         load_cached_file_hashes_for_selected(launcher_paths, selected_mods, target)?;
     let split = split_selected_by_cached_hash(selected_mods, &hash_by_mod_id);
@@ -384,7 +469,20 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     })
     .await;
 
-    if let Some(error) = &outcome.bulk_error {
+    if let (true, Some(error)) = (outcome.bulk_unreachable, &outcome.bulk_error) {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] Modrinth could not be reached for {} cached hashes; no request per mod is sent ({error})",
+                split.hashed.len()
+            ),
+        );
+        return Ok(VersionLookup {
+            versions: HashMap::new(),
+            network_error: Some(error.clone()),
+        });
+    } else if let Some(error) = &outcome.bulk_error {
         let _ = emit_log(
             app_handle,
             ProcessLogStream::Stderr,
@@ -427,7 +525,58 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     )
     .await?;
 
-    Ok(merge_resolved_versions(outcome.resolved, per_project))
+    Ok(VersionLookup {
+        versions: merge_resolved_versions(outcome.resolved, per_project.versions),
+        network_error: per_project.network_error,
+    })
+}
+
+/// The second pass over the final selection (audit 101,
+/// r2-scala-mod-list-grandi-2): the availability pass already holds a version
+/// for every mod it asked, and an answer does not change within one launch,
+/// so only the mods it never asked go to Modrinth — after a full fixed point,
+/// none. Before, the same set was asked twice, 2×N requests in a row.
+pub(super) async fn versions_for_final_selection(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    lookups: &SelectionLookups,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<VersionLookup> {
+    let unasked = selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| !lookups.asked.contains(&selected.mod_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut lookup = if unasked.is_empty() || lookups.network_error.is_some() {
+        VersionLookup::default()
+    } else {
+        resolve_compatible_versions_hybrid(
+            app_handle,
+            launcher_paths,
+            http_client,
+            &unasked,
+            client,
+            target,
+        )
+        .await?
+    };
+
+    for selected in selected_mods {
+        if let Some(version) = lookups.versions.get(&selected.mod_id) {
+            lookup
+                .versions
+                .entry(selected.mod_id.clone())
+                .or_insert_with(|| version.clone());
+        }
+    }
+    if lookup.network_error.is_none() {
+        lookup.network_error = lookups.network_error.clone();
+    }
+    Ok(lookup)
 }
 
 pub(super) async fn prefetch_ranked_versions_for_selected(
@@ -1074,6 +1223,23 @@ pub(super) struct TargetSelection {
     pub(super) dropped: Vec<DroppedMod>,
     /// Every mod the availability pass disabled, alternatives included.
     pub(super) unavailable: Vec<String>,
+    /// What the online pass learned on the way, kept for the second pass.
+    /// Empty on the offline path, which asks nothing.
+    pub(super) lookups: SelectionLookups,
+}
+
+/// The answers of the online availability pass (audit 101,
+/// r2-scala-mod-list-grandi-2).
+#[derive(Debug, Clone, Default)]
+pub(super) struct SelectionLookups {
+    /// The version each asked mod got, when it got one.
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// Every mod id Modrinth was asked about (or would have been, before the
+    /// network failed).
+    pub(super) asked: HashSet<String>,
+    /// Set when Modrinth could not be reached (precheck-5): from then on the
+    /// pass asked the cache alone.
+    pub(super) network_error: Option<String>,
 }
 
 /// The pending ids of an `AvailabilityFixpoint` in the shape the availability
@@ -1108,6 +1274,7 @@ fn finish_selection(
         selected_mods,
         dropped,
         unavailable,
+        lookups: SelectionLookups::default(),
     }
 }
 
@@ -1604,6 +1771,7 @@ pub(super) async fn resolve_online_selection(
     target: &ResolutionTarget,
 ) -> Result<TargetSelection> {
     let mut pass = AvailabilityFixpoint::pinned(modlist, pins.clone(), target)?;
+    let mut lookups = SelectionLookups::default();
 
     loop {
         let pending_ids = pass.pending();
@@ -1611,15 +1779,30 @@ pub(super) async fn resolve_online_selection(
             break;
         }
         let pending = pending_selection(&pending_ids);
-        let versions = resolve_compatible_versions_hybrid(
-            app_handle,
-            launcher_paths,
-            http_client,
-            &pending,
-            client,
-            target,
-        )
-        .await?;
+        // Once Modrinth could not be reached, the later rounds (alternatives
+        // coming in) ask the cache alone instead of failing again, one round
+        // of retries each (audit 101, precheck-5).
+        let versions = if lookups.network_error.is_none() {
+            let lookup = resolve_compatible_versions_hybrid(
+                app_handle,
+                launcher_paths,
+                http_client,
+                &pending,
+                client,
+                target,
+            )
+            .await?;
+            lookups.network_error = lookup.network_error;
+            lookup.versions
+        } else {
+            HashMap::new()
+        };
+        lookups.asked.extend(pending_ids.iter().cloned());
+        lookups.versions.extend(
+            versions
+                .iter()
+                .map(|(mod_id, version)| (mod_id.clone(), version.clone())),
+        );
         // D29 on this path too: a jar this machine already has makes the mod
         // available whatever Modrinth says, or fails to say. Without it a
         // version Modrinth has dropped, or a Modrinth that does not answer,
@@ -1640,9 +1823,11 @@ pub(super) async fn resolve_online_selection(
         pass.record(&pending_ids, &unavailable)?;
     }
 
-    Ok(finish_selection(modlist, target, pass, &|_| {
+    let mut selection = finish_selection(modlist, target, pass, &|_| {
         DropReason::NoVersionAndNoCachedJar
-    }))
+    });
+    selection.lookups = lookups;
+    Ok(selection)
 }
 
 /// Same as `resolve_online_selection`, with no network at all.
@@ -1819,6 +2004,112 @@ mod tests {
             files: Vec::new(),
             date_published: date_published.into(),
         }
+    }
+
+    /// A real connection failure, made locally: nothing listens on port 1.
+    async fn connection_refused() -> anyhow::Error {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        anyhow::Error::new(error).context("failed to query Modrinth")
+    }
+
+    /// Audit 101, r2-scala-mod-list-grandi-2: the per-project requests run
+    /// concurrently, never more than the permits allow.
+    #[tokio::test]
+    async fn per_project_requests_run_concurrently_within_the_permits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let (counter, observed_peak) = (in_flight.clone(), peak.clone());
+        let mod_ids = (0..12).map(|index| format!("mod-{index}")).collect();
+
+        let outcome = fetch_per_project_concurrently(mod_ids, 4, move |mod_id| {
+            let counter = counter.clone();
+            let observed_peak = observed_peak.clone();
+            async move {
+                let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                observed_peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                counter.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some(test_version(&mod_id, "2026-01-01T00:00:00Z")))
+            }
+        })
+        .await;
+
+        assert_eq!(outcome.versions.len(), 12);
+        assert!(outcome.network_error.is_none());
+        assert!(peak.load(Ordering::SeqCst) > 1, "the requests overlap");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "never more than the permits"
+        );
+    }
+
+    /// Audit 101, precheck-5: one request that cannot reach Modrinth stops
+    /// the stage — the mods still queued are not asked, each with its own
+    /// retries — while an error Modrinth answers costs its mod only.
+    #[tokio::test]
+    async fn a_network_that_does_not_answer_stops_the_per_project_stage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let mod_ids = (0..20).map(|index| format!("mod-{index}")).collect();
+
+        let outcome = fetch_per_project_concurrently(mod_ids, 1, move |_mod_id| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(connection_refused().await)
+            }
+        })
+        .await;
+
+        assert!(outcome.network_error.is_some());
+        assert!(outcome.failures.is_empty());
+        assert!(
+            asked.load(Ordering::SeqCst) < 20,
+            "the queued requests are dropped, asked {}",
+            asked.load(Ordering::SeqCst)
+        );
+
+        let answered = fetch_per_project_concurrently(
+            vec!["broken".into(), "fine".into()],
+            2,
+            |mod_id| async move {
+                if mod_id == "broken" {
+                    Err(anyhow::anyhow!("Modrinth returned an error"))
+                } else {
+                    Ok(Some(test_version(&mod_id, "2026-01-01T00:00:00Z")))
+                }
+            },
+        )
+        .await;
+        assert!(answered.network_error.is_none());
+        assert_eq!(answered.failures.len(), 1);
+        assert!(answered.versions.contains_key("fine"));
+    }
+
+    #[tokio::test]
+    async fn a_bulk_call_that_cannot_reach_modrinth_is_told_apart() {
+        let split = CachedHashSplit {
+            hashed: vec![("sodium".into(), "hash-a".into())],
+            unhashed: vec!["iris".into()],
+        };
+        let unreachable = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err::<HashMap<String, ModrinthVersion>, _>(connection_refused().await)
+        })
+        .await;
+        assert!(unreachable.bulk_unreachable);
+
+        let answered = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err::<HashMap<String, ModrinthVersion>, _>(anyhow::anyhow!("500 from Modrinth"))
+        })
+        .await;
+        assert!(!answered.bulk_unreachable);
+        assert!(answered.bulk_error.is_some());
     }
 
     #[test]
