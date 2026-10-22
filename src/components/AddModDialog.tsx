@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
+import { Show, createSignal, createEffect, on, onCleanup, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import {
   addModModalOpen, setAddModModalOpen,
@@ -153,7 +153,11 @@ export function AddModDialog(props: AddModDialogProps) {
     filters();
     contentType();
     clearTimeout(debounceTimer);
-    if (addModMode() !== "modrinth") return;
+    // The dialog is always mounted, and the filters follow the mod list's
+    // version and loader (D149): closed, a change there is no search
+    // (review-frontend-shell-22). Opening runs the first one, so the open
+    // state is read untracked.
+    if (!untrack(addModModalOpen) || addModMode() !== "modrinth") return;
 
     setPage(0);
     debounceTimer = setTimeout(() => void runSearch(0), 350);
