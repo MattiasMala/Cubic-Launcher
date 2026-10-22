@@ -13,10 +13,12 @@ use crate::instance_configs::{
     materialize_custom_configs, prepare_instance_config_directory, CachedConfigPlacement,
 };
 use crate::instance_mods::prepare_instance_mods_directory;
-use crate::java_runtime::required_java_version_for_minecraft;
+use crate::java_runtime::required_java_for_minecraft_version;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
-use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
+use crate::minecraft_downloader::{
+    ensure_minecraft_version, extract_natives, MinecraftCachePolicy,
+};
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
 use crate::process_streaming::ProcessLogStream;
@@ -290,6 +292,38 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         .await;
     }
 
+    let minecraft_progress = |label: &str, detail: &str| {
+        let _ = emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            format!("[MC] {label}: {detail}"),
+        );
+    };
+    // D142: con l'account offline Minecraft deve essere già tutto in cache, e
+    // lo si guarda prima dei mod e di Java: se manca qualcosa il lancio si
+    // ferma qui con un errore che lo dice, senza una richiesta (D132). Prima
+    // partivano manifest, client, librerie e migliaia di asset.
+    let cached_minecraft = if plays_offline {
+        Some(
+            ensure_minecraft_version(
+                &http_client,
+                &target.minecraft_version,
+                &launcher_paths,
+                MinecraftCachePolicy::CacheOnly,
+                &minecraft_progress,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // lancio-11: i metadati del loader prima di risolvere e scaricare
+    // qualunque cosa. Una coppia versione/loader che non esiste (NeoForge
+    // 1.19.2) si ferma qui, invece che dopo centinaia di MB di mod e di
+    // Minecraft.
+    let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
+
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let modrinth_client = ModrinthClient::new();
 
@@ -363,13 +397,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
 
-    let (
-        all_remote_versions,
-        cached_remote_records,
-        missing_jar_records,
-        effective_required_java,
-        project_aliases,
-    ) = if matches!(
+    let (all_remote_versions, cached_remote_records, missing_jar_records, project_aliases) = if matches!(
         resolution_path,
         LaunchResolutionPath::Preresolved(_) | LaunchResolutionPath::Offline
     ) {
@@ -417,7 +445,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             parent_versions,
             split.cached_records,
             split.missing_jar_records,
-            required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     } else {
@@ -493,7 +520,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             parent_versions,
             fallback.cached_records,
             fallback.missing_jar_records,
-            required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     };
@@ -514,10 +540,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     launch_log_session.append_summary_line(&format!(
         "resolved_cached_records={}",
         cached_remote_records.len()
-    ))?;
-    launch_log_session.append_summary_line(&format!(
-        "required_java_before_loader={}",
-        effective_required_java
     ))?;
     emit_progress(
         &app_handle,
@@ -575,30 +597,37 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &project_aliases,
     )?;
 
-    emit_progress(
-        &app_handle,
-        "resolving",
-        58,
-        "Download Minecraft",
-        &format!(
-            "Ensuring Minecraft {} client, libraries and assets are cached.",
-            target.minecraft_version
-        ),
-    )?;
-
-    let mc_data = ensure_minecraft_version(
-        &http_client,
-        &target.minecraft_version,
-        &launcher_paths,
-        |label, detail| {
-            let _ = emit_log(
+    let mc_data = match cached_minecraft {
+        Some(mc_data) => mc_data,
+        None => {
+            emit_progress(
                 &app_handle,
-                ProcessLogStream::Stdout,
-                format!("[MC] {label}: {detail}"),
-            );
-        },
-    )
-    .await?;
+                "resolving",
+                58,
+                "Download Minecraft",
+                &format!(
+                    "Ensuring Minecraft {} client, libraries and assets are cached.",
+                    target.minecraft_version
+                ),
+            )?;
+            ensure_minecraft_version(
+                &http_client,
+                &target.minecraft_version,
+                &launcher_paths,
+                MinecraftCachePolicy::Download,
+                &minecraft_progress,
+            )
+            .await?
+        }
+    };
+    // download-3: la major di Java la dice il version.json, che conosce anche
+    // snapshot, pre-release e release candidate.
+    let effective_required_java =
+        required_java_for_minecraft_version(mc_data.java_major_version, &target.minecraft_version);
+    launch_log_session.append_summary_line(&format!(
+        "required_java_before_loader={}",
+        effective_required_java
+    ))?;
 
     emit_progress(
         &app_handle,
@@ -713,7 +742,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         .await?;
     }
 
-    let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
     let mut loader_library_paths =
         materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;
     let loader_maven_file_paths =

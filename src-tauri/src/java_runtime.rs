@@ -51,7 +51,10 @@ impl JavaBinaryInspector for CommandJavaBinaryInspector {
         // aarch64 e niente su una JVM a 32 bit (download-4). Una JVM che non
         // conosce l'opzione non stampa la versione, e allora si riprova con
         // `-version` soltanto.
-        for args in [&["-XshowSettings:properties", "-version"][..], &["-version"][..]] {
+        for args in [
+            &["-XshowSettings:properties", "-version"][..],
+            &["-version"][..],
+        ] {
             let Some(combined_output) = run_java_for_output(path, args) else {
                 return Ok(None); // binary not executable or missing
             };
@@ -177,10 +180,10 @@ pub fn persist_java_installations(
 pub fn select_java_for_minecraft(
     installations: &[JavaInstallation],
     minecraft_version: &str,
-) -> Result<Option<JavaInstallation>> {
-    let required_version = required_java_version_for_minecraft(minecraft_version)?;
+) -> Option<JavaInstallation> {
+    let required_version = required_java_for_minecraft_version(None, minecraft_version);
 
-    Ok(select_java_for_requirement(installations, required_version))
+    select_java_for_requirement(installations, required_version)
 }
 
 pub fn select_java_for_requirement(
@@ -221,6 +224,25 @@ pub fn select_exact_java_for_requirement(
                 .cmp(&right.source)
                 .then(left.path.cmp(&right.path))
         })
+}
+
+/// La major di Java che una versione di Minecraft chiede: quella che il suo
+/// version.json dichiara (`javaVersion.majorVersion`), poi la tabella sul nome
+/// della versione, poi 8.
+///
+/// Il version.json prima di tutto (download-3): la tabella capisce solo i
+/// nomi numerici, e snapshot, pre-release e release candidate («25w14a»,
+/// «1.21-pre1») facevano fallire il lancio con `invalid Minecraft version`.
+/// Mai un errore: un nome che la tabella non capisce vale 8, come un
+/// version.json senza `javaVersion` (le versioni vecchie).
+pub fn required_java_for_minecraft_version(
+    declared_major: Option<u32>,
+    minecraft_version: &str,
+) -> u32 {
+    declared_major
+        .filter(|major| *major > 0)
+        .or_else(|| required_java_version_for_minecraft(minecraft_version).ok())
+        .unwrap_or(8)
 }
 
 pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u32> {
@@ -487,11 +509,10 @@ mod tests {
     use super::{
         candidates_from_java_home_root, candidates_from_path_entries, host_java_architecture,
         inspect_java_binary_candidates, java_architecture_matches_host, parse_java_architecture,
-        parse_java_major_version,
-        persist_java_installations, required_java_version_for_minecraft,
-        select_exact_java_for_requirement, select_java_for_minecraft, select_java_for_requirement,
-        JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation, JavaInstallationSource,
-        JavaProbe,
+        parse_java_major_version, persist_java_installations, required_java_for_minecraft_version,
+        required_java_version_for_minecraft, select_exact_java_for_requirement,
+        select_java_for_minecraft, select_java_for_requirement, JavaBinaryCandidate,
+        JavaBinaryInspector, JavaInstallation, JavaInstallationSource, JavaProbe,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -521,6 +542,25 @@ mod tests {
         assert_eq!(required_java_version_for_minecraft("1.20.4").unwrap(), 17);
         assert_eq!(required_java_version_for_minecraft("1.20.5").unwrap(), 21);
         assert_eq!(required_java_version_for_minecraft("1.21.1").unwrap(), 21);
+    }
+
+    /// download-3: il version.json decide, la tabella è il ripiego, e un nome
+    /// che non è numerico non è più un errore.
+    #[test]
+    fn required_java_comes_from_the_version_json_first() {
+        // Snapshot e release candidate: dal version.json.
+        assert_eq!(required_java_for_minecraft_version(Some(21), "25w14a"), 21);
+        assert_eq!(
+            required_java_for_minecraft_version(Some(17), "1.18-rc3"),
+            17
+        );
+        // Il version.json vince anche sulla tabella.
+        assert_eq!(required_java_for_minecraft_version(Some(25), "1.21.1"), 25);
+        // Senza `javaVersion`: la tabella, e per un nome che non capisce, 8.
+        assert_eq!(required_java_for_minecraft_version(None, "1.20.4"), 17);
+        assert_eq!(required_java_for_minecraft_version(None, "25w14a"), 8);
+        assert_eq!(required_java_for_minecraft_version(None, "1.21-pre1"), 8);
+        assert_eq!(required_java_for_minecraft_version(Some(0), "1.16.5"), 8);
     }
 
     #[test]
@@ -700,7 +740,6 @@ mod tests {
 
         let installations = inspect_java_binary_candidates(&candidates, &inspector).unwrap();
         let selected = select_java_for_minecraft(&installations, "1.20.4")
-            .unwrap()
             .expect("matching installation should exist");
 
         assert_eq!(selected.path, system_path);

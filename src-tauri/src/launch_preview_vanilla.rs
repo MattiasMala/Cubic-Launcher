@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
-use crate::java_runtime::required_java_version_for_minecraft;
+use crate::java_runtime::required_java_for_minecraft_version;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::LoaderMetadataClient;
@@ -16,8 +16,9 @@ use crate::worlds::quick_play_arguments;
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
     launch_profiler, load_player_identity, merge_minecraft_and_loader_jvm_arguments,
-    select_or_download_java, spawn_minecraft_process, substitute_loader_placeholders,
-    EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
+    minecraft_cache_policy, select_or_download_java, spawn_minecraft_process,
+    substitute_loader_placeholders, EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders,
+    SelectedMod, StartedLaunch,
 };
 
 // Nove input distinti di un passo del lancio. Una struct di parametri
@@ -63,12 +64,6 @@ pub(super) async fn run_vanilla_launch_pipeline(
     launch_log_session.append_summary_line("resolved_remote_versions=0")?;
     launch_log_session.append_summary_line("resolved_cached_records=0")?;
 
-    let effective_required_java = required_java_version_for_minecraft(&target.minecraft_version)?;
-    launch_log_session.append_summary_line(&format!(
-        "required_java_before_loader={}",
-        effective_required_java
-    ))?;
-
     emit_progress(
         &app_handle,
         "resolving",
@@ -80,10 +75,13 @@ pub(super) async fn run_vanilla_launch_pipeline(
         ),
     )?;
 
+    // D142: offline la cache deve avere tutto, e nessuna richiesta parte. Qui
+    // non ci sono mod, e Java viene dopo: il controllo è già il primo passo.
     let mc_data = ensure_minecraft_version(
         &http_client,
         &target.minecraft_version,
         &launcher_paths,
+        minecraft_cache_policy(plays_offline),
         |label, detail| {
             let _ = emit_log(
                 &app_handle,
@@ -93,6 +91,14 @@ pub(super) async fn run_vanilla_launch_pipeline(
         },
     )
     .await?;
+
+    // download-3: la major di Java la dice il version.json appena letto.
+    let effective_required_java =
+        required_java_for_minecraft_version(mc_data.java_major_version, &target.minecraft_version);
+    launch_log_session.append_summary_line(&format!(
+        "required_java_before_loader={}",
+        effective_required_java
+    ))?;
 
     emit_progress(
         &app_handle,

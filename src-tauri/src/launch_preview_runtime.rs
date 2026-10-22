@@ -21,6 +21,7 @@ use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
+use crate::minecraft_downloader::MinecraftCachePolicy;
 use crate::offline_account::deterministic_offline_uuid;
 use crate::path_safety::{contained_join, validate_path_component};
 use crate::process_streaming::{spawn_and_stream_process, ProcessEventSink, ProcessLogStream};
@@ -352,6 +353,15 @@ pub(super) fn maven_artifact_relative_path(coordinates: &str) -> Result<PathBuf>
         .join(artifact)
         .join(version)
         .join(file_name))
+}
+
+/// D142: l'account offline non scarica Minecraft, lo trova in cache.
+pub(super) fn minecraft_cache_policy(plays_offline: bool) -> MinecraftCachePolicy {
+    if plays_offline {
+        MinecraftCachePolicy::CacheOnly
+    } else {
+        MinecraftCachePolicy::Download
+    }
 }
 
 pub(super) async fn fetch_launch_loader_metadata(

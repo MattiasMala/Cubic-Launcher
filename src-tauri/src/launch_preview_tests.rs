@@ -15,9 +15,10 @@ use super::{
     maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
     merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
     minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
-    split_installations_by_host_architecture, substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
-    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest,
-    LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
+    split_installations_by_host_architecture, substitute_known_placeholders,
+    validate_content_filename, EffectiveLaunchSettings, EmbeddedFabricRequirementSet,
+    EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
+    LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
 };
 use crate::java_runtime::{JavaInstallation, JavaInstallationSource};
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -769,8 +770,14 @@ fn legacy_and_optional_placeholders_never_reach_the_game_literally() {
     assert_eq!(substituted[user_properties + 1], "{}");
 
     // 1.19+: `--clientId ${clientid} --xuid ${auth_xuid}`.
-    assert_eq!(substitute_known_placeholders("${clientid}", &placeholders), "");
-    assert_eq!(substitute_known_placeholders("${auth_xuid}", &placeholders), "");
+    assert_eq!(
+        substitute_known_placeholders("${clientid}", &placeholders),
+        ""
+    );
+    assert_eq!(
+        substitute_known_placeholders("${auth_xuid}", &placeholders),
+        ""
+    );
 }
 
 #[test]
@@ -1215,7 +1222,10 @@ fn java_of_another_architecture_is_left_out_of_the_choice() {
     ]);
 
     assert_eq!(
-        usable.iter().map(|java| java.path.clone()).collect::<Vec<_>>(),
+        usable
+            .iter()
+            .map(|java| java.path.clone())
+            .collect::<Vec<_>>(),
         vec![PathBuf::from("/launcher/java-runtimes/java-8/bin/java")]
     );
     assert_eq!(skipped.len(), 1);
