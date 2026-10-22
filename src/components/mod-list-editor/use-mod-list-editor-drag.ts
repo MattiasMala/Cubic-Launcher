@@ -40,6 +40,7 @@ export function useModListEditorDrag(options: ModListEditorDragOptions) {
         : { kind: "group", id: item.id }
     ),
     onCommit: (fromId, dropId, fromKind) => commitDrop(fromId, dropId, fromKind),
+    detect: cursorY => detectEnhancedDropTarget(cursorY),
   });
 
   {
@@ -157,23 +158,14 @@ export function useModListEditorDrag(options: ModListEditorDragOptions) {
       }
     }
 
-    return null;
+    // Below every item: after the last one, in this detector's own ids.
+    const last = [...items].reverse().find(item => tlId(item) !== dragTlId);
+    if (!last) return null;
+    return last.kind === "group" ? `tl-group-after:${last.id}` : `row-after:${last.row.id}`;
   };
 
   const handleStartDrag = (id: string, kind: "row" | "group", event: PointerEvent | MouseEvent) => {
     engine.startDrag(id, kind, event);
-
-    const onMoveOverride = (pointerEvent: PointerEvent) => {
-      if (!engine.draggingId()) return;
-      const target = detectEnhancedDropTarget(pointerEvent.clientY);
-      if (target !== null) engine.setHoveredDropId(target);
-    };
-    const onUpCleanup = () => {
-      window.removeEventListener("pointermove", onMoveOverride);
-      window.removeEventListener("pointerup", onUpCleanup);
-    };
-    window.addEventListener("pointermove", onMoveOverride);
-    window.addEventListener("pointerup", onUpCleanup);
   };
 
   const previewTLItems = createMemo(() => {

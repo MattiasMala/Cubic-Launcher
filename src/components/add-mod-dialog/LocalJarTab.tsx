@@ -1,5 +1,4 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
-import { localJarRuleName, setLocalJarRuleName } from "../../store";
 import { UploadIcon } from "../icons";
 import type { LocalImportFailure } from "../../lib/contentImportErrors";
 import type { LocalPickMode, LocalUploadContentType } from "./shared";
@@ -38,34 +37,51 @@ export function LocalJarTab(props: {
     }
   };
 
-  onMount(async () => {
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      const win = getCurrentWindow();
-      const unlisten = await win.onDragDropEvent(async event => {
-        if (event.payload.type === "over" || event.payload.type === "enter") {
-          setDragging(true);
-        } else if (event.payload.type === "leave") {
-          setDragging(false);
-        } else if (event.payload.type === "drop") {
-          setDragging(false);
-          const paths: string[] = event.payload.paths ?? [];
-          // A mod is a .jar and nothing else. A pack is a .zip *or* a folder,
-          // and a dropped folder arrives as a plain path with no extension to
-          // match on, so anything that is not a .zip is handed to the backend,
-          // which is the only side that can tell a folder from a stray file.
-          const matchedPath = isMod()
-            ? paths.find(path => path.toLowerCase().endsWith(fileExt()))
-            : paths.find(path => path.toLowerCase().endsWith(".zip")) ?? paths[0];
-          if (matchedPath && props.onDropLocal) {
-            await run(() => props.onDropLocal!(matchedPath, props.contentType));
+  // Il cleanup si registra subito, mentre Solid ha ancora un owner: dopo un
+  // `await` `onCleanup` non registra niente, e il listener restava vivo a
+  // dialog chiuso, aggiungendo in silenzio ogni .jar trascinato sulla finestra
+  // (audit 101, ui-schermate-6). Se la tab si chiude prima che la
+  // registrazione finisca, il listener appena nato si toglie da solo.
+  let disposed = false;
+  let unlisten: (() => void) | undefined;
+  onCleanup(() => {
+    disposed = true;
+    unlisten?.();
+    unlisten = undefined;
+  });
+
+  onMount(() => {
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        if (disposed) return;
+        const win = getCurrentWindow();
+        const stop = await win.onDragDropEvent(async event => {
+          if (event.payload.type === "over" || event.payload.type === "enter") {
+            setDragging(true);
+          } else if (event.payload.type === "leave") {
+            setDragging(false);
+          } else if (event.payload.type === "drop") {
+            setDragging(false);
+            const paths: string[] = event.payload.paths ?? [];
+            // A mod is a .jar and nothing else. A pack is a .zip *or* a folder,
+            // and a dropped folder arrives as a plain path with no extension to
+            // match on, so anything that is not a .zip is handed to the backend,
+            // which is the only side that can tell a folder from a stray file.
+            const matchedPath = isMod()
+              ? paths.find(path => path.toLowerCase().endsWith(fileExt()))
+              : paths.find(path => path.toLowerCase().endsWith(".zip")) ?? paths[0];
+            if (matchedPath && props.onDropLocal) {
+              await run(() => props.onDropLocal!(matchedPath, props.contentType));
+            }
           }
-        }
-      });
-      onCleanup(() => unlisten());
-    } catch {
-      // not in Tauri
-    }
+        });
+        if (disposed) stop();
+        else unlisten = stop;
+      } catch {
+        // not in Tauri
+      }
+    })();
   });
 
   return (
@@ -88,15 +104,6 @@ export function LocalJarTab(props: {
           </Show>
         </p>
         <div class="flex w-full max-w-xs flex-col gap-3">
-          <Show when={isMod()}>
-            <input
-              type="text"
-              placeholder="Rule name (optional - defaults to filename)"
-              value={localJarRuleName()}
-              onInput={e => setLocalJarRuleName(e.currentTarget.value)}
-              class="rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-          </Show>
           <button
             disabled={busy()}
             onClick={() => void run(() => props.onUploadLocal(props.contentType, "file"))}

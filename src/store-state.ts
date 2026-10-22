@@ -15,7 +15,6 @@ import type {
   LauncherUiError,
   LinkRule,
   ModListCard,
-  ModrinthResult,
   ModRow,
   UpdatePrecheckResult,
   VersionRule,
@@ -43,17 +42,6 @@ export const DEMO_MOD_LISTS: ModListCard[] = [
 
 export const DEMO_ACCOUNTS: AccountSummary[] = [
   { id: "demo", gamertag: "Not logged in", email: "", status: "offline", lastMode: "offline", playsOffline: false },
-];
-
-export const MOCK_MODRINTH: ModrinthResult[] = [
-  { id: "sodium", name: "Sodium", author: "jellysquid3", description: "Modern rendering optimization mod with strong Fabric support.", categories: ["Optimization", "Rendering"] },
-  { id: "iris", name: "Iris Shaders", author: "coderbot", description: "Shader support compatible with Sodium.", categories: ["Shaders", "Rendering"] },
-  { id: "xaeros-minimap", name: "Xaero's Minimap", author: "xaero96", description: "Compact minimap for utility and navigation.", categories: ["Utility", "Map"] },
-  { id: "fabric-api", name: "FabricMC", author: "FabricMC", description: "Core modding API - almost always required by Fabric mods.", categories: ["Library", "Core"] },
-  { id: "lithium", name: "Lithium", author: "jellysquid3", description: "General-purpose optimization mod.", categories: ["Optimization"] },
-  { id: "create", name: "Create", author: "simibubi", description: "Automation and aesthetics with rotating contraptions.", categories: ["Content", "Tech"] },
-  { id: "journeymap", name: "JourneyMap", author: "techbrew", description: "Real-time in-game mapping.", categories: ["Utility", "Map"] },
-  { id: "modmenu", name: "Mod Menu", author: "Prospector", description: "Adds a mod menu to view installed mods.", categories: ["Utility"] },
 ];
 
 export const [modListCards, setModListCards] = createSignal<ModListCard[]>([]);
@@ -157,7 +145,6 @@ export const [createModlistModalOpen, setCreateModlistModalOpen] = createSignal(
 export const [createModlistName, setCreateModlistName] = createSignal("");
 export const [createModlistDescription, setCreateModlistDescription] = createSignal("");
 export const [createModlistBusy, setCreateModlistBusy] = createSignal(false);
-export const [localJarRuleName, setLocalJarRuleName] = createSignal("");
 export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
 /** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */

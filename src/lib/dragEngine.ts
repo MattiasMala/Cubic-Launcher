@@ -2,7 +2,8 @@
  * Unified drag-and-drop engine for ModListEditor, AltSection, and AlternativesPanel.
  *
  * All layout measurements are taken ONCE at dragStart and cached in signals.
- * No getBoundingClientRect calls during pointermove.
+ * During the drag only the container is measured again, to know how far the
+ * page under the cursor has scrolled since the start.
  * hoveredDropId is "sticky" — never reset to null mid-drag.
  */
 import { createSignal, createMemo, onMount, onCleanup, batch } from "solid-js";
@@ -18,6 +19,15 @@ export type DragEngineConfig = {
   containerRef: () => HTMLElement | undefined;
   getItems: () => DragItem[];
   onCommit: (fromId: string, dropId: string, fromKind: "row" | "group") => void;
+  /**
+   * The drop target under the cursor, for lists whose targets are not the
+   * plain `before:`/`after:` ids (groups with inner rows, alt groups). It is
+   * the only detector: both pointer moves and scrolls ask it. When a separate
+   * pointermove listener did it, a scroll (the autoscroll at the edges) wrote
+   * `before:`/`after:` ids that no commit knew, and the row ended up last and
+   * out of its group (audit 101, editor-logica-6).
+   */
+  detect?: (cursorY: number) => string | null;
 };
 
 const dragItemId = (item: DragItem): string =>
@@ -39,7 +49,6 @@ export function useDragEngine(config: DragEngineConfig) {
   const [cachedMidYs,         setCachedMidYs]         = createSignal<Map<string, number>>(new Map());
   // Scroll offset delta since drag started (viewport-relative positions shift by this).
   const [scrollDelta,         setScrollDelta]         = createSignal(0);
-  let scrollAtDragStart = 0;
 
   const anyDragging = () => draggingId() != null;
 
@@ -164,11 +173,6 @@ export function useDragEngine(config: DragEngineConfig) {
     event.stopPropagation();
 
     measureAll();
-
-    // Capture initial scroll position of the scroll container (parent of item container).
-    const container = config.containerRef();
-    const scrollParent = container?.parentElement;
-    scrollAtDragStart = scrollParent?.scrollTop ?? 0;
     setScrollDelta(0);
 
     batch(() => {
@@ -200,17 +204,23 @@ export function useDragEngine(config: DragEngineConfig) {
     document.body.style.userSelect = "";
   }
 
+  const detect = (cursorY: number): string | null =>
+    config.detect ? config.detect(cursorY) : detectDropTarget(cursorY);
+
   onMount(() => {
+    // How far the list moved up since dragStart, whichever ancestor scrolled:
+    // the scroll container is not always the container's parent (an AltSection
+    // inside the editor, the Fallback Order modal).
     const updateScrollDelta = () => {
       const container = config.containerRef();
-      const scrollParent = container?.parentElement;
-      if (scrollParent) setScrollDelta(scrollParent.scrollTop - scrollAtDragStart);
+      const startRect = cachedContainerRect();
+      if (container && startRect) setScrollDelta(startRect.top - container.getBoundingClientRect().top);
     };
     const onMove = (event: PointerEvent) => {
       if (!draggingId()) return;
       setDragPointer({ x: event.clientX, y: event.clientY });
       updateScrollDelta();
-      const newTarget = detectDropTarget(event.clientY);
+      const newTarget = detect(event.clientY);
       if (newTarget !== null) {
         setHoveredDropId(newTarget);
       }
@@ -220,7 +230,7 @@ export function useDragEngine(config: DragEngineConfig) {
       updateScrollDelta();
       const ptr = dragPointer();
       if (ptr) {
-        const newTarget = detectDropTarget(ptr.y);
+        const newTarget = detect(ptr.y);
         if (newTarget !== null) setHoveredDropId(newTarget);
       }
     };
@@ -253,7 +263,6 @@ export function useDragEngine(config: DragEngineConfig) {
     cachedMidYs,
     cachedContainerRect,
     scrollDelta,
-    // Allow components to override detection (for groups with inner rows, alt groups, etc.)
     setHoveredDropId,
   };
 }

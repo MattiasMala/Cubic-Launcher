@@ -9,6 +9,7 @@ import type { CustomConfig, LauncherUiError, VersionRule } from "./lib/types";
 import {
   aestheticGroups,
   draftLinks,
+  modRowsState,
   editingGroupId,
   functionalGroups,
   functionalGroupTone,
@@ -39,6 +40,7 @@ import {
   setLaunchState,
   setLinkModalModIds,
   setLinkModalOpen,
+  setModRowsState,
   setNewFunctionalGroupName,
   setSavedIncompatibilities,
   setSavedLinks,
@@ -48,7 +50,9 @@ import {
 } from "./store-state";
 import {
   parentIdByChildId,
+  rowMap,
 } from "./store-selectors";
+import { contiguousGroupOrder } from "./app/row-state";
 import { LAUNCH_STAGES } from "./lib/types";
 
 export function upsertDownloadProgress(update: { filename: string; progress: number }) {
@@ -160,7 +164,17 @@ export function commitGroupRename(id: string) {
   setEditingGroupId(null);
 }
 
-export function createAestheticGroup() {
+/**
+ * How a new group's rule order reaches the backend: `onReorder` for the top
+ * level (reorder_rules_command), `onReorderAlts` for the alternatives of one
+ * parent (save_alternative_order_command).
+ */
+export interface GroupOrderPersistence {
+  onReorder?: (orderedIds: string[]) => void;
+  onReorderAlts?: (parentId: string, orderedIds: string[]) => void;
+}
+
+export function createAestheticGroup(persist: GroupOrderPersistence = {}) {
   const context = selectionContext();
   if (context === "empty") {
     pushUiError({
@@ -188,13 +202,40 @@ export function createAestheticGroup() {
   const id = `ag-${Date.now()}`;
   const name = nextAestheticGroupName(scopeRowId);
 
-  setAestheticGroups(current => {
-    const withoutSelected = current.map(group => ({
+  // The members follow the rule order, not the order they were clicked in, and
+  // the rules become contiguous at the place of the first member: the editor
+  // draws a group there, so the launcher must try them there too (audit 101,
+  // editor-logica-8).
+  const scopeRows = scopeRowId ? (rowMap().get(scopeRowId)?.alternatives ?? []) : modRowsState();
+  const scopeIds = scopeRows.map(row => row.id);
+  const selectedSet = new Set(selected);
+  const blockIds = [
+    ...scopeIds.filter(rowId => selectedSet.has(rowId)),
+    ...selected.filter(rowId => !scopeIds.includes(rowId)),
+  ];
+
+  const nextGroups = [
+    ...aestheticGroups().map(group => ({
       ...group,
-      blockIds: group.blockIds.filter(blockId => !selected.includes(blockId)),
-    }));
-    return [...withoutSelected, { id, name, collapsed: false, blockIds: selected, scopeRowId }];
-  });
+      blockIds: group.blockIds.filter(blockId => !selectedSet.has(blockId)),
+    })),
+    { id, name, collapsed: false, blockIds, scopeRowId },
+  ];
+  setAestheticGroups(nextGroups);
+
+  const nextOrder = contiguousGroupOrder(
+    scopeIds,
+    nextGroups.filter(group => (group.scopeRowId ?? null) === scopeRowId),
+  );
+  if (nextOrder.some((rowId, index) => rowId !== scopeIds[index])) {
+    if (scopeRowId) {
+      persist.onReorderAlts?.(scopeRowId, nextOrder);
+    } else {
+      const rowById = new Map(scopeRows.map(row => [row.id, row]));
+      setModRowsState(nextOrder.map(rowId => rowById.get(rowId)!));
+      persist.onReorder?.(nextOrder);
+    }
+  }
   startGroupRename(id, name);
 }
 

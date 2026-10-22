@@ -18,6 +18,8 @@ interface ContentAdvancedPanelProps {
   contentType: string;
   onClose: () => void;
   onUpdate: (entryId: string, rules: ContentEntry["versionRules"]) => void;
+  /** Rilegge la scheda dal disco: dopo un salvataggio rifiutato vale quello. */
+  onReload: () => Promise<void>;
 }
 
 export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
@@ -30,23 +32,38 @@ export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
 
   const versions = () => showSnapshots() ? mcWithSnapshots() : minecraftVersions();
 
+  // Il pannello copre il banner degli avvisi: un salvataggio rifiutato si dice
+  // qui, e le regole tornano a quelle sul disco invece di sembrare salvate
+  // (audit 101, § 1 errori ingoiati).
+  const [saveError, setSaveError] = createSignal<string | null>(null);
+
   const save = async (versionRules: ContentEntry["versionRules"]) => {
+    // «Any version» è una lista vuota per il backend; una stringa vuota non
+    // combacia con nessuna versione (audit 101, ui-schermate-5). Si pulisce
+    // anche quello che arriva da file scritti prima della correzione.
+    const normalized = versionRules.map(rule => ({ ...rule, mcVersions: rule.mcVersions.filter(version => version !== "") }));
     try {
       await invoke("save_content_version_rules_command", {
         input: {
           modlistName: props.modlistName,
           contentType: props.contentType,
           entryId: props.entry.id,
-          versionRules: versionRules.map(rule => ({
+          versionRules: normalized.map(rule => ({
             kind: rule.kind,
             mc_versions: rule.mcVersions,
             loader: rule.loader,
           })),
         },
       });
-      props.onUpdate(props.entry.id, versionRules);
-    } catch {
-      // best effort
+      setSaveError(null);
+      props.onUpdate(props.entry.id, normalized);
+    } catch (error) {
+      setSaveError(String(error));
+      // Prima le ultime regole confermate, poi quelle vere del disco.
+      setRules(props.entry.versionRules);
+      await props.onReload();
+      const reloaded = props.entry as ContentEntry | null;
+      if (reloaded) setRules(reloaded.versionRules);
     }
   };
 
@@ -89,6 +106,12 @@ export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
             <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Version Rules</h3>
           </div>
           <div class="space-y-2 p-4">
+            <Show when={saveError()}>
+              <div class="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2" role="alert">
+                <p class="text-xs font-semibold text-foreground">Could not save version rules</p>
+                <p class="mt-0.5 text-xs text-muted-foreground">The rules shown are the ones saved on disk. {saveError()}</p>
+              </div>
+            </Show>
             <For each={rules()}>
               {(rule, index) => (
                 <div class="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background p-2">
@@ -115,7 +138,7 @@ export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
                     ]}
                     onChange={value => {
                       const updated = rules().map((candidate, candidateIndex) =>
-                        candidateIndex === index() ? { ...candidate, mcVersions: [value] } : candidate
+                        candidateIndex === index() ? { ...candidate, mcVersions: value ? [value] : [] } : candidate
                       );
                       setRules(updated);
                       void save(updated);

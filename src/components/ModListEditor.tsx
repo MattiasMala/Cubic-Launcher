@@ -1,7 +1,6 @@
 import { For, Show } from "solid-js";
 import type { ContentTabId } from "../store";
 import {
-  activeAccount,
   activeContentTab,
   instancePresentation,
   modIcons,
@@ -144,7 +143,9 @@ export function ModListEditor(props: Props) {
               <div class="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                 <span>{modRowsState().length} rule{modRowsState().length !== 1 ? "s" : ""}</span>
                 <span>·</span>
-                <span>by {instancePresentation().iconAccent || activeAccount()?.gamertag || "—"}</span>
+                {/* «Created by» della presentazione, altrimenti l'author di rules.json:
+                    l'account attivo non è l'autore di una lista importata (audit 101, ui-schermate-10). */}
+                <span>by {instancePresentation().iconAccent.trim() || activeModList()!.author || "—"}</span>
               </div>
             </div>
             <div class="flex shrink-0 items-center gap-1">
@@ -207,7 +208,12 @@ export function ModListEditor(props: Props) {
             />
           }
         >
-          <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
+          <ActionBar
+            onAddMod={props.onAddMod}
+            onDeleteSelected={props.onDeleteSelected}
+            onReorder={props.onReorder}
+            onReorderAlts={props.onReorderAlts}
+          />
 
           <div class="flex-1 p-4" ref={setScrollContainerRef} style={{ overflow: "auto" }}>
             <Show when={hasContent()} fallback={<ModListEditorEmptyState onAddMod={props.onAddMod} />}>

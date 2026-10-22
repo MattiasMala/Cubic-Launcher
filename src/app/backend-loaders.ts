@@ -1,3 +1,4 @@
+import { batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
 import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
@@ -22,6 +23,32 @@ export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS
 
 let resolutionSeq = 0;
 export const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
+
+/**
+ * True once `minecraftVersions` holds the list the backend fetched, not the
+ * placeholder of `store-state.ts`. Only then is its first entry a real "latest
+ * release" that may be written as a mod list's version.
+ */
+let minecraftVersionsKnown = false;
+export function markMinecraftVersionsKnown() {
+  minecraftVersionsKnown = true;
+}
+
+/** The version proposed to a mod list that has none saved yet. */
+export function defaultMinecraftVersion(): string {
+  return minecraftVersions()[0] ?? "1.21.1";
+}
+
+/**
+ * Write a mod list's Minecraft version and loader, and nothing else: the RAM,
+ * JVM and wrapper overrides on disk stay as they are (todo.md:1618, audit 101
+ * "Noto 1"). Rejects, so the caller can tell the user and undo.
+ */
+export async function saveModlistTarget(modlistName: string, version: string, loader: string) {
+  await invoke("save_modlist_target_command", {
+    input: { modlistName, minecraftVersion: version, modLoader: normalizeModLoader(loader) },
+  });
+}
 
 export async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
   const name = modlistName ?? selectedModListName();
@@ -87,7 +114,13 @@ export async function loadMinecraftVersions() {
       withSnapshots: payload.withSnapshots.length,
       source: payload.source,
     });
-    if (payload.releases.length > 0) setMinecraftVersions(payload.releases);
+    if (payload.releases.length > 0) {
+      setMinecraftVersions(payload.releases);
+      // A real manifest, fresh or the one saved last time: its first release
+      // may become a mod list's saved version. A list of the installed
+      // versions alone is not "the latest release", so it never is.
+      if (payload.source !== "installed") markMinecraftVersionsKnown();
+    }
     if (payload.withSnapshots.length > 0) setMcWithSnapshots(payload.withSnapshots);
     setMinecraftVersionsNotice(minecraftVersionsNoticeFor(payload));
   } catch (error) {
@@ -173,6 +206,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         iconLabel: prev?.iconLabel,
         iconAccent: prev?.iconAccent,
         displayName: prev?.displayName,
+        author: typeof modlist.author === "string" && modlist.author.trim() ? modlist.author.trim() : undefined,
         mcVersion: modlist.minecraft_version ?? undefined,
         modLoader: normalizeModLoader(modlist.mod_loader),
       };
@@ -214,24 +248,43 @@ export async function loadShellSnapshot(preferredName?: string | null) {
 
     const overrides = snap.selected_modlist_overrides;
     if (overrides) {
-      setModlistOverrides(current => ({
-        ...current,
+      // An override that is off shows what the launch would use without it,
+      // never the value of the mod list shown before: ticking the box would
+      // save that one on this list (audit 101, 085 scheda 7).
+      setModlistOverrides({
         minRamEnabled: overrides.min_ram_mb != null,
-        minRamMb: overrides.min_ram_mb ?? current.minRamMb,
+        minRamMb: overrides.min_ram_mb ?? gs?.min_ram_mb ?? 2048,
         maxRamEnabled: overrides.max_ram_mb != null,
-        maxRamMb: overrides.max_ram_mb ?? current.maxRamMb,
+        maxRamMb: overrides.max_ram_mb ?? gs?.max_ram_mb ?? 4096,
         customArgsEnabled: overrides.custom_jvm_args != null,
-        customJvmArgs: overrides.custom_jvm_args ?? current.customJvmArgs,
+        customJvmArgs: overrides.custom_jvm_args ?? "",
         profilerEnabled: overrides.profiler_enabled != null,
-        profilerActive: overrides.profiler_enabled ?? current.profilerActive,
+        profilerActive: overrides.profiler_enabled ?? false,
         wrapperEnabled: overrides.wrapper_command != null,
-        wrapperCommand: overrides.wrapper_command ?? current.wrapperCommand,
-      }));
-      const resolvedVersion = overrides.minecraft_version ?? minecraftVersions()[0] ?? "1.21.1";
+        wrapperCommand: overrides.wrapper_command ?? "",
+      });
+      const overridesName: string | null = overrides.modlist_name ?? null;
+      const resolvedVersion: string = overrides.minecraft_version ?? defaultMinecraftVersion();
       const resolvedLoader = normalizeModLoader(overrides.mod_loader);
       setSelectedMcVersion(resolvedVersion);
       setSelectedModLoader(resolvedLoader);
-      if (preferredName) modlistVersionLoaderCache.set(preferredName, { version: resolvedVersion, loader: resolvedLoader });
+      if (overridesName) {
+        modlistVersionLoaderCache.set(overridesName, { version: resolvedVersion, loader: resolvedLoader });
+        // A mod list with no saved version used to get the latest release at
+        // every start, so a new Mojang release silently moved it to a new,
+        // empty instance (audit 101, r2-primo-avvio-ambiente-degradato-1).
+        // The default is written the first time it is shown, and from then on
+        // it is the list's own. Not with the placeholder list: offline that
+        // would pin "1.21.1" on a list that never asked for it.
+        if ((overrides.minecraft_version == null || overrides.mod_loader == null) && minecraftVersionsKnown && isTauri()) {
+          void saveModlistTarget(overridesName, resolvedVersion, resolvedLoader)
+            .then(() => {
+              logger.info("App", "saved the default target of a mod list that had none", { modlist: overridesName, version: resolvedVersion, loader: resolvedLoader });
+              setModListCards(current => current.map(card => card.name === overridesName ? { ...card, mcVersion: resolvedVersion, modLoader: resolvedLoader } : card));
+            })
+            .catch(error => logger.warn("App", "could not save the default target of a mod list", { modlist: overridesName, error: String(error) }));
+        }
+      }
     }
 
     return snap;
@@ -277,9 +330,6 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
     const snap: any = await invoke("load_modlist_editor_command", { selectedModlistName: modlistName });
     const mappedRows = mapEditorRowsToModRows(snap.rows ?? []);
 
-    setModRowsState(current => smartSetModRows(current, mappedRows));
-    patchModNames();
-
     const primaryModToRowId = new Map<string, string>();
     const collectPrimaryMods = (rows: ModRow[]) => {
       for (const row of rows) {
@@ -300,17 +350,8 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
       }
     };
     collectLinks(mappedRows);
-    setSavedLinks(restoredLinks);
-
-    if (resetGroups) {
-      setFunctionalGroups([]);
-    }
 
     const incompat: Array<{ winnerId: string; loserId: string }> = snap.incompatibilities ?? [];
-    setSavedIncompatibilities(incompat.map(rule => ({
-      winnerId: primaryModToRowId.get(rule.winnerId) ?? rule.winnerId,
-      loserId: primaryModToRowId.get(rule.loserId) ?? rule.loserId,
-    })));
 
     const extractedVersionRules: VersionRule[] = [];
     const extractedCustomConfigs: CustomConfig[] = [];
@@ -328,14 +369,33 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
       }
     };
     collectAdvanced(snap.rows ?? []);
-    setVersionRules(extractedVersionRules);
-    setCustomConfigs(extractedCustomConfigs);
+
+    // Rows and the states keyed by their ids change together: the persistence
+    // effects must never see new rows with old ids (or the reverse), or they
+    // would send a stale id to the backend (audit 101, modlist-5).
+    batch(() => {
+      setModRowsState(current => smartSetModRows(current, mappedRows));
+      setSavedLinks(restoredLinks);
+      if (resetGroups) setFunctionalGroups([]);
+      setSavedIncompatibilities(incompat.map(rule => ({
+        winnerId: primaryModToRowId.get(rule.winnerId) ?? rule.winnerId,
+        loserId: primaryModToRowId.get(rule.loserId) ?? rule.loserId,
+      })));
+      setVersionRules(extractedVersionRules);
+      setCustomConfigs(extractedCustomConfigs);
+    });
+    patchModNames();
 
     void invoke("backfill_availability_command", {
       modlistName,
       mcVersion: selectedMcVersion(),
       modLoader: normalizeModLoader(selectedModLoader()),
-    }).catch(() => {}).then(() => runResolution(modlistName));
+    }).catch(() => {}).then(() => {
+      // The user may have moved to another mod list while the backfill ran:
+      // resolving this one now would put its name on the indicators and throw
+      // away the current list's resolution (audit 101, stato-frontend-8).
+      if (selectedModListName() === modlistName) void runResolution(modlistName);
+    });
 
     return snap;
   } catch (error) {

@@ -140,6 +140,16 @@ pub struct ShellModListOverridesInput {
     pub mod_loader: Option<String>,
 }
 
+/// A mod list's target alone: what the version and loader dropdowns write, and
+/// what a new mod list starts on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellModListTargetInput {
+    pub modlist_name: String,
+    pub minecraft_version: String,
+    pub mod_loader: String,
+}
+
 /// Async, with the database and the keyring on a blocking thread: a
 /// synchronous Tauri command runs on the main thread, and on Linux a locked
 /// keyring can hold the call for as long as its unlock prompt stays open,
@@ -463,6 +473,17 @@ pub fn save_modlist_overrides_command(
         Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
 
     save_modlist_overrides(&connection, &overrides).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn save_modlist_target_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ShellModListTargetInput,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
+
+    save_modlist_target(&connection, &input).map_err(|error| error.to_string())
 }
 
 /// `secret_store` is where the active account's token key lives. The commands
@@ -867,6 +888,29 @@ pub fn save_modlist_overrides(
     replace_modlist_settings(connection, &overrides.modlist_name, &values)
 }
 
+/// Write a mod list's Minecraft version and loader, leaving its overrides
+/// alone. The dropdowns used to go through `save_modlist_overrides` with the
+/// overrides the frontend had on screen, which could be another list's.
+pub fn save_modlist_target(connection: &Connection, input: &ShellModListTargetInput) -> Result<()> {
+    let minecraft_version = input.minecraft_version.trim();
+    let mod_loader = input.mod_loader.trim();
+    if minecraft_version.is_empty() {
+        bail!("minecraft_version cannot be empty");
+    }
+    if mod_loader.is_empty() {
+        bail!("mod_loader cannot be empty");
+    }
+
+    upsert_modlist_settings(
+        connection,
+        &input.modlist_name,
+        &[
+            ("minecraft_version", minecraft_version.to_string()),
+            ("mod_loader", mod_loader.to_string()),
+        ],
+    )
+}
+
 fn load_key_value_settings(
     connection: &Connection,
     modlist_name: Option<&str>,
@@ -945,25 +989,63 @@ fn upsert_global_settings(connection: &Connection, values: &[(&str, String)]) ->
     Ok(())
 }
 
+/// The overrides of the settings form: a key missing from what the form sends
+/// means "override off", so these are cleared before the write.
+const MODLIST_OVERRIDE_KEYS: [&str; 5] = [
+    "min_ram_mb",
+    "max_ram_mb",
+    "custom_jvm_args",
+    "profiler_enabled",
+    "wrapper_command",
+];
+
+/// Write the settings form's keys of one mod list, leaving every other row of
+/// that list alone.
+///
+/// It used to delete every key of the list first (todo.md:1618), the same trap
+/// `upsert_global_settings` was freed of: the version and loader went with a
+/// save that did not carry them, and so would any key another writer adds.
+/// Only the overrides are cleared — off means absent — and the rest is upserted.
 fn replace_modlist_settings(
     connection: &Connection,
     modlist_name: &str,
     values: &[(&str, String)],
 ) -> Result<()> {
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute(
-        "DELETE FROM modlist_settings WHERE modlist_name = ?1",
-        [modlist_name],
-    )?;
-
-    for (key, value) in values {
+    for key in MODLIST_OVERRIDE_KEYS {
         transaction.execute(
-            "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3)",
+            "DELETE FROM modlist_settings WHERE modlist_name = ?1 AND key = ?2",
+            [modlist_name, key],
+        )?;
+    }
+    upsert_modlist_settings_in(&transaction, modlist_name, values)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_modlist_settings(
+    connection: &Connection,
+    modlist_name: &str,
+    values: &[(&str, String)],
+) -> Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    upsert_modlist_settings_in(&transaction, modlist_name, values)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_modlist_settings_in(
+    connection: &Connection,
+    modlist_name: &str,
+    values: &[(&str, String)],
+) -> Result<()> {
+    for (key, value) in values {
+        connection.execute(
+            "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(modlist_name, key) DO UPDATE SET value = excluded.value",
             [modlist_name, *key, value.as_str()],
         )?;
     }
-
-    transaction.commit()?;
     Ok(())
 }
 
@@ -987,7 +1069,8 @@ mod tests {
         account_profile_data_json, active_account_plays_offline,
         load_account_list_with_secret_store, load_active_account_summary_with_secret_store,
         load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
-        signed_in_as_another_account, ShellGlobalSettingsInput, ShellModListOverridesInput,
+        save_modlist_target, signed_in_as_another_account, ShellGlobalSettingsInput,
+        ShellModListOverridesInput, ShellModListTargetInput,
     };
     use crate::launcher_paths::LauncherPaths;
 
@@ -1633,5 +1716,145 @@ mod tests {
 
         save_global_settings(&connection, &settings(1024, 4096))
             .expect("valid RAM settings should save");
+    }
+    fn modlist_settings_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE modlist_settings (
+                    modlist_name TEXT NOT NULL,
+                    key          TEXT NOT NULL,
+                    value        TEXT NOT NULL,
+                    PRIMARY KEY (modlist_name, key)
+                );",
+            )
+            .expect("modlist settings schema should initialize");
+        connection
+    }
+
+    fn modlist_setting(connection: &Connection, modlist_name: &str, key: &str) -> Option<String> {
+        connection
+            .query_row(
+                "SELECT value FROM modlist_settings WHERE modlist_name = ?1 AND key = ?2",
+                params![modlist_name, key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn overrides_off(modlist_name: &str) -> ShellModListOverridesInput {
+        ShellModListOverridesInput {
+            modlist_name: modlist_name.into(),
+            min_ram_mb: None,
+            max_ram_mb: None,
+            custom_jvm_args: None,
+            profiler_enabled: None,
+            wrapper_command: None,
+            minecraft_version: None,
+            mod_loader: None,
+        }
+    }
+
+    /// todo.md:1618: saving the form clears the overrides it switches off, and
+    /// nothing else — not the target, not a key some other writer put there.
+    #[test]
+    fn save_modlist_overrides_clears_only_the_overrides_it_owns() {
+        let connection = modlist_settings_connection();
+        save_modlist_overrides(
+            &connection,
+            &ShellModListOverridesInput {
+                min_ram_mb: Some(4096),
+                wrapper_command: Some("mangohud".into()),
+                minecraft_version: Some("1.20.1".into()),
+                mod_loader: Some("Fabric".into()),
+                ..overrides_off("Pack")
+            },
+        )
+        .expect("overrides should save");
+        connection
+            .execute(
+                "INSERT INTO modlist_settings (modlist_name, key, value) VALUES ('Pack', 'some_other_key', 'kept')",
+                [],
+            )
+            .expect("foreign key should insert");
+
+        save_modlist_overrides(&connection, &overrides_off("Pack")).expect("overrides should save");
+
+        assert_eq!(modlist_setting(&connection, "Pack", "min_ram_mb"), None);
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "wrapper_command"),
+            None
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.20.1")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "mod_loader").as_deref(),
+            Some("Fabric")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "some_other_key").as_deref(),
+            Some("kept")
+        );
+    }
+
+    /// The version dropdown writes the target and leaves the overrides as they
+    /// are: it can no longer copy another list's RAM or wrapper onto this one.
+    #[test]
+    fn save_modlist_target_writes_only_version_and_loader() {
+        let connection = modlist_settings_connection();
+        save_modlist_overrides(
+            &connection,
+            &ShellModListOverridesInput {
+                max_ram_mb: Some(6144),
+                minecraft_version: Some("1.20.1".into()),
+                mod_loader: Some("Fabric".into()),
+                ..overrides_off("Pack")
+            },
+        )
+        .expect("overrides should save");
+
+        save_modlist_target(
+            &connection,
+            &ShellModListTargetInput {
+                modlist_name: "Pack".into(),
+                minecraft_version: "1.21.1".into(),
+                mod_loader: "NeoForge".into(),
+            },
+        )
+        .expect("target should save");
+
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.21.1")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "mod_loader").as_deref(),
+            Some("NeoForge")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "max_ram_mb").as_deref(),
+            Some("6144")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Other", "minecraft_version"),
+            None
+        );
+
+        let error = save_modlist_target(
+            &connection,
+            &ShellModListTargetInput {
+                modlist_name: "Pack".into(),
+                minecraft_version: " ".into(),
+                mod_loader: "Fabric".into(),
+            },
+        )
+        .expect_err("an empty version must be refused");
+        assert_eq!(error.to_string(), "minecraft_version cannot be empty");
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.21.1")
+        );
     }
 }
