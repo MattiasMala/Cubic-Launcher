@@ -344,6 +344,13 @@ pub(super) async fn run_content_precheck(
                     versions_by_entry
                         .insert(entry.id.as_str(), versions_for_category(category, versions));
                 }
+                // review-risoluzione-10, as precheck-5 does for the mods: no
+                // connection is about every pack that follows, each with its
+                // retries (~14 s apiece). The whole check fails at once and the
+                // frontend takes its D19 branch.
+                Err(error) if crate::modrinth::is_connection_failure(&error) => {
+                    anyhow::bail!("Modrinth could not be reached: {error:#}");
+                }
                 Err(error) => {
                     // Left out of the rows and of the map — promising a
                     // version we could not read would be worse than letting
