@@ -1001,7 +1001,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             request.quick_play_singleplayer.as_deref(),
             mc_data.supports_quick_play_singleplayer,
         ),
-        config_attribution: None,
     })?;
 
     // I tre file condivisi entrano **prima dello spawn**: per `servers.dat` il

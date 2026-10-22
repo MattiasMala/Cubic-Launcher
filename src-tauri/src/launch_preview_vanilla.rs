@@ -248,7 +248,6 @@ pub(super) async fn run_vanilla_launch_pipeline(
             quick_play_singleplayer.as_deref(),
             mc_data.supports_quick_play_singleplayer,
         ),
-        config_attribution: None,
     })?;
 
     // Stessa regola del percorso moddato: la copia entra prima dello spawn.

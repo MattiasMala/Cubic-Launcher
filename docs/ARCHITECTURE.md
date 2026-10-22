@@ -150,7 +150,7 @@ The local SQLite database is `launcher_data.db`. `database.rs` initializes and m
 - `mod_cache` — cached remote or local artifact metadata keyed by Modrinth version and launch target
 - `modrinth_project_aliases` — slug-to-canonical-project-ID mappings used by cache lookups
 - `dependencies` — unused legacy dependency-link table; nothing writes it and nothing reads it
-- `config_attribution` — generated config paths linked to their originating JARs
+- `config_attribution` — unused legacy table for config files traced to the JAR that wrote them; the Java agent that would have filled it was never built, nothing writes it and nothing reads it
 - `global_settings` — launcher-wide settings
 - `modlist_settings` — per-modlist overrides
 - `modrinth_availability` — cached project availability by Minecraft version and loader

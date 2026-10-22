@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::config_attribution::ConfigAttributionLaunchConfig;
 use crate::loader_metadata::LoaderMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +118,6 @@ pub struct JavaLaunchRequest {
     pub loader_metadata: LoaderMetadata,
     pub launch_settings: JavaLaunchSettings,
     pub additional_game_arguments: Vec<String>,
-    pub config_attribution: Option<ConfigAttributionLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,10 +183,6 @@ fn build_java_invocation_args(request: &JavaLaunchRequest) -> Vec<String> {
 
     if let Some(profiler) = &request.launch_settings.profiler {
         args.push(profiler.to_jvm_arg());
-    }
-
-    if let Some(config_attribution) = &request.config_attribution {
-        args.extend(config_attribution.to_jvm_args());
     }
 
     args.push("-cp".to_string());
@@ -308,7 +302,6 @@ pub fn join_classpath_entries(classpath_entries: &[PathBuf]) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::config_attribution::ConfigAttributionLaunchConfig;
     use crate::loader_metadata::LoaderMetadata;
     use crate::resolver::ModLoader;
 
@@ -431,11 +424,6 @@ mod tests {
                 wrapper_command: None,
             },
             additional_game_arguments: vec!["--username".into(), "PlayerOne".into()],
-            config_attribution: Some(ConfigAttributionLaunchConfig {
-                agent_jar_path: PathBuf::from("java-agent/build/libs/config-agent.jar"),
-                output_file_path: PathBuf::from("temp/config-attribution.ndjson"),
-                mods_cache_dir: PathBuf::from("cache/mods"),
-            }),
         }
     }
 
@@ -494,9 +482,6 @@ mod tests {
             &"-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=launch-logs/1-pack/profile.jfr"
                 .to_string()
         ));
-        assert!(command
-            .args
-            .contains(&"-javaagent:java-agent/build/libs/config-agent.jar".to_string()));
         assert!(command
             .args
             .contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_string()));

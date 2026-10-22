@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS dependencies (
     PRIMARY KEY (mod_parent_id, dependency_id)
 );
 
+-- Unused: the Java agent that would have filled it was never built. Kept so
+-- existing databases need no destructive migration.
 CREATE TABLE IF NOT EXISTS config_attribution (
     config_path     TEXT NOT NULL,
     jar_filename    TEXT NOT NULL,

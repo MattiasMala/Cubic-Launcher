@@ -397,7 +397,6 @@ fn jvm_args_for(settings: &EffectiveLaunchSettings, java_major: u32) -> Vec<Stri
         },
         launch_settings: settings.java_launch_settings(decision.into_recording()),
         additional_game_arguments: Vec::new(),
-        config_attribution: None,
     };
     build_launch_command(&request)
         .expect("launch command should build")
