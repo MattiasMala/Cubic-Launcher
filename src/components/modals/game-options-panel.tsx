@@ -94,6 +94,12 @@ interface Props {
   /** Vista iniziale, quando il chiamante l'ha già caricata. */
   initialView?: SharedOptionsView;
   initialInstances?: string[];
+  /**
+   * Hands the caller a way to save the pending edits, so a modal's own save
+   * button can write them too (D154). It resolves to `false` when the save
+   * failed; the panel shows why.
+   */
+  registerPendingSave?: (save: () => Promise<boolean>) => void;
 }
 
 export function GameOptionsPanel(props: Props) {
@@ -336,11 +342,11 @@ export function GameOptionsPanel(props: Props) {
     }
   };
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     setNotice(null);
     setError(null);
     const current = view();
-    if (!current) return;
+    if (!current) return true;
     // Si rimandano **tutte** le righe, comprese quelle che non mostriamo:
     // salvare solo le visibili cancellerebbe lo stato interno dal file.
     const entries = current.entries.map(entry => ({
@@ -351,10 +357,26 @@ export function GameOptionsPanel(props: Props) {
       await call()("save_shared_options_command", { scope: props.scope, entries });
       setNotice("Saved.");
       await load();
+      return true;
     } catch (saveError) {
       setError(String(saveError));
+      return false;
     }
   };
+
+  /**
+   * Edits that differ from the file. Only the file of this level can have
+   * them: an instance opened from «From» is read-only.
+   */
+  const hasPendingEdits = () => {
+    if (previewing()) return false;
+    const entries = view()?.entries ?? [];
+    return Object.entries(edits()).some(
+      ([key, value]) => entries.find(entry => entry.key === key)?.value !== value,
+    );
+  };
+
+  props.registerPendingSave?.(async () => (hasPendingEdits() ? save() : true));
 
   const onSourceChange = (value: string) => {
     // Il Select in-DOM lascia cliccare la voce già scelta: ricaricare lì
