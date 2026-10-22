@@ -242,31 +242,45 @@ pub const MICROSOFT_LOGIN_URL_EVENT: &str = "microsoft-login-url";
 /// frontend compares against it to tell a cancel from a failure.
 pub const MICROSOFT_LOGIN_CANCELLED: &str = "Microsoft sign-in cancelled";
 
-/// The sign-in in progress, if any: the sender that cancels it (account-3).
+/// The sign-in in progress, if any: the sender that cancels it (account-3),
+/// with the number of the sign-in it belongs to.
 #[derive(Default)]
 pub struct MicrosoftLoginState {
-    cancel: Mutex<Option<oneshot::Sender<()>>>,
+    cancel: Mutex<Option<(u64, oneshot::Sender<()>)>>,
+    started: std::sync::atomic::AtomicU64,
 }
 
 /// Holds the cancel slot for the length of one sign-in and empties it however
-/// the sign-in ends.
-struct LoginInProgress<'a>(&'a MicrosoftLoginState);
+/// the sign-in ends — unless a newer sign-in took it over.
+struct LoginInProgress<'a> {
+    state: &'a MicrosoftLoginState,
+    id: u64,
+}
 
 impl<'a> LoginInProgress<'a> {
-    fn start(state: &'a MicrosoftLoginState) -> Result<(Self, oneshot::Receiver<()>), String> {
-        let mut slot = state.cancel.lock();
-        if slot.is_some() {
-            return Err("A Microsoft sign-in is already in progress".to_string());
-        }
+    /// A sign-in already waiting is cancelled and replaced, not refused
+    /// (review-frontend-shell-26): after a reload of the window the frontend
+    /// no longer knows about it and shows no Cancel, and it would block every
+    /// new sign-in for up to five minutes.
+    fn start(state: &'a MicrosoftLoginState) -> (Self, oneshot::Receiver<()>) {
+        let id = state
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        *slot = Some(sender);
-        Ok((Self(state), receiver))
+        let previous = state.cancel.lock().replace((id, sender));
+        if let Some((_, previous)) = previous {
+            let _ = previous.send(());
+        }
+        (Self { state, id }, receiver)
     }
 }
 
 impl Drop for LoginInProgress<'_> {
     fn drop(&mut self) {
-        self.0.cancel.lock().take();
+        let mut slot = self.state.cancel.lock();
+        if slot.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            slot.take();
+        }
     }
 }
 
@@ -275,7 +289,7 @@ impl Drop for LoginInProgress<'_> {
 /// saved. Without a sign-in in progress it does nothing.
 #[tauri::command]
 pub fn cancel_microsoft_login_command(login_state: State<'_, MicrosoftLoginState>) {
-    if let Some(sender) = login_state.cancel.lock().take() {
+    if let Some((_, sender)) = login_state.cancel.lock().take() {
         let _ = sender.send(());
     }
 }
@@ -318,6 +332,10 @@ pub async fn microsoft_login_command(
     replace_unreadable: Option<bool>,
     expected_microsoft_id: Option<String>,
 ) -> Result<String, String> {
+    // The cancel slot first (review-frontend-shell-26): the window shows
+    // "Cancel sign-in" at once, and the keyring check below can wait on an
+    // unlock prompt. A Cancel pressed meanwhile is kept, and answered there.
+    let (_in_progress, mut cancelled) = LoginInProgress::start(&login_state);
     let replace_unreadable = replace_unreadable.unwrap_or(false);
     let env_path = launcher_paths.root_dir().join(".env");
     let client_id = configured_microsoft_client_id(&env_path).map_err(|e| e.to_string())?;
@@ -344,7 +362,9 @@ pub async fn microsoft_login_command(
         }
     };
 
-    let (_in_progress, cancelled) = LoginInProgress::start(&login_state)?;
+    if cancelled.try_recv().is_ok() {
+        return Err(MICROSOFT_LOGIN_CANCELLED.to_string());
+    }
     let url_app = app.clone();
     let login = run_microsoft_login(&client_id, move |url| {
         let _ = url_app.emit(MICROSOFT_LOGIN_URL_EVENT, url.to_string());
@@ -1095,6 +1115,35 @@ mod tests {
                 .insert(key.to_string(), secret.to_string());
             Ok(())
         }
+    }
+
+    /// review-frontend-shell-26: a new sign-in cancels and replaces one left
+    /// waiting (a reloaded window), and the old one ending does not empty the
+    /// slot of the new one; a Cancel then reaches the new one.
+    #[test]
+    fn a_new_sign_in_takes_over_the_one_left_waiting() {
+        let state = super::MicrosoftLoginState::default();
+        let (old, mut old_cancelled) = super::LoginInProgress::start(&state);
+        let (new, mut new_cancelled) = super::LoginInProgress::start(&state);
+        assert!(
+            old_cancelled.try_recv().is_ok(),
+            "the old sign-in is cancelled"
+        );
+        drop(old);
+        assert!(
+            state.cancel.lock().is_some(),
+            "the new sign-in keeps its slot"
+        );
+
+        if let Some((_, sender)) = state.cancel.lock().take() {
+            let _ = sender.send(());
+        }
+        assert!(
+            new_cancelled.try_recv().is_ok(),
+            "Cancel reaches the new one"
+        );
+        drop(new);
+        assert!(state.cancel.lock().is_none());
     }
 
     #[test]
