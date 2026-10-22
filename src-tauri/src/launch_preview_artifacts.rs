@@ -7,21 +7,19 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::launcher_paths::LauncherPaths;
-use crate::mod_cache::{CacheProbe, ModCacheRecord};
+use crate::mod_cache::{CacheProbe, InstanceJars, ModCacheRecord};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
-    resolve_modlist, version_rules_conflict, FailureReason, ModLoader, ResolutionResult,
-    ResolutionTarget, RuleOutcome,
+    resolve_modlist_without, version_rules_conflict, AvailabilityFixpoint, FailureReason,
+    ModLoader, PinAliases, ResolutionResult, ResolutionTarget, RuleOutcome,
 };
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
-    embedded_minecraft_requirements_match, emit_launcher_issue, emit_log,
-    ensure_remote_version_cached, load_cached_file_hashes_for_selected,
-    probe_cached_mod_for_target, probe_cached_version_for_target,
-    read_embedded_fabric_requirements, SelectedMod,
+    emit_launcher_issue, emit_log, load_cached_file_hashes_for_selected,
+    probe_cached_mod_for_target, probe_cached_version_for_target, SelectedMod,
 };
 
 pub(super) struct TopLevelVersionCandidates {
@@ -54,12 +52,24 @@ pub(super) enum RemoteArtifact {
 /// they throw away. One comparator, two accessors, so the two cannot drift
 /// (D56).
 fn preferred_version_index(versions: &[ModrinthVersion]) -> Option<usize> {
+    preferred_version_index_by(versions, |_| 0)
+}
+
+/// The same comparator with a loader rank between channel and date: for a mod
+/// on NeoForge 1.20.1 a `neoforge` build wins over a `forge` one at equal
+/// channel (D148), and a `forge` release still wins over a `neoforge` beta.
+/// Every other target has one loader, so the rank is constant there.
+fn preferred_version_index_by(
+    versions: &[ModrinthVersion],
+    loader_rank: impl Fn(&ModrinthVersion) -> u8,
+) -> Option<usize> {
     versions
         .iter()
         .enumerate()
         .max_by(|(_, left), (_, right)| {
             left.channel_rank()
                 .cmp(&right.channel_rank())
+                .then_with(|| loader_rank(left).cmp(&loader_rank(right)))
                 .then_with(|| left.date_published.cmp(&right.date_published))
         })
         .map(|(index, _)| index)
@@ -75,6 +85,18 @@ pub(super) fn select_preferred_version(
     mut versions: Vec<ModrinthVersion>,
 ) -> Option<ModrinthVersion> {
     preferred_version_index(&versions).map(|index| versions.swap_remove(index))
+}
+
+/// The preferred version of a **mod** for `target`: the loader the target is
+/// counts too (`crate::modrinth::loader_affinity`).
+pub(super) fn select_preferred_mod_version(
+    mut versions: Vec<ModrinthVersion>,
+    target: &ResolutionTarget,
+) -> Option<ModrinthVersion> {
+    preferred_version_index_by(&versions, |version| {
+        crate::modrinth::loader_affinity(version, target)
+    })
+    .map(|index| versions.swap_remove(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +134,17 @@ pub(super) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
     }
 }
 
+/// The pins of a mod list, for the resolver (audit 101, modlist-1): read from
+/// the markers next to the jars, which live in the mod list's directory and
+/// not in `rules.json` (D14).
+pub(super) fn load_modlist_pins(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    modlist: &ModList,
+) -> PinAliases {
+    crate::mod_version_pin::pin_aliases(&launcher_paths.modlists_dir().join(modlist_name), modlist)
+}
+
 pub(super) fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<ModList> {
     validate_path_component(modlist_name)?;
     let rules_path = launcher_paths
@@ -128,9 +161,87 @@ pub(super) fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -
     })
 }
 
+/// What a version lookup answered, and whether Modrinth could be reached.
+#[derive(Debug, Default, Clone)]
+pub(super) struct VersionLookup {
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// Set when a request could not reach Modrinth at all (audit 101,
+    /// precheck-5). The requests not yet sent were dropped: the mods they were
+    /// for have no answer, which is not the same as "no version".
+    pub(super) network_error: Option<String>,
+}
+
+/// What the per-project stage answered.
+#[derive(Debug, Default)]
+pub(super) struct PerProjectOutcome {
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// `(mod_id, error)` for a request Modrinth answered with an error: that
+    /// mod only, as before.
+    pub(super) failures: Vec<(String, String)>,
+    pub(super) network_error: Option<String>,
+}
+
+/// How many per-project requests run at once. Same pressure as the editor's
+/// availability check (`resolver::check_availability_concurrently`), well
+/// under Modrinth's 300 requests a minute once the answers take ~0.2 s.
+pub(super) const PER_PROJECT_PERMITS: usize = 10;
+
+/// One request per mod id, `permits` at a time (audit 101,
+/// r2-scala-mod-list-grandi-2: in a row, 300 mods took ~106 s of "CHECKING").
+///
+/// A request that cannot reach Modrinth stops the stage: the requests still
+/// queued are dropped instead of each paying its own retries against a
+/// network that is down (precheck-5). Generic over the request so both
+/// behaviours are testable without network.
+pub(super) async fn fetch_per_project_concurrently<Fetch, Fut>(
+    mod_ids: Vec<String>,
+    permits: usize,
+    fetch: Fetch,
+) -> PerProjectOutcome
+where
+    Fetch: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Option<ModrinthVersion>>> + Send + 'static,
+{
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for mod_id in mod_ids {
+        let fetch = fetch.clone();
+        let permit_source = semaphore.clone();
+        tasks.spawn(async move {
+            // Held through the request, so concurrency stays bounded.
+            let _permit = permit_source.acquire_owned().await;
+            let answer = fetch(mod_id.clone()).await;
+            (mod_id, answer)
+        });
+    }
+
+    let mut outcome = PerProjectOutcome::default();
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((mod_id, answer)) = joined else {
+            // Aborted below, after the network failed: no answer to keep.
+            continue;
+        };
+        match answer {
+            Ok(Some(version)) => {
+                outcome.versions.insert(mod_id, version);
+            }
+            Ok(None) => {}
+            Err(error) if crate::modrinth::is_connection_failure(&error) => {
+                if outcome.network_error.is_none() {
+                    outcome.network_error = Some(format!("{error:#}"));
+                    tasks.abort_all();
+                }
+            }
+            Err(error) => outcome.failures.push((mod_id, format!("{error:#}"))),
+        }
+    }
+    outcome
+}
+
 /// Fetch compatible versions only for the mods that were actually selected by resolution.
-/// Network/API errors for individual mods are treated as "no compatible version"
-/// so that the re-resolution pass can disable them and try alternatives.
+/// An error Modrinth answers for one mod is treated as "no compatible version"
+/// so that the re-resolution pass can disable it and try alternatives; a
+/// network that does not answer stops the stage (`VersionLookup::network_error`).
 pub(super) async fn prefetch_compatible_versions_for_selected(
     app_handle: &tauri::AppHandle,
     _launcher_paths: &LauncherPaths,
@@ -138,39 +249,39 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
-) -> Result<HashMap<String, ModrinthVersion>> {
-    let mut versions = HashMap::new();
+) -> Result<VersionLookup> {
+    let mut seen = HashSet::new();
+    let mod_ids = selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| seen.insert(selected.mod_id.as_str()))
+        .map(|selected| selected.mod_id.clone())
+        .collect::<Vec<_>>();
 
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth) {
-            continue;
+    let client = client.clone();
+    let fetch_target = target.clone();
+    let outcome = fetch_per_project_concurrently(mod_ids, PER_PROJECT_PERMITS, move |mod_id| {
+        let client = client.clone();
+        let target = fetch_target.clone();
+        async move {
+            let versions = client.fetch_project_versions(&mod_id, &target).await?;
+            Ok(select_preferred_mod_version(versions, &target))
         }
-        if versions.contains_key(&selected.mod_id) {
-            continue;
-        }
-        match client
-            .fetch_project_versions(&selected.mod_id, target)
-            .await
-        {
-            Ok(candidate_versions) => {
-                if let Some(version) = select_preferred_version(candidate_versions) {
-                    versions.insert(selected.mod_id.clone(), version);
-                }
-            }
-            Err(err) => {
-                let _ = emit_log(
-                    app_handle,
-                    ProcessLogStream::Stderr,
-                    format!(
-                        "[Launch] skipping mod '{}': failed to query Modrinth ({:#})",
-                        selected.mod_id, err
-                    ),
-                );
-            }
-        }
+    })
+    .await;
+
+    for (mod_id, error) in &outcome.failures {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Launch] skipping mod '{mod_id}': failed to query Modrinth ({error})"),
+        );
     }
 
-    Ok(versions)
+    Ok(VersionLookup {
+        versions: outcome.versions,
+        network_error: outcome.network_error,
+    })
 }
 
 /// Selected Modrinth mods split by whether `mod_cache` knows a sha1 for them on
@@ -193,6 +304,10 @@ pub(super) struct HashStageOutcome {
     pub(super) omitted_mod_ids: Vec<String>,
     /// Set when the bulk call itself failed and its whole set fell back.
     pub(super) bulk_error: Option<String>,
+    /// The bulk call failed because Modrinth could not be reached: falling
+    /// back to one request per mod would only fail again, once per mod
+    /// (audit 101, precheck-5).
+    pub(super) bulk_unreachable: bool,
 }
 
 pub(super) fn split_selected_by_cached_hash(
@@ -283,6 +398,7 @@ where
             per_project_mod_ids: split.unhashed.clone(),
             omitted_mod_ids: Vec::new(),
             bulk_error: None,
+            bulk_unreachable: false,
         };
     }
 
@@ -311,6 +427,7 @@ where
                 per_project_mod_ids,
                 omitted_mod_ids,
                 bulk_error: None,
+                bulk_unreachable: false,
             }
         }
         Err(error) => {
@@ -325,6 +442,7 @@ where
                 resolved: HashMap::new(),
                 per_project_mod_ids,
                 omitted_mod_ids: Vec::new(),
+                bulk_unreachable: crate::modrinth::is_connection_failure(&error),
                 bulk_error: Some(format!("{error:#}")),
             }
         }
@@ -342,7 +460,7 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
-) -> Result<HashMap<String, ModrinthVersion>> {
+) -> Result<VersionLookup> {
     let hash_by_mod_id =
         load_cached_file_hashes_for_selected(launcher_paths, selected_mods, target)?;
     let split = split_selected_by_cached_hash(selected_mods, &hash_by_mod_id);
@@ -351,7 +469,20 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     })
     .await;
 
-    if let Some(error) = &outcome.bulk_error {
+    if let (true, Some(error)) = (outcome.bulk_unreachable, &outcome.bulk_error) {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Launch] Modrinth could not be reached for {} cached hashes; no request per mod is sent ({error})",
+                split.hashed.len()
+            ),
+        );
+        return Ok(VersionLookup {
+            versions: HashMap::new(),
+            network_error: Some(error.clone()),
+        });
+    } else if let Some(error) = &outcome.bulk_error {
         let _ = emit_log(
             app_handle,
             ProcessLogStream::Stderr,
@@ -394,7 +525,58 @@ pub(super) async fn resolve_compatible_versions_hybrid(
     )
     .await?;
 
-    Ok(merge_resolved_versions(outcome.resolved, per_project))
+    Ok(VersionLookup {
+        versions: merge_resolved_versions(outcome.resolved, per_project.versions),
+        network_error: per_project.network_error,
+    })
+}
+
+/// The second pass over the final selection (audit 101,
+/// r2-scala-mod-list-grandi-2): the availability pass already holds a version
+/// for every mod it asked, and an answer does not change within one launch,
+/// so only the mods it never asked go to Modrinth — after a full fixed point,
+/// none. Before, the same set was asked twice, 2×N requests in a row.
+pub(super) async fn versions_for_final_selection(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    selected_mods: &[SelectedMod],
+    lookups: &SelectionLookups,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<VersionLookup> {
+    let unasked = selected_mods
+        .iter()
+        .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+        .filter(|selected| !lookups.asked.contains(&selected.mod_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut lookup = if unasked.is_empty() || lookups.network_error.is_some() {
+        VersionLookup::default()
+    } else {
+        resolve_compatible_versions_hybrid(
+            app_handle,
+            launcher_paths,
+            http_client,
+            &unasked,
+            client,
+            target,
+        )
+        .await?
+    };
+
+    for selected in selected_mods {
+        if let Some(version) = lookups.versions.get(&selected.mod_id) {
+            lookup
+                .versions
+                .entry(selected.mod_id.clone())
+                .or_insert_with(|| version.clone());
+        }
+    }
+    if lookup.network_error.is_none() {
+        lookup.network_error = lookups.network_error.clone();
+    }
+    Ok(lookup)
 }
 
 pub(super) async fn prefetch_ranked_versions_for_selected(
@@ -441,77 +623,13 @@ pub(super) async fn prefetch_ranked_versions_for_selected(
     Ok(versions)
 }
 
-pub(super) async fn select_latest_launch_compatible_version(
-    app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
-    client: &ModrinthClient,
-    project_id_or_slug: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModrinthVersion>> {
-    Ok(select_launch_compatible_versions(
-        app_handle,
-        launcher_paths,
-        http_client,
-        client,
-        project_id_or_slug,
-        target,
-    )
-    .await?
-    .into_iter()
-    .next())
-}
-
-pub(super) async fn select_launch_compatible_versions(
-    app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
-    client: &ModrinthClient,
-    project_id_or_slug: &str,
-    target: &ResolutionTarget,
-) -> Result<Vec<ModrinthVersion>> {
-    let mut versions = client
-        .fetch_project_versions(project_id_or_slug, target)
-        .await?;
-    crate::modrinth::sort_versions_by_target_preference(&mut versions, target);
-
-    let mut compatible_versions = Vec::new();
-    for version in versions {
-        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, &version, target)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to cache '{}' candidate version '{}'",
-                    project_id_or_slug, version.id
-                )
-            })?;
-        let requirements = read_embedded_fabric_requirements(&jar_path)?;
-        if requirements.entries.is_empty()
-            || embedded_minecraft_requirements_match(&requirements, target)
-        {
-            compatible_versions.push(version);
-            continue;
-        }
-
-        let _ = emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            format!(
-                "[Launch] skipping remote version '{}' for '{}': embedded metadata is incompatible with {} / {}",
-                version.version_number,
-                project_id_or_slug,
-                target.minecraft_version,
-                target.mod_loader.as_modrinth_loader()
-            ),
-        );
-    }
-
-    Ok(compatible_versions)
-}
-
+/// `unavailable` are the mods the availability pass disabled: their slot
+/// comes back `Disabled` like a rule the user switched off, and the log says
+/// which of the two it was (todo.md, «Una riga di log che mente»).
 pub(super) fn log_resolution(
     app_handle: &tauri::AppHandle,
     resolution: &ResolutionResult,
+    unavailable: &[String],
 ) -> Result<()> {
     for rule in &resolution.resolved_rules {
         match &rule.outcome {
@@ -526,7 +644,13 @@ pub(super) fn log_resolution(
                 format!(
                     "[Resolver] {} unresolved ({})",
                     rule.mod_id,
-                    describe_failure_reason(*reason)
+                    if *reason == FailureReason::Disabled
+                        && unavailable.iter().any(|mod_id| mod_id == &rule.mod_id)
+                    {
+                        "nothing installable for this target"
+                    } else {
+                        describe_failure_reason(*reason)
+                    }
                 ),
             )?,
         }
@@ -537,6 +661,7 @@ pub(super) fn log_resolution(
 
 pub(super) fn describe_failure_reason(reason: FailureReason) -> &'static str {
     match reason {
+        FailureReason::Disabled => "disabled in the mod-list",
         FailureReason::ExcludedByActiveMod => "excluded by already-selected mods",
         FailureReason::RequiredModMissing => "required mod not active",
         FailureReason::IncompatibleVersion => "incompatible version/loader",
@@ -662,6 +787,7 @@ pub(super) fn probe_selected_mods(
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<Vec<(String, CacheProbe)>> {
     let mut probes = Vec::new();
     let mut seen = HashSet::new();
@@ -673,7 +799,7 @@ pub(super) fn probe_selected_mods(
 
         probes.push((
             selected.mod_id.clone(),
-            probe_cached_mod_for_target(launcher_paths, &selected.mod_id, target)?,
+            probe_cached_mod_for_target(launcher_paths, &selected.mod_id, target, instance)?,
         ));
     }
 
@@ -762,8 +888,9 @@ pub(super) fn resolve_cache_fallback_artifacts(
     selected_mods: &[SelectedMod],
     resolved: &HashMap<String, ModrinthVersion>,
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<RemoteArtifactSplit> {
-    let probes = probe_selected_mods(launcher_paths, selected_mods, target)?;
+    let probes = probe_selected_mods(launcher_paths, selected_mods, target, instance)?;
     let fallback = cached_artifacts_for_unresolved(&probes, resolved);
 
     for (mod_id, artifact) in &fallback {
@@ -799,6 +926,7 @@ pub(super) fn resolve_cache_fallback_artifacts(
         );
     }
 
+    let mut lost = Vec::new();
     for (mod_id, probe) in &probes {
         if resolved.contains_key(mod_id) {
             continue;
@@ -812,27 +940,24 @@ pub(super) fn resolve_cache_fallback_artifacts(
                     app_handle,
                     ProcessLogStream::Stderr,
                     format!(
-                        "[Cache] the cached jar of '{}' is gone ({}) and no version came back from Modrinth to fetch it with; the mod is skipped",
-                        mod_id, record.jar_filename
+                        "[Cache] the cached jar of '{}' is gone ({}, version {}) and no version came back from Modrinth to fetch it with; the mod is skipped",
+                        mod_id, record.jar_filename, record.modrinth_version_id
                     ),
                 );
-                let _ = emit_launcher_issue(
-                    app_handle,
-                    "Mod left out of the launch",
-                    &format!(
-                        "The jar of '{mod_id}' is gone from the cache and Modrinth gave no version to fetch it with."
-                    ),
-                    &format!(
-                        "{} (version {}) would have to be downloaded again, and this launch got no answer for it.",
-                        record.jar_filename, record.modrinth_version_id
-                    ),
-                    "warning",
-                    "launch",
-                );
+                lost.push(DroppedMod {
+                    mod_id: mod_id.clone(),
+                    reason: DropReason::NoVersionAndNoCachedJar,
+                });
             }
-            _ => report_unusable_probe(app_handle, mod_id, probe),
+            _ => lost.extend(log_unusable_probe(
+                app_handle,
+                mod_id,
+                probe,
+                DropReason::NoVersionAndNoCachedJar,
+            )),
         }
     }
+    report_dropped_notices(app_handle, &lost, target);
 
     let artifacts = fallback
         .into_iter()
@@ -870,54 +995,52 @@ fn report_restored_jar(app_handle: &tauri::AppHandle, mod_id: &str, record: &Mod
     );
 }
 
-/// A mod the cache cannot serve and nothing can restore, with the reason.
+/// A mod the cache cannot serve and nothing can restore: the log line, with
+/// the jar and the version, and the reason the banner will say.
 ///
 /// Both selection passes treat it as unavailable — today's behaviour — and
 /// this is the one case where the mod is **not** in the game: the log names it
 /// and the banner says so, because a mod missing in silence is the worst
-/// failure this pipeline has.
-fn report_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &CacheProbe) {
-    let (message, detail) = match probe {
+/// failure this pipeline has. The banner is not emitted here: the caller
+/// collects the losses of the whole stage and says them one notice per reason
+/// (`report_dropped_notices`), the same shape as the availability pass (D47,
+/// todo.md «Due forme per lo stesso avviso»). `not_cached` is the reason of a
+/// mod with no row at all, which depends on the path.
+fn log_unusable_probe(
+    app_handle: &tauri::AppHandle,
+    mod_id: &str,
+    probe: &CacheProbe,
+    not_cached: DropReason,
+) -> Option<DroppedMod> {
+    let (message, reason) = match probe {
         CacheProbe::JarMissingUnrecoverable(record) if record.is_local => (
             format!(
                 "[Cache] the cached jar of local mod '{}' is gone ({}); a locally copied jar has no Modrinth download url, so it cannot be restored and the mod is skipped",
                 mod_id, record.jar_filename
             ),
-            format!(
-                "{} was copied in by hand, so there is no download url to restore it from. Add the jar again to get the mod back.",
-                record.jar_filename
-            ),
+            DropReason::LocalJarGone,
         ),
         CacheProbe::JarMissingUnrecoverable(record) => (
             format!(
                 "[Cache] the cached jar of '{}' is gone ({}, version {}) and its cache row has no download url, so it cannot be restored and the mod is skipped",
                 mod_id, record.jar_filename, record.modrinth_version_id
             ),
-            format!(
-                "{} (version {}) is missing and its cache row has no download url.",
-                record.jar_filename, record.modrinth_version_id
-            ),
+            DropReason::RegisteredRowWithoutUrl,
         ),
         CacheProbe::NotCached => (
             format!(
-                "[Cache] '{mod_id}' has never been cached for this target and this launch has no chosen version to fetch it with; the mod is skipped"
+                "[Cache] '{mod_id}' has never been cached for this target and this launch has no version to fetch it with; the mod is skipped"
             ),
-            "The mod has never been downloaded for this Minecraft version and loader, and this launch had no chosen version to fetch it with.".to_string(),
+            not_cached,
         ),
-        CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return,
+        CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return None,
     };
 
     let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
-    let _ = emit_launcher_issue(
-        app_handle,
-        "Mod left out of the launch",
-        &format!(
-            "'{mod_id}' is not in this launch: its jar is not in the cache and cannot be fetched."
-        ),
-        &detail,
-        "warning",
-        "launch",
-    );
+    Some(DroppedMod {
+        mod_id: mod_id.to_string(),
+        reason,
+    })
 }
 
 /// What the launch installs for the selected mods when it may not choose
@@ -927,12 +1050,15 @@ fn report_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &Ca
 /// at **its** version id, from the cache when the row matches and the jar is
 /// there, from `GET /versions?ids=` plus the normal download stage when it is
 /// not (D16, D27). Without a map, or for a mod the map does not cover, the
-/// project lookup answers exactly as it always did.
+/// cache row of the project answers, and nothing is looked up on Modrinth.
 ///
-/// A registered row whose jar disappeared is its own case in both paths: it is
-/// restored at the version the row names, from the row's own url and hash, so
-/// "launch from your cached versions" cannot drift into "launch from the
-/// newest".
+/// A registered row whose jar disappeared is restored at the version the row
+/// names, from the row's own url and hash, so "launch from your cached
+/// versions" cannot drift into "launch from the newest" — but only with a map.
+/// Without one the account plays offline (D138): restoring is a download, so
+/// the mod leaves the launch with `DropReason::RegisteredJarGoneOffline`
+/// instead (audit 101, risoluzione-3). The selection already keeps such a mod
+/// out; this is the guard for a jar that disappears between the two stages.
 pub(super) async fn resolve_selected_remote_artifacts(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
@@ -940,6 +1066,7 @@ pub(super) async fn resolve_selected_remote_artifacts(
     client: &ModrinthClient,
     target: &ResolutionTarget,
     preresolved: Option<&HashMap<String, String>>,
+    instance: &InstanceJars,
 ) -> Result<HashMap<String, RemoteArtifact>> {
     // An absent map behaves as a map that covers nothing, which is what makes
     // "no map means exactly today's behaviour" structural instead of asserted.
@@ -1042,23 +1169,46 @@ pub(super) async fn resolve_selected_remote_artifacts(
         }
     }
 
+    // Senza mappa l'account gioca offline: un mod senza riga non ha niente da
+    // scaricare e non si scarica niente (todo.md:1341, la frase del motivo).
+    let not_cached = if preresolved.is_some() {
+        DropReason::NoChosenVersionAndNothingCached
+    } else {
+        DropReason::NothingCachedOffline
+    };
+    let mut lost = Vec::new();
     for mod_id in &by_project {
         if artifacts.contains_key(mod_id) {
             continue;
         }
 
-        let probe = probe_cached_mod_for_target(launcher_paths, mod_id, target)?;
+        let probe = probe_cached_mod_for_target(launcher_paths, mod_id, target, instance)?;
         match probe {
             CacheProbe::Ready(record) => {
                 artifacts.insert(mod_id.clone(), RemoteArtifact::Cached(record));
+            }
+            CacheProbe::JarMissing(record) if preresolved.is_none() => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Cache] the cached jar of '{}' is gone ({}, version {}) and the active account plays offline, so it is not downloaded again; the mod is skipped",
+                        mod_id, record.jar_filename, record.modrinth_version_id
+                    ),
+                );
+                lost.push(DroppedMod {
+                    mod_id: mod_id.clone(),
+                    reason: DropReason::RegisteredJarGoneOffline,
+                });
             }
             CacheProbe::JarMissing(record) => {
                 report_restored_jar(app_handle, mod_id, &record);
                 artifacts.insert(mod_id.clone(), RemoteArtifact::MissingJar(record));
             }
-            other => report_unusable_probe(app_handle, mod_id, &other),
+            other => lost.extend(log_unusable_probe(app_handle, mod_id, &other, not_cached)),
         }
     }
+    report_dropped_notices(app_handle, &lost, target);
 
     Ok(artifacts)
 }
@@ -1071,6 +1221,61 @@ pub(super) struct TargetSelection {
     pub(super) resolution: ResolutionResult,
     pub(super) selected_mods: Vec<SelectedMod>,
     pub(super) dropped: Vec<DroppedMod>,
+    /// Every mod the availability pass disabled, alternatives included.
+    pub(super) unavailable: Vec<String>,
+    /// What the online pass learned on the way, kept for the second pass.
+    /// Empty on the offline path, which asks nothing.
+    pub(super) lookups: SelectionLookups,
+}
+
+/// The answers of the online availability pass (audit 101,
+/// r2-scala-mod-list-grandi-2).
+#[derive(Debug, Clone, Default)]
+pub(super) struct SelectionLookups {
+    /// The version each asked mod got, when it got one.
+    pub(super) versions: HashMap<String, ModrinthVersion>,
+    /// Every mod id Modrinth was asked about (or would have been, before the
+    /// network failed).
+    pub(super) asked: HashSet<String>,
+    /// Set when Modrinth could not be reached (precheck-5): from then on the
+    /// pass asked the cache alone.
+    pub(super) network_error: Option<String>,
+}
+
+/// The pending ids of an `AvailabilityFixpoint` in the shape the availability
+/// questions take. `pending` only returns Modrinth mods.
+fn pending_selection(pending: &[String]) -> Vec<SelectedMod> {
+    pending
+        .iter()
+        .map(|mod_id| SelectedMod {
+            mod_id: mod_id.clone(),
+            source: ModSource::Modrinth,
+        })
+        .collect()
+}
+
+/// What a finished availability pass loads and what it lost.
+fn finish_selection(
+    modlist: &ModList,
+    target: &ResolutionTarget,
+    pass: AvailabilityFixpoint<'_>,
+    unavailable_reason: &dyn Fn(&str) -> DropReason,
+) -> TargetSelection {
+    let (first, resolution, unavailable) = pass.into_parts();
+    let dropped = if unavailable.is_empty() {
+        Vec::new()
+    } else {
+        mods_dropped_without_replacement(&first, &resolution, &unavailable, unavailable_reason)
+    };
+    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+
+    TargetSelection {
+        resolution,
+        selected_mods,
+        dropped,
+        unavailable,
+        lookups: SelectionLookups::default(),
+    }
 }
 
 /// The Modrinth mods resolution selected and for which no artifact is
@@ -1104,14 +1309,7 @@ pub(super) fn reresolve_without_unavailable(
         return Ok(resolution);
     }
 
-    let mut patched = modlist.clone();
-    for mod_id in unavailable {
-        if let Some(rule) = patched.find_rule_mut(mod_id) {
-            rule.enabled = false;
-        }
-    }
-
-    resolve_modlist(&patched, target)
+    resolve_modlist_without(modlist, unavailable, target)
 }
 
 /// Why a mod is not in the launch.
@@ -1129,6 +1327,12 @@ pub(super) enum DropReason {
     /// The pre-checked path: no version was chosen for it before the launch
     /// and the cache cannot produce a jar either.
     NoChosenVersionAndNothingCached,
+    /// Il percorso offline senza mappa, per un mod che non ha nessuna riga per
+    /// questo target: nessuna versione viene scelta né scaricata. Un valore
+    /// suo perché la frase «this launch had no version chosen» è il
+    /// vocabolario del percorso con la mappa, e offline suonava storta
+    /// (todo.md:1341).
+    NothingCachedOffline,
     /// D-b (onda 8a): il percorso offline senza mappa, per un mod che ha la
     /// riga registrata per questo target ma il cui jar non è più sul disco.
     /// Ripristinarlo è un download, e l'account attivo gioca offline: il mod
@@ -1137,6 +1341,12 @@ pub(super) enum DropReason {
     /// `NoChosenVersionAndNothingCached`, perché «la cache non ha un jar» qui
     /// è falso: ha la riga, non il file.
     RegisteredJarGoneOffline,
+    /// Lo stadio degli artefatti: il jar di un mod copiato a mano è sparito, e
+    /// un jar copiato a mano non ha un url da cui riscaricarlo.
+    LocalJarGone,
+    /// Lo stadio degli artefatti: la riga registrata ha perso il jar e non ha
+    /// un url da cui riscaricarlo.
+    RegisteredRowWithoutUrl,
     /// A mod it `requires` was the one nothing could install
     /// (`FailureReason::RequiredModMissing` after the pass). Leaving this one
     /// silent would reopen the hole one rule further down.
@@ -1193,15 +1403,16 @@ pub(super) struct DroppedMod {
 ///
 /// The reason is read off the mod's own slot in `after`, except for the mods
 /// in `unavailable`: those took the `!rule.enabled` branch and come back as
-/// `ExcludedByActiveMod` (`resolver.rs:210-218`), indistinguishable from a
-/// real `exclude_if`, so for them `FailureReason` is worthless and the path's
-/// own reason is used. For every other lost mod the rule is still enabled, so
+/// `FailureReason::Disabled`, which says nothing about why they are not
+/// installable, so the path's own reason is used. For every other lost mod the rule is still enabled, so
 /// the failure reason is the resolver's honest answer.
 ///
 /// Comparing by slot index is sound because both resolutions ran over the same
-/// top-level rule vector: `reresolve_without_unavailable` clones the mod-list
-/// and only flips `enabled`, and `resolve_modlist` pushes one `resolved_rules`
-/// entry per top-level rule, in order.
+/// top-level rule vector: `resolve_modlist_without` clones the mod-list and
+/// only flips `enabled`, and `resolve_modlist` pushes one `resolved_rules`
+/// entry per top-level rule, in order. `after` is the last resolution of the
+/// availability pass, however many rounds it took, and `unavailable` every mod
+/// any round disabled.
 ///
 /// `unavailable_reason` dà il motivo **per mod** (D-b): sul percorso offline
 /// senza mappa un mod con la riga e senza il jar non manca per la stessa
@@ -1286,6 +1497,11 @@ pub(super) fn dropped_reason_clause(
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ),
+        DropReason::NothingCachedOffline => format!(
+            "your cache has no jar of {object} for Minecraft {} / {}, and an account that plays offline does not download {object}",
+            target.minecraft_version,
+            target.mod_loader.as_modrinth_loader()
+        ),
         DropReason::RegisteredJarGoneOffline => {
             let (its, jar_is, it) = if many {
                 ("their", "jars are", "them")
@@ -1295,6 +1511,23 @@ pub(super) fn dropped_reason_clause(
             format!(
                 "{its} {jar_is} registered but no longer on disk, and an account that plays offline does not download {it} again"
             )
+        }
+        DropReason::LocalJarGone => {
+            let (its, jar_was, is, it) = if many {
+                ("their", "jars were", "are", "them")
+            } else {
+                ("its", "jar was", "is", "it")
+            };
+            format!(
+                "{its} {jar_was} copied in by hand and {is} gone from the cache, so there is nothing to restore {it} from"
+            )
+        }
+        DropReason::RegisteredRowWithoutUrl => {
+            if many {
+                "their jars are gone from the cache and their cache rows have no download url".to_string()
+            } else {
+                "its jar is gone from the cache and its cache row has no download url".to_string()
+            }
         }
         DropReason::RequiredModLeftOut => {
             format!("a mod {subject} need{verb_s} is not in this launch either")
@@ -1322,6 +1555,22 @@ pub(super) fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
         }
         DropReason::NoChosenVersionAndNothingCached => format!(
             "The versions chosen before this launch do not cover {it}, and the cache has no jar for this Minecraft version and loader."
+        ),
+        DropReason::NothingCachedOffline => format!(
+            "The cache has no jar of {it} for this Minecraft version and loader, and the active account plays offline, so nothing is downloaded."
+        ),
+        DropReason::LocalJarGone => {
+            let (jars, them_again) = if many {
+                ("jars", "the jars again to get the mods back")
+            } else {
+                ("jar", "the jar again to get the mod back")
+            };
+            format!(
+                "A {jars} copied in by hand has no download url, so the launcher cannot fetch {it} again. Add {them_again}."
+            )
+        }
+        DropReason::RegisteredRowWithoutUrl => format!(
+            "The launcher registered a version of {it} for this Minecraft version and loader, but the jar is missing and the cache row does not say where to download it again."
         ),
         DropReason::RegisteredJarGoneOffline => {
             let (jars, files_are, they_are) = if many {
@@ -1364,21 +1613,19 @@ fn dropped_mod_names(mod_ids: &[&str]) -> String {
     }
 }
 
-/// One notice per reason, in the order the reasons first appear; empty when
+/// One notice per reason, in the fixed order of `DropReason`; empty when
 /// nothing was lost.
 ///
-/// A notice per mod is what `report_unusable_probe` does, and it is the wrong
-/// shape here: this pass decides about the whole selection at once, so a
-/// Modrinth that does not answer drops every mod with no jar on disk — 24 of
-/// them on this repository's own mod-list — and the banner shows three at a
-/// time (`NoticeBanner.tsx:19`). Aggregating is what A3 already chose for the
-/// cache fallback. Grouping by reason rather than into one line is the price
-/// of not lying: the mods a dropped dependency took with it are out for a
-/// different reason than the mods nothing could install, and one sentence
-/// cannot be true of both. At most three notices, one per `DropReason`.
-///
-/// The title is `report_unusable_probe`'s, so that two stages reporting the
-/// same kind of loss do not look like two different problems.
+/// A notice per mod is the wrong shape: the availability pass decides about
+/// the whole selection at once, so a Modrinth that does not answer drops every
+/// mod with no jar on disk — 24 of them on this repository's own mod-list —
+/// and the banner shows three at a time (`NoticeBanner.tsx:19`). Aggregating
+/// is what A3 already chose for the cache fallback, and D47 chose it over one
+/// line per mod; the artifact stage now says its losses the same way
+/// (`report_dropped_notices`). Grouping by reason rather than into one line is
+/// the price of not lying: the mods a dropped dependency took with it are out
+/// for a different reason than the mods nothing could install, and one
+/// sentence cannot be true of both. At most one notice per `DropReason` value.
 fn dropped_mods_notices(
     dropped: &[DroppedMod],
     target: &ResolutionTarget,
@@ -1388,7 +1635,10 @@ fn dropped_mods_notices(
     for reason in [
         DropReason::NoVersionAndNoCachedJar,
         DropReason::NoChosenVersionAndNothingCached,
+        DropReason::NothingCachedOffline,
         DropReason::RegisteredJarGoneOffline,
+        DropReason::LocalJarGone,
+        DropReason::RegisteredRowWithoutUrl,
         DropReason::RequiredModLeftOut,
         DropReason::ExcludedByReplacement,
         DropReason::RulesLeftItOut,
@@ -1442,6 +1692,16 @@ pub(super) fn report_dropped_mods(
         );
     }
 
+    report_dropped_notices(app_handle, dropped, target);
+}
+
+/// The banner half of `report_dropped_mods`, for the artifact stage, whose log
+/// lines name the jar and the version and are written where the loss is found.
+fn report_dropped_notices(
+    app_handle: &tauri::AppHandle,
+    dropped: &[DroppedMod],
+    target: &ResolutionTarget,
+) {
     for (title, message, detail) in dropped_mods_notices(dropped, target) {
         let _ = emit_launcher_issue(app_handle, title, &message, &detail, "warning", "launch");
     }
@@ -1454,7 +1714,11 @@ pub(super) fn report_dropped_mods(
 /// order — the same shape `versions_by_mod_id` consumes. `uncovered` is
 /// everything else: mods the pre-check never saw, which means the mod-list
 /// changed between the pre-check and the launch. That is a real case, not an
-/// error, and those mods are resolved the usual way.
+/// error — but nothing resolves those mods against Modrinth any more (audit
+/// 101, precheck-7): `resolve_selected_remote_artifacts` installs the cached
+/// artifact of their project, and a mod with no row for the target has
+/// already left the launch in `resolve_offline_selection`
+/// (`DropReason::NoChosenVersionAndNothingCached`).
 pub(super) fn split_selected_by_preresolved(
     selected_mods: &[SelectedMod],
     preresolved: &HashMap<String, String>,
@@ -1480,193 +1744,96 @@ pub(super) fn split_selected_by_preresolved(
     (covered, uncovered)
 }
 
-fn selection_subset(selected_mods: &[SelectedMod], mod_ids: &[String]) -> Vec<SelectedMod> {
-    let wanted = mod_ids.iter().map(String::as_str).collect::<HashSet<_>>();
-
-    selected_mods
-        .iter()
-        .filter(|selected| wanted.contains(selected.mod_id.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// The mod ids the normal resolver still has to answer for, in the order they
-/// will be logged: first the pre-checked versions Modrinth no longer returns,
-/// then the mods the pre-check never covered.
-///
-/// The first group is the one that matters and the one nobody would think of:
-/// the popup showed a version, the user agreed to it, and it is gone. Falling
-/// back keeps the mod in the launch instead of dropping it silently.
-pub(super) fn mod_ids_needing_resolution(
-    covered: &[(String, String)],
-    resolved: &HashMap<String, ModrinthVersion>,
-    uncovered: &[String],
-) -> (Vec<String>, Vec<String>) {
-    let dropped = covered
-        .iter()
-        .map(|(mod_id, _)| mod_id)
-        .filter(|mod_id| !resolved.contains_key(mod_id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut all = dropped.clone();
-    all.extend(uncovered.iter().cloned());
-
-    (all, dropped)
-}
-
-/// The versions the launch will install, taken from the ids the pre-check
-/// already chose (D16) instead of choosing again.
-///
-/// `GET /versions?ids=` fetches those exact versions in one request — it is a
-/// lookup, not a selection, so nothing here can pick a different version than
-/// the popup showed. Modrinth still has to be asked because the metadata the
-/// download stage needs (file name, url, sha1, size) lives in the version and
-/// not in `mod_cache`.
-///
-/// Two sets fall back to the normal resolver: mod ids the map does not cover,
-/// and version ids the response omitted — Modrinth dropped the exact version
-/// the popup showed. Both are logged, because both mean the launch is not
-/// installing what the user was shown.
-pub(super) async fn resolve_preresolved_versions(
-    app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
-    selected_mods: &[SelectedMod],
-    client: &ModrinthClient,
-    target: &ResolutionTarget,
-    preresolved: &HashMap<String, String>,
-) -> Result<HashMap<String, ModrinthVersion>> {
-    let (covered, uncovered) = split_selected_by_preresolved(selected_mods, preresolved);
-
-    if !uncovered.is_empty() {
-        let _ = emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            format!(
-                "[Launch] the pre-check did not cover {}; resolving {} the usual way (the mod-list changed between the pre-check and the launch)",
-                uncovered.join(", "),
-                if uncovered.len() == 1 { "it" } else { "them" }
-            ),
-        );
-    }
-
-    let version_ids = covered
-        .iter()
-        .map(|(_, version_id)| version_id.clone())
-        .collect::<Vec<_>>();
-    let by_version_id = client.fetch_versions_by_ids(&version_ids).await?;
-    let resolved = versions_by_mod_id(&covered, &by_version_id);
-
-    let (fallback_mod_ids, dropped) = mod_ids_needing_resolution(&covered, &resolved, &uncovered);
-    if !dropped.is_empty() {
-        let _ = emit_log(
-            app_handle,
-            ProcessLogStream::Stderr,
-            format!(
-                "[Launch] Modrinth no longer returns the pre-checked version of {}; resolving the usual way",
-                dropped.join(", ")
-            ),
-        );
-    }
-
-    let fallback = resolve_compatible_versions_hybrid(
-        app_handle,
-        launcher_paths,
-        http_client,
-        &selection_subset(selected_mods, &fallback_mod_ids),
-        client,
-        target,
-    )
-    .await?;
-
-    Ok(merge_resolved_versions(resolved, fallback))
-}
-
-/// Resolve, drop what Modrinth has no compatible version for, re-resolve, and
-/// collect what the target loads.
+/// Resolve, ask Modrinth about every mod the resolution selects, disable
+/// what has no compatible version, re-resolve, and repeat until the selection
+/// stops changing (`AvailabilityFixpoint`). The result is what the target
+/// loads.
 ///
 /// Shared between `run_launch_pipeline` and the update pre-check on purpose:
 /// the pre-check exists to show exactly what the launch will install, and two
 /// copies of "which mods does this target load" are the easiest thing in this
-/// feature to let drift apart. The version map of this pass is thrown away here
-/// as it always was — only `unavailable` is used — because the authoritative
-/// set is the one after the re-resolution.
+/// feature to let drift apart. The version maps of this pass are thrown away
+/// here as they always were — only the verdict is used — because the
+/// authoritative set is the one after the last re-resolution.
 ///
-/// `preresolved` short-circuits the availability question for the mods it
-/// covers: the pre-check already established they have a version, so asking
-/// again would both cost requests and let the two answers disagree. Mods it
-/// does not cover still go through the resolver, so a mod-list that grew after
-/// the pre-check is not silently disabled.
+/// Every round asks only the mods no earlier round asked: an alternative that
+/// comes in for an unavailable mod is asked before it is trusted, and the
+/// chain goes on to the next alternative when it is unavailable too (audit
+/// 101, risoluzione-2). Before, the availability was asked once, on the first
+/// selection, and an alternative entered unverified.
 pub(super) async fn resolve_online_selection(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
     http_client: &reqwest::Client,
     modlist: &ModList,
+    pins: &PinAliases,
     client: &ModrinthClient,
     target: &ResolutionTarget,
-    preresolved: Option<&HashMap<String, String>>,
 ) -> Result<TargetSelection> {
-    let resolution = resolve_modlist(modlist, target)?;
-    let selected = collect_selected_mods(modlist, &resolution, target);
-    let to_query = match preresolved {
-        Some(preresolved) => {
-            let (_, uncovered) = split_selected_by_preresolved(&selected, preresolved);
-            selection_subset(&selected, &uncovered)
-        }
-        None => selected.clone(),
-    };
-    let versions = resolve_compatible_versions_hybrid(
-        app_handle,
-        launcher_paths,
-        http_client,
-        &to_query,
-        client,
-        target,
-    )
-    .await?;
-    // D29 on this path too: a jar this machine already has makes the mod
-    // available whatever Modrinth says, or fails to say. Without it a version
-    // Modrinth has dropped, or a Modrinth that does not answer, empties the
-    // mod-list — measured on this repository: 25 selected mods down to 1.
-    //
-    // `JarOnDisk` and not `RestorableFromRow`: see `CacheBacking`. Restoring
-    // here would make the launch depend on the host that just went silent, and
-    // a failed download ends the launch instead of costing one mod — measured.
-    let cache_backed = cache_backed_mods(
-        &probe_selected_mods(launcher_paths, &selected, target)?,
-        CacheBacking::JarOnDisk,
-    );
-    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
-        versions.contains_key(mod_id)
-            || cache_backed.contains(mod_id)
-            || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
-    });
-    // Taken before the pass disables anything: telling a lost mod from a
-    // replaced one needs both resolutions. The clone only happens when
-    // something is actually unavailable, the same path that then re-runs the
-    // whole resolver.
-    let before = (!unavailable.is_empty()).then(|| resolution.clone());
-    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
-    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+    let mut pass = AvailabilityFixpoint::pinned(modlist, pins.clone(), target)?;
+    let mut lookups = SelectionLookups::default();
 
-    Ok(TargetSelection {
-        dropped: before
-            .map(|before| {
-                mods_dropped_without_replacement(&before, &resolution, &unavailable, &|_| {
-                    DropReason::NoVersionAndNoCachedJar
-                })
-            })
-            .unwrap_or_default(),
-        resolution,
-        selected_mods,
-    })
+    loop {
+        let pending_ids = pass.pending();
+        if pending_ids.is_empty() {
+            break;
+        }
+        let pending = pending_selection(&pending_ids);
+        // Once Modrinth could not be reached, the later rounds (alternatives
+        // coming in) ask the cache alone instead of failing again, one round
+        // of retries each (audit 101, precheck-5).
+        let versions = if lookups.network_error.is_none() {
+            let lookup = resolve_compatible_versions_hybrid(
+                app_handle,
+                launcher_paths,
+                http_client,
+                &pending,
+                client,
+                target,
+            )
+            .await?;
+            lookups.network_error = lookup.network_error;
+            lookup.versions
+        } else {
+            HashMap::new()
+        };
+        lookups.asked.extend(pending_ids.iter().cloned());
+        lookups.versions.extend(
+            versions
+                .iter()
+                .map(|(mod_id, version)| (mod_id.clone(), version.clone())),
+        );
+        // D29 on this path too: a jar this machine already has makes the mod
+        // available whatever Modrinth says, or fails to say. Without it a
+        // version Modrinth has dropped, or a Modrinth that does not answer,
+        // empties the mod-list — measured on this repository: 25 selected mods
+        // down to 1.
+        //
+        // `JarOnDisk` and not `RestorableFromRow`: see `CacheBacking`.
+        // Restoring here would make the launch depend on the host that just
+        // went silent, and a failed download ends the launch instead of
+        // costing one mod — measured.
+        let cache_backed = cache_backed_mods(
+            &probe_selected_mods(launcher_paths, &pending, target, &InstanceJars::default())?,
+            CacheBacking::JarOnDisk,
+        );
+        let unavailable = unavailable_selected_mods(&pending, |mod_id| {
+            versions.contains_key(mod_id) || cache_backed.contains(mod_id)
+        });
+        pass.record(&pending_ids, &unavailable)?;
+    }
+
+    let mut selection = finish_selection(modlist, target, pass, &|_| {
+        DropReason::NoVersionAndNoCachedJar
+    });
+    selection.lookups = lookups;
+    Ok(selection)
 }
 
 /// Same as `resolve_online_selection`, with no network at all.
 ///
 /// "Available" is the cache's answer alone. `preresolved` short-circuits the
-/// question exactly as it does online — a version the pre-check chose exists
+/// question for the mods it covers — a version the pre-check chose exists
 /// whether or not this machine has it, and an update accepted a second ago
 /// never does.
 ///
@@ -1675,7 +1842,10 @@ pub(super) async fn resolve_online_selection(
 /// lancio ripristina il jar: è il caso in cui la rete c'è appena stata e la
 /// versione è nominata (`CacheBacking`). Senza mappa (`Offline`) l'account
 /// gioca offline, ripristinare è un download, e un mod col jar sparito esce
-/// dal lancio con `DropReason::RegisteredJarGoneOffline`.
+/// dal lancio con `DropReason::RegisteredJarGoneOffline` — anche quando è
+/// un'alternativa entrata al posto di un altro mod (audit 101, risoluzione-3):
+/// ogni giro sonda la cache per i mod che la ri-risoluzione ha appena
+/// selezionato, invece di sondare solo la prima selezione.
 ///
 /// Named for what it guarantees, zero requests, and not for the setting that
 /// used to select it: `cache_only_mode` no longer exists, and a name that
@@ -1684,46 +1854,51 @@ pub(super) async fn resolve_online_selection(
 pub(super) fn resolve_offline_selection(
     launcher_paths: &LauncherPaths,
     modlist: &ModList,
+    pins: &PinAliases,
     target: &ResolutionTarget,
     preresolved: Option<&HashMap<String, String>>,
 ) -> Result<TargetSelection> {
-    let resolution = resolve_modlist(modlist, target)?;
-    let selected = collect_selected_mods(modlist, &resolution, target);
-    let probes = probe_selected_mods(launcher_paths, &selected, target)?;
     let backing = if preresolved.is_some() {
         CacheBacking::RestorableFromRow
     } else {
         CacheBacking::JarOnDisk
     };
-    let cache_backed = cache_backed_mods(&probes, backing);
-    let unavailable = unavailable_selected_mods(&selected, |mod_id| {
-        cache_backed.contains(mod_id)
-            || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
-    });
-    let jar_gone = probes
-        .iter()
-        .filter(|(_, probe)| matches!(probe, CacheProbe::JarMissing(_)))
-        .map(|(mod_id, _)| mod_id.as_str())
-        .collect::<HashSet<_>>();
-    let before = (!unavailable.is_empty()).then(|| resolution.clone());
-    let resolution = reresolve_without_unavailable(modlist, resolution, &unavailable, target)?;
-    let selected_mods = collect_selected_mods(modlist, &resolution, target);
+    let mut pass = AvailabilityFixpoint::pinned(modlist, pins.clone(), target)?;
+    let mut jar_gone = HashSet::new();
 
-    Ok(TargetSelection {
-        dropped: before
-            .map(|before| {
-                mods_dropped_without_replacement(&before, &resolution, &unavailable, &|mod_id| {
-                    if jar_gone.contains(mod_id) {
-                        DropReason::RegisteredJarGoneOffline
-                    } else {
-                        DropReason::NoChosenVersionAndNothingCached
-                    }
-                })
-            })
-            .unwrap_or_default(),
-        resolution,
-        selected_mods,
-    })
+    loop {
+        let pending_ids = pass.pending();
+        if pending_ids.is_empty() {
+            break;
+        }
+        let pending = pending_selection(&pending_ids);
+        // Whether the cache can serve a mod does not depend on which version
+        // the instance holds: the artifact stage picks that one (D147).
+        let probes =
+            probe_selected_mods(launcher_paths, &pending, target, &InstanceJars::default())?;
+        jar_gone.extend(
+            probes
+                .iter()
+                .filter(|(_, probe)| matches!(probe, CacheProbe::JarMissing(_)))
+                .map(|(mod_id, _)| mod_id.clone()),
+        );
+        let cache_backed = cache_backed_mods(&probes, backing);
+        let unavailable = unavailable_selected_mods(&pending, |mod_id| {
+            cache_backed.contains(mod_id)
+                || preresolved.is_some_and(|preresolved| preresolved.contains_key(mod_id))
+        });
+        pass.record(&pending_ids, &unavailable)?;
+    }
+
+    Ok(finish_selection(modlist, target, pass, &|mod_id| {
+        if jar_gone.contains(mod_id) {
+            DropReason::RegisteredJarGoneOffline
+        } else if preresolved.is_some() {
+            DropReason::NoChosenVersionAndNothingCached
+        } else {
+            DropReason::NothingCachedOffline
+        }
+    }))
 }
 
 pub(super) fn alt_viable_for_launch(
@@ -1805,6 +1980,7 @@ pub(super) fn collect_top_level_version_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::resolve_modlist;
     use crate::rules::{VersionRule, VersionRuleKind};
 
     fn test_version(id: &str, date_published: &str) -> ModrinthVersion {
@@ -1828,6 +2004,151 @@ mod tests {
             files: Vec::new(),
             date_published: date_published.into(),
         }
+    }
+
+    /// A real connection failure, made locally: nothing listens on port 1.
+    async fn connection_refused() -> anyhow::Error {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        anyhow::Error::new(error).context("failed to query Modrinth")
+    }
+
+    /// Audit 101, r2-scala-mod-list-grandi-2: the per-project requests run
+    /// concurrently, never more than the permits allow.
+    #[tokio::test]
+    async fn per_project_requests_run_concurrently_within_the_permits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let (counter, observed_peak) = (in_flight.clone(), peak.clone());
+        let mod_ids = (0..12).map(|index| format!("mod-{index}")).collect();
+
+        let outcome = fetch_per_project_concurrently(mod_ids, 4, move |mod_id| {
+            let counter = counter.clone();
+            let observed_peak = observed_peak.clone();
+            async move {
+                let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                observed_peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                counter.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some(test_version(&mod_id, "2026-01-01T00:00:00Z")))
+            }
+        })
+        .await;
+
+        assert_eq!(outcome.versions.len(), 12);
+        assert!(outcome.network_error.is_none());
+        assert!(peak.load(Ordering::SeqCst) > 1, "the requests overlap");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "never more than the permits"
+        );
+    }
+
+    /// Audit 101, precheck-5: one request that cannot reach Modrinth stops
+    /// the stage — the mods still queued are not asked, each with its own
+    /// retries — while an error Modrinth answers costs its mod only.
+    #[tokio::test]
+    async fn a_network_that_does_not_answer_stops_the_per_project_stage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let mod_ids = (0..20).map(|index| format!("mod-{index}")).collect();
+
+        let outcome = fetch_per_project_concurrently(mod_ids, 1, move |_mod_id| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(connection_refused().await)
+            }
+        })
+        .await;
+
+        assert!(outcome.network_error.is_some());
+        assert!(outcome.failures.is_empty());
+        assert!(
+            asked.load(Ordering::SeqCst) < 20,
+            "the queued requests are dropped, asked {}",
+            asked.load(Ordering::SeqCst)
+        );
+
+        let answered = fetch_per_project_concurrently(
+            vec!["broken".into(), "fine".into()],
+            2,
+            |mod_id| async move {
+                if mod_id == "broken" {
+                    Err(anyhow::anyhow!("Modrinth returned an error"))
+                } else {
+                    Ok(Some(test_version(&mod_id, "2026-01-01T00:00:00Z")))
+                }
+            },
+        )
+        .await;
+        assert!(answered.network_error.is_none());
+        assert_eq!(answered.failures.len(), 1);
+        assert!(answered.versions.contains_key("fine"));
+    }
+
+    #[tokio::test]
+    async fn a_bulk_call_that_cannot_reach_modrinth_is_told_apart() {
+        let split = CachedHashSplit {
+            hashed: vec![("sodium".into(), "hash-a".into())],
+            unhashed: vec!["iris".into()],
+        };
+        let unreachable = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err::<HashMap<String, ModrinthVersion>, _>(connection_refused().await)
+        })
+        .await;
+        assert!(unreachable.bulk_unreachable);
+
+        let answered = resolve_versions_for_cached_hashes(&split, |_hashes| async {
+            Err::<HashMap<String, ModrinthVersion>, _>(anyhow::anyhow!("500 from Modrinth"))
+        })
+        .await;
+        assert!(!answered.bulk_unreachable);
+        assert!(answered.bulk_error.is_some());
+    }
+
+    #[test]
+    fn on_neoforge_1_20_1_a_neoforge_build_wins_at_equal_channel_only() {
+        let target = ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::NeoForge,
+        };
+        let with_loader = |id: &str, date: &str, channel: &str, loader: &str| ModrinthVersion {
+            loaders: vec![loader.into()],
+            ..test_version_with_channel(id, date, channel)
+        };
+        let forge_newer = with_loader("forge-newer", "2026-03-01T00:00:00Z", "release", "forge");
+        let neoforge_older = with_loader(
+            "neoforge-older",
+            "2026-01-01T00:00:00Z",
+            "release",
+            "neoforge",
+        );
+        let neoforge_beta =
+            with_loader("neoforge-beta", "2026-05-01T00:00:00Z", "beta", "neoforge");
+
+        // D148: a parità di canale vince «neoforge», anche se più vecchia...
+        assert_eq!(
+            select_preferred_mod_version(
+                vec![
+                    forge_newer.clone(),
+                    neoforge_older.clone(),
+                    neoforge_beta.clone()
+                ],
+                &target,
+            ),
+            Some(neoforge_older)
+        );
+        // ...ma il canale viene prima: una release «forge» batte una beta «neoforge».
+        assert_eq!(
+            select_preferred_mod_version(vec![neoforge_beta, forge_newer.clone()], &target),
+            Some(forge_newer)
+        );
     }
 
     #[test]
@@ -2103,7 +2424,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mod_added_after_the_precheck_is_resolved_as_usual() {
+    fn a_mod_added_after_the_precheck_is_left_uncovered() {
         let selected = vec![
             modrinth_mod("sodium"),
             modrinth_mod("polytone"),
@@ -2130,38 +2451,6 @@ mod tests {
 
         assert!(covered.is_empty());
         assert_eq!(uncovered, vec!["sodium".to_string(), "lithium".to_string()]);
-    }
-
-    #[test]
-    fn a_prechecked_version_modrinth_dropped_falls_back_to_the_resolver() {
-        let covered = vec![
-            ("sodium".to_string(), "sodium-v2".to_string()),
-            ("lithium".to_string(), "lithium-v7".to_string()),
-        ];
-        let resolved = HashMap::from([(
-            "sodium".to_string(),
-            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
-        )]);
-
-        let (all, dropped) =
-            mod_ids_needing_resolution(&covered, &resolved, &["polytone".to_string()]);
-
-        assert_eq!(dropped, vec!["lithium".to_string()]);
-        assert_eq!(all, vec!["lithium".to_string(), "polytone".to_string()]);
-    }
-
-    #[test]
-    fn nothing_falls_back_when_every_prechecked_version_still_exists() {
-        let covered = vec![("sodium".to_string(), "sodium-v2".to_string())];
-        let resolved = HashMap::from([(
-            "sodium".to_string(),
-            test_version("sodium-v2", "2026-01-01T00:00:00Z"),
-        )]);
-
-        let (all, dropped) = mod_ids_needing_resolution(&covered, &resolved, &[]);
-
-        assert!(all.is_empty());
-        assert!(dropped.is_empty());
     }
 
     fn cached_record(version_id: &str, jar: &str) -> ModCacheRecord {
@@ -2651,6 +2940,74 @@ mod tests {
         assert_eq!(
             plural(DropReason::RegisteredJarGoneOffline),
             "2 mods are not in this launch (one, two): their jars are registered but no longer on disk, and an account that plays offline does not download them again."
+        );
+        assert_eq!(
+            plural(DropReason::NothingCachedOffline),
+            "2 mods are not in this launch (one, two): your cache has no jar of them for Minecraft 1.20.1 / forge, and an account that plays offline does not download them."
+        );
+        assert_eq!(
+            plural(DropReason::LocalJarGone),
+            "2 mods are not in this launch (one, two): their jars were copied in by hand and are gone from the cache, so there is nothing to restore them from."
+        );
+        assert_eq!(
+            plural(DropReason::RegisteredRowWithoutUrl),
+            "2 mods are not in this launch (one, two): their jars are gone from the cache and their cache rows have no download url."
+        );
+    }
+
+    /// todo.md:1671 e D47: lo stadio degli artefatti dava un avviso per mod con
+    /// parole sue, la passata di disponibilità uno per motivo. Ora tutti e due
+    /// passano da `dropped_mods_notices`: stesso titolo, stessa forma, e i mod
+    /// persi per lo stesso motivo stanno in un avviso solo.
+    #[test]
+    fn the_artifact_stage_losses_share_the_aggregated_notice_shape() {
+        let notices = dropped_mods_notices(
+            &[
+                DroppedMod {
+                    mod_id: "my-sodium".into(),
+                    reason: DropReason::LocalJarGone,
+                },
+                DroppedMod {
+                    mod_id: "lithium".into(),
+                    reason: DropReason::RegisteredRowWithoutUrl,
+                },
+                DroppedMod {
+                    mod_id: "iris".into(),
+                    reason: DropReason::RegisteredRowWithoutUrl,
+                },
+                DroppedMod {
+                    mod_id: "polytone".into(),
+                    reason: DropReason::NothingCachedOffline,
+                },
+            ],
+            &a5_target(),
+        );
+
+        assert_eq!(
+            notices
+                .iter()
+                .map(|(title, message, _)| (*title, message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Mod left out of the launch",
+                    "'polytone' is not in this launch: your cache has no jar of it for Minecraft 1.20.1 / forge, and an account that plays offline does not download it.",
+                ),
+                (
+                    "Mod left out of the launch",
+                    "'my-sodium' is not in this launch: its jar was copied in by hand and is gone from the cache, so there is nothing to restore it from.",
+                ),
+                (
+                    "Mods left out of the launch",
+                    "2 mods are not in this launch (lithium, iris): their jars are gone from the cache and their cache rows have no download url.",
+                ),
+            ]
+        );
+        // L'offline non parla più di una versione «scelta» (todo.md:1341).
+        assert!(!notices[0].2.contains("chosen"));
+        assert_eq!(
+            notices[1].2,
+            "A jar copied in by hand has no download url, so the launcher cannot fetch it again. Add the jar again to get the mod back. Nothing took its place, so the game starts without it."
         );
     }
 }

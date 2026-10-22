@@ -186,6 +186,7 @@ function mapEditorRow(row: any, ruleIndex: number, path: string): ModRow {
     alternatives,
     links: (row.requires ?? []) as string[],
     altGroups: [],
+    pin: row.pin ? { ownsJar: row.pin.ownsJar === true } : undefined,
   };
 }
 

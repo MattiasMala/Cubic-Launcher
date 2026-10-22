@@ -159,12 +159,14 @@ pub fn sort_versions_by_target_preference(
             game_version_affinity(left, target),
             explicit_version_affinity(left, target),
             left.channel_rank(),
+            loader_affinity(left, target),
             &left.date_published,
         );
         let right_key = (
             game_version_affinity(right, target),
             explicit_version_affinity(right, target),
             right.channel_rank(),
+            loader_affinity(right, target),
             &right.date_published,
         );
         right_key.cmp(&left_key)
@@ -235,6 +237,22 @@ pub(crate) fn build_download_client() -> reqwest::Client {
         .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .build()
         .unwrap_or_default()
+}
+
+/// Whether `error` is the network not reaching the host at all — refused,
+/// unresolved, or silent until the timeout — as opposed to an answer Modrinth
+/// gave (audit 101, precheck-5).
+///
+/// The difference decides what a failure costs. An answer is about one mod; no
+/// connection is about every request that follows, and asking the next three
+/// hundred mods one by one, each with its retries, is how a pre-check without
+/// Wi-Fi stayed on "CHECKING" for minutes.
+pub(crate) fn is_connection_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
+    })
 }
 
 // Retry on HTTP 429 to be polite to Modrinth's rate limiter, and on transient
@@ -466,9 +484,33 @@ impl ModrinthClient {
         target: &ResolutionTarget,
     ) -> Result<HashMap<String, ModrinthVersion>> {
         resolve_hash_cascade(sha1_hashes, |chunk, version_type| {
-            self.post_version_files_update(chunk, target, version_type)
+            self.post_version_files_update_by_loader(chunk, target, version_type)
         })
         .await
+    }
+
+    /// One channel stage of the cascade, asked one loader at a time in the
+    /// order of `modrinth_query_loaders`, so that the preferred loader wins at
+    /// equal channel (D148). With one loader — every target but NeoForge
+    /// 1.20.1 — this is exactly one request, as before.
+    async fn post_version_files_update_by_loader(
+        &self,
+        sha1_hashes: Vec<String>,
+        target: &ResolutionTarget,
+        version_type: &'static str,
+    ) -> Result<HashMap<String, ModrinthVersion>> {
+        let mut found = HashMap::with_capacity(sha1_hashes.len());
+        let mut pending = sha1_hashes;
+        for loader in target.modrinth_query_loaders() {
+            if pending.is_empty() {
+                break;
+            }
+            let stage = self
+                .post_version_files_update(pending.clone(), target, loader, version_type)
+                .await?;
+            pending = apply_cascade_stage(&pending, stage, &mut found);
+        }
+        Ok(found)
     }
 
     /// Looks up whether each SHA-1 has at least one compatible version for the
@@ -523,10 +565,11 @@ impl ModrinthClient {
         &self,
         sha1_hashes: Vec<String>,
         target: &ResolutionTarget,
+        loader: &'static str,
         version_type: &'static str,
     ) -> Result<HashMap<String, ModrinthVersion>> {
         let url = build_version_files_update_url(&self.base_url)?;
-        let body = build_version_files_update_body(&sha1_hashes, target, version_type);
+        let body = build_version_files_update_body(&sha1_hashes, target, loader, version_type);
 
         let response = send_with_retry(|| self.http_client.post(url.clone()).json(&body))
             .await
@@ -667,7 +710,7 @@ pub fn build_project_versions_url(
     ))
     .with_context(|| format!("invalid Modrinth base URL '{base_url}'"))?;
 
-    let loaders_json = serde_json::to_string(&vec![target.mod_loader.as_modrinth_loader()])?;
+    let loaders_json = serde_json::to_string(target.modrinth_query_loaders())?;
     let game_versions_json = serde_json::to_string(&vec![target.minecraft_version.clone()])?;
 
     url.query_pairs_mut()
@@ -727,7 +770,10 @@ pub fn build_version_files_update_url(base_url: &str) -> Result<Url> {
 
 /// Body of `POST /version_files/update`. `loaders` is always populated: an
 /// absent or empty array is not "no filter wanted" but "no filter", and the
-/// endpoint then answers with builds for other loaders.
+/// endpoint then answers with builds for other loaders. One loader per
+/// request: the endpoint answers the newest version inside the filter, so the
+/// NeoForge 1.20.1 preference (D148) is asked one loader at a time, like the
+/// channels.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct VersionFilesUpdateRequest<'a> {
     hashes: &'a [String],
@@ -743,19 +789,20 @@ pub(crate) struct VersionFilesUpdateRequest<'a> {
 pub(crate) struct VersionFilesLookupRequest<'a> {
     hashes: &'a [String],
     algorithm: &'static str,
-    loaders: [&'static str; 1],
+    loaders: &'static [&'static str],
     game_versions: [&'a str; 1],
 }
 
 pub(crate) fn build_version_files_update_body<'a>(
     hashes: &'a [String],
     target: &'a ResolutionTarget,
+    loader: &'static str,
     version_type: &'a str,
 ) -> VersionFilesUpdateRequest<'a> {
     VersionFilesUpdateRequest {
         hashes,
         algorithm: "sha1",
-        loaders: [target.mod_loader.as_modrinth_loader()],
+        loaders: [loader],
         game_versions: [target.minecraft_version.as_str()],
         version_types: [version_type],
     }
@@ -768,7 +815,7 @@ pub(crate) fn build_version_files_lookup_body<'a>(
     VersionFilesLookupRequest {
         hashes,
         algorithm: "sha1",
-        loaders: [target.mod_loader.as_modrinth_loader()],
+        loaders: target.modrinth_query_loaders(),
         game_versions: [target.minecraft_version.as_str()],
     }
 }
@@ -901,7 +948,19 @@ pub fn is_version_compatible(version: &ModrinthVersion, target: &ResolutionTarge
         && version
             .loaders
             .iter()
-            .any(|loader| loader == target.mod_loader.as_modrinth_loader())
+            .any(|loader| target.modrinth_query_loaders().contains(&loader.as_str()))
+}
+
+/// 1 for a build tagged with the target's own loader, 0 for one accepted only
+/// through `modrinth_query_loaders` (a `forge` build on NeoForge 1.20.1). It
+/// ranks right after the channel: «neoforge» wins at equal channel (D148).
+pub(crate) fn loader_affinity(version: &ModrinthVersion, target: &ResolutionTarget) -> u8 {
+    u8::from(
+        version
+            .loaders
+            .iter()
+            .any(|loader| loader == target.mod_loader.as_modrinth_loader()),
+    )
 }
 
 pub fn select_latest_compatible_version(
@@ -911,6 +970,32 @@ pub fn select_latest_compatible_version(
     let mut compatible = filter_compatible_versions(versions, target);
     sort_versions_by_target_preference(&mut compatible, target);
     compatible.into_iter().next()
+}
+
+impl ResolutionTarget {
+    /// The loaders a Modrinth lookup for this target accepts, preferred first.
+    ///
+    /// D148 (audit 101, rete-2): NeoForge on Minecraft 1.20.1 is the fork of
+    /// Forge 47.1 and loads Forge 1.20.1 mods — the launcher installs it from
+    /// the `net.neoforged:forge` coordinate for the same reason
+    /// (`launch_preview_runtime.rs`). Asking for `neoforge` alone left out
+    /// half the Forge mods there. Only 1.20.1: from 1.20.2 the two loaders
+    /// diverge. Every other target asks for its own loader only.
+    ///
+    /// `as_modrinth_loader` stays the target's identity — cache keys, log
+    /// paths, the `version_rules` match — and is the preferred entry here.
+    pub fn modrinth_query_loaders(&self) -> &'static [&'static str] {
+        match self.mod_loader {
+            ModLoader::NeoForge if self.minecraft_version.trim() == "1.20.1" => {
+                &["neoforge", "forge"]
+            }
+            ModLoader::Fabric => &["fabric"],
+            ModLoader::NeoForge => &["neoforge"],
+            ModLoader::Forge => &["forge"],
+            ModLoader::Quilt => &["quilt"],
+            ModLoader::Vanilla => &["vanilla"],
+        }
+    }
 }
 
 impl ModLoader {
@@ -1016,6 +1101,101 @@ mod tests {
             "files": []
           }
         ]"#
+    }
+
+    fn neoforge(minecraft_version: &str) -> ResolutionTarget {
+        ResolutionTarget {
+            minecraft_version: minecraft_version.into(),
+            mod_loader: ModLoader::NeoForge,
+        }
+    }
+
+    fn version_for(id: &str, loaders: &[&str], channel: &str, date: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: id.into(),
+            project_id: "cloth-config".into(),
+            version_number: id.into(),
+            name: id.into(),
+            game_versions: vec!["1.20.1".into()],
+            loaders: loaders.iter().map(|loader| (*loader).into()).collect(),
+            version_type: channel.into(),
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            date_published: date.into(),
+        }
+    }
+
+    /// D148 (audit 101, rete-2): NeoForge 1.20.1 è il fork di Forge 47.1 e
+    /// carica i mod Forge 1.20.1; le domande a Modrinth accettano anche le
+    /// build «forge», solo su 1.20.1 e solo per NeoForge.
+    #[test]
+    fn only_neoforge_on_1_20_1_also_asks_modrinth_for_forge_builds() {
+        assert_eq!(
+            neoforge("1.20.1").modrinth_query_loaders(),
+            &["neoforge", "forge"]
+        );
+        assert_eq!(neoforge("1.20.2").modrinth_query_loaders(), &["neoforge"]);
+        assert_eq!(neoforge("1.21.1").modrinth_query_loaders(), &["neoforge"]);
+        let forge = ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Forge,
+        };
+        assert_eq!(forge.modrinth_query_loaders(), &["forge"]);
+        assert_eq!(target().modrinth_query_loaders(), &["fabric"]);
+
+        let url = build_project_versions_url(
+            "https://api.modrinth.com/v2",
+            "cloth-config",
+            &neoforge("1.20.1"),
+        )
+        .expect("url should build");
+        assert_eq!(
+            url.as_str(),
+            "https://api.modrinth.com/v2/project/cloth-config/version?loaders=%5B%22neoforge%22%2C%22forge%22%5D&game_versions=%5B%221.20.1%22%5D"
+        );
+
+        let hashes = vec!["aa".to_string()];
+        let target = neoforge("1.20.1");
+        assert_eq!(
+            serde_json::to_value(build_version_files_lookup_body(&hashes, &target))
+                .expect("lookup body should serialize")["loaders"],
+            serde_json::json!(["neoforge", "forge"])
+        );
+    }
+
+    #[test]
+    fn a_forge_build_is_compatible_with_neoforge_1_20_1_and_neoforge_wins_at_equal_channel() {
+        let forge_release = version_for("forge-r", &["forge"], "release", "2026-03-01T00:00:00Z");
+        let neoforge_release =
+            version_for("neo-r", &["neoforge"], "release", "2026-01-01T00:00:00Z");
+        let neoforge_beta = version_for("neo-b", &["neoforge"], "beta", "2026-05-01T00:00:00Z");
+
+        let on_1_20_1 = filter_compatible_versions(
+            &[
+                forge_release.clone(),
+                neoforge_release.clone(),
+                neoforge_beta.clone(),
+            ],
+            &neoforge("1.20.1"),
+        );
+        assert_eq!(on_1_20_1.len(), 3);
+        assert_eq!(
+            select_latest_compatible_version(&on_1_20_1, &neoforge("1.20.1")),
+            Some(neoforge_release.clone())
+        );
+        // Il canale resta prima del loader.
+        assert_eq!(
+            select_latest_compatible_version(
+                &[forge_release.clone(), neoforge_beta],
+                &neoforge("1.20.1")
+            ),
+            Some(forge_release.clone())
+        );
+
+        // Fuori da 1.20.1 una build solo «forge» non vale per NeoForge.
+        let mut forge_1_21 = forge_release;
+        forge_1_21.game_versions = vec!["1.21.1".into()];
+        assert!(filter_compatible_versions(&[forge_1_21], &neoforge("1.21.1")).is_empty());
     }
 
     #[test]
@@ -1293,7 +1473,7 @@ mod tests {
     fn update_body_pins_algorithm_loader_and_single_channel() {
         let hashes = vec!["aa".to_string(), "bb".to_string()];
         let target = target();
-        let body = build_version_files_update_body(&hashes, &target, "beta");
+        let body = build_version_files_update_body(&hashes, &target, "fabric", "beta");
 
         assert_eq!(
             serde_json::to_value(&body).expect("body should serialize"),
@@ -1313,9 +1493,10 @@ mod tests {
         let target = target();
         let lookup = serde_json::to_value(build_version_files_lookup_body(&hashes, &target))
             .expect("lookup body should serialize");
-        let update =
-            serde_json::to_value(build_version_files_update_body(&hashes, &target, "beta"))
-                .expect("update body should serialize");
+        let update = serde_json::to_value(build_version_files_update_body(
+            &hashes, &target, "fabric", "beta",
+        ))
+        .expect("update body should serialize");
 
         assert_eq!(
             lookup,

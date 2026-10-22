@@ -500,9 +500,12 @@ pub(super) fn spawn_minecraft_process(
         super::set_active_launch_log_session(None);
         // Il gioco è uscito: da adesso nessuno sta più scrivendo i tre file
         // condivisi, e quello che l'istanza ha in mano può tornare alla
-        // modlist. Se il launcher viene chiuso mentre il gioco gira questo
-        // punto non viene mai raggiunto e le modifiche restano solo
-        // nell'istanza — è il buco dichiarato di questa fase.
+        // modlist. Se il launcher viene chiuso o aggiornato mentre il gioco
+        // gira questo punto non viene mai raggiunto: le modifiche restano
+        // nell'istanza fino al lancio dopo, e lì la copia dentro le riconosce
+        // dall'impronta dell'ultima copia e le riporta indietro prima di
+        // scrivere (D152, `shared_files::copy_into_instance`). Prima di D152
+        // quella copia dentro ci scriveva sopra senza `.bak`.
         let _ = emit_log(
             &app_for_wait,
             ProcessLogStream::Stdout,

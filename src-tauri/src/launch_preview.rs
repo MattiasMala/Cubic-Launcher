@@ -434,6 +434,10 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         fetch_launch_loader_metadata(&app_handle, &launcher_paths, &target, plays_offline).await?;
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
+    let pins = load_modlist_pins(&launcher_paths, &modlist_name, &modlist);
+    // D147: what this instance holds, read before its `mods/` is rebuilt —
+    // the version a mod keeps when nothing newer was chosen for it.
+    let instance_jars = read_instance_jars(&launcher_paths, &modlist_name, &target)?;
     let modrinth_client = ModrinthClient::new();
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
@@ -446,19 +450,13 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // launch will install.
     let resolution_path =
         LaunchResolutionPath::for_active_account(plays_offline, request.resolved_versions.as_ref());
-    // `None` on the `Resolve` path, always — the path is chosen by the map's
-    // presence. The online branch below keeps reading it so that "no map" is
-    // literally today's path, unchanged: whether that branch should still
-    // carry its map handling is part of the merge-the-two-branches decision
-    // this task does not take.
-    let preresolved_versions = resolution_path.preresolved();
     let selection = match resolution_path {
         LaunchResolutionPath::Preresolved(preresolved) => {
-            resolve_offline_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
+            resolve_offline_selection(&launcher_paths, &modlist, &pins, &target, Some(preresolved))?
         }
         // No map, and none wanted: the cache alone answers (D115).
         LaunchResolutionPath::Offline => {
-            resolve_offline_selection(&launcher_paths, &modlist, &target, None)?
+            resolve_offline_selection(&launcher_paths, &modlist, &pins, &target, None)?
         }
         LaunchResolutionPath::Resolve => {
             resolve_online_selection(
@@ -466,23 +464,23 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 &launcher_paths,
                 &http_client,
                 &modlist,
+                &pins,
                 &modrinth_client,
                 &target,
-                // No map on this path, by construction.
-                None,
             )
             .await?
         }
     };
-    log_resolution(&app_handle, &selection.resolution)?;
+    log_resolution(&app_handle, &selection.resolution, &selection.unavailable)?;
     // The availability pass runs before the artifact stage, so a mod it
-    // disabled is gone from `selected_mods` and `report_unusable_probe` can no
+    // disabled is gone from `selected_mods` and `log_unusable_probe` can no
     // longer see it: this is the only place that names it (A5). The pre-check
     // calls the same pass and does not report — it decides what the popup
     // shows, and a notice there would say it twice for one launch.
     report_dropped_mods(&app_handle, &selection.dropped, &target);
 
     let selected_mods = selection.selected_mods;
+    let selection_lookups = selection.lookups;
     launch_log_session.write_selected_mods(&selected_mods)?;
     if selected_mods.len() > 300 {
         let detail = match resolution_path {
@@ -528,6 +526,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &modrinth_client,
             &target,
             resolution_path.preresolved(),
+            &instance_jars,
         )
         .await?;
         // The rows for the versions fetched here are written at the end of the
@@ -557,43 +556,35 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             project_aliases,
         )
     } else {
-        // DESIGN: deliberately a second pass, not a reuse of the one inside
-        // `resolve_online_selection`. That one ran on the mods the first
-        // resolution selected; this one runs on `selected_mods`, which exists
-        // only after the re-resolution and can contain alternatives the first
-        // pass never saw. Merging the two means handling that delta, and
-        // getting it wrong means a mod the re-resolution enabled that nobody
-        // looks up. Two passes still cost ~10 requests against the 52 of one
-        // request per mod per pass.
+        // The versions of the final `selected_mods`: the availability pass
+        // already asked every mod it selected and kept the answers, so only a
+        // mod it never asked goes to Modrinth here (audit 101,
+        // r2-scala-mod-list-grandi-2). Before, this second pass asked the
+        // whole set again.
         //
-        // With a version map from the pre-check this pass stops choosing and
-        // starts looking up: the launch installs exactly what the popup showed
-        // (D16).
-        let compatible_versions = match preresolved_versions {
-            Some(preresolved) => {
-                resolve_preresolved_versions(
-                    &app_handle,
-                    &launcher_paths,
-                    &http_client,
-                    &selected_mods,
-                    &modrinth_client,
-                    &target,
-                    preresolved,
-                )
-                .await?
-            }
-            None => {
-                resolve_compatible_versions_hybrid(
-                    &app_handle,
-                    &launcher_paths,
-                    &http_client,
-                    &selected_mods,
-                    &modrinth_client,
-                    &target,
-                )
-                .await?
-            }
-        };
+        // No version map reaches this branch: a map always takes the
+        // `Preresolved` path above (`LaunchResolutionPath::for_active_account`),
+        // so the old map handling here was unreachable (audit 101, precheck-7).
+        let lookup = versions_for_final_selection(
+            &app_handle,
+            &launcher_paths,
+            &http_client,
+            &selected_mods,
+            &selection_lookups,
+            &modrinth_client,
+            &target,
+        )
+        .await?;
+        // Precheck-5: without Modrinth the launch does not wait on it mod by
+        // mod; the jars already in the cache answer (D29, the fallback below).
+        if let Some(error) = &lookup.network_error {
+            emit_log(
+                &app_handle,
+                ProcessLogStream::Stderr,
+                format!("[Launch] Modrinth could not be reached; the mods are installed from the jars already in the cache ({error})"),
+            )?;
+        }
+        let compatible_versions = lookup.versions;
         // The mods no version came back for keep the jar the cache already
         // holds (D29): the availability pass kept them, so this is where they
         // are actually acquired.
@@ -603,6 +594,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &selected_mods,
             &compatible_versions,
             &target,
+            &instance_jars,
         )?;
         let parent_versions = selected_mods
             .iter()
@@ -773,6 +765,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &instance_mods_dir,
         &cached_mod_jars,
     )?;
+    // Audit 101, risoluzione-8: the versions just linked become the last used
+    // on this target. Only an ordering: a failure costs the launch nothing,
+    // and is said.
+    let linked_versions = cached_remote_records
+        .iter()
+        .chain(&missing_jar_records)
+        .map(|record| record.modrinth_version_id.clone())
+        .chain(all_remote_versions.iter().map(|version| version.id.clone()))
+        .collect::<Vec<_>>();
+    if let Err(error) = record_versions_used(&launcher_paths, &linked_versions, &target) {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Cache] could not record which versions this launch used: {error:#}"),
+        )?;
+    }
     prepare_instance_config_directory(
         launcher_paths.configs_cache_dir(),
         &instance_config_dir,

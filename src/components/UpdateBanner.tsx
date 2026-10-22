@@ -2,6 +2,7 @@ import { Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  launchState,
   pushUiError,
   setUpdateBusy,
   setUpdateInfo,
@@ -19,13 +20,50 @@ const summarizeNotes = (notes: string | null) => {
   return compact.length > 200 ? `${compact.slice(0, 197).trimEnd()}...` : compact;
 };
 
+/** The backend's prefix when it refuses to install while the game runs (`updater.rs`). */
+const MINECRAFT_RUNNING = "minecraft-running:";
+
+/**
+ * Installing restarts the launcher, and with the game open the restart skips
+ * the copy back of the shared files (D152). Asked here before the install; the
+ * backend refuses without it, so a launcher that lost track of the game (a
+ * reloaded window) still asks.
+ */
+const confirmInstallWhileRunning = async () => {
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  return ask(
+    "Minecraft is still running. Installing the update restarts Cubic Launcher, and the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.",
+    {
+      title: "Install the update now?",
+      kind: "warning",
+      okLabel: "Install and restart",
+      cancelLabel: "Later",
+    },
+  );
+};
+
 export function UpdateBanner() {
   const handleInstallUpdate = async () => {
     if (!isTauri() || updateBusy()) return;
 
+    let confirmedWhileRunning = false;
+    if (launchState() === "running") {
+      if (!(await confirmInstallWhileRunning())) return;
+      confirmedWhileRunning = true;
+    }
+
     setUpdateBusy(true);
     try {
-      await invoke<void>("install_update");
+      try {
+        await invoke<void>("install_update", { confirmedWhileRunning });
+      } catch (err) {
+        if (confirmedWhileRunning || !String(err).includes(MINECRAFT_RUNNING)) throw err;
+        if (!(await confirmInstallWhileRunning())) {
+          setUpdateBusy(false);
+          return;
+        }
+        await invoke<void>("install_update", { confirmedWhileRunning: true });
+      }
     } catch (err) {
       pushUiError({
         title: "Update failed",

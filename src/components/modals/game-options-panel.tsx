@@ -94,6 +94,12 @@ interface Props {
   /** Vista iniziale, quando il chiamante l'ha già caricata. */
   initialView?: SharedOptionsView;
   initialInstances?: string[];
+  /**
+   * Hands the caller a way to save the pending edits, so a modal's own save
+   * button can write them too (D154). It resolves to `false` when the save
+   * failed; the panel shows why.
+   */
+  registerPendingSave?: (save: () => Promise<boolean>) => void;
 }
 
 export function GameOptionsPanel(props: Props) {
@@ -131,6 +137,8 @@ export function GameOptionsPanel(props: Props) {
   const [confirm, setConfirm] = createSignal<null | {
     title: string;
     detail: string;
+    /** The button: "Overwrite" when the whole file is replaced, "Apply" when only the checked lines are. */
+    action: string;
     run: () => Promise<void>;
   }>(null);
 
@@ -308,7 +316,12 @@ export function GameOptionsPanel(props: Props) {
     return `Nothing to do: ${status.target} already exists.`;
   };
 
-  const apply = async (from: OptionsScope, to: OptionsScope, toInstance: boolean) => {
+  /**
+   * `merge` (D155): «Re-apply to instance» e «Promote» scrivono solo le righe
+   * spuntate e lasciano il resto del file di arrivo com'è; «Bring these
+   * settings» sostituisce il file della modlist intero, come prima.
+   */
+  const apply = async (from: OptionsScope, to: OptionsScope, toInstance: boolean, merge: boolean) => {
     setNotice(null);
     setError(null);
     try {
@@ -320,6 +333,7 @@ export function GameOptionsPanel(props: Props) {
         // resta fuori è già in `unchecked`. Così il default di D67 resta un
         // default e non una regola cablata nella direzione.
         includeResourcePacks: true,
+        merge,
       })) as SeedStatus;
       setNotice(describe(status));
       await load();
@@ -328,11 +342,11 @@ export function GameOptionsPanel(props: Props) {
     }
   };
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     setNotice(null);
     setError(null);
     const current = view();
-    if (!current) return;
+    if (!current) return true;
     // Si rimandano **tutte** le righe, comprese quelle che non mostriamo:
     // salvare solo le visibili cancellerebbe lo stato interno dal file.
     const entries = current.entries.map(entry => ({
@@ -343,10 +357,26 @@ export function GameOptionsPanel(props: Props) {
       await call()("save_shared_options_command", { scope: props.scope, entries });
       setNotice("Saved.");
       await load();
+      return true;
     } catch (saveError) {
       setError(String(saveError));
+      return false;
     }
   };
+
+  /**
+   * Edits that differ from the file. Only the file of this level can have
+   * them: an instance opened from «From» is read-only.
+   */
+  const hasPendingEdits = () => {
+    if (previewing()) return false;
+    const entries = view()?.entries ?? [];
+    return Object.entries(edits()).some(
+      ([key, value]) => entries.find(entry => entry.key === key)?.value !== value,
+    );
+  };
+
+  props.registerPendingSave?.(async () => (hasPendingEdits() ? save() : true));
 
   const onSourceChange = (value: string) => {
     // Il Select in-DOM lascia cliccare la voce già scelta: ricaricare lì
@@ -370,8 +400,9 @@ export function GameOptionsPanel(props: Props) {
     setConfirm({
       title: `Bring the settings from ${sourceLabel()} here?`,
       detail: `Overwrites mod-lists/${modlistName()}/options.txt, the default that new instances are born from. Instances that already exist do not change.`,
+      action: "Overwrite",
       run: async () => {
-        await apply(sourceScope(), props.scope, false);
+        await apply(sourceScope(), props.scope, false, false);
         setSource("default");
         setCheckedOverride({});
         await load();
@@ -385,16 +416,18 @@ export function GameOptionsPanel(props: Props) {
     if (!target || modlist === null) return;
     setConfirm({
       title: `Re-apply to “${target}”?`,
-      detail: `Overwrites mod-lists/${modlist}/instances/${target}/options.txt, which has belonged to the game since it was created: whatever you changed in-game in that instance is lost.`,
-      run: () => apply(props.scope, { level: "instance", modlist, instance: target }, true),
+      detail: `Writes the checked settings into mod-lists/${modlist}/instances/${target}/options.txt, over the values you set in-game for those settings. Everything else in that file stays as it is: unchecked lines, mod keybinds and the game's own state.`,
+      action: "Apply",
+      run: () => apply(props.scope, { level: "instance", modlist, instance: target }, true, true),
     });
   };
 
   const promoteToGlobal = () => {
     setConfirm({
       title: "Promote to the global default?",
-      detail: "Overwrites the global options.txt, the template for new mod-lists. Mod-lists that already exist do not change.",
-      run: () => apply(props.scope, { level: "global" }, false),
+      detail: "Writes the checked settings into the global options.txt, the template for new mod-lists. The other lines of the global file stay as they are, and mod-lists that already exist do not change.",
+      action: "Apply",
+      run: () => apply(props.scope, { level: "global" }, false, true),
     });
   };
 
@@ -710,7 +743,7 @@ export function GameOptionsPanel(props: Props) {
                 }}
                 class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
-                Overwrite
+                {confirm()!.action}
               </button>
             </div>
           </div>

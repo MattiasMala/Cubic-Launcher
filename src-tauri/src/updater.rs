@@ -70,8 +70,35 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> UpdateCheckPayload {
     payload_from_outcome(&current_version, outcome)
 }
 
+/// Il prefisso dell'errore con cui l'installazione si ferma col gioco aperto:
+/// il frontend lo riconosce, chiede conferma e riprova con
+/// `confirmed_while_running` (D152).
+const MINECRAFT_RUNNING: &str = "minecraft-running:";
+
+/// L'aggiornamento riavvia il launcher, e col gioco aperto il riavvio salta la
+/// copia indietro dei file condivisi (`concorrenza-1`): si installa solo con la
+/// conferma di chi ha visto l'avviso.
+fn install_refusal(game_running: bool, confirmed_while_running: bool) -> Option<String> {
+    (game_running && !confirmed_while_running).then(|| {
+        format!(
+            "{MINECRAFT_RUNNING} Minecraft is still running; installing the update restarts \
+             Cubic Launcher"
+        )
+    })
+}
+
 #[tauri::command]
-pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn install_update(
+    app: tauri::AppHandle,
+    confirmed_while_running: Option<bool>,
+) -> Result<(), String> {
+    if let Some(refusal) = install_refusal(
+        crate::launch_preview::current_minecraft_pid().is_some(),
+        confirmed_while_running.unwrap_or(false),
+    ) {
+        return Err(refusal);
+    }
+
     let updater = app
         .updater()
         .map_err(|error| format!("Failed to initialize updater: {error}"))?;
@@ -91,7 +118,15 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{payload_from_outcome, CheckOutcome, Status};
+    use super::{install_refusal, payload_from_outcome, CheckOutcome, Status, MINECRAFT_RUNNING};
+
+    #[test]
+    fn an_update_waits_for_a_confirmation_while_the_game_runs() {
+        let refusal = install_refusal(true, false).expect("a running game must stop the install");
+        assert!(refusal.starts_with(MINECRAFT_RUNNING));
+        assert_eq!(install_refusal(true, true), None);
+        assert_eq!(install_refusal(false, false), None);
+    }
 
     #[test]
     fn maps_up_to_date_outcome() {

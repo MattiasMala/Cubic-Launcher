@@ -255,6 +255,8 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
 
     let ids_to_remove: std::collections::HashSet<&str> =
         input.mod_ids.iter().map(|s| s.as_str()).collect();
+    let mut original_ids = std::collections::HashSet::new();
+    collect_tree_ids(&modlist.rules, &mut original_ids);
 
     modlist
         .rules
@@ -264,6 +266,19 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
         remove_from_alternatives(rule, &ids_to_remove);
     }
 
+    // Un `requires` o un `exclude_if` verso un mod che non c'è più resta nel
+    // file e nessuno lo vede: X requires Y, si cancella Y, e X resta rossa per
+    // sempre senza nessun link visibile (audit 101, editor-logica-5). Si
+    // tolgono, in tutto l'albero, i riferimenti a ogni id che non c'è più: i
+    // mod cancellati e le alternative che spariscono insieme a loro.
+    let mut remaining = std::collections::HashSet::new();
+    collect_tree_ids(&modlist.rules, &mut remaining);
+    let gone = original_ids
+        .into_iter()
+        .filter(|mod_id| !remaining.contains(mod_id))
+        .collect::<std::collections::HashSet<_>>();
+    remove_references(&mut modlist.rules, &gone);
+
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
 
@@ -272,6 +287,21 @@ fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&st
         .retain(|alt| !ids.contains(alt.mod_id.as_str()));
     for alt in &mut rule.alternatives {
         remove_from_alternatives(alt, ids);
+    }
+}
+
+fn collect_tree_ids(rules: &[Rule], ids: &mut std::collections::HashSet<String>) {
+    for rule in rules {
+        ids.insert(rule.mod_id.clone());
+        collect_tree_ids(&rule.alternatives, ids);
+    }
+}
+
+fn remove_references(rules: &mut [Rule], gone: &std::collections::HashSet<String>) {
+    for rule in rules {
+        rule.requires.retain(|mod_id| !gone.contains(mod_id));
+        rule.exclude_if.retain(|mod_id| !gone.contains(mod_id));
+        remove_references(&mut rule.alternatives, gone);
     }
 }
 
@@ -734,6 +764,9 @@ fn build_editor_row(rule: &Rule, modlist_dir: &Path) -> EditorRow {
             }
             ModSource::Modrinth => None,
         },
+        pin: crate::mod_version_pin::pin_kind(rule, modlist_dir).map(|kind| EditorPin {
+            owns_jar: kind == crate::mod_version_pin::PinKind::Marked,
+        }),
         enabled: rule.enabled,
         exclude_if: rule.exclude_if.clone(),
         requires: rule.requires.clone(),

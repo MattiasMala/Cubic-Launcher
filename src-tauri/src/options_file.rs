@@ -76,12 +76,15 @@ impl OptionsFile {
         rendered
     }
 
+    /// Con rename (todo.md:1531): un `options.txt` lasciato a metà da
+    /// un'interruzione è un file senza la riga `version:` in fondo, o peggio
+    /// senza le righe dopo il taglio, e il gioco lo leggerebbe così.
     pub fn write(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        std::fs::write(path, self.render())
+        crate::atomic_write::write_atomically(path, self.render())
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
@@ -180,6 +183,31 @@ mod tests {
         file.set_first(VERSION_KEY, "3465");
 
         assert_eq!(file.render(), "version:3465\nfov:0.5\n");
+    }
+
+    #[test]
+    fn writing_replaces_the_file_and_leaves_no_partial() {
+        let dir = std::env::temp_dir().join(format!(
+            "cubic-options-file-write-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let path = dir.join("options.txt");
+        OptionsFile::parse("version:3465\nfov:0.5\n")
+            .write(&path)
+            .expect("the first write should succeed");
+        OptionsFile::parse("version:3465\nfov:0.9\n")
+            .write(&path)
+            .expect("the second write should replace the first");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version:3465\nfov:0.9\n"
+        );
+        assert!(!dir.join("options.txt.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

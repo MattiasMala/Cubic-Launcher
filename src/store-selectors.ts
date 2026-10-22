@@ -29,7 +29,6 @@ import {
   selectedModListName,
   tagFilter,
   advancedPanelModId,
-  versionRules,
 } from "./store-state";
 
 function collectRowsRecursive(rows: ModRow[], map: Map<string, ModRow>) {
@@ -155,17 +154,17 @@ export const advancedPanelMod = createMemo(() => {
 });
 
 /**
- * Rows that are a pinned version: a local entry carrying an `only` version
- * rule. That rule is what the pin writes, and it is what tells a pin apart
- * from a jar the user uploaded by hand — whose jar must never be deleted.
+ * Rows that are a pinned version, as the backend marks them (`row.pin`). A
+ * local jar with an "Only when" is not a pin: inferring one from that shape
+ * made "Remove pin" delete a jar the user uploaded by hand (audit 101,
+ * modlist-2).
  */
 export const pinnedRowIds = createMemo(() => {
-  const rows = rowMap();
-  return new Set(
-    versionRules()
-      .filter(rule => rule.kind === "only" && rows.get(rule.modId)?.kind === "local")
-      .map(rule => rule.modId)
-  );
+  const ids = new Set<string>();
+  for (const row of rowMap().values()) {
+    if (row.pin) ids.add(row.id);
+  }
+  return ids;
 });
 
 /** Top-level rows, the only ones a version can be pinned on (plus the dynamic entry of a pin). */

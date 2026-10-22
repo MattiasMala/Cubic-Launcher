@@ -71,6 +71,30 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
   const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
   const [lastUpdateCheck, setLastUpdateCheck] = createSignal<UpdateCheckResponse | null>(null);
   const [notificationsAdvancedOpen, setNotificationsAdvancedOpen] = createSignal(false);
+  /** The Game settings panel's own save, for its pending options.txt edits (D154). */
+  const [saveGameOptions, setSaveGameOptions] = createSignal<(() => Promise<boolean>) | null>(null);
+  const [saving, setSaving] = createSignal(false);
+
+  /**
+   * Save Settings saves everything the modal shows, options.txt included
+   * (D154). The options go first: if they fail the modal stays open on the
+   * global tab, where the panel says why, instead of closing over edits that
+   * were never written.
+   */
+  const handleSave = async () => {
+    if (saving()) return;
+    setSaving(true);
+    try {
+      const saveOptions = saveGameOptions();
+      if (saveOptions && !(await saveOptions())) {
+        setSettingsTab("global");
+        return;
+      }
+      await props.onSave(globalDraft(), modlistDraft());
+    } finally {
+      setSaving(false);
+    }
+  };
 
   createEffect(on(settingsModalOpen, open => {
     if (!open) return;
@@ -264,28 +288,36 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     </Show>
                   </div>
                 </div>
-                {/*
-                  Il terzo livello di D66. Stesso componente della scheda
-                  «Game settings» di una modlist, su uno scope diverso: senza
-                  di questo, «Promote to global default» scriveva un file che
-                  poi non si poteva né vedere né modificare da nessuna parte.
-                */}
-                <div class="rounded-md border border-border bg-background p-4">
-                  <p class="mb-1 text-sm font-medium text-foreground">Game settings</p>
-                  <p class="mb-3 text-xs text-muted-foreground">
-                    The global <code>options.txt</code>: the template new mod-lists are born
-                    from. Changing it here does not touch mod-lists or instances that already
-                    exist.
-                  </p>
-                  <GameOptionsPanel scope={{ level: "global" }} />
-                </div>
               </div>
             </Show>
+            {/*
+              Il terzo livello di D66. Stesso componente della scheda
+              «Game settings» di una modlist, su uno scope diverso: senza
+              di questo, «Promote to global default» scriveva un file che
+              poi non si poteva né vedere né modificare da nessuna parte.
+
+              Sta fuori dallo `<Show>` delle schede e si nasconde invece di
+              smontarsi: smontato, cambiare scheda buttava via le modifiche
+              non ancora salvate (ui-modali-7). «Save Settings» le salva
+              insieme al resto (D154).
+            */}
+            <div class={`rounded-md border border-border bg-background p-4 ${settingsTab() === "global" ? "" : "hidden"}`}>
+              <p class="mb-1 text-sm font-medium text-foreground">Game settings</p>
+              <p class="mb-3 text-xs text-muted-foreground">
+                The global <code>options.txt</code>: the template new mod-lists are born
+                from. Changing it here does not touch mod-lists or instances that already
+                exist. Save Settings also saves the changes made here.
+              </p>
+              <GameOptionsPanel
+                scope={{ level: "global" }}
+                registerPendingSave={save => setSaveGameOptions(() => save)}
+              />
+            </div>
           </div>
         </div>
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
           <button onClick={handleCancel} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
-          <button onClick={() => void props.onSave(globalDraft(), modlistDraft())} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save Settings</button>
+          <button onClick={() => void handleSave()} disabled={saving()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Save Settings</button>
         </div>
       </Modal>
     </Show>

@@ -27,6 +27,11 @@ export interface PinVersionModalProps {
   loadReleases: (mcVersion: string) => Promise<PinRelease[]>;
   /** The version currently pinned, when there is one: enables "Remove pin". */
   pinnedLabel?: string;
+  /**
+   * Whether "Remove pin" deletes the pin's jar (audit 101, modlist-2): only a
+   * pin with its marker owns it. Said in the confirmation either way.
+   */
+  removePinDeletesJar?: boolean;
   /** False when the pin has no dynamic entry left to re-pin (D5 removed it). */
   canPin: boolean;
   onSave: (choice: { versionId: string; mcVersion: string; removeDynamic: boolean }) => Promise<void>;
@@ -42,6 +47,9 @@ export function PinVersionModal(props: PinVersionModalProps) {
   const [loading, setLoading] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  // "Remove pin" asks first: it deletes a jar, and the jar may be the only
+  // copy of that release on this machine (audit 101, modlist-2).
+  const [confirmRemove, setConfirmRemove] = createSignal(false);
 
   // One effect for the whole dropdown-2 contents: it re-runs on the Minecraft
   // version, which is the only thing the release list depends on.
@@ -62,6 +70,17 @@ export function PinVersionModal(props: PinVersionModalProps) {
       })
       .finally(() => setLoading(false));
   });
+
+  // The pin is scoped to one (Minecraft version, loader) pair (D14), and what
+  // the other targets get depends on whether the dynamic entry survives it
+  // (D5): with it removed, or already gone, they load no version at all
+  // (audit 101, ui-modali-10).
+  const pinScope = () => {
+    const scope = `The pin applies to ${mcVersion()} + ${props.loader} only`;
+    return removeDynamic() || !props.canPin
+      ? `${scope}; with no dynamic entry, every other target loads no version of this mod.`
+      : `${scope}; every other target keeps using the dynamic entry.`;
+  };
 
   // "0.6.0 (release)", the label of the mock in todo.md § B2.
   const releaseOptions = () =>
@@ -86,7 +105,7 @@ export function PinVersionModal(props: PinVersionModalProps) {
     <Modal onClose={props.onClose} maxWidth="max-w-lg">
       <ModalHeader
         title={`${props.modName} — choose version`}
-        description={`The pin applies to ${props.loader} only; every other target keeps using the dynamic entry.`}
+        description={pinScope()}
         onClose={props.onClose}
       />
 
@@ -126,14 +145,49 @@ export function PinVersionModal(props: PinVersionModalProps) {
         <Show when={error()}>
           <p class="text-xs text-destructive">{error()}</p>
         </Show>
+
+        <Show when={confirmRemove() && props.onRemovePin}>
+          <div
+            data-testid="pin-remove-confirm"
+            class="flex flex-col gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-3"
+          >
+            <p class="text-sm text-foreground">
+              {props.removePinDeletesJar
+                ? `Remove the pin? Its jar (${props.pinnedLabel}.jar) is deleted from this mod list.`
+                : `Remove the pin? Its jar (${props.pinnedLabel}.jar) stays in the mod list's local-jars folder.`}
+            </p>
+            <div class="flex justify-end gap-2">
+              <button
+                onClick={() => setConfirmRemove(false)}
+                disabled={busy()}
+                class="rounded-md border border-border px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                data-testid="pin-remove-confirm-yes"
+                onClick={() =>
+                  void run(async () => {
+                    await props.onRemovePin!();
+                    setConfirmRemove(false);
+                  })
+                }
+                disabled={busy()}
+                class="rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-destructive/90 disabled:opacity-40"
+              >
+                Remove pin
+              </button>
+            </div>
+          </div>
+        </Show>
       </div>
 
       <div class="flex flex-col items-end gap-2 border-t border-border px-6 py-4">
         <div class="flex w-full items-center justify-between gap-2">
           <Show when={props.onRemovePin} fallback={<span />}>
             <button
-              onClick={() => void run(async () => { await props.onRemovePin!(); })}
-              disabled={busy()}
+              onClick={() => setConfirmRemove(true)}
+              disabled={busy() || confirmRemove()}
               class="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:opacity-40"
             >
               <MaterialIcon name="link_off" size="sm" />
