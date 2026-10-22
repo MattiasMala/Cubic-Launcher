@@ -742,6 +742,17 @@ fn import_modlist_from_root(
             if relative.is_empty() {
                 continue;
             }
+            // review-decisioni-35: the bookkeeping of the exporter's instances
+            // (an archive from an older build still has it) describes another
+            // machine; its sync record would send a copy-back into a local mod
+            // list that happens to have the exporter's name.
+            if relative.starts_with("instances/")
+                && relative
+                    .split('/')
+                    .any(|part| part == crate::modlist_assets::LAUNCHER_BOOKKEEPING_DIR)
+            {
+                continue;
+            }
 
             // The global cache of an old export: jars that are downloaded again
             // on launch. Only a local mod's jar is kept, see
@@ -1187,6 +1198,37 @@ mod tests {
             .join("note.txt")
             .exists());
         assert_eq!(modlist_folders(&root), vec!["Valid Pack".to_string()]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// review-decisioni-35: an archive from an older build carries the
+    /// exporter's `.cubic/` bookkeeping; the import leaves it out.
+    #[test]
+    fn import_leaves_out_the_exporters_bookkeeping() {
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+        let archive = root.join("old.zip");
+        write_test_zip(
+            &archive,
+            &[
+                ("Pack/rules.json", VALID_RULES),
+                (
+                    "Pack/instances/1.20.1-fabric/.cubic/shared-files.json",
+                    br#"{"owner":"Pack","synced":{}}"# as &[u8],
+                ),
+                ("Pack/instances/1.20.1-fabric/servers.dat", b"nbt" as &[u8]),
+            ],
+        );
+        let name =
+            import_modlist_from_root(&root, &test_db(&root), archive.to_str().unwrap()).unwrap();
+        let instance = root
+            .join("mod-lists")
+            .join(&name)
+            .join("instances")
+            .join("1.20.1-fabric");
+        assert!(instance.join("servers.dat").exists());
+        assert!(!instance.join(".cubic").exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

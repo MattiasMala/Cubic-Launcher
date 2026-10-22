@@ -679,7 +679,7 @@ fn write_export_archive(
                 |path| {
                     !crate::shared_files::is_excluded_from_export(
                         &path.file_name().unwrap_or_default().to_string_lossy(),
-                    )
+                    ) && !is_launcher_bookkeeping(path)
                 },
             )?;
         }
@@ -692,6 +692,20 @@ fn write_export_archive(
         .with_context(|| format!("failed to flush {}", partial_path.display()))?;
     Ok(())
 }
+
+/// A file under a `.cubic/` folder: the launcher's own bookkeeping of an
+/// instance or a world (the shared-files sync record, the pack manifests, the
+/// loader it last prepared). It describes this machine only. Imported
+/// elsewhere, the sync record names the exporter's mod list as the owner of
+/// the shared copy, and a local mod list with that name got the imported
+/// server list over its own (review-decisioni-35).
+fn is_launcher_bookkeeping(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == LAUNCHER_BOOKKEEPING_DIR)
+}
+
+/// The folder of [`is_launcher_bookkeeping`].
+pub(crate) const LAUNCHER_BOOKKEEPING_DIR: &str = ".cubic";
 
 /// The content types whose list (`resourcepacks.json`, …) is part of a mod
 /// list's definition.
@@ -1242,6 +1256,52 @@ mod tests {
             .expect("the deflated entry should read back");
         assert_eq!(read_back, contents);
         drop(entry);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// review-decisioni-35: un'istanza esportata intera non porta con sé il
+    /// registro dei file condivisi né gli altri file di `.cubic/`.
+    #[test]
+    fn the_launcher_bookkeeping_never_leaves_in_an_archive() {
+        let root_dir = unique_test_root();
+        let instance = root_dir
+            .join("mod-lists")
+            .join("Pack")
+            .join("instances")
+            .join("1.20.1-fabric");
+        fs::create_dir_all(instance.join(".cubic")).expect("bookkeeping folder");
+        fs::write(instance.join(".cubic").join("shared-files.json"), b"{}").expect("record");
+        fs::write(instance.join("servers.dat"), b"nbt").expect("servers");
+        let archive_path = root_dir.join("export.zip");
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Pack".into(),
+                destination_path: archive_path.display().to_string(),
+                rules_json: false,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: true,
+                selected_content_paths: Vec::new(),
+                selected_other_paths: vec!["1.20.1-fabric".to_string()],
+            },
+        )
+        .expect("export should succeed");
+
+        let archive =
+            zip::ZipArchive::new(fs::File::open(&archive_path).expect("archive")).expect("zip");
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        assert!(
+            names.iter().any(|name| name.ends_with("servers.dat")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains(".cubic")),
+            "{names:?}"
+        );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
