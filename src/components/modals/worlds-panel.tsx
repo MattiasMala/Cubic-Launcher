@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { For, Show, createMemo, createSignal, onMount } from "solid-js";
 import { modListCards } from "../../store";
+import { ToggleSwitch } from "../ToggleSwitch";
 import { loadInstancesByModlist } from "../../lib/instances";
 import {
   worldIdOf,
@@ -225,23 +226,13 @@ export function WorldsPanel(props: Props) {
                                     </span>
                                   </Show>
                                 </span>
-                                <button
-                                  role="switch"
-                                  aria-checked={on()}
-                                  aria-label={`${modlistName} · ${instanceName} sees ${world().levelName}`}
+                                <ToggleSwitch
+                                  checked={on()}
+                                  label={`${modlistName} · ${instanceName} sees ${world().levelName}`}
                                   disabled={busy() || home()}
-                                  data-testid={`worlds-switch-${modlistName}-${instanceName}`}
-                                  onClick={() => void toggle(world(), modlistName, instanceName)}
-                                  class={`h-6 w-11 shrink-0 rounded-full border transition-colors disabled:opacity-60 ${
-                                    on() ? "border-primary bg-primary" : "border-border bg-muted"
-                                  }`}
-                                >
-                                  <span
-                                    class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                                      on() ? "translate-x-6" : "translate-x-1"
-                                    }`}
-                                  />
-                                </button>
+                                  testId={`worlds-switch-${modlistName}-${instanceName}`}
+                                  onToggle={() => void toggle(world(), modlistName, instanceName)}
+                                />
                               </div>
                             );
                           }}

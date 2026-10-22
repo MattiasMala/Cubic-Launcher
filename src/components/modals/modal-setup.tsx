@@ -24,6 +24,7 @@ import { GameOptionsPanel } from "./game-options-panel";
 import { SharedFilesPanel } from "./shared-files-panel";
 import { WorldsPanel } from "./worlds-panel";
 import { ChevronDownIcon, ChevronRightIcon } from "../icons";
+import { ToggleSwitch } from "../ToggleSwitch";
 import { modlistNameProblem } from "../../lib/modlist-name";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
@@ -211,23 +212,12 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                   <div class="flex gap-3">
                     <input type="checkbox" checked={modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
                     <label class={`flex flex-1 items-center gap-2 text-sm text-foreground ${modlistDraft().profilerEnabled ? "" : "opacity-40"}`}>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={modlistDraft().profilerActive}
+                      <ToggleSwitch
+                        checked={modlistDraft().profilerActive}
                         disabled={!modlistDraft().profilerEnabled}
-                        data-testid="modlist-profiler-switch"
-                        onClick={() => setModlistDraft(c => ({ ...c, profilerActive: !c.profilerActive }))}
-                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                          modlistDraft().profilerActive ? "border-primary bg-primary" : "border-border bg-muted"
-                        }`}
-                      >
-                        <span
-                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                            modlistDraft().profilerActive ? "translate-x-6" : "translate-x-1"
-                          }`}
-                        />
-                      </button>
+                        testId="modlist-profiler-switch"
+                        onToggle={() => setModlistDraft(c => ({ ...c, profilerActive: !c.profilerActive }))}
+                      />
                       Record a JFR profile for this mod list
                     </label>
                   </div>
@@ -549,26 +539,16 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     </Show>
                     <div class="flex items-center gap-1.5">
                       <span class="text-[10px] text-muted-foreground">Play offline</span>
-                      <button
-                        role="switch"
-                        aria-checked={acc.playsOffline}
-                        aria-label={`Play ${acc.gamertag} offline`}
+                      <ToggleSwitch
+                        checked={acc.playsOffline}
+                        label={`Play ${acc.gamertag} offline`}
                         disabled={savingOffline()}
-                        data-testid={`account-plays-offline-switch-${acc.id}`}
-                        onClick={e => {
+                        testId={`account-plays-offline-switch-${acc.id}`}
+                        onToggle={e => {
                           e.stopPropagation();
                           void setPlaysOffline(acc.id, !acc.playsOffline);
                         }}
-                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                          acc.playsOffline ? "border-primary bg-primary" : "border-border bg-muted"
-                        }`}
-                      >
-                        <span
-                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                            acc.playsOffline ? "translate-x-6" : "translate-x-1"
-                          }`}
-                        />
-                      </button>
+                      />
                     </div>
                     <Show when={confirmRemoveId() === acc.id} fallback={
                       <button

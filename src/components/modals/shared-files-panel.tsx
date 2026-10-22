@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { MaterialIcon } from "../icons";
+import { ToggleSwitch } from "../ToggleSwitch";
 
 /**
  * La condivisione dei tre file d'istanza (`servers.dat`, `hotbar.nbt`,
@@ -135,29 +136,20 @@ export function SharedFilesPanel(props: Props) {
                   {toggle.filename}
                 </code>
               </div>
-              <button
-                role="switch"
-                aria-checked={toggle.enabled}
-                aria-label={`Share ${FILE_COPY[toggle.key].title}`}
+              <ToggleSwitch
+                checked={toggle.enabled}
+                label={`Share ${FILE_COPY[toggle.key].title}`}
                 disabled={busy()}
-                data-testid={`shared-file-switch-${toggle.key}`}
-                onClick={() =>
+                testId={`shared-file-switch-${toggle.key}`}
+                onToggle={() =>
                   void run("set_shared_file_enabled_command", {
                     modlist: props.modlist,
                     file: toggle.key,
                     enabled: !toggle.enabled,
                   })
                 }
-                class={`mt-1 h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                  toggle.enabled ? "border-primary bg-primary" : "border-border bg-muted"
-                }`}
-              >
-                <span
-                  class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                    toggle.enabled ? "translate-x-6" : "translate-x-1"
-                  }`}
-                />
-              </button>
+                class="mt-1"
+              />
             </div>
           )}
         </For>
