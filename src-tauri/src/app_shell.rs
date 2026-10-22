@@ -3,9 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 
 use crate::account_manager::{
     AccountManager, AccountSummary, ManagedAccountProfile, ManagedAccountTokens,
@@ -20,9 +22,22 @@ use crate::token_storage::{CredentialState, KeyringSecretStore, SecretStore};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
     pub modlists: Vec<ShellModListSummary>,
+    /// Mod list folders whose `rules.json` could not be read. They are left
+    /// out of `modlists` instead of failing the whole snapshot (todo.md:1414):
+    /// one broken folder must not hide the others, the settings and the
+    /// accounts, nor stop the launch of another mod list.
+    pub unreadable_modlists: Vec<ShellUnreadableModList>,
     pub active_account: Option<ShellAccount>,
     pub global_settings: ShellGlobalSettings,
     pub selected_modlist_overrides: ShellModListOverrides,
+}
+
+/// A mod list folder left out of the snapshot, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellUnreadableModList {
+    /// The folder name under `mod-lists/`.
+    pub folder: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +71,10 @@ pub struct ShellAccount {
     /// with it is offline, whatever `credentials` says. A second sign apart
     /// from `status` on purpose: choosing offline is not a broken sign-in.
     pub plays_offline: bool,
+    /// The row the launch uses. The account list carries it so that the
+    /// interface learns which account is active from the list alone, without
+    /// depending on the snapshot (todo.md:1414, todo.md:1390).
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -121,17 +140,26 @@ pub struct ShellModListOverridesInput {
     pub mod_loader: Option<String>,
 }
 
+/// Async, with the database and the keyring on a blocking thread: a
+/// synchronous Tauri command runs on the main thread, and on Linux a locked
+/// keyring can hold the call for as long as its unlock prompt stays open,
+/// freezing the whole window (account-8).
 #[tauri::command]
-pub fn load_shell_snapshot_command(
+pub async fn load_shell_snapshot_command(
     launcher_paths: State<'_, LauncherPaths>,
     selected_modlist_name: Option<String>,
 ) -> Result<ShellSnapshot, String> {
-    load_shell_snapshot_from_root(
-        launcher_paths.root_dir(),
-        selected_modlist_name.as_deref(),
-        KeyringSecretStore::new(),
-    )
-    .map_err(|error| error.to_string())
+    let root_dir = launcher_paths.root_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_shell_snapshot_from_root(
+            &root_dir,
+            selected_modlist_name.as_deref(),
+            KeyringSecretStore::new(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -148,15 +176,36 @@ pub fn switch_active_account_command(
 }
 
 /// Every saved account, the active one first (D113): the list the Accounts
-/// window shows and switches between.
+/// window shows and switches between. Off the main thread for the same
+/// reason as the snapshot (account-8): it asks the keyring.
 #[tauri::command]
-pub fn list_accounts_command(
+pub async fn list_accounts_command(
     launcher_paths: State<'_, LauncherPaths>,
 ) -> Result<Vec<ShellAccount>, String> {
-    let connection =
-        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
-    load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
-        .map_err(|error| error.to_string())
+    let database_path = launcher_paths.database_path().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
+        load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Whether the active account plays offline (D115), from its row. The app's
+/// own requests ask this before going to the network (D140): with it the
+/// launcher works from what it has on disk, and asks nobody. No active
+/// account plays online, as before.
+pub fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    Ok(AccountsRepository::new(&connection)
+        .load_active_account()?
+        .is_some_and(|account| account.plays_offline))
 }
 
 /// Saves the choice to play one account offline (D115). The launch and the
@@ -174,16 +223,89 @@ pub fn set_account_plays_offline_command(
         .map_err(|error| error.to_string())
 }
 
+/// The event that carries the Microsoft page the browser was sent to, so
+/// that the Accounts window can show it as a link (account-3).
+pub const MICROSOFT_LOGIN_URL_EVENT: &str = "microsoft-login-url";
+
+/// What `microsoft_login_command` answers when the user pressed Cancel. The
+/// frontend compares against it to tell a cancel from a failure.
+pub const MICROSOFT_LOGIN_CANCELLED: &str = "Microsoft sign-in cancelled";
+
+/// The sign-in in progress, if any: the sender that cancels it (account-3).
+#[derive(Default)]
+pub struct MicrosoftLoginState {
+    cancel: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+/// Holds the cancel slot for the length of one sign-in and empties it however
+/// the sign-in ends.
+struct LoginInProgress<'a>(&'a MicrosoftLoginState);
+
+impl<'a> LoginInProgress<'a> {
+    fn start(state: &'a MicrosoftLoginState) -> Result<(Self, oneshot::Receiver<()>), String> {
+        let mut slot = state.cancel.lock();
+        if slot.is_some() {
+            return Err("A Microsoft sign-in is already in progress".to_string());
+        }
+        let (sender, receiver) = oneshot::channel();
+        *slot = Some(sender);
+        Ok((Self(state), receiver))
+    }
+}
+
+impl Drop for LoginInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.cancel.lock().take();
+    }
+}
+
+/// Stops the sign-in in progress: the loopback listener closes and
+/// `microsoft_login_command` answers `MICROSOFT_LOGIN_CANCELLED`. Nothing is
+/// saved. Without a sign-in in progress it does nothing.
+#[tauri::command]
+pub fn cancel_microsoft_login_command(login_state: State<'_, MicrosoftLoginState>) {
+    if let Some(sender) = login_state.cancel.lock().take() {
+        let _ = sender.send(());
+    }
+}
+
+/// Whether a "Sign in again" on one row came back with another Microsoft
+/// account (todo.md:1417). The Microsoft id is the row's key; the Minecraft
+/// UUID also counts as the same player, for a row saved before Microsoft
+/// returned its own user id.
+fn signed_in_as_another_account(
+    expected_microsoft_id: &str,
+    expected_minecraft_uuid: Option<&str>,
+    login_microsoft_id: &str,
+    login_minecraft_uuid: &str,
+) -> bool {
+    let same_uuid = expected_minecraft_uuid.is_some_and(|uuid| {
+        !uuid.is_empty() && uuid.replace('-', "") == login_minecraft_uuid.replace('-', "")
+    });
+    expected_microsoft_id != login_microsoft_id && !same_uuid
+}
+
 /// Starts the Microsoft OAuth login flow, opens the browser, waits for
 /// callback, exchanges tokens through Xbox Live → XSTS → Minecraft, and
 /// saves the account to the database.
 ///
 /// `replace_unreadable` is the "Sign in again" button (F1): it allows the save
 /// to discard saved sign-ins that the keyring says nobody can decrypt.
+///
+/// `expected_microsoft_id` is the row a "Sign in again" belongs to: when the
+/// browser signs in another Microsoft account, nothing is saved and the
+/// answer says so, instead of adding or activating that other account while
+/// the row stays as it was (todo.md:1417).
+///
+/// The page the browser is sent to goes out as `MICROSOFT_LOGIN_URL_EVENT`,
+/// and `cancel_microsoft_login_command` ends the wait (account-3).
 #[tauri::command]
 pub async fn microsoft_login_command(
+    app: AppHandle,
     launcher_paths: State<'_, LauncherPaths>,
+    login_state: State<'_, MicrosoftLoginState>,
     replace_unreadable: Option<bool>,
+    expected_microsoft_id: Option<String>,
 ) -> Result<String, String> {
     let replace_unreadable = replace_unreadable.unwrap_or(false);
     let env_path = launcher_paths.root_dir().join(".env");
@@ -204,16 +326,52 @@ pub async fn microsoft_login_command(
 
     // Before the browser: a sign-in that could not be saved must not cost the
     // user the whole OAuth round trip first.
-    {
+    let expected_account = {
         let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
         AccountManager::new(&connection, KeyringSecretStore::new())
             .check_login_can_be_saved(replace_unreadable)
             .map_err(|e| format!("{e:#}"))?;
-    }
+        match expected_microsoft_id.as_deref() {
+            Some(expected) => Some(
+                AccountsRepository::new(&connection)
+                    .list_accounts()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|account| account.microsoft_id == expected)
+                    .ok_or_else(|| format!("account '{expected}' does not exist"))?,
+            ),
+            None => None,
+        }
+    };
 
-    let login_result = run_microsoft_login(&client_id)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    let (_in_progress, cancelled) = LoginInProgress::start(&login_state)?;
+    let url_app = app.clone();
+    let login = run_microsoft_login(&client_id, move |url| {
+        let _ = url_app.emit(MICROSOFT_LOGIN_URL_EVENT, url.to_string());
+    });
+    let login_result = tokio::select! {
+        result = login => result.map_err(|e| format!("{e:#}"))?,
+        _ = cancelled => return Err(MICROSOFT_LOGIN_CANCELLED.to_string()),
+    };
+
+    if let Some(expected) = &expected_account {
+        if signed_in_as_another_account(
+            &expected.microsoft_id,
+            expected.minecraft_uuid.as_deref(),
+            &login_result.microsoft_id,
+            &login_result.minecraft_uuid,
+        ) {
+            let row_name = resolve_row_name(expected);
+            return Err(format!(
+                "You signed in as {signed_in}, a different Microsoft account from {row_name}. \
+                 Nothing was saved, and {row_name} still needs signing in: press \"Sign in again\" \
+                 on its row and choose its account in the browser (\"Use another account\" if \
+                 Microsoft signs you straight in). To add {signed_in} as well, use \
+                 \"Login with Microsoft\".",
+                signed_in = login_result.minecraft_username,
+            ));
+        }
+    }
 
     // Save to database
     let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
@@ -241,6 +399,22 @@ pub async fn microsoft_login_command(
     Ok(login_result
         .xbox_gamertag
         .unwrap_or(login_result.microsoft_id))
+}
+
+/// The name a row shows: the Minecraft name saved with it, else its gamertag,
+/// else its Microsoft id.
+fn resolve_row_name(account: &crate::microsoft_auth::AccountRecord) -> String {
+    account
+        .profile_data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("username")
+                .and_then(|u| u.as_str())
+                .map(String::from)
+        })
+        .or_else(|| account.xbox_gamertag.clone())
+        .unwrap_or_else(|| account.microsoft_id.clone())
 }
 
 /// Build the profile_data JSON stored for an account.
@@ -307,7 +481,8 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
         )
     })?;
 
-    let raw_modlists = load_modlist_summaries(launcher_paths.modlists_dir())?;
+    let (raw_modlists, unreadable_modlists) =
+        load_modlist_summaries(launcher_paths.modlists_dir())?;
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
         .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
@@ -330,6 +505,7 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
 
     Ok(ShellSnapshot {
         modlists,
+        unreadable_modlists,
         active_account,
         global_settings,
         selected_modlist_overrides,
@@ -364,12 +540,18 @@ fn load_all_modlist_version_loaders(connection: &Connection) -> Result<VersionLo
     Ok(map)
 }
 
-fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary>> {
+/// The mod lists under `mod-lists/`, and the folders left out because their
+/// `rules.json` can't be read. Only a `mod-lists/` that can't be scanned at
+/// all is an error.
+fn load_modlist_summaries(
+    modlists_dir: &Path,
+) -> Result<(Vec<ShellModListSummary>, Vec<ShellUnreadableModList>)> {
     if !modlists_dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut summaries = Vec::new();
+    let mut unreadable = Vec::new();
 
     for entry in fs::read_dir(modlists_dir)
         .with_context(|| format!("failed to scan {}", modlists_dir.display()))?
@@ -382,7 +564,18 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
 
         let rules_path = path.join(RULES_FILENAME);
         if rules_path.exists() {
-            let modlist = ModList::read_from_file(&rules_path)?;
+            let modlist = match ModList::read_from_file(&rules_path) {
+                Ok(modlist) => modlist,
+                Err(error) => {
+                    let folder = entry.file_name().to_string_lossy().into_owned();
+                    eprintln!("[Shell] Skipping mod list '{folder}': {error:#}");
+                    unreadable.push(ShellUnreadableModList {
+                        folder,
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
             summaries.push(ShellModListSummary {
                 name: modlist.modlist_name,
                 description: modlist.description,
@@ -404,7 +597,8 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
     }
 
     summaries.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(summaries)
+    unreadable.sort_by(|left, right| left.folder.cmp(&right.folder));
+    Ok((summaries, unreadable))
 }
 
 fn load_active_account_summary_with_secret_store<S: SecretStore>(
@@ -469,6 +663,7 @@ fn shell_account(summary: AccountSummary) -> ShellAccount {
         credentials: summary.credentials.as_str().to_string(),
         credentials_detail,
         plays_offline: summary.plays_offline,
+        is_active: summary.is_active,
     }
 }
 
@@ -721,11 +916,12 @@ mod tests {
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     use super::{
-        account_profile_data_json, load_account_list_with_secret_store,
-        load_active_account_summary_with_secret_store, load_shell_snapshot_from_root,
-        save_global_settings, save_modlist_overrides, ShellGlobalSettingsInput,
-        ShellModListOverridesInput,
+        account_profile_data_json, active_account_plays_offline,
+        load_account_list_with_secret_store, load_active_account_summary_with_secret_store,
+        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
+        signed_in_as_another_account, ShellGlobalSettingsInput, ShellModListOverridesInput,
     };
+    use crate::launcher_paths::LauncherPaths;
 
     fn unique_test_root() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -1136,6 +1332,162 @@ mod tests {
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
+    #[test]
+    fn an_unreadable_rules_json_skips_that_mod_list_and_keeps_the_rest() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let good_root = root_dir.join("mod-lists").join("Good Pack");
+        let broken_root = root_dir.join("mod-lists").join("Broken Pack");
+        fs::create_dir_all(&good_root).expect("good modlist directory should exist");
+        fs::create_dir_all(&broken_root).expect("broken modlist directory should exist");
+        initialize_database(&database_path).expect("database should initialize");
+        ModList {
+            modlist_name: "Good Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: Vec::new(),
+        }
+        .write_to_file(&good_root.join("rules.json"))
+        .expect("good rules should write");
+        fs::write(broken_root.join("rules.json"), "{ not json").expect("broken rules should write");
+        let connection = Connection::open(&database_path).expect("database should open");
+        AccountsRepository::new(&connection)
+            .upsert_account(&AccountRecord {
+                microsoft_id: "account-a".into(),
+                xbox_gamertag: Some("PlayerA".into()),
+                minecraft_uuid: Some("uuid-a".into()),
+                access_token_enc: None,
+                refresh_token_enc: None,
+                profile_data: None,
+                is_active: true,
+                plays_offline: false,
+            })
+            .expect("account should insert");
+        drop(connection);
+
+        // Selecting the good one, as a launch of it does.
+        let snapshot = load_shell_snapshot_from_root(
+            &root_dir,
+            Some("Good Pack"),
+            MemorySecretStore::default(),
+        )
+        .expect("one broken mod list must not fail the snapshot");
+
+        let names: Vec<&str> = snapshot.modlists.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["Good Pack"]);
+        assert_eq!(snapshot.unreadable_modlists.len(), 1);
+        assert_eq!(snapshot.unreadable_modlists[0].folder, "Broken Pack");
+        assert!(!snapshot.unreadable_modlists[0].error.is_empty());
+        assert_eq!(
+            snapshot
+                .active_account
+                .as_ref()
+                .map(|account| account.microsoft_id.as_str()),
+            Some("account-a")
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn the_account_list_says_which_row_is_active() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        for (microsoft_id, is_active) in [("account-a", false), ("account-b", true)] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: None,
+                    minecraft_uuid: None,
+                    access_token_enc: None,
+                    refresh_token_enc: None,
+                    profile_data: None,
+                    is_active,
+                    plays_offline: false,
+                })
+                .expect("account should insert");
+        }
+
+        let list = load_account_list_with_secret_store(&connection, MemorySecretStore::default())
+            .expect("account list should load");
+        let flags: Vec<(&str, bool)> = list
+            .iter()
+            .map(|account| (account.microsoft_id.as_str(), account.is_active))
+            .collect();
+        assert_eq!(flags, vec![("account-b", true), ("account-a", false)]);
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn plays_offline_is_read_from_the_active_row_only() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let paths = LauncherPaths::new(root_dir.clone());
+        assert!(!active_account_plays_offline(&paths).expect("no account reads as online"));
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        for (microsoft_id, is_active) in [("offline-row", false), ("online-row", true)] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: None,
+                    minecraft_uuid: None,
+                    access_token_enc: None,
+                    refresh_token_enc: None,
+                    profile_data: None,
+                    is_active,
+                    plays_offline: false,
+                })
+                .expect("account should insert");
+        }
+        repository
+            .set_plays_offline("offline-row", true)
+            .expect("choice should save");
+        assert!(!active_account_plays_offline(&paths).expect("active row plays online"));
+
+        repository
+            .set_active_account("offline-row")
+            .expect("switch should work");
+        assert!(active_account_plays_offline(&paths).expect("active row plays offline"));
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn sign_in_again_with_another_microsoft_account_is_told_apart() {
+        // Same Microsoft id: the row's own account.
+        assert!(!signed_in_as_another_account(
+            "ms-a",
+            Some("uuid-a"),
+            "ms-a",
+            "uuid-a"
+        ));
+        // A row saved with the Minecraft UUID as its id, signed in again with
+        // the same player: still the same account.
+        assert!(!signed_in_as_another_account(
+            "0f1e2d3c-0000-0000-0000-000000000001",
+            Some("0f1e2d3c-0000-0000-0000-000000000001"),
+            "ms-a",
+            "0f1e2d3c000000000000000000000001"
+        ));
+        // Another player altogether.
+        assert!(signed_in_as_another_account(
+            "ms-a",
+            Some("uuid-a"),
+            "ms-b",
+            "uuid-b"
+        ));
+        assert!(signed_in_as_another_account("ms-a", None, "ms-b", "uuid-b"));
+    }
+
     #[test]
     fn save_global_settings_rejects_invalid_ram() {
         let connection = Connection::open_in_memory().expect("in-memory database should open");

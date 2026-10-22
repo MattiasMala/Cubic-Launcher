@@ -73,6 +73,7 @@ pub fn run() {
 
             app.manage(launcher_paths.clone());
             app.manage(skins::SkinsState::default());
+            app.manage(app_shell::MicrosoftLoginState::default());
 
             if launch_preview::automation_mode_enabled() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -93,6 +94,7 @@ pub fn run() {
             app_shell::load_shell_snapshot_command,
             app_shell::switch_active_account_command,
             app_shell::microsoft_login_command,
+            app_shell::cancel_microsoft_login_command,
             app_shell::delete_account_command,
             app_shell::list_accounts_command,
             app_shell::set_account_plays_offline_command,
