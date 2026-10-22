@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
@@ -12,21 +10,15 @@ use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
-    resolve_modlist_without, version_rules_conflict, AvailabilityFixpoint, FailureReason,
-    ModLoader, PinAliases, ResolutionResult, ResolutionTarget, RuleOutcome,
+    AvailabilityFixpoint, FailureReason, ModLoader, PinAliases, ResolutionResult, ResolutionTarget,
+    RuleOutcome,
 };
-use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
+use crate::rules::{ModList, ModSource, RULES_FILENAME};
 
 use super::{
     emit_launcher_issue, emit_log, load_cached_file_hashes_for_selected,
     probe_cached_mod_for_target, probe_cached_version_for_target, SelectedMod,
 };
-
-pub(super) struct TopLevelVersionCandidates {
-    selected_mod_id: String,
-    project_id: String,
-    candidates: Vec<ModrinthVersion>,
-}
 
 #[derive(Debug, Clone)]
 pub(super) enum RemoteArtifact {
@@ -579,50 +571,6 @@ pub(super) async fn versions_for_final_selection(
     Ok(lookup)
 }
 
-pub(super) async fn prefetch_ranked_versions_for_selected(
-    app_handle: &tauri::AppHandle,
-    selected_mods: &[SelectedMod],
-    client: &ModrinthClient,
-    target: &ResolutionTarget,
-) -> Result<HashMap<String, Vec<ModrinthVersion>>> {
-    let mut versions = HashMap::new();
-
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth)
-            || versions.contains_key(&selected.mod_id)
-        {
-            continue;
-        }
-
-        match client
-            .fetch_project_versions(&selected.mod_id, target)
-            .await
-        {
-            Ok(mut candidate_versions) => {
-                crate::modrinth::sort_versions_by_target_preference(
-                    &mut candidate_versions,
-                    target,
-                );
-                if !candidate_versions.is_empty() {
-                    versions.insert(selected.mod_id.clone(), candidate_versions);
-                }
-            }
-            Err(err) => {
-                let _ = emit_log(
-                    app_handle,
-                    ProcessLogStream::Stderr,
-                    format!(
-                        "[Launch] skipping mod '{}': failed to query Modrinth ({:#})",
-                        selected.mod_id, err
-                    ),
-                );
-            }
-        }
-    }
-
-    Ok(versions)
-}
-
 /// `unavailable` are the mods the availability pass disabled: their slot
 /// comes back `Disabled` like a rule the user switched off, and the log says
 /// which of the two it was (todo.md, «Una riga di log che mente»).
@@ -694,15 +642,6 @@ pub(super) fn collect_selected_mods(
     }
 
     selected
-}
-
-pub(super) fn remote_artifact_project_id(artifact: &RemoteArtifact) -> &str {
-    match artifact {
-        RemoteArtifact::Live(version) => &version.project_id,
-        RemoteArtifact::Cached(record) | RemoteArtifact::MissingJar(record) => {
-            &record.modrinth_project_id
-        }
-    }
 }
 
 /// The three artifact kinds as the three lists the download stage and the
@@ -1296,22 +1235,6 @@ where
         .collect()
 }
 
-/// Temporarily disable the mods with no available artifact and re-resolve, so
-/// alternatives get a chance. Nothing unavailable means the first resolution
-/// stands and no second resolution happens — the normal case.
-pub(super) fn reresolve_without_unavailable(
-    modlist: &ModList,
-    resolution: ResolutionResult,
-    unavailable: &[String],
-    target: &ResolutionTarget,
-) -> Result<ResolutionResult> {
-    if unavailable.is_empty() {
-        return Ok(resolution);
-    }
-
-    resolve_modlist_without(modlist, unavailable, target)
-}
-
 /// Why a mod is not in the launch.
 ///
 /// The first two are the availability pass itself, and they are two values and
@@ -1901,87 +1824,11 @@ pub(super) fn resolve_offline_selection(
     }))
 }
 
-pub(super) fn alt_viable_for_launch(
-    rule: &Rule,
-    active_mods: &HashSet<String>,
-    target: &ResolutionTarget,
-) -> bool {
-    if !rule.enabled {
-        return false;
-    }
-    if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
-        return false;
-    }
-    if rule.requires.iter().any(|id| !active_mods.contains(id)) {
-        return false;
-    }
-    !version_rules_conflict(&rule.version_rules, target)
-}
-
-pub(super) fn collect_resolved_parent_versions(
-    selected_mods: &[SelectedMod],
-    compatible_versions: &HashMap<String, Vec<ModrinthVersion>>,
-) -> Vec<ModrinthVersion> {
-    let mut versions = Vec::new();
-    let mut seen_projects = HashSet::new();
-
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth)
-            || !seen_projects.insert(selected.mod_id.clone())
-        {
-            continue;
-        }
-
-        // Skip mods that have no compatible version on Modrinth for this
-        // target — they were resolved by local rules but simply don't have
-        // a release for this MC version + loader.
-        if let Some(version) = compatible_versions
-            .get(&selected.mod_id)
-            .and_then(|versions| versions.first())
-        {
-            versions.push(version.clone());
-        }
-    }
-
-    versions
-}
-
-pub(super) fn collect_top_level_version_candidates(
-    selected_mods: &[SelectedMod],
-    compatible_versions: &HashMap<String, Vec<ModrinthVersion>>,
-) -> Vec<TopLevelVersionCandidates> {
-    let mut top_level_candidates = Vec::new();
-    let mut seen_selected_mod_ids = HashSet::new();
-
-    for selected in selected_mods {
-        if !matches!(selected.source, ModSource::Modrinth)
-            || !seen_selected_mod_ids.insert(selected.mod_id.clone())
-        {
-            continue;
-        }
-
-        let Some(candidates) = compatible_versions.get(&selected.mod_id) else {
-            continue;
-        };
-        let Some(first_candidate) = candidates.first() else {
-            continue;
-        };
-
-        top_level_candidates.push(TopLevelVersionCandidates {
-            selected_mod_id: selected.mod_id.clone(),
-            project_id: first_candidate.project_id.clone(),
-            candidates: candidates.clone(),
-        });
-    }
-
-    top_level_candidates
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::resolve_modlist;
-    use crate::rules::{VersionRule, VersionRuleKind};
+    use crate::resolver::{resolve_modlist, resolve_modlist_without};
+    use crate::rules::{Rule, VersionRule, VersionRuleKind};
 
     fn test_version(id: &str, date_published: &str) -> ModrinthVersion {
         test_version_with_channel(id, date_published, "release")
@@ -2625,7 +2472,7 @@ mod tests {
     //
     // The availability pass disables three different things and only one of
     // them is a loss, so these tests run the real pair — `resolve_modlist`
-    // then `reresolve_without_unavailable` — and check the decision against
+    // then `resolve_modlist_without` — and check the decision against
     // it. No network: the availability verdict is the `unavailable` list,
     // which is what the network would have produced.
 
@@ -2667,8 +2514,7 @@ mod tests {
             .map(|mod_id| (*mod_id).to_string())
             .collect::<Vec<_>>();
         let before = resolve_modlist(modlist, &target).expect("first resolution");
-        let after = reresolve_without_unavailable(modlist, before.clone(), &unavailable, &target)
-            .expect("re-resolution");
+        let after = resolve_modlist_without(modlist, &unavailable, &target).expect("re-resolution");
         let dropped = mods_dropped_without_replacement(&before, &after, &unavailable, &|_| {
             DropReason::NoVersionAndNoCachedJar
         });

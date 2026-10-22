@@ -392,16 +392,6 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
     Ok(())
 }
 
-// ── Version list ──────────────────────────────────────────────────────────────
-
-/// Returns `true` if `client.jar` for the given version is already in the cache.
-pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool {
-    launcher_paths
-        .mc_version_dir(version)
-        .join("client.jar")
-        .exists()
-}
-
 // ── Main public function ──────────────────────────────────────────────────────
 
 /// Ensures all Minecraft files for `minecraft_version` are present in the shared

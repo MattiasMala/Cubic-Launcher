@@ -359,15 +359,6 @@ impl ModrinthClient {
         Ok(filter_compatible_versions(&versions, target))
     }
 
-    pub async fn fetch_latest_compatible_version(
-        &self,
-        project_id: &str,
-        target: &ResolutionTarget,
-    ) -> Result<Option<ModrinthVersion>> {
-        let versions = self.fetch_project_versions(project_id, target).await?;
-        Ok(select_latest_compatible_version(&versions, target))
-    }
-
     /// Fetch versions for a content pack (resource pack, data pack, shader).
     /// Only filters by game version, not by loader.
     pub async fn fetch_content_pack_versions(
@@ -963,6 +954,9 @@ pub(crate) fn loader_affinity(version: &ModrinthVersion, target: &ResolutionTarg
     )
 }
 
+/// Filter plus preference order, the selection a launch makes from
+/// `fetch_project_versions`: kept for the tests that pin that order down.
+#[cfg(test)]
 pub fn select_latest_compatible_version(
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,

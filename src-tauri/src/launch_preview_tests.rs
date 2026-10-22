@@ -6,10 +6,10 @@ use crate::launch_command::{build_launch_command, split_argument_string, JavaLau
 use crate::modrinth::{ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
+use super::verification::automation_exit_code;
 use super::{
-    active_account_plays_offline, automation_exit_code, build_instance_root,
-    build_modded_classpath_entries, contained_loader_library_path, decrypt_launch_account,
-    embedded_min_java_requirement, fabric_dependency_predicates_match,
+    active_account_plays_offline, build_instance_root, build_modded_classpath_entries,
+    contained_loader_library_path, decrypt_launch_account, embedded_min_java_requirement,
     filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
     installed_java_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
     merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
@@ -1187,30 +1187,6 @@ fn tilde_minecraft_predicates_match_target_patch_line() {
     assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.6"));
     assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.9"));
     assert!(!minecraft_version_predicate_matches("~1.21.6", "1.22.0"));
-}
-
-#[test]
-fn fabric_dependency_predicates_match_semver_ranges() {
-    assert!(fabric_dependency_predicates_match(
-        &["<7.0.0".into()],
-        "6.2.9"
-    ));
-    assert!(fabric_dependency_predicates_match(
-        &[">=17.0.6".into()],
-        "17.0.6"
-    ));
-    assert!(!fabric_dependency_predicates_match(
-        &["<3.0.0".into()],
-        "3.0.0"
-    ));
-    assert!(fabric_dependency_predicates_match(
-        &["<1.8.0".into()],
-        "1.8.0-beta.4+mc1.21.1"
-    ));
-    assert!(!fabric_dependency_predicates_match(
-        &[">=1.8.0".into()],
-        "1.8.0-beta.4+mc1.21.1"
-    ));
 }
 
 // ── Automation entry-point (env → full verification) ────────────────────────

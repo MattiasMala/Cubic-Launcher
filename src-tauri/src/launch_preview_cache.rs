@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 // Cache and artifact helpers for the launch pipeline.
 //
 // A launch that resolves versions online and one that launches from a version
@@ -33,40 +31,10 @@ use super::{
     SelectedMod,
 };
 
-pub(super) fn load_cached_mod_record_for_target(
-    launcher_paths: &LauncherPaths,
-    project_id: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModCacheRecord>> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_compatible_by_project_or_alias(project_id, target)
-}
-
-pub(super) fn load_cached_mod_record_by_version(
-    launcher_paths: &LauncherPaths,
-    version_id: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModCacheRecord>> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_by_version_id(version_id, target)
-}
-
-/// `load_cached_mod_record_for_target` plus the answer it cannot give: whether
-/// a mod with no usable artifact was never cached, or is registered and lost
-/// its jar. The version `instance` holds comes first (D147); an empty one
-/// leaves the project's answer, which is what the availability passes want.
+/// The cached record of a project on this target, plus whether a mod with no
+/// usable artifact was never cached or is registered and lost its jar. The
+/// version `instance` holds comes first (D147); an empty one leaves the
+/// project's answer, which is what the availability passes want.
 pub(super) fn probe_cached_mod_for_target(
     launcher_paths: &LauncherPaths,
     project_id: &str,
@@ -129,7 +97,7 @@ pub(super) fn probe_cached_version_for_target(
 /// One cache column per selected Modrinth mod, on this target, keyed by the mod
 /// id used in the rules.
 ///
-/// One connection for the whole pass, unlike `load_cached_mod_record_for_target`
+/// One connection for the whole pass, unlike `probe_cached_mod_for_target`
 /// which opens one per mod. Mods with no row — or a row whose column is unusable
 /// — are simply absent from the map.
 fn load_cached_column_for_selected<Lookup>(

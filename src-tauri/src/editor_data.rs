@@ -98,14 +98,6 @@ pub fn save_incompatibilities_command(
 }
 
 #[tauri::command]
-pub fn save_rule_advanced_command(
-    launcher_paths: State<'_, LauncherPaths>,
-    input: SaveRuleAdvancedInput,
-) -> Result<(), String> {
-    save_rule_advanced_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn save_advanced_batch_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveAdvancedBatchInput,

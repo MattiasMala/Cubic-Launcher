@@ -55,9 +55,9 @@ pub fn maybe_start_automation_verifier(
 
     tauri::async_runtime::spawn(async move {
         append_automation_trace(&launcher_paths, "automation task started");
-        // Route through the SAME verification path as verify_launch_command, so
-        // the env entry-point observes the launch (timeout/successAfter/terminate*)
-        // and emits a full LaunchVerificationResult with the 5 states.
+        // Route through the full verification path, so the env entry-point
+        // observes the launch (timeout/successAfter/terminate*) and emits a
+        // full LaunchVerificationResult with the 5 states.
         let verification =
             run_launch_verification(app_handle.clone(), launcher_paths.clone(), request).await;
 

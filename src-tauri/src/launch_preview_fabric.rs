@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-
-use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
@@ -8,8 +5,6 @@ use anyhow::{Context, Result};
 
 use crate::instance_mods::CachedModJar;
 use crate::resolver::{ModLoader, ResolutionTarget};
-
-use super::compare_fabric_dependency_versions;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EmbeddedFabricRequirementSet {
@@ -21,71 +16,6 @@ pub(super) struct EmbeddedFabricRequirementSet {
 pub(super) struct EmbeddedFabricRequirements {
     pub(super) root_entry: Option<EmbeddedFabricRequirementSet>,
     pub(super) entries: Vec<EmbeddedFabricRequirementSet>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct EmbeddedFabricModMetadata {
-    pub(super) mod_id: String,
-    pub(super) version: String,
-    pub(super) provides: Vec<String>,
-    pub(super) depends: HashMap<String, Vec<String>>,
-    pub(super) breaks: HashMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OwnedEmbeddedFabricModMetadata {
-    pub(super) owner_project_id: String,
-    pub(super) metadata: EmbeddedFabricModMetadata,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FabricValidationIssue {
-    pub(super) reason_code: &'static str,
-    pub(super) owner_project_id: String,
-    pub(super) mod_id: String,
-    pub(super) dependency_id: Option<String>,
-    pub(super) detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FabricIssueRetryState {
-    pub(super) signature: String,
-    pub(super) consecutive_attempts: usize,
-}
-
-pub(super) fn fabric_issue_signature(issue: &FabricValidationIssue) -> String {
-    format!(
-        "{}|{}|{}|{}",
-        issue.reason_code,
-        issue.owner_project_id,
-        issue.mod_id,
-        issue.dependency_id.as_deref().unwrap_or("-"),
-    )
-}
-
-pub(super) fn fabric_issue_reason_priority(reason_code: &str) -> u8 {
-    match reason_code {
-        "exact_dependency_conflict" => 0,
-        "breaks_conflict" => 1,
-        "incompatible_dependency_version" => 2,
-        "missing_dependency" => 3,
-        "embedded_version_incompatible" => 4,
-        _ => 10,
-    }
-}
-
-pub(super) fn choose_primary_fabric_issue(
-    issues: &HashMap<String, FabricValidationIssue>,
-) -> Option<(&String, &FabricValidationIssue)> {
-    let mut entries = issues.iter().collect::<Vec<_>>();
-    entries.sort_by(
-        |(left_project_id, left_issue), (right_project_id, right_issue)| {
-            fabric_issue_reason_priority(left_issue.reason_code)
-                .cmp(&fabric_issue_reason_priority(right_issue.reason_code))
-                .then_with(|| left_project_id.cmp(right_project_id))
-        },
-    );
-    entries.into_iter().next()
 }
 
 pub(super) fn required_java_for_cached_mod_jars(jars: &[CachedModJar]) -> Result<u32> {
@@ -120,90 +50,6 @@ pub(super) fn read_embedded_fabric_requirements(
         .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
 
     read_embedded_fabric_requirements_from_archive(&mut archive, &jar_path.display().to_string())
-}
-
-pub(super) fn read_embedded_fabric_mod_metadata(
-    jar_path: &Path,
-) -> Result<Vec<EmbeddedFabricModMetadata>> {
-    let file = std::fs::File::open(jar_path)
-        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
-
-    read_embedded_fabric_mod_metadata_from_archive(&mut archive, &jar_path.display().to_string())
-}
-
-pub(super) fn read_root_fabric_mod_metadata(
-    jar_path: &Path,
-) -> Result<Option<EmbeddedFabricModMetadata>> {
-    let file = std::fs::File::open(jar_path)
-        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
-    let metadata =
-        match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())? {
-            Some(metadata) => metadata,
-            None => return Ok(None),
-        };
-
-    Ok(fabric_mod_metadata_from_json(&metadata))
-}
-
-pub(super) fn read_root_fabric_provided_ids(jar_path: &Path) -> Result<HashSet<String>> {
-    let file = std::fs::File::open(jar_path)
-        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
-    let metadata =
-        match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())? {
-            Some(metadata) => metadata,
-            None => return Ok(HashSet::new()),
-        };
-
-    Ok(fabric_mod_metadata_from_json(&metadata)
-        .map(|entry| provided_ids_for_metadata(&entry))
-        .unwrap_or_default())
-}
-
-pub(super) fn read_bundled_fabric_provided_ids(jar_path: &Path) -> Result<HashSet<String>> {
-    let file = std::fs::File::open(jar_path)
-        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
-    let metadata =
-        match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())? {
-            Some(metadata) => metadata,
-            None => return Ok(HashSet::new()),
-        };
-
-    let mut provided_ids = HashSet::new();
-    for nested_path in nested_fabric_jar_paths(&metadata) {
-        let mut nested_bytes = Vec::new();
-        let read_nested = {
-            let mut nested_file = match archive.by_name(&nested_path) {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
-            nested_file.read_to_end(&mut nested_bytes).is_ok()
-        };
-        if !read_nested {
-            continue;
-        }
-
-        let mut nested_archive = match zip::ZipArchive::new(Cursor::new(nested_bytes)) {
-            Ok(archive) => archive,
-            Err(_) => continue,
-        };
-        let nested_entries = read_embedded_fabric_mod_metadata_from_archive(
-            &mut nested_archive,
-            &format!("{}!{nested_path}", jar_path.display()),
-        )?;
-        for entry in nested_entries {
-            provided_ids.extend(provided_ids_for_metadata(&entry));
-        }
-    }
-
-    Ok(provided_ids)
 }
 
 fn read_embedded_fabric_requirements_from_archive<R: Read + Seek>(
@@ -247,52 +93,11 @@ fn read_embedded_fabric_requirements_from_archive<R: Read + Seek>(
     Ok(requirements)
 }
 
-fn read_embedded_fabric_mod_metadata_from_archive<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    source: &str,
-) -> Result<Vec<EmbeddedFabricModMetadata>> {
-    let metadata = match read_embedded_fabric_metadata(archive, source)? {
-        Some(metadata) => metadata,
-        None => return Ok(Vec::new()),
-    };
-
-    let mut entries = fabric_mod_metadata_from_json(&metadata)
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    for nested_path in nested_fabric_jar_paths(&metadata) {
-        let mut nested_bytes = Vec::new();
-        let read_nested = {
-            let mut nested_file = match archive.by_name(&nested_path) {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
-            nested_file.read_to_end(&mut nested_bytes).is_ok()
-        };
-        if !read_nested {
-            continue;
-        }
-
-        let mut nested_archive = match zip::ZipArchive::new(Cursor::new(nested_bytes)) {
-            Ok(archive) => archive,
-            Err(_) => continue,
-        };
-        let nested_entries = read_embedded_fabric_mod_metadata_from_archive(
-            &mut nested_archive,
-            &format!("{source}!{nested_path}"),
-        )?;
-        entries.extend(nested_entries);
-    }
-
-    Ok(entries)
-}
-
 /// The root `fabric.mod.json` of an already-open archive, if it has one.
 ///
 /// `pub(crate)` for [`crate::mod_icons`]: the icon of a local mod jar comes
-/// from the **root** entry, so the nested-jar recursion in
-/// [`read_embedded_fabric_mod_metadata_from_archive`] would answer with a
-/// bundled mod's icon. Taking the archive by reference is what lets the caller
+/// from the **root** entry, so a reader that recursed into the nested jars
+/// would answer with a bundled mod's icon. Taking the archive by reference is what lets the caller
 /// read `fabric.mod.json` and `META-INF/*.mods.toml` from one open handle.
 pub(crate) fn read_embedded_fabric_metadata<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
@@ -311,49 +116,6 @@ pub(crate) fn read_embedded_fabric_metadata<R: Read + Seek>(
     Ok(serde_json::from_str(&metadata).ok())
 }
 
-fn fabric_mod_metadata_from_json(
-    metadata: &serde_json::Value,
-) -> Option<EmbeddedFabricModMetadata> {
-    let mod_id = metadata
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let version = metadata
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("*")
-        .to_string();
-
-    let mut provides = metadata
-        .get("provides")
-        .map(json_predicates_to_strings)
-        .unwrap_or_default();
-    provides.retain(|value| !value.trim().is_empty() && value != &mod_id);
-    provides.sort();
-    provides.dedup();
-
-    Some(EmbeddedFabricModMetadata {
-        mod_id,
-        version,
-        provides,
-        depends: fabric_dependency_map_from_json(metadata, "depends"),
-        breaks: fabric_dependency_map_from_json(metadata, "breaks"),
-    })
-}
-
-pub(super) fn provided_ids_for_metadata(metadata: &EmbeddedFabricModMetadata) -> HashSet<String> {
-    let mut provided_ids = HashSet::new();
-    if !metadata.mod_id.trim().is_empty() {
-        provided_ids.insert(metadata.mod_id.clone());
-    }
-    provided_ids.extend(metadata.provides.iter().cloned());
-    provided_ids
-}
-
 fn requirement_set_from_metadata(metadata: &serde_json::Value) -> EmbeddedFabricRequirementSet {
     let depends = metadata
         .get("depends")
@@ -369,35 +131,6 @@ fn requirement_set_from_metadata(metadata: &serde_json::Value) -> EmbeddedFabric
             .map(json_predicates_to_strings)
             .unwrap_or_default(),
     }
-}
-
-fn fabric_dependency_map_from_json(
-    metadata: &serde_json::Value,
-    key: &str,
-) -> HashMap<String, Vec<String>> {
-    let mut dependency_map = metadata
-        .get(key)
-        .and_then(serde_json::Value::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|(dependency_id, predicates)| {
-                    let dependency_id = dependency_id.trim();
-                    if dependency_id.is_empty() {
-                        return None;
-                    }
-
-                    Some((
-                        dependency_id.to_string(),
-                        json_predicates_to_strings(predicates),
-                    ))
-                })
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
-
-    dependency_map.retain(|dependency_id, _| !dependency_id.trim().is_empty());
-    dependency_map
 }
 
 fn nested_fabric_jar_paths(metadata: &serde_json::Value) -> Vec<String> {
@@ -592,76 +325,6 @@ pub(super) fn minimum_java_version_for_predicate(predicate: &str) -> Option<u32>
         .filter(|branch| !branch.is_empty())
         .filter_map(minimum_java_version_for_branch)
         .min()
-}
-
-pub(super) fn fabric_dependency_predicates_match(predicates: &[String], concrete: &str) -> bool {
-    predicates.is_empty()
-        || predicates
-            .iter()
-            .any(|predicate| fabric_dependency_predicate_matches(predicate, concrete))
-}
-
-fn fabric_dependency_predicate_matches(predicate: &str, concrete: &str) -> bool {
-    let predicate = predicate.trim();
-    if predicate.is_empty() || predicate == "*" {
-        return true;
-    }
-
-    predicate
-        .split("||")
-        .map(str::trim)
-        .filter(|branch| !branch.is_empty())
-        .any(|branch| {
-            branch
-                .replace(',', " ")
-                .split_whitespace()
-                .all(|token| fabric_dependency_token_matches(token, concrete))
-        })
-}
-
-fn fabric_dependency_token_matches(token: &str, concrete: &str) -> bool {
-    let token = token.trim();
-    if token.is_empty() || token == "*" {
-        return true;
-    }
-
-    for (prefix, ordering) in [
-        (">=", Some(std::cmp::Ordering::Greater)),
-        ("<=", Some(std::cmp::Ordering::Less)),
-        (">", Some(std::cmp::Ordering::Greater)),
-        ("<", Some(std::cmp::Ordering::Less)),
-        ("=", None),
-    ] {
-        if let Some(expected) = token.strip_prefix(prefix) {
-            let expected = expected.trim();
-            let Some(actual_ordering) = compare_fabric_dependency_versions(concrete, expected)
-            else {
-                return concrete.eq_ignore_ascii_case(expected);
-            };
-            return match (prefix, ordering) {
-                (">=", Some(std::cmp::Ordering::Greater)) => {
-                    actual_ordering == std::cmp::Ordering::Greater
-                        || actual_ordering == std::cmp::Ordering::Equal
-                }
-                ("<=", Some(std::cmp::Ordering::Less)) => {
-                    actual_ordering == std::cmp::Ordering::Less
-                        || actual_ordering == std::cmp::Ordering::Equal
-                }
-                (">", Some(std::cmp::Ordering::Greater)) => {
-                    actual_ordering == std::cmp::Ordering::Greater
-                }
-                ("<", Some(std::cmp::Ordering::Less)) => {
-                    actual_ordering == std::cmp::Ordering::Less
-                }
-                ("=", None) => actual_ordering == std::cmp::Ordering::Equal,
-                _ => true,
-            };
-        }
-    }
-
-    compare_fabric_dependency_versions(concrete, token)
-        .is_some_and(|ordering| ordering == std::cmp::Ordering::Equal)
-        || concrete.eq_ignore_ascii_case(token)
 }
 
 fn minimum_java_version_for_branch(branch: &str) -> Option<u32> {

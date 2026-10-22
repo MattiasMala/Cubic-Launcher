@@ -804,15 +804,6 @@ pub fn apply_options(
     ))
 }
 
-#[tauri::command]
-pub async fn derive_option_keys_command(
-    launcher_paths: State<'_, LauncherPaths>,
-    version_id: String,
-) -> Result<VanillaOptionKeys, String> {
-    let launcher_paths = launcher_paths.inner().clone();
-    off_main_thread(move || load_or_derive(&launcher_paths, &version_id)).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

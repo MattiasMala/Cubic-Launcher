@@ -36,6 +36,8 @@ impl LoaderMetadataClient {
         }
     }
 
+    /// Test seam: the same client against local servers.
+    #[cfg(test)]
     pub fn with_base_urls(
         fabric_base_url: impl Into<String>,
         quilt_base_url: impl Into<String>,

@@ -32,10 +32,6 @@ use std::path::Path;
 pub(crate) mod fabric;
 use fabric::*;
 
-#[path = "launch_preview_fabric_versions.rs"]
-mod fabric_versions;
-use fabric_versions::*;
-
 #[path = "launch_preview_artifacts.rs"]
 mod artifacts;
 use artifacts::*;
@@ -65,7 +61,6 @@ use logging::*;
 
 #[path = "launch_preview_verification.rs"]
 mod verification;
-use verification::*;
 pub use verification::{automation_mode_enabled, maybe_start_automation_verifier};
 
 #[path = "launch_preview_content.rs"]
@@ -118,17 +113,6 @@ pub fn start_launch_command(
     });
 
     Ok(())
-}
-
-#[tauri::command]
-pub async fn verify_launch_command(
-    app_handle: tauri::AppHandle,
-    launcher_paths: State<'_, LauncherPaths>,
-    request: LaunchVerificationRequest,
-) -> Result<LaunchVerificationResult, String> {
-    run_launch_verification(app_handle, launcher_paths.inner().clone(), request)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 /// The pre-check the frontend calls before a launch: what would be updated,
