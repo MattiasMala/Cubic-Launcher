@@ -72,6 +72,18 @@ export function ContentTabView(props: ContentTabViewProps) {
         </header>
       </Show>
 
+      {/* D144: data packs are linked into every world at launch, so a world
+          made in game only has them from the launch after. */}
+      <Show when={props.type === "datapack"}>
+        <div class="px-6 py-2 border-b border-borderColor shrink-0 flex items-center gap-2 text-xs text-muted-foreground">
+          <MaterialIcon name="info" size="sm" />
+          <span>
+            Data packs are added to every world of the instance each time you press Play. A world you
+            create in game receives them from the next launch.
+          </span>
+        </div>
+      </Show>
+
       <div class="flex-1 p-4" style={{ overflow: "auto" }}>
         <Show when={state.entries().length > 0} fallback={
           <div class="flex flex-col items-center justify-center py-16 text-center">

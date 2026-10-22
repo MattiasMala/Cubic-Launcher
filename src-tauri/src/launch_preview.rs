@@ -688,30 +688,21 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // Download and install content packs (resource packs, data packs, shaders),
     // at the versions the pre-check named when it named any (D58).
     //
-    // D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
-    // Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
-    // i file del lancio precedente. Il lookup fallito lasciava già lo stesso
-    // risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
-    // funzionante un account offline si vedeva aggiornare i pack.
-    if plays_offline {
-        emit_log(
-            &app_handle,
-            ProcessLogStream::Stdout,
-            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
-        )?;
-    } else {
-        resolve_and_install_content_packs(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &modrinth_client,
-            &modlist_name,
-            &target,
-            &instance_root,
-            request.resolved_content.as_ref(),
-        )
-        .await?;
-    }
+    // D-c (onda 8a), D157: con l'account offline i pack Modrinth non si
+    // cercano né si installano, quelli locali sì; la condizione vive dentro
+    // `resolve_and_install_content_packs`.
+    resolve_and_install_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &modrinth_client,
+        &modlist_name,
+        &target,
+        &instance_root,
+        request.resolved_content.as_ref(),
+        plays_offline,
+    )
+    .await?;
 
     let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
     let mut loader_library_paths =

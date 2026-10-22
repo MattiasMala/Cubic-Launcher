@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::content_packs::{load_content_list, ContentEntry, ContentList};
 use crate::launcher_paths::LauncherPaths;
-use crate::local_content_packs::{link_local_pack, plan_local_pack_installs, PackLinkOutcome};
+use crate::local_content_packs::{link_local_pack_as, plan_local_pack_installs, PackLinkOutcome};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
@@ -14,8 +14,8 @@ use crate::rules::VersionRuleKind;
 
 use super::{download_file, emit_log, select_preferred_version};
 
-/// The three content categories, each with the instance subdirectory its packs
-/// are linked into.
+/// The three content categories, each with the subdirectory its packs are
+/// linked into: of the instance, or for data packs of each world (D144).
 ///
 /// One list because the pre-check keys [`ResolvedContentVersions`] by the
 /// category string and the launch looks its own entries up by that same
@@ -26,8 +26,8 @@ pub(super) const CONTENT_CATEGORIES: [(&str, &str); 3] = [
     ("datapack", "datapacks"),
 ];
 
-/// The category the loop below does not install: data packs go to one
-/// top-level directory, through [`install_datapacks`].
+/// The category the loop below does not install: data packs go into every
+/// world of the instance, through [`install_datapacks`] (D144).
 pub(super) const DATAPACK_CATEGORY: &str = "datapack";
 
 /// `category → (entry id → Modrinth version id)`: the content-pack half of what
@@ -267,7 +267,8 @@ pub(super) struct ContentEntryResolution {
 ///
 /// The pre-checked version wins whenever the map names one that Modrinth still
 /// returns; everything else is resolved exactly as a launch without a
-/// pre-check does, with the same preference the mods use (D56).
+/// pre-check does, with the same preference the mods use (D56), among the
+/// versions that are packs of the category (contentpack-8).
 pub(super) async fn resolve_content_entry_versions(
     modrinth_client: &ModrinthClient,
     plan: &ContentPackPlan<'_>,
@@ -278,7 +279,13 @@ pub(super) async fn resolve_content_entry_versions(
     let mut resolutions = Vec::with_capacity(entry_ids.len());
 
     for entry_id in entry_ids {
-        if let Some(version) = plan.version_for(category, entry_id) {
+        // contentpack-8: a named version that is not a pack of this category
+        // — a `.jar` an older launch installed, kept by a "Skip" — is not
+        // installed; the entry is resolved again among its own packs.
+        if let Some(version) = plan
+            .version_for(category, entry_id)
+            .filter(|version| version_fits_category(category, version))
+        {
             resolutions.push(ContentEntryResolution {
                 entry_id: (*entry_id).to_string(),
                 version: Some(version.clone()),
@@ -294,7 +301,7 @@ pub(super) async fn resolve_content_entry_versions(
         {
             Ok(versions) => ContentEntryResolution {
                 entry_id: (*entry_id).to_string(),
-                version: select_preferred_version(versions),
+                version: select_preferred_version(versions_for_category(category, versions)),
                 lookup_error: None,
                 preresolved: false,
             },
@@ -311,36 +318,113 @@ pub(super) async fn resolve_content_entry_versions(
     resolutions
 }
 
-/// Link the `source: "local"` entries of one category into the instance, and
-/// return the names that reached it.
+/// Where the linking steps write their launch-log lines: `emit_log` in the
+/// launch, a vector in the tests, which have no `tauri::AppHandle`.
+pub(super) type ContentLog<'a> = dyn FnMut(ProcessLogStream, String) -> Result<()> + 'a;
+
+/// One pack this launch links, after every decision and download: what the
+/// per-directory linking needs and nothing else.
 ///
-/// Those names are the point of this function: they go into the set
-/// [`crate::instance_content::sync_managed_content_dir`] compares the previous
-/// manifest against. A pack that is linked but left out of that set is removed
-/// on the *next* launch — the wipe C1 closed, reappearing in a form that takes
-/// two launches to notice.
+/// Pulled out of the linking so that data packs can be prepared once and
+/// linked into every world (D144): the lookups and the downloads happen once
+/// per launch, the links once per directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreparedPack {
+    /// The name the pack gets in the target directory.
+    pub(super) file_name: String,
+    pub(super) source: PreparedPackSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PreparedPackSource {
+    /// A `source: "local"` pack, file or folder, inside the mod list.
+    Local { source_path: PathBuf },
+    /// A Modrinth pack in the cache, with the identity the manifest records.
+    Modrinth {
+        entry_id: String,
+        version_id: String,
+        cached_path: PathBuf,
+        was_cached: bool,
+    },
+}
+
+/// Every pack of one category this launch links, and whether that list is
+/// the whole answer.
+#[derive(Debug)]
+pub(super) struct PreparedCategory {
+    pub(super) packs: Vec<PreparedPack>,
+    /// `false` when at least one Modrinth entry is unknown: a failed lookup,
+    /// or an account that plays offline (D157). Nothing may be removed then.
+    pub(super) lookups_complete: bool,
+}
+
+/// The Modrinth loaders a category's versions are published under
+/// (contentpack-8).
 ///
-/// A missing file is an answer, not a failure: it is logged and does not freeze
-/// the category's removals, because we know exactly which pack is gone. Nothing
-/// here touches the network.
-fn install_local_content_packs(
+/// A project can publish a data pack and a mod under one slug — Terralith
+/// does — and the version list asked by game version alone holds both. Picked
+/// by channel and date, the mod's `.jar` won and was linked as a data pack.
+pub(super) fn category_loaders(category: &str) -> &'static [&'static str] {
+    match category {
+        "datapack" => &["datapack"],
+        "resourcepack" => &["minecraft"],
+        "shader" => &["iris", "optifine", "canvas", "vanilla"],
+        _ => &[],
+    }
+}
+
+/// Whether a Modrinth version is a pack of this category: published under one
+/// of its loaders, and not a `.jar`, which no pack directory can load.
+pub(super) fn version_fits_category(category: &str, version: &ModrinthVersion) -> bool {
+    let loaders = category_loaders(category);
+    let loader_fits = version.loaders.iter().any(|loader| {
+        loaders
+            .iter()
+            .any(|wanted| loader.eq_ignore_ascii_case(wanted))
+    });
+    let is_jar = version
+        .primary_file()
+        .is_some_and(|file| file.filename.to_ascii_lowercase().ends_with(".jar"));
+    loader_fits && !is_jar
+}
+
+/// The versions of a list that belong to the category, in their order: the
+/// filter both the launch and the pre-check apply before choosing.
+pub(super) fn versions_for_category(
+    category: &str,
+    versions: Vec<ModrinthVersion>,
+) -> Vec<ModrinthVersion> {
+    versions
+        .into_iter()
+        .filter(|version| version_fits_category(category, version))
+        .collect()
+}
+
+/// Resolve and download one category's packs, local and Modrinth, without
+/// linking anything yet.
+// Dieci input distinti di un passo del lancio, gli stessi delle due funzioni
+// che la chiamano: il lint è sospeso solo qui, come lì (D120).
+#[allow(clippy::too_many_arguments)]
+async fn prepare_category_packs(
     app_handle: &tauri::AppHandle,
+    http_client: &reqwest::Client,
+    modrinth_client: &ModrinthClient,
+    plan: &ContentPackPlan<'_>,
     modlist_dir: &Path,
+    cache_dir: &Path,
     content_type: &str,
-    instance_root: &Path,
-    instance_subdir: &str,
-    instance_dir: &Path,
+    mc_version: &str,
     active_entries: &[&ContentEntry],
-) -> Result<Vec<String>> {
-    let mut installed = Vec::new();
+    plays_offline: bool,
+) -> Result<PreparedCategory> {
+    let mut prepared = PreparedCategory {
+        packs: Vec::new(),
+        lookups_complete: true,
+    };
 
-    // What the last launch says it put here. It decides one thing only: whether
-    // a real directory or a real file already under a pack's name may be
-    // replaced. Without it the install would delete what the user put there.
-    let previous = crate::instance_content::read_manifest_files(
-        &crate::instance_content::manifest_path(instance_root, instance_subdir),
-    );
-
+    // A missing file is an answer, not a failure: it is logged and does not
+    // freeze the category's removals, because we know exactly which pack is
+    // gone. Nothing here touches the network.
     for pack in plan_local_pack_installs(modlist_dir, content_type, active_entries) {
         if !pack.present {
             emit_log(
@@ -354,56 +438,253 @@ fn install_local_content_packs(
             )?;
             continue;
         }
+        prepared.packs.push(PreparedPack {
+            file_name: pack.file_name,
+            source: PreparedPackSource::Local {
+                source_path: pack.source_path,
+            },
+        });
+    }
 
-        let target_path = instance_dir.join(&pack.file_name);
-        let target_is_ours = previous.iter().any(|name| name == &pack.file_name);
-        let outcome = link_local_pack(&pack.source_path, &target_path, target_is_ours)
-            .with_context(|| {
-                format!(
-                    "failed to install local content pack '{}' into instance",
-                    pack.file_name
-                )
-            })?;
-
-        let how = match outcome {
-            PackLinkOutcome::Linked => "",
-            // Not silent: a copied folder is a second set of bytes on disk, and
-            // whoever reads the log has to be able to tell why.
-            PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
-            PackLinkOutcome::SkippedForeignDirectory | PackLinkOutcome::SkippedForeignFile => {
-                // Left out of `installed` on purpose: the name is not in the
-                // manifest, so the sync will not remove it either, and what the
-                // user put there stays exactly as it is.
-                let what = if outcome == PackLinkOutcome::SkippedForeignFile {
-                    "a file"
-                } else {
-                    "a directory"
-                };
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Content] Skipped local pack '{}': {} is {what} the launcher did not create",
-                        pack.file_name,
-                        target_path.display()
-                    ),
-                )?;
-                continue;
-            }
-        };
-
-        if !installed.iter().any(|name| name == &pack.file_name) {
-            installed.push(pack.file_name.clone());
-        }
-
+    for entry in active_entries
+        .iter()
+        .filter(|entry| entry.source != "modrinth" && entry.source != "local")
+    {
+        // The old code skipped everything non-Modrinth without a word, so a
+        // typo in `source` looked like an empty list.
         emit_log(
             app_handle,
             ProcessLogStream::Stdout,
-            format!("[Content] {} -> {}{}", pack.file_name, instance_subdir, how),
+            format!(
+                "[Content] Skipping '{}': unknown source '{}'",
+                entry.id, entry.source
+            ),
         )?;
     }
 
+    let modrinth_entry_ids: Vec<&str> = active_entries
+        .iter()
+        .filter(|entry| entry.source == "modrinth")
+        .map(|entry| entry.id.as_str())
+        .collect();
+
+    // D157: with the account offline the local packs above are installed all
+    // the same; only the Modrinth entries are not looked up. What they linked
+    // last time is unknown to this launch, so it stays where it is.
+    if plays_offline {
+        if !modrinth_entry_ids.is_empty() {
+            prepared.lookups_complete = false;
+        }
+        return Ok(prepared);
+    }
+
+    for resolution in resolve_content_entry_versions(
+        modrinth_client,
+        plan,
+        content_type,
+        mc_version,
+        &modrinth_entry_ids,
+    )
+    .await
+    {
+        let entry_id = resolution.entry_id;
+        if let Some(error) = resolution.lookup_error {
+            // Not an answer: we do not know which file this entry wants, so
+            // nothing may be removed on this pass.
+            prepared.lookups_complete = false;
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!("[Content] Failed to fetch versions for '{entry_id}': {error}"),
+            )?;
+            continue;
+        }
+
+        let Some(version) = resolution.version else {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!("[Content] No compatible version found for '{entry_id}' on {mc_version}"),
+            )?;
+            continue;
+        };
+        let Some(file) = version.primary_file() else {
+            continue;
+        };
+
+        let (cached_path, was_cached) = ensure_content_pack_cached(
+            http_client,
+            cache_dir,
+            &version.id,
+            &file.filename,
+            &file.url,
+            || {
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!("[Content] Downloading {} ({})", entry_id, file.filename),
+                )
+            },
+        )
+        .await
+        .with_context(|| format!("failed to download content pack '{entry_id}'"))?;
+
+        prepared.packs.push(PreparedPack {
+            file_name: file.filename.clone(),
+            source: PreparedPackSource::Modrinth {
+                entry_id,
+                version_id: version.id.clone(),
+                cached_path,
+                was_cached,
+            },
+        });
+    }
+
+    Ok(prepared)
+}
+
+/// Link prepared packs into one directory, applying the manifest rule on the
+/// way in (D1), and return what reached it.
+///
+/// What is returned is the point of this function: it is the set
+/// [`crate::instance_content::sync_managed_content`] compares the previous
+/// manifest against, with the origin of every Modrinth file. A pack that is
+/// linked but left out of that set is removed on the *next* launch — the wipe
+/// C1 closed, reappearing in a form that takes two launches to notice.
+///
+/// `label` is how the log names the directory (`resourcepacks`,
+/// `saves/<world>/datapacks`).
+pub(super) fn link_prepared_packs(
+    log: &mut ContentLog<'_>,
+    packs: &[PreparedPack],
+    target_dir: &Path,
+    previous: &crate::instance_content::PreviousContent,
+    label: &str,
+    kind: crate::instance_content::LinkKind,
+) -> Result<crate::instance_content::InstalledContent> {
+    let mut installed = crate::instance_content::InstalledContent::default();
+
+    if !packs.is_empty() {
+        std::fs::create_dir_all(target_dir)
+            .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    }
+
+    for pack in packs {
+        let target_path = target_dir.join(&pack.file_name);
+        let target_is_ours = previous.owns(&pack.file_name);
+
+        match &pack.source {
+            PreparedPackSource::Local { source_path } => {
+                let outcome = link_local_pack_as(source_path, &target_path, target_is_ours, kind)
+                    .with_context(|| {
+                    format!(
+                        "failed to install local content pack '{}' into {label}",
+                        pack.file_name
+                    )
+                })?;
+
+                let how = match outcome {
+                    PackLinkOutcome::Linked => "",
+                    // Not silent: a copied folder is a second set of bytes on
+                    // disk, and whoever reads the log has to be able to tell why.
+                    PackLinkOutcome::Copied
+                        if kind == crate::instance_content::LinkKind::NoSymlink =>
+                    {
+                        " (copied: a world cannot hold a link to a folder)"
+                    }
+                    PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
+                    PackLinkOutcome::SkippedForeignDirectory
+                    | PackLinkOutcome::SkippedForeignFile => {
+                        // Left out of `installed` on purpose: the name is not in
+                        // the manifest, so the sync will not remove it either,
+                        // and what the user put there stays exactly as it is.
+                        let what = if outcome == PackLinkOutcome::SkippedForeignFile {
+                            "a file"
+                        } else {
+                            "a directory"
+                        };
+                        log(
+                            ProcessLogStream::Stdout,
+                            format!(
+                                "[Content] Skipped local pack '{}': {} is {what} the launcher did not create",
+                                pack.file_name,
+                                target_path.display()
+                            ),
+                        )?;
+                        continue;
+                    }
+                };
+
+                installed.add(&pack.file_name, None);
+                log(
+                    ProcessLogStream::Stdout,
+                    format!("[Content] {} -> {label}{how}", pack.file_name),
+                )?;
+            }
+            PreparedPackSource::Modrinth {
+                entry_id,
+                version_id,
+                cached_path,
+                was_cached,
+            } => {
+                let outcome = crate::instance_content::link_content_file_as(
+                    cached_path,
+                    &target_path,
+                    target_is_ours,
+                    kind,
+                )
+                .with_context(|| {
+                    format!("failed to link content pack '{entry_id}' into {label}")
+                })?;
+                if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
+                    // Left out of `installed`: the name is not in the manifest,
+                    // so the sync will not remove it either.
+                    log(
+                        ProcessLogStream::Stdout,
+                        format!(
+                            "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
+                            target_path.display()
+                        ),
+                    )?;
+                    continue;
+                }
+
+                installed.add(
+                    &pack.file_name,
+                    Some(crate::instance_content::ManagedFileOrigin {
+                        entry_id: entry_id.clone(),
+                        version_id: version_id.clone(),
+                    }),
+                );
+                let cache_label = if *was_cached { " (cached)" } else { "" };
+                log(
+                    ProcessLogStream::Stdout,
+                    format!("[Content] {entry_id} -> {label}{cache_label}"),
+                )?;
+            }
+        }
+    }
+
     Ok(installed)
+}
+
+/// The active entries of one category list. A missing or unreadable file is
+/// an empty list, exactly as it has always been for the launch.
+fn active_category_entries(
+    modlist_dir: &Path,
+    content_type: &str,
+    mc_version: &str,
+    loader: &str,
+) -> Vec<ContentEntry> {
+    let list = load_content_list(modlist_dir, content_type).unwrap_or_else(|_| ContentList {
+        content_type: content_type.to_string(),
+        entries: vec![],
+        groups: vec![],
+    });
+    list.entries
+        .into_iter()
+        .filter(|entry| is_content_entry_active(entry, mc_version, loader))
+        .collect()
 }
 
 /// Resolve, download and install content packs into the instance.
@@ -412,7 +693,11 @@ fn install_local_content_packs(
 /// re-resolves from scratch, which is what it always did — and which is also
 /// how a popup's answer used to be ignored in silence, since nothing carried
 /// it here.
-// Otto input distinti di un passo del lancio. Una struct di parametri
+///
+/// `plays_offline` (D157): the local packs are installed all the same, the
+/// Modrinth ones are neither looked up nor installed, and what they linked on
+/// the previous launch stays.
+// Nove input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
 #[allow(clippy::too_many_arguments)]
@@ -425,6 +710,7 @@ pub(super) async fn resolve_and_install_content_packs(
     target: &ResolutionTarget,
     instance_root: &Path,
     resolved_content: Option<&ResolvedContentVersions>,
+    plays_offline: bool,
 ) -> Result<()> {
     validate_path_component(modlist_name)?;
     let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
@@ -439,19 +725,29 @@ pub(super) async fn resolve_and_install_content_packs(
     let mc_version = &target.minecraft_version;
     let loader_str = target.mod_loader.as_modrinth_loader();
 
-    // Degraded, never fatal: without the metadata every entry is resolved the
-    // usual way, which is exactly the launch of before this field existed.
-    let plan = match ContentPackPlan::prepare(modrinth_client, resolved_content).await {
-        Ok(plan) => plan,
-        Err(error) => {
-            emit_log(
-                app_handle,
-                ProcessLogStream::Stderr,
-                format!(
-                    "[Content] Could not look up the pre-checked pack versions; resolving every entry the usual way ({error:#})"
-                ),
-            )?;
-            ContentPackPlan::unplanned()
+    let plan = if plays_offline {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            "[Content] The active account plays offline: Modrinth packs are not looked up or installed, local packs are; the instance keeps the Modrinth packs of the previous launch".to_string(),
+        )?;
+        ContentPackPlan::unplanned()
+    } else {
+        // Degraded, never fatal: without the metadata every entry is resolved
+        // the usual way, which is exactly the launch of before this field
+        // existed.
+        match ContentPackPlan::prepare(modrinth_client, resolved_content).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Content] Could not look up the pre-checked pack versions; resolving every entry the usual way ({error:#})"
+                    ),
+                )?;
+                ContentPackPlan::unplanned()
+            }
         }
     };
     if plan.covered() > 0 {
@@ -482,163 +778,87 @@ pub(super) async fn resolve_and_install_content_packs(
         .filter(|(content_type, _)| *content_type != DATAPACK_CATEGORY)
         .copied()
     {
-        let list = load_content_list(&modlist_dir, content_type).unwrap_or_else(|_| ContentList {
-            content_type: content_type.to_string(),
-            entries: vec![],
-            groups: vec![],
-        });
-
-        let active_entries: Vec<&ContentEntry> = list
-            .entries
-            .iter()
-            .filter(|entry| is_content_entry_active(entry, mc_version, loader_str))
-            .collect();
-
-        let instance_dir = instance_root.join(instance_subdir);
-        // What we link this launch; the previous launch's list comes from the
-        // manifest, and only the difference is removed. Nothing else in the
-        // directory is touched.
-        let mut installed: Vec<String> = Vec::new();
-        let mut lookups_complete = true;
-        // Whether a real file under a pack's name is ours to replace (D1).
-        let previous = crate::instance_content::read_manifest_files(
-            &crate::instance_content::manifest_path(instance_root, instance_subdir),
-        );
-
-        if !active_entries.is_empty() {
-            std::fs::create_dir_all(&instance_dir)
-                .with_context(|| format!("failed to create {}", instance_dir.display()))?;
-        }
-
-        installed.extend(install_local_content_packs(
+        let entries = active_category_entries(&modlist_dir, content_type, mc_version, loader_str);
+        let active_entries: Vec<&ContentEntry> = entries.iter().collect();
+        let prepared = prepare_category_packs(
             app_handle,
-            &modlist_dir,
-            content_type,
-            instance_root,
-            instance_subdir,
-            &instance_dir,
-            &active_entries,
-        )?);
-
-        for entry in active_entries
-            .iter()
-            .filter(|entry| entry.source != "modrinth" && entry.source != "local")
-        {
-            // The old code skipped everything non-Modrinth without a word, so a
-            // typo in `source` looked like an empty list.
-            emit_log(
-                app_handle,
-                ProcessLogStream::Stdout,
-                format!(
-                    "[Content] Skipping '{}': unknown source '{}'",
-                    entry.id, entry.source
-                ),
-            )?;
-        }
-
-        let modrinth_entry_ids: Vec<&str> = active_entries
-            .iter()
-            .filter(|entry| entry.source == "modrinth")
-            .map(|entry| entry.id.as_str())
-            .collect();
-
-        for resolution in resolve_content_entry_versions(
+            http_client,
             modrinth_client,
             &plan,
+            &modlist_dir,
+            cache_dir,
             content_type,
             mc_version,
-            &modrinth_entry_ids,
+            &active_entries,
+            plays_offline,
         )
-        .await
-        {
-            let entry_id = resolution.entry_id;
-            if let Some(error) = resolution.lookup_error {
-                // Not an answer: we do not know which file this entry wants,
-                // so nothing may be removed on this pass.
-                lookups_complete = false;
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!("[Content] Failed to fetch versions for '{entry_id}': {error}"),
-                )?;
-                continue;
-            }
+        .await?;
 
-            let Some(version) = resolution.version else {
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Content] No compatible version found for '{entry_id}' on {mc_version}"
-                    ),
-                )?;
-                continue;
-            };
-            let Some(file) = version.primary_file() else {
-                continue;
-            };
-
-            let (cached_path, was_cached) = ensure_content_pack_cached(
-                http_client,
-                cache_dir,
-                &version.id,
-                &file.filename,
-                &file.url,
-                || {
-                    emit_log(
-                        app_handle,
-                        ProcessLogStream::Stdout,
-                        format!("[Content] Downloading {} ({})", entry_id, file.filename),
-                    )
-                },
-            )
-            .await
-            .with_context(|| format!("failed to download content pack '{entry_id}'"))?;
-            let target_path = instance_dir.join(&file.filename);
-            let target_is_ours = previous.iter().any(|name| name == &file.filename);
-            let outcome = crate::instance_content::link_content_file(
-                &cached_path,
-                &target_path,
-                target_is_ours,
-            )
-            .with_context(|| format!("failed to link content pack '{entry_id}' into instance"))?;
-            if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
-                // Left out of `installed`: the name is not in the manifest, so
-                // the sync will not remove it either.
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
-                        target_path.display()
-                    ),
-                )?;
-                continue;
-            }
-            if !installed.iter().any(|name| name == &file.filename) {
-                installed.push(file.filename.clone());
-            }
-            let cache_label = if was_cached { " (cached)" } else { "" };
-            emit_log(
-                app_handle,
-                ProcessLogStream::Stdout,
-                format!("[Content] {entry_id} -> {instance_subdir}{cache_label}"),
-            )?;
-        }
-
-        let removed = crate::instance_content::sync_managed_content_dir(
+        let instance_dir = instance_root.join(instance_subdir);
+        // What the previous launch linked here, from the manifest; for an
+        // instance a launcher before the manifest set up, what is provably
+        // its own (r2-aggiornamento-da-0.1.2-1). Only the difference with this
+        // launch is removed; nothing else in the directory is touched.
+        let previous = crate::instance_content::previous_content(
             instance_root,
             instance_subdir,
             &instance_dir,
-            &installed,
-            lookups_complete,
+            Some(cache_dir),
+        );
+        let installed = link_prepared_packs(
+            &mut |stream, line| emit_log(app_handle, stream, line),
+            &prepared.packs,
+            &instance_dir,
+            &previous,
+            instance_subdir,
+            crate::instance_content::LinkKind::Symlink,
         )?;
-        for name in removed {
+
+        let outcome = crate::instance_content::sync_managed_content(
+            instance_root,
+            instance_subdir,
+            &instance_dir,
+            &previous,
+            &installed,
+            prepared.lookups_complete,
+        )?;
+        for name in outcome.removed {
             emit_log(
                 app_handle,
                 ProcessLogStream::Stdout,
                 format!("[Content] Removed {} from {}", name, instance_subdir),
             )?;
+        }
+        // D145: an update renamed the file, and the game still calls the pack
+        // by its old name. Never fatal: at worst the pack comes back disabled,
+        // which is what happened before.
+        match crate::instance_content::rewrite_renamed_pack_references(
+            instance_root,
+            instance_subdir,
+            &outcome.renamed,
+        ) {
+            Ok(rewritten) => {
+                for path in rewritten {
+                    emit_log(
+                        app_handle,
+                        ProcessLogStream::Stdout,
+                        format!(
+                            "[Content] Updated {} for the renamed {}: {}",
+                            path.strip_prefix(instance_root).unwrap_or(&path).display(),
+                            instance_subdir,
+                            describe_renames(&outcome.renamed)
+                        ),
+                    )?;
+                }
+            }
+            Err(error) => emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Content] Could not point the game's settings at the renamed {instance_subdir} ({}): {error:#}",
+                    describe_renames(&outcome.renamed)
+                ),
+            )?,
         }
     }
 
@@ -652,11 +872,31 @@ pub(super) async fn resolve_and_install_content_packs(
         mc_version,
         loader_str,
         instance_root,
+        plays_offline,
     )
     .await
 }
 
-// Nove input distinti di un passo del lancio. Una struct di parametri
+fn describe_renames(renamed: &[(String, String)]) -> String {
+    renamed
+        .iter()
+        .map(|(old, new)| format!("{old} -> {new}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Data packs go into `saves/<world>/datapacks/` of every world of the
+/// instance, shared worlds included, at every launch (D144): the only place
+/// Minecraft reads them from. Each world keeps its own manifest in
+/// `<world>/.cubic/`, so a pack dropped from the list leaves every world it
+/// was linked into, and a data pack the user put in a world by hand is never
+/// touched. A world created in game gets them on the next launch. They are
+/// hard links or copies, never symlinks: see
+/// [`crate::instance_content::LinkKind::NoSymlink`].
+///
+/// Until D144 they were linked into `<instance>/datapacks/`, a folder nothing
+/// reads; what the launcher put there is cleaned up and nothing else.
+// Dieci input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
 #[allow(clippy::too_many_arguments)]
@@ -670,155 +910,145 @@ async fn install_datapacks(
     mc_version: &str,
     loader_str: &str,
     instance_root: &Path,
+    plays_offline: bool,
 ) -> Result<()> {
-    // Data packs are world-specific, so put them in a top-level datapacks
-    // folder supported by mods such as Open Loader.
-    let list = load_content_list(modlist_dir, DATAPACK_CATEGORY).unwrap_or_else(|_| ContentList {
-        content_type: DATAPACK_CATEGORY.to_string(),
-        entries: vec![],
-        groups: vec![],
-    });
-    let active_entries: Vec<&ContentEntry> = list
-        .entries
-        .iter()
-        .filter(|entry| is_content_entry_active(entry, mc_version, loader_str))
-        .collect();
-
-    let instance_dir = instance_root.join("datapacks");
-    let mut installed: Vec<String> = Vec::new();
-    let mut lookups_complete = true;
-    // Whether a real file under a pack's name is ours to replace (D1).
-    let previous = crate::instance_content::read_manifest_files(
-        &crate::instance_content::manifest_path(instance_root, "datapacks"),
-    );
-
-    if !active_entries.is_empty() {
-        std::fs::create_dir_all(&instance_dir)
-            .with_context(|| format!("failed to create {}", instance_dir.display()))?;
+    match crate::instance_content::retire_legacy_content_dir(
+        instance_root,
+        LEGACY_DATAPACKS_DIR,
+        cache_dir,
+    ) {
+        Ok(removed) => {
+            for name in removed {
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Content] Removed {name} from {LEGACY_DATAPACKS_DIR} (data packs now go into each world)"
+                    ),
+                )?;
+            }
+        }
+        Err(error) => emit_log(
+            app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Content] Could not clean up the old {LEGACY_DATAPACKS_DIR} folder: {error:#}"
+            ),
+        )?,
     }
 
-    installed.extend(install_local_content_packs(
+    let entries = active_category_entries(modlist_dir, DATAPACK_CATEGORY, mc_version, loader_str);
+    let active_entries: Vec<&ContentEntry> = entries.iter().collect();
+    let prepared = prepare_category_packs(
         app_handle,
+        http_client,
+        modrinth_client,
+        plan,
         modlist_dir,
+        cache_dir,
         DATAPACK_CATEGORY,
-        instance_root,
-        "datapacks",
-        &instance_dir,
+        mc_version,
         &active_entries,
-    )?);
+        plays_offline,
+    )
+    .await?;
 
-    for entry in active_entries
-        .iter()
-        .filter(|entry| entry.source != "modrinth" && entry.source != "local")
-    {
-        emit_log(
-            app_handle,
+    link_datapacks_into_worlds(
+        &mut |stream, line| emit_log(app_handle, stream, line),
+        instance_root,
+        &prepared,
+    )
+}
+
+/// Link the prepared data packs into every world of the instance, each world
+/// with its own manifest (D144).
+pub(super) fn link_datapacks_into_worlds(
+    log: &mut ContentLog<'_>,
+    instance_root: &Path,
+    prepared: &PreparedCategory,
+) -> Result<()> {
+    let worlds = match crate::instance_content::instance_world_dirs(instance_root) {
+        Ok(worlds) => worlds,
+        Err(error) => {
+            log(
+                ProcessLogStream::Stderr,
+                format!("[Content] Could not list the worlds for the data packs: {error:#}"),
+            )?;
+            return Ok(());
+        }
+    };
+    if worlds.is_empty() && !prepared.packs.is_empty() {
+        log(
             ProcessLogStream::Stdout,
             format!(
-                "[Content] Skipping '{}': unknown source '{}'",
-                entry.id, entry.source
+                "[Content] No world in this instance yet: {} data pack(s) go into each world from the launch after it is created",
+                prepared.packs.len()
             ),
         )?;
     }
 
-    let modrinth_entry_ids: Vec<&str> = active_entries
-        .iter()
-        .filter(|entry| entry.source == "modrinth")
-        .map(|entry| entry.id.as_str())
-        .collect();
-
-    for resolution in resolve_content_entry_versions(
-        modrinth_client,
-        plan,
-        DATAPACK_CATEGORY,
-        mc_version,
-        &modrinth_entry_ids,
-    )
-    .await
-    {
-        let entry_id = resolution.entry_id;
-        if let Some(error) = resolution.lookup_error {
-            // Not an answer: we do not know which file this entry wants, so
-            // nothing may be removed on this pass.
-            lookups_complete = false;
-            emit_log(
-                app_handle,
-                ProcessLogStream::Stdout,
-                format!("[Content] Failed to fetch versions for '{entry_id}': {error}"),
+    for world_dir in worlds {
+        let world_name = world_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = format!("saves/{world_name}/{WORLD_DATAPACKS_DIR}");
+        // One world that cannot be updated — a file held open on Windows, a
+        // read-only folder — must not stop the launch nor the other worlds.
+        if let Err(error) = sync_world_datapacks(log, &world_dir, prepared, &label) {
+            log(
+                ProcessLogStream::Stderr,
+                format!("[Content] Could not update the data packs of {label}: {error:#}"),
             )?;
-            continue;
         }
-
-        // A data pack with no compatible version is silent here, as it has
-        // always been; the resource pack loop says so out loud. The pre-check
-        // reports both (D60), and aligning the two logs is not this task.
-        let Some(version) = resolution.version else {
-            continue;
-        };
-        let Some(file) = version.primary_file() else {
-            continue;
-        };
-
-        let (cached_path, was_cached) = ensure_content_pack_cached(
-            http_client,
-            cache_dir,
-            &version.id,
-            &file.filename,
-            &file.url,
-            || {
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!("[Content] Downloading {} ({})", entry_id, file.filename),
-                )
-            },
-        )
-        .await
-        .with_context(|| format!("failed to download data pack '{entry_id}'"))?;
-        let target_path = instance_dir.join(&file.filename);
-        let target_is_ours = previous.iter().any(|name| name == &file.filename);
-        let outcome =
-            crate::instance_content::link_content_file(&cached_path, &target_path, target_is_ours)
-                .with_context(|| format!("failed to link data pack '{entry_id}' into instance"))?;
-        if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
-            // Left out of `installed`: the name is not in the manifest, so the
-            // sync will not remove it either.
-            emit_log(
-                app_handle,
-                ProcessLogStream::Stdout,
-                format!(
-                    "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
-                    target_path.display()
-                ),
-            )?;
-            continue;
-        }
-        if !installed.iter().any(|name| name == &file.filename) {
-            installed.push(file.filename.clone());
-        }
-        let cache_label = if was_cached { " (cached)" } else { "" };
-        emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            format!("[Content] {entry_id} -> datapacks{cache_label}"),
-        )?;
     }
 
-    let removed = crate::instance_content::sync_managed_content_dir(
-        instance_root,
-        "datapacks",
-        &instance_dir,
-        &installed,
-        lookups_complete,
+    Ok(())
+}
+
+/// Where a world keeps its data packs, and the category name of its manifest.
+const WORLD_DATAPACKS_DIR: &str = "datapacks";
+
+/// The instance-root folder data packs went to before D144.
+const LEGACY_DATAPACKS_DIR: &str = "datapacks";
+
+fn sync_world_datapacks(
+    log: &mut ContentLog<'_>,
+    world_dir: &Path,
+    prepared: &PreparedCategory,
+    label: &str,
+) -> Result<()> {
+    let datapacks_dir = world_dir.join(WORLD_DATAPACKS_DIR);
+    // No adoption here: no launcher before D144 wrote into a world, so a file
+    // in it that the manifest does not name is the user's.
+    let previous = crate::instance_content::previous_content(
+        world_dir,
+        WORLD_DATAPACKS_DIR,
+        &datapacks_dir,
+        None,
+    );
+    let installed = link_prepared_packs(
+        log,
+        &prepared.packs,
+        &datapacks_dir,
+        &previous,
+        label,
+        crate::instance_content::LinkKind::NoSymlink,
     )?;
-    for name in removed {
-        emit_log(
-            app_handle,
+    let outcome = crate::instance_content::sync_managed_content(
+        world_dir,
+        WORLD_DATAPACKS_DIR,
+        &datapacks_dir,
+        &previous,
+        &installed,
+        prepared.lookups_complete,
+    )?;
+    for name in outcome.removed {
+        log(
             ProcessLogStream::Stdout,
-            format!("[Content] Removed {name} from datapacks"),
+            format!("[Content] Removed {name} from {label}"),
         )?;
     }
-
     Ok(())
 }
 
@@ -1237,5 +1467,418 @@ mod tests {
         );
         assert!(!resolutions[0].preresolved);
         assert_eq!(requests.lock().expect("recorder").len(), 1);
+    }
+
+    // ── contentpack-8: only packs of the category ───────────────────────────
+
+    fn pack_version_json(
+        version_id: &str,
+        version_type: &str,
+        date_published: &str,
+        loaders: &[&str],
+        filename: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": version_id,
+            "project_id": "bPFzA8pz",
+            "version_number": version_id,
+            "name": version_id,
+            "game_versions": ["1.20.1"],
+            "loaders": loaders,
+            "version_type": version_type,
+            "files": [{
+                "hashes": { "sha1": "0c4978ce9daa8343189cffb55f0ad0f096718f50" },
+                "url": format!("http://example.invalid/{filename}"),
+                "filename": filename,
+                "primary": true,
+                "size": 4,
+            }],
+            "date_published": date_published,
+        })
+    }
+
+    fn pack_version(value: serde_json::Value) -> ModrinthVersion {
+        serde_json::from_value(value).expect("the version payload should deserialize")
+    }
+
+    /// The shape of Terralith on Modrinth: one project, a data pack and a mod.
+    /// Asked by game version alone the list holds both, and the newest
+    /// release is the Fabric `.jar` — which used to land in `datapacks/`.
+    #[tokio::test]
+    async fn a_data_pack_entry_never_resolves_to_a_mod_jar() {
+        let (base_url, _requests) = routing_server(vec![(
+            "/project/terralith/version",
+            serde_json::json!([
+                pack_version_json(
+                    "fabricJar",
+                    "release",
+                    "2026-08-01",
+                    &["fabric", "quilt"],
+                    "Terralith_1.20.x_v2.5.5.jar"
+                ),
+                pack_version_json(
+                    "dataZip",
+                    "release",
+                    "2026-07-01",
+                    &["datapack"],
+                    "Terralith_1.20.x_v2.5.4.zip"
+                ),
+            ])
+            .to_string(),
+        )]);
+        let client = ModrinthClient::with_base_url(base_url);
+
+        let resolutions = resolve_content_entry_versions(
+            &client,
+            &ContentPackPlan::unplanned(),
+            "datapack",
+            "1.20.1",
+            &["terralith"],
+        )
+        .await;
+
+        assert_eq!(
+            resolutions[0]
+                .version
+                .as_ref()
+                .map(|version| version.id.as_str()),
+            Some("dataZip")
+        );
+    }
+
+    /// The same filter on a version the pre-check's map names: a `.jar` an
+    /// older launch installed and a "Skip" kept is not installed again.
+    #[tokio::test]
+    async fn a_named_jar_is_not_installed_as_a_data_pack() {
+        let (base_url, requests) = routing_server(vec![(
+            "/project/terralith/version",
+            serde_json::json!([pack_version_json(
+                "dataZip",
+                "release",
+                "2026-07-01",
+                &["datapack"],
+                "Terralith.zip"
+            )])
+            .to_string(),
+        )]);
+        let client = ModrinthClient::with_base_url(base_url);
+        let named = plan_map(&[("datapack", "terralith", "fabricJar")]);
+        let metadata = HashMap::from([(
+            "fabricJar".to_string(),
+            pack_version(pack_version_json(
+                "fabricJar",
+                "release",
+                "2026-08-01",
+                &["fabric"],
+                "Terralith.jar",
+            )),
+        )]);
+        let plan = ContentPackPlan::new(Some(&named), metadata);
+
+        let resolutions =
+            resolve_content_entry_versions(&client, &plan, "datapack", "1.20.1", &["terralith"])
+                .await;
+
+        assert_eq!(
+            resolutions[0]
+                .version
+                .as_ref()
+                .map(|version| version.id.as_str()),
+            Some("dataZip")
+        );
+        assert!(!resolutions[0].preresolved);
+        assert_eq!(requests.lock().expect("recorder").len(), 1);
+    }
+
+    #[test]
+    fn each_category_takes_its_own_loaders() {
+        let resource = pack_version(pack_version_json(
+            "rp",
+            "release",
+            "2026-01-01",
+            &["minecraft"],
+            "Pack.zip",
+        ));
+        let shader = pack_version(pack_version_json(
+            "sh",
+            "release",
+            "2026-01-01",
+            &["iris", "optifine"],
+            "Shader.zip",
+        ));
+        let data = pack_version(pack_version_json(
+            "dp",
+            "release",
+            "2026-01-01",
+            &["datapack"],
+            "Data.zip",
+        ));
+        // Loader right, file wrong: a `.jar` is no pack in any directory.
+        let odd = pack_version(pack_version_json(
+            "odd",
+            "release",
+            "2026-01-01",
+            &["datapack"],
+            "Data.JAR",
+        ));
+
+        assert!(version_fits_category("resourcepack", &resource));
+        assert!(!version_fits_category("datapack", &resource));
+        assert!(version_fits_category("shader", &shader));
+        assert!(!version_fits_category("resourcepack", &shader));
+        assert!(version_fits_category("datapack", &data));
+        assert!(!version_fits_category("shader", &data));
+        assert!(!version_fits_category("datapack", &odd));
+    }
+
+    // ── D144: data packs go into every world ────────────────────────────────
+
+    fn make_world(dir: &Path) {
+        fs::create_dir_all(dir).expect("world dir");
+        fs::write(dir.join("level.dat"), b"nbt").expect("level.dat");
+    }
+
+    fn modrinth_pack(cache: &Path, entry_id: &str, version_id: &str, name: &str) -> PreparedPack {
+        let dir = cache.join(version_id);
+        fs::create_dir_all(&dir).expect("cache entry");
+        fs::write(dir.join(name), version_id.as_bytes()).expect("cached pack");
+        PreparedPack {
+            file_name: name.to_string(),
+            source: PreparedPackSource::Modrinth {
+                entry_id: entry_id.to_string(),
+                version_id: version_id.to_string(),
+                cached_path: dir.join(name),
+                was_cached: true,
+            },
+        }
+    }
+
+    fn local_pack(modlist: &Path, name: &str) -> PreparedPack {
+        let dir = modlist.join("datapacks");
+        fs::create_dir_all(&dir).expect("local packs dir");
+        fs::write(dir.join(name), b"local").expect("local pack");
+        PreparedPack {
+            file_name: name.to_string(),
+            source: PreparedPackSource::Local {
+                source_path: dir.join(name),
+            },
+        }
+    }
+
+    fn link_into_worlds(
+        instance_root: &Path,
+        packs: Vec<PreparedPack>,
+        complete: bool,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        link_datapacks_into_worlds(
+            &mut |_, line| {
+                lines.push(line);
+                Ok(())
+            },
+            instance_root,
+            &PreparedCategory {
+                packs,
+                lookups_complete: complete,
+            },
+        )
+        .expect("linking into the worlds should succeed");
+        lines
+    }
+
+    /// A temporary instance with two worlds — one of its own, one shared (a
+    /// link to the canonical folder, as `shared_worlds` makes it) — and a
+    /// folder in `saves/` that is no world. Both worlds get both packs, each
+    /// with its own manifest; a pack dropped from the list leaves both; the
+    /// data pack the user put in a world by hand stays; a world created later
+    /// gets the packs on the next launch.
+    #[cfg(unix)]
+    #[test]
+    fn data_packs_reach_every_world_and_leave_every_world() {
+        let root = unique_test_root("datapacks-worlds");
+        let cache = root.join("cache/content-packs");
+        let modlist = root.join("mod-lists/Pack");
+        let instance_root = modlist.join("instances/1.20.1-fabric");
+        let own_world = instance_root.join("saves/Survival");
+        let shared_world = root.join("worlds/Shared");
+        make_world(&own_world);
+        make_world(&shared_world);
+        std::os::unix::fs::symlink(&shared_world, instance_root.join("saves/Shared"))
+            .expect("the shared world's link");
+        fs::create_dir_all(instance_root.join("saves/not a world")).expect("a stray folder");
+        fs::create_dir_all(own_world.join("datapacks")).expect("the world's datapacks");
+        fs::write(own_world.join("datapacks/hand-made.zip"), b"user").expect("user pack");
+
+        let first = link_into_worlds(
+            &instance_root,
+            vec![
+                modrinth_pack(&cache, "terralith", "VerA0001", "Terralith.zip"),
+                local_pack(&modlist, "mine.zip"),
+            ],
+            true,
+        );
+
+        for world in [&own_world, &shared_world] {
+            assert_eq!(
+                fs::read(world.join("datapacks/Terralith.zip")).expect("linked"),
+                b"VerA0001",
+                "{} has the Modrinth pack",
+                world.display()
+            );
+            assert!(world.join("datapacks/mine.zip").exists());
+            for name in ["Terralith.zip", "mine.zip"] {
+                assert!(
+                    !fs::symlink_metadata(world.join("datapacks").join(name))
+                        .expect("placed")
+                        .file_type()
+                        .is_symlink(),
+                    "Minecraft refuses a world with a symlink inside: {name} must be a real file"
+                );
+            }
+            let manifest = crate::instance_content::read_manifest(
+                &crate::instance_content::manifest_path(world, "datapacks"),
+            )
+            .expect("each world has its own manifest");
+            assert_eq!(
+                manifest
+                    .origins
+                    .get("Terralith.zip")
+                    .map(|o| o.version_id.as_str()),
+                Some("VerA0001")
+            );
+        }
+        assert!(
+            !instance_root.join("saves/not a world/datapacks").exists(),
+            "a folder without level.dat is no world"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|line| line == "[Content] terralith -> saves/Shared/datapacks (cached)"),
+            "the log names the world, got {first:?}"
+        );
+
+        // The same packs again: our own hard links give way, nothing fails.
+        link_into_worlds(
+            &instance_root,
+            vec![
+                modrinth_pack(&cache, "terralith", "VerA0001", "Terralith.zip"),
+                local_pack(&modlist, "mine.zip"),
+            ],
+            true,
+        );
+        assert!(own_world.join("datapacks/Terralith.zip").exists());
+
+        // A world created in game since the last launch.
+        let new_world = instance_root.join("saves/New World");
+        make_world(&new_world);
+
+        link_into_worlds(&instance_root, vec![local_pack(&modlist, "mine.zip")], true);
+
+        for world in [&own_world, &shared_world] {
+            assert!(
+                fs::symlink_metadata(world.join("datapacks/Terralith.zip")).is_err(),
+                "the dropped pack left {}",
+                world.display()
+            );
+            assert!(world.join("datapacks/mine.zip").exists());
+        }
+        assert!(new_world.join("datapacks/mine.zip").exists());
+        assert_eq!(
+            fs::read(own_world.join("datapacks/hand-made.zip")).expect("the user's pack"),
+            b"user",
+            "a data pack the manifest does not name is never touched"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// D157 and a failed lookup look the same from a world: the Modrinth
+    /// entries are unknown this launch, so what they linked stays.
+    #[test]
+    fn an_incomplete_launch_removes_nothing_from_the_worlds() {
+        let root = unique_test_root("datapacks-incomplete");
+        let cache = root.join("cache/content-packs");
+        let modlist = root.join("mod-lists/Pack");
+        let instance_root = modlist.join("instances/1.20.1-fabric");
+        let world = instance_root.join("saves/Survival");
+        make_world(&world);
+
+        link_into_worlds(
+            &instance_root,
+            vec![modrinth_pack(
+                &cache,
+                "terralith",
+                "VerA0001",
+                "Terralith.zip",
+            )],
+            true,
+        );
+        link_into_worlds(
+            &instance_root,
+            vec![local_pack(&modlist, "mine.zip")],
+            false,
+        );
+
+        assert!(world.join("datapacks/Terralith.zip").exists());
+        assert!(world.join("datapacks/mine.zip").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_instance_without_worlds_says_when_the_packs_arrive() {
+        let root = unique_test_root("datapacks-no-world");
+        let modlist = root.join("mod-lists/Pack");
+        let instance_root = modlist.join("instances/1.20.1-fabric");
+        fs::create_dir_all(&instance_root).expect("instance");
+
+        let lines = link_into_worlds(&instance_root, vec![local_pack(&modlist, "mine.zip")], true);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("go into each world from the launch after it is created")),
+            "got {lines:?}"
+        );
+        assert!(!instance_root.join("datapacks").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An unpacked local data pack is a folder: copied into the world, never
+    /// linked, and replaced by the next launch because the manifest names it.
+    #[test]
+    fn a_folder_data_pack_is_copied_into_the_world() {
+        let root = unique_test_root("datapacks-folder");
+        let modlist = root.join("mod-lists/Pack");
+        let instance_root = modlist.join("instances/1.20.1-fabric");
+        let world = instance_root.join("saves/Survival");
+        make_world(&world);
+        let folder = modlist.join("datapacks/my-pack");
+        fs::create_dir_all(folder.join("data")).expect("pack folder");
+        fs::write(folder.join("pack.mcmeta"), b"{}").expect("mcmeta");
+        let pack = PreparedPack {
+            file_name: "my-pack".to_string(),
+            source: PreparedPackSource::Local {
+                source_path: folder.clone(),
+            },
+        };
+
+        let lines = link_into_worlds(&instance_root, vec![pack.clone()], true);
+        link_into_worlds(&instance_root, vec![pack], true);
+
+        let placed = world.join("datapacks/my-pack");
+        let file_type = fs::symlink_metadata(&placed).expect("placed").file_type();
+        assert!(file_type.is_dir() && !file_type.is_symlink());
+        assert!(placed.join("pack.mcmeta").is_file());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("(copied: a world cannot hold a link to a folder)")),
+            "got {lines:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
