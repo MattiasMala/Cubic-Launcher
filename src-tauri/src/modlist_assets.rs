@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 
 use crate::atomic_write::write_atomically;
 use crate::content_packs::filename_for_type;
@@ -957,7 +957,7 @@ fn add_file_to_zip<W: Write + Seek>(
     archive
         .start_file(
             archive_path,
-            FileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
         )
         .with_context(|| format!("failed to create archive entry {archive_path}"))?;
     // A file at a time, not read whole into memory: a world can be gigabytes.
@@ -1187,6 +1187,61 @@ mod tests {
                 .is_ok(),
             "the contained selected file should be exported"
         );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Il passaggio da zip 0.6 a 4.x (todo.md:1656) gira senza le feature di
+    /// default: questo test dice se ne manca una che l'export usa. Senza
+    /// `deflate-flate2` l'entry compressa non si scrive o non si rilegge;
+    /// senza `time` la data di default dell'entry torna al 1980.
+    #[test]
+    fn an_exported_entry_is_deflated_readable_and_dated_now() {
+        let root_dir = unique_test_root();
+        let profile_dir = root_dir
+            .join("mod-lists")
+            .join("Safe Pack")
+            .join("instances")
+            .join("profile");
+        fs::create_dir_all(&profile_dir).expect("instance directory should exist");
+        let contents = "fov:70\n".repeat(200);
+        fs::write(profile_dir.join("options.txt"), &contents).expect("options should exist");
+
+        let archive_path = root_dir.join("dated.zip");
+        export_modlist_from_root(
+            &root_dir,
+            &ExportModlistInput {
+                modlist_name: "Safe Pack".into(),
+                destination_path: archive_path.display().to_string(),
+                rules_json: false,
+                config_files: false,
+                resource_packs: false,
+                data_packs: false,
+                shaders: false,
+                other_files: true,
+                selected_content_paths: Vec::new(),
+                selected_other_paths: vec!["profile/options.txt".into()],
+            },
+        )
+        .expect("the selected file should export");
+
+        let archive_file = fs::File::open(&archive_path).expect("export archive should open");
+        let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
+        let mut entry = archive
+            .by_name("Safe Pack/instances/profile/options.txt")
+            .expect("the selected file should be in the archive");
+        assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+        let year = entry
+            .last_modified()
+            .expect("the entry should carry a date")
+            .year();
+        assert!(year >= 2024, "the entry is dated {year}, not now");
+        let mut read_back = String::new();
+        entry
+            .read_to_string(&mut read_back)
+            .expect("the deflated entry should read back");
+        assert_eq!(read_back, contents);
+        drop(entry);
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

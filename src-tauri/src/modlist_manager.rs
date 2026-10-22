@@ -920,7 +920,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
 
     use crate::editor_data::load_editor_snapshot_from_root;
     use crate::rules::ModList;
@@ -955,7 +955,9 @@ mod tests {
         let file = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
         for (name, contents) in entries {
-            archive.start_file(*name, FileOptions::default()).unwrap();
+            archive
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
             archive.write_all(contents).unwrap();
         }
         archive.finish().unwrap();

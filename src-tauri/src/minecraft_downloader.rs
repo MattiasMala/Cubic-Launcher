@@ -1635,7 +1635,7 @@ mod tests {
         let file = fs::File::create(path).expect("native jar");
         let mut zip = zip::ZipWriter::new(file);
         for (name, bytes) in entries {
-            zip.start_file(*name, zip::write::FileOptions::default())
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
                 .expect("entry");
             zip.write_all(bytes).expect("entry bytes");
         }

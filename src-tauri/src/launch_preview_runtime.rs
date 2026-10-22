@@ -1605,7 +1605,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
 
     use crate::database::initialize_database;
     use crate::token_storage::{EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore};
@@ -1898,7 +1898,7 @@ mod tests {
             let file = std::fs::File::create(&path).expect("test jar should be created");
             let mut archive = zip::ZipWriter::new(file);
             archive
-                .start_file("version.json", FileOptions::default())
+                .start_file("version.json", SimpleFileOptions::default())
                 .expect("version.json entry should start");
             archive
                 .write_all(forge_version_json().as_bytes())

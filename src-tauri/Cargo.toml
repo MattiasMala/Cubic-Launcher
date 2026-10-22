@@ -78,7 +78,10 @@ tokio = { version = "1", features = ["full"] }
 # implementation only covered Linux, and Windows is a shipped target.
 trash = "5"
 uuid = { version = "1", features = ["v5"] }
-zip = "0.6"
+# The 4.x line tauri-plugin-updater already pulls in on Windows, so the build
+# carries one zip, not 0.6 beside it (audit 101, todo.md:1656). Deflate through
+# the `flate2` above; `time` keeps "now" as the default entry date on export.
+zip = { version = "4.6", default-features = false, features = ["deflate-flate2", "time"] }
 flate2 = "1"
 # The world list (E10) reads three fields out of `level.dat`, which is gzipped
 # NBT. `flate2` above handles the gzip; this handles the NBT.

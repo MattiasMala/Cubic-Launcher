@@ -257,7 +257,7 @@ mod tests {
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         for (name, bytes) in members {
-            zip.start_file(*name, zip::write::FileOptions::default())
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
                 .unwrap();
             zip.write_all(bytes).unwrap();
         }

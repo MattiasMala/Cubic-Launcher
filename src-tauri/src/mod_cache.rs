@@ -916,7 +916,7 @@ pub(crate) fn test_jar_bytes(marker: &str) -> Vec<u8> {
 
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     writer
-        .start_file("marker.txt", zip::write::FileOptions::default())
+        .start_file("marker.txt", zip::write::SimpleFileOptions::default())
         .expect("zip entry should start");
     writer
         .write_all(marker.as_bytes())

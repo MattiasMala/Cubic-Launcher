@@ -867,7 +867,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
 
     use crate::content_packs::{load_content_list, ContentEntry};
 
@@ -919,7 +919,7 @@ mod tests {
         let mut writer = zip::ZipWriter::new(file);
         for (name, bytes) in members {
             writer
-                .start_file(*name, FileOptions::default())
+                .start_file(*name, SimpleFileOptions::default())
                 .expect("zip member should start");
             writer
                 .write_all(bytes)

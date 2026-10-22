@@ -106,10 +106,10 @@ fn local_rules_and_local_alternatives_both_get_their_jar_icon() {
     for mod_id in ["top-local", "alt-local"] {
         let file = fs::File::create(jars.join(format!("{mod_id}.jar"))).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("fabric.mod.json", zip::write::FileOptions::default())
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(br#"{"id":"m","icon":"icon.png"}"#).unwrap();
-        zip.start_file("icon.png", zip::write::FileOptions::default())
+        zip.start_file("icon.png", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(b"\x89PNG\r\n\x1a\nbytes").unwrap();
         zip.finish().unwrap();
