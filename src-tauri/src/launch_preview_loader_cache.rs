@@ -15,6 +15,16 @@
 // Il formato è un tipo di questo file, non `LoaderMetadata` con serde: i due si
 // convertono con una destrutturazione completa, così un campo aggiunto a
 // `LoaderMetadata` non compila finché qualcuno non decide cosa farne qui.
+//
+// Le librerie del loader però stanno nell'istanza, non nella cache: la voce di
+// combinazione dice quale loader l'ultimo lancio online di *una* mod list ha
+// usato, non quale ha sul disco *questa* (review-lancio-1). Per questo un lancio
+// online che ha preparato tutti i file del loader ne lascia una copia anche
+// nell'istanza, in `<istanza>/.cubic/loader-metadata.json`, e offline vince
+// quella: è il loader di cui l'istanza ha davvero le librerie. Senza la copia
+// dell'istanza resta la voce di combinazione (D137); e offline un file del
+// loader che manca nell'istanza ferma il lancio con un messaggio suo, senza
+// nessuna richiesta (D132).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -249,31 +259,53 @@ pub(super) fn read_cached_loader_metadata(
     target: &ResolutionTarget,
 ) -> Result<CachedLoaderMetadata> {
     let path = loader_metadata_cache_path(cache_dir, target)?;
-    let contents = match std::fs::read_to_string(&path) {
+    Ok(read_loader_metadata_entry(&path, target))
+}
+
+/// La copia che l'istanza tiene del loader di cui ha preparato i file.
+pub(super) fn instance_loader_metadata_path(instance_root: &Path) -> PathBuf {
+    instance_root.join(".cubic").join("loader-metadata.json")
+}
+
+/// Rilegge la copia dell'istanza; stesso formato e stesse regole della voce di
+/// combinazione.
+pub(super) fn read_instance_loader_metadata(
+    instance_root: &Path,
+    target: &ResolutionTarget,
+) -> CachedLoaderMetadata {
+    read_loader_metadata_entry(&instance_loader_metadata_path(instance_root), target)
+}
+
+/// Scrive la copia dell'istanza. Va chiamata solo quando tutti i file del
+/// loader sono nell'istanza, e con i metadati come la rete li ha dati (prima
+/// che ForgeWrapper ci aggiunga i suoi argomenti).
+pub(super) fn write_instance_loader_metadata(
+    instance_root: &Path,
+    metadata: &LoaderMetadata,
+) -> Result<()> {
+    write_loader_metadata_entry(&instance_loader_metadata_path(instance_root), metadata)
+}
+
+fn read_loader_metadata_entry(path: &Path, target: &ResolutionTarget) -> CachedLoaderMetadata {
+    let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CachedLoaderMetadata::Missing)
+            return CachedLoaderMetadata::Missing
         }
         Err(error) => {
-            return Ok(CachedLoaderMetadata::Unreadable(format!(
-                "{}: {error}",
-                path.display()
-            )))
+            return CachedLoaderMetadata::Unreadable(format!("{}: {error}", path.display()))
         }
     };
     let file = match serde_json::from_str::<CachedLoaderMetadataFile>(&contents) {
         Ok(file) => file,
         Err(error) => {
-            return Ok(CachedLoaderMetadata::Unreadable(format!(
-                "{}: {error}",
-                path.display()
-            )))
+            return CachedLoaderMetadata::Unreadable(format!("{}: {error}", path.display()))
         }
     };
-    Ok(match from_cache_file(file, target) {
+    match from_cache_file(file, target) {
         Ok(metadata) => CachedLoaderMetadata::Found(metadata),
         Err(reason) => CachedLoaderMetadata::Unreadable(format!("{}: {reason}", path.display())),
-    })
+    }
 }
 
 /// Scrive la voce della combinazione in modo atomico: un lancio interrotto a
@@ -284,13 +316,17 @@ pub(super) fn write_cached_loader_metadata(
     metadata: &LoaderMetadata,
 ) -> Result<()> {
     let path = loader_metadata_cache_path(cache_dir, target)?;
+    write_loader_metadata_entry(&path, metadata)
+}
+
+fn write_loader_metadata_entry(path: &Path, metadata: &LoaderMetadata) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let bytes = serde_json::to_vec_pretty(&to_cache_file(metadata))
         .context("failed to serialize the loader metadata")?;
-    write_atomically(&path, bytes).with_context(|| format!("failed to write {}", path.display()))
+    write_atomically(path, bytes).with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Il messaggio di D137, vincolo 3: nomina la combinazione e dice cosa fare.
@@ -303,6 +339,20 @@ pub(super) fn never_launched_online_message(target: &ResolutionTarget) -> String
     )
 }
 
+/// Offline, un file del loader che l'istanza non ha (review-lancio-1): la
+/// voce di combinazione può venire dal lancio online di un'altra mod list, o da
+/// un lancio online morto prima di scaricare le librerie. Come D137 nomina cosa
+/// manca e dice cosa fare, senza parlare di rete.
+pub(super) fn loader_not_installed_message(metadata: &LoaderMetadata, missing: &Path) -> String {
+    let loader = loader_display_name(metadata.mod_loader);
+    let minecraft = &metadata.minecraft_version;
+    let version = &metadata.loader_version;
+    format!(
+        "{loader} {version} for Minecraft {minecraft} is not installed in this mod list (missing {}), and the active account plays offline, so nothing is downloaded. Play this mod list once with the account online (switch the account to online for one launch); after that it plays offline too, with the same loader version.",
+        missing.display()
+    )
+}
+
 /// I metadati del loader per un lancio.
 ///
 /// - Vanilla: `fetch` e basta, senza cache (non chiede niente a nessuno).
@@ -310,10 +360,12 @@ pub(super) fn never_launched_online_message(target: &ResolutionTarget) -> String
 ///   cache **prima** di ogni modifica del chiamante (vincolo 8). Un errore
 ///   della rete resta l'errore di rete: niente ripiego sulla cache. Una
 ///   scrittura che fallisce non ferma il lancio, lo dice il log.
-/// - Offline: la voce in cache, senza chiamare `fetch`; assente o illeggibile,
-///   il messaggio di D137.
+/// - Offline: senza chiamare `fetch`, la copia dell'istanza se c'è (il loader
+///   di cui l'istanza ha i file), altrimenti la voce di combinazione; assenti o
+///   illeggibili tutte e due, il messaggio di D137.
 pub(super) async fn loader_metadata_for_launch<F, Fut>(
     cache_dir: &Path,
+    instance_root: &Path,
     target: &ResolutionTarget,
     plays_offline: bool,
     fetch: F,
@@ -337,6 +389,20 @@ where
             ));
         }
         return Ok(metadata);
+    }
+
+    match read_instance_loader_metadata(instance_root, target) {
+        CachedLoaderMetadata::Found(metadata) => {
+            log(format!(
+                "[Loader] The active account plays offline: using {loader} loader {} for Minecraft {minecraft}, the one this mod list was last launched online with. The latest stable loader is not looked up.",
+                metadata.loader_version
+            ));
+            return Ok(metadata);
+        }
+        CachedLoaderMetadata::Missing => {}
+        CachedLoaderMetadata::Unreadable(reason) => log(format!(
+            "[Loader] This mod list's saved {loader} {minecraft} loader metadata cannot be read, so the one saved for {loader} {minecraft} is used: {reason}"
+        )),
     }
 
     match read_cached_loader_metadata(cache_dir, target)? {
@@ -585,6 +651,7 @@ mod tests {
         let lines = RefCell::new(Vec::new());
         let result = loader_metadata_for_launch(
             dir,
+            &dir.join("instance"),
             target,
             plays_offline,
             || {
@@ -611,6 +678,81 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("Fabric loader 0.16.10") && line.contains("1.20.1")));
+    }
+
+    /// review-lancio-1: la voce di combinazione l'ha riscritta il lancio online
+    /// di un'altra mod list con un loader più nuovo; offline questa mod list usa
+    /// il loader di cui la sua istanza ha i file.
+    #[tokio::test]
+    async fn offline_prefers_the_loader_this_instance_was_launched_with() {
+        let dir = TestDir::new("offline-instance");
+        let target = target("1.20.1", ModLoader::Fabric);
+        let mut newer = sample_metadata("1.20.1", ModLoader::Fabric, Some(17));
+        newer.loader_version = "0.16.14".to_string();
+        write_cached_loader_metadata(&dir.0, &target, &newer).unwrap();
+        let own = sample_metadata("1.20.1", ModLoader::Fabric, Some(17));
+        write_instance_loader_metadata(&dir.0.join("instance"), &own).unwrap();
+
+        let (result, calls, lines) =
+            launch_with(&dir.0, &target, true, Err(anyhow!("network touched"))).await;
+        assert_eq!(result.unwrap(), own);
+        assert_eq!(calls, 0);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("0.16.10") && line.contains("this mod list")));
+    }
+
+    #[tokio::test]
+    async fn offline_with_a_damaged_instance_copy_uses_the_combination_entry() {
+        let dir = TestDir::new("offline-instance-damaged");
+        let target = target("1.20.1", ModLoader::Fabric);
+        let saved = sample_metadata("1.20.1", ModLoader::Fabric, Some(17));
+        write_cached_loader_metadata(&dir.0, &target, &saved).unwrap();
+        let copy = instance_loader_metadata_path(&dir.0.join("instance"));
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, "{").unwrap();
+
+        let (result, calls, lines) =
+            launch_with(&dir.0, &target, true, Err(anyhow!("network touched"))).await;
+        assert_eq!(result.unwrap(), saved);
+        assert_eq!(calls, 0);
+        assert!(lines.iter().any(|line| line.contains("cannot be read")));
+    }
+
+    /// Un'istanza copiata da un'altra combinazione non presta il suo loader.
+    #[test]
+    fn an_instance_copy_of_another_combination_is_unreadable() {
+        let dir = TestDir::new("instance-other-combo");
+        write_instance_loader_metadata(&dir.0, &sample_metadata("1.21.1", ModLoader::Fabric, None))
+            .unwrap();
+        assert!(matches!(
+            read_instance_loader_metadata(&dir.0, &target("1.20.1", ModLoader::Fabric)),
+            CachedLoaderMetadata::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn the_not_installed_message_names_the_loader_and_what_to_do() {
+        let metadata = sample_metadata("1.20.1", ModLoader::Fabric, None);
+        let message =
+            loader_not_installed_message(&metadata, Path::new("libraries/net/fabricmc/x.jar"));
+        assert!(
+            message.contains("Fabric 0.16.10 for Minecraft 1.20.1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("not installed in this mod list"),
+            "{message}"
+        );
+        assert!(
+            message.contains("libraries/net/fabricmc/x.jar"),
+            "{message}"
+        );
+        assert!(
+            message.contains("once with the account online"),
+            "{message}"
+        );
+        assert!(!message.to_lowercase().contains("network"), "{message}");
     }
 
     #[tokio::test]

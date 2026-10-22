@@ -61,6 +61,13 @@ prova niente:
 - `control-online-still-fetches` — Fabric, `priming` due volte: anche con la voce
                           presente la seconda chiede ancora `meta.fabricmc.net`
                           (la cache non vince mai sulla rete, D137 vincolo 2).
+- `control-other-modlist` — Fabric, `priming` (online), poi la misura (offline)
+                          su un'**altra** mod list vuota, mai lanciata: la voce di
+                          combinazione c'è, le librerie del loader in quell'istanza
+                          no (review-lancio-1). Atteso: 0 richieste, `java` non
+                          raggiunto, e il motivo dice che il loader non è
+                          installato in quella mod list. Se chiede a
+                          `maven.fabricmc.net`, il lancio offline scarica ancora.
 
 Esce con 0 se ogni scenario e ogni controllo combacia con l'atteso, 1 altrimenti.
 
@@ -126,6 +133,8 @@ DEFAULT_MISSING_JAR = "fabric/unerR5MN/ferritecore-6.0.1-fabric.jar"
 VANILLA_MODLIST = "offline-guard-vanilla"
 # La mod list Fabric sintetica e vuota dell'innesco online (D160).
 PRIMING_MODLIST = "offline-guard-priming"
+# Una seconda mod list Fabric vuota, mai lanciata (review-lancio-1).
+OTHER_MODLIST = "offline-guard-other"
 GUARD_ACCOUNT = "offline-guard"
 # Il `devUrl` del binario debug (`tauri.conf.json`): se qui risponde qualcuno,
 # la webview carica il frontend e le sue richieste finiscono nel log.
@@ -155,6 +164,9 @@ FORWARDED_METADATA_HOSTS = frozenset({FABRIC_META_HOST})
 PRIMING_FATAL_ARTIFACT_HOSTS = ("piston-data.mojang.com", "maven.fabricmc.net")
 # Il pezzo fisso del messaggio di D137, vincolo 3: offline, combinazione mai lanciata online.
 NEVER_LAUNCHED_ONLINE = "has never been launched online"
+# Il pezzo fisso del messaggio di review-lancio-1: offline, la voce c'è ma l'istanza
+# non ha i file di quel loader.
+NOT_INSTALLED_IN_MODLIST = "is not installed in this mod list"
 
 
 # ---- proxy che logga, e rifiuta o inoltra -------------------------------------
@@ -311,6 +323,7 @@ def build_workspace(args: argparse.Namespace, scenario: "Scenario") -> HarnessWo
     else:
         # Vuota: l'innesco online non ha niente da chiedere a Modrinth (D160).
         ws.create_modlist(vanilla_modlist(PRIMING_MODLIST))
+        ws.create_modlist(vanilla_modlist(OTHER_MODLIST))
         source = real / "mod-lists" / args.modlist
         target = f"mod-lists/{args.modlist}"
         for name in (*MODLIST_JSON_FILES, "options.txt"):
@@ -323,6 +336,14 @@ def build_workspace(args: argparse.Namespace, scenario: "Scenario") -> HarnessWo
         libraries = source / "instances" / f"{args.mc}-{scenario.loader}" / "libraries"
         if libraries.is_dir():
             ws.copy_from(libraries, f"{target}/instances/{args.mc}-{scenario.loader}/libraries")
+        # Il loader di cui quelle librerie sono i file (review-lancio-1): offline
+        # vince sulla voce di combinazione. Copiato, mai in hard link.
+        instance_loader = libraries.parent / ".cubic" / "loader-metadata.json"
+        if instance_loader.is_file():
+            ws.copy_from(
+                instance_loader,
+                f"{target}/instances/{args.mc}-{scenario.loader}/.cubic/loader-metadata.json",
+            )
         ws.assert_private(f"{target}/instances")
         for name in (*MODLIST_JSON_FILES, "options.txt", "custom_configs"):
             if (ws.launcher_root / target / name).exists():
@@ -458,6 +479,23 @@ CONTROLS = [
         "control-online-still-fetches",
         "fabric",
         [priming(), priming("priming-again", loader_cache_before=True)],
+    ),
+    # review-lancio-1: la voce è per combinazione, le librerie per istanza. Offline
+    # una mod list che non ha i file di quel loader non li scarica.
+    Scenario(
+        "control-other-modlist",
+        "fabric",
+        [
+            priming(),
+            Phase(
+                "measure-other-modlist",
+                expected_hosts={},
+                expect_java=False,
+                modlist=OTHER_MODLIST,
+                loader_cache_before=True,
+                failure_must_contain=(NOT_INSTALLED_IN_MODLIST, "Fabric", "{mc}"),
+            ),
+        ],
     ),
 ]
 

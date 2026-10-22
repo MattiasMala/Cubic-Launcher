@@ -37,24 +37,50 @@ use super::{
 /// Legacy Forge (<=1.12.2) instead uses `net.minecraft.launchwrapper.Launch`.
 const FORGE_WRAPPER_MAIN_CLASS: &str = "io.github.zekerzhayard.forgewrapper.installer.Main";
 
+/// Da dove arriva un file del loader che manca nell'istanza.
+pub(super) enum LoaderArtifactSource<'a> {
+    /// Account online: si scarica.
+    Download(&'a reqwest::Client),
+    /// Account offline (D132, review-lancio-1): nessuna richiesta. Un file che
+    /// manca ferma il lancio con il messaggio di `loader_not_installed_message`
+    /// per questi metadati, invece di un errore di rete.
+    InstanceOnly(&'a LoaderMetadata),
+}
+
+impl LoaderArtifactSource<'_> {
+    async fn fetch(&self, url: &str, destination_path: &Path, library_root: &Path) -> Result<()> {
+        match self {
+            Self::Download(http_client) => download_file(http_client, url, destination_path).await,
+            Self::InstanceOnly(metadata) => {
+                let shown = destination_path
+                    .strip_prefix(library_root.parent().unwrap_or(library_root))
+                    .unwrap_or(destination_path);
+                bail!(super::loader_cache::loader_not_installed_message(
+                    metadata, shown
+                ))
+            }
+        }
+    }
+}
+
 pub(super) async fn materialize_loader_libraries(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     loader_metadata: &LoaderMetadata,
 ) -> Result<Vec<PathBuf>> {
-    materialize_loader_artifacts(http_client, library_root, &loader_metadata.libraries).await
+    materialize_loader_artifacts(source, library_root, &loader_metadata.libraries).await
 }
 
 pub(super) async fn materialize_loader_maven_files(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     loader_metadata: &LoaderMetadata,
 ) -> Result<Vec<PathBuf>> {
-    materialize_loader_artifacts(http_client, library_root, &loader_metadata.maven_files).await
+    materialize_loader_artifacts(source, library_root, &loader_metadata.maven_files).await
 }
 
 async fn materialize_loader_artifacts(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     artifacts: &[LoaderLibrary],
 ) -> Result<Vec<PathBuf>> {
@@ -82,7 +108,9 @@ async fn materialize_loader_artifacts(
                 continue; // no way to obtain this library
             };
 
-            download_file(http_client, &download_url, &destination_path).await?;
+            source
+                .fetch(&download_url, &destination_path, library_root)
+                .await?;
         }
 
         paths.push(destination_path);
@@ -102,7 +130,7 @@ pub(super) fn contained_loader_library_path(
 }
 
 pub(super) async fn prepare_forge_wrapper_launch(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     // La cartella di lavoro di Java: installer e librerie le passano relative.
     working_directory: &Path,
     library_root: &Path,
@@ -116,7 +144,9 @@ pub(super) async fn prepare_forge_wrapper_launch(
     let installer_path =
         contained_loader_library_path(library_root, &installer_artifact.relative_path)?;
     if !installer_path.exists() {
-        download_file(http_client, &installer_artifact.url, &installer_path).await?;
+        source
+            .fetch(&installer_artifact.url, &installer_path, library_root)
+            .await?;
     }
 
     loader_metadata
@@ -130,7 +160,7 @@ pub(super) async fn prepare_forge_wrapper_launch(
 
     let profile_libraries = read_forge_installer_profile_libraries(&installer_path)?;
     let profile_library_paths =
-        materialize_loader_artifacts(http_client, library_root, &profile_libraries).await?;
+        materialize_loader_artifacts(source, library_root, &profile_libraries).await?;
 
     Ok(Some(ForgeWrapperLaunchPreparation {
         installer_path,
@@ -434,11 +464,13 @@ pub(super) fn minecraft_cache_policy(plays_offline: bool) -> MinecraftCachePolic
 pub(super) async fn fetch_launch_loader_metadata(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
+    instance_root: &Path,
     target: &ResolutionTarget,
     plays_offline: bool,
 ) -> Result<LoaderMetadata> {
     super::loader_cache::loader_metadata_for_launch(
         &launcher_paths.loader_metadata_cache_dir(),
+        instance_root,
         target,
         plays_offline,
         || async {
@@ -1979,5 +2011,74 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// review-lancio-1: offline un file del loader che l'istanza non ha non si
+    /// scarica (l'URL punta a una porta chiusa: una richiesta darebbe un altro
+    /// errore); il lancio si ferma con il messaggio che nomina loader e file.
+    #[tokio::test]
+    async fn offline_loader_artifacts_come_only_from_the_instance() {
+        use crate::loader_metadata::{LoaderLibrary, LoaderMetadata};
+        use crate::resolver::ModLoader;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let instance = std::env::temp_dir().join(format!(
+            "cubic-offline-loader-{unique}-{}",
+            std::process::id()
+        ));
+        let library_root = instance.join("libraries");
+        let present =
+            library_root.join("net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, b"jar").unwrap();
+
+        let library = |name: &str| LoaderLibrary {
+            name: name.to_string(),
+            url: Some("http://127.0.0.1:9/".to_string()),
+            download: None,
+        };
+        let metadata = LoaderMetadata {
+            mod_loader: ModLoader::Fabric,
+            minecraft_version: "1.20.1".to_string(),
+            loader_version: "0.16.10".to_string(),
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            libraries: vec![library("net.fabricmc:fabric-loader:0.16.10")],
+            maven_files: vec![],
+            jvm_arguments: vec![],
+            game_arguments: vec![],
+            min_java_version: None,
+        };
+        let source = super::LoaderArtifactSource::InstanceOnly(&metadata);
+
+        let paths = super::materialize_loader_libraries(&source, &library_root, &metadata)
+            .await
+            .expect("a library already in the instance needs nothing");
+        assert_eq!(paths, vec![present]);
+
+        let mut newer = metadata.clone();
+        newer.loader_version = "0.16.14".to_string();
+        newer.libraries = vec![library("net.fabricmc:fabric-loader:0.16.14")];
+        let source = super::LoaderArtifactSource::InstanceOnly(&newer);
+        let message = format!(
+            "{:#}",
+            super::materialize_loader_libraries(&source, &library_root, &newer)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            message
+                .contains("Fabric 0.16.14 for Minecraft 1.20.1 is not installed in this mod list"),
+            "{message}"
+        );
+        assert!(message.contains("fabric-loader-0.16.14.jar"), "{message}");
+        assert!(!message.contains("failed to request"), "{message}");
+        assert!(!library_root
+            .join("net/fabricmc/fabric-loader/0.16.14")
+            .exists());
+
+        std::fs::remove_dir_all(&instance).ok();
     }
 }

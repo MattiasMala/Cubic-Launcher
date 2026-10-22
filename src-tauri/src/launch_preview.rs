@@ -410,8 +410,15 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // Minecraft. Con l'account offline vengono dalla cache scritta dall'ultimo
     // lancio online della combinazione (D137): senza la voce il lancio si
     // ferma qui, prima di toccare mods/ e i config dell'istanza.
-    let mut loader_metadata =
-        fetch_launch_loader_metadata(&app_handle, &launcher_paths, &target, plays_offline).await?;
+    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
+    let mut loader_metadata = fetch_launch_loader_metadata(
+        &app_handle,
+        &launcher_paths,
+        &instance_root,
+        &target,
+        plays_offline,
+    )
+    .await?;
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let pins = load_modlist_pins(&launcher_paths, &modlist_name, &modlist);
@@ -718,7 +725,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Refreshing mods, loader libraries, configs and launch metadata.",
     )?;
 
-    let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
     let instance_mods_dir = instance_root.join("mods");
     let instance_config_dir = instance_root.join("config");
     let instance_natives_dir = instance_root.join("natives");
@@ -835,10 +841,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     )
     .await?;
 
+    // review-lancio-1: offline nessun file del loader si scarica (D132). La
+    // voce di combinazione può nominare un loader che questa istanza non ha
+    // mai preparato: allora il lancio si ferma con un messaggio suo.
+    let offline_metadata = plays_offline.then(|| loader_metadata.clone());
+    let loader_source = match &offline_metadata {
+        Some(metadata) => LoaderArtifactSource::InstanceOnly(metadata),
+        None => LoaderArtifactSource::Download(&http_client),
+    };
+    // I metadati come la rete li ha dati: ForgeWrapper qui sotto ci aggiunge
+    // i suoi argomenti, che la copia dell'istanza non deve contenere.
+    let fetched_loader_metadata = (!plays_offline).then(|| loader_metadata.clone());
     let mut loader_library_paths =
-        materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;
+        materialize_loader_libraries(&loader_source, &instance_library_dir, &loader_metadata)
+            .await?;
     let loader_maven_file_paths =
-        materialize_loader_maven_files(&http_client, &instance_library_dir, &loader_metadata)
+        materialize_loader_maven_files(&loader_source, &instance_library_dir, &loader_metadata)
             .await?;
     if !loader_maven_file_paths.is_empty() {
         emit_log(
@@ -851,7 +869,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
     if let Some(preparation) = prepare_forge_wrapper_launch(
-        &http_client,
+        &loader_source,
         &instance_root,
         &instance_library_dir,
         &mc_data.client_jar_path,
@@ -882,6 +900,21 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 ),
             )?;
             loader_library_paths.extend(preparation.profile_library_paths);
+        }
+    }
+
+    // Tutti i file del loader sono nell'istanza: da qui offline questa mod
+    // list rilancia proprio questo loader, qualunque cosa un'altra mod list
+    // scriva poi nella voce di combinazione (review-lancio-1).
+    if let Some(fetched) = &fetched_loader_metadata {
+        if let Err(error) = loader_cache::write_instance_loader_metadata(&instance_root, fetched) {
+            emit_log(
+                &app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Loader] Could not save which loader this mod list has, for offline launches: {error:#}"
+                ),
+            )?;
         }
     }
 
