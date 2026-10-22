@@ -63,6 +63,17 @@ export function PinVersionModal(props: PinVersionModalProps) {
       .finally(() => setLoading(false));
   });
 
+  // The pin is scoped to one (Minecraft version, loader) pair (D14), and what
+  // the other targets get depends on whether the dynamic entry survives it
+  // (D5): with it removed, or already gone, they load no version at all
+  // (audit 101, ui-modali-10).
+  const pinScope = () => {
+    const scope = `The pin applies to ${mcVersion()} + ${props.loader} only`;
+    return removeDynamic() || !props.canPin
+      ? `${scope}; with no dynamic entry, every other target loads no version of this mod.`
+      : `${scope}; every other target keeps using the dynamic entry.`;
+  };
+
   // "0.6.0 (release)", the label of the mock in todo.md § B2.
   const releaseOptions = () =>
     releases().map(release => ({
@@ -86,7 +97,7 @@ export function PinVersionModal(props: PinVersionModalProps) {
     <Modal onClose={props.onClose} maxWidth="max-w-lg">
       <ModalHeader
         title={`${props.modName} — choose version`}
-        description={`The pin applies to ${props.loader} only; every other target keeps using the dynamic entry.`}
+        description={pinScope()}
         onClose={props.onClose}
       />
 
