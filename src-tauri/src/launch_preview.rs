@@ -303,12 +303,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // launch will install.
     let resolution_path =
         LaunchResolutionPath::for_active_account(plays_offline, request.resolved_versions.as_ref());
-    // `None` on the `Resolve` path, always — the path is chosen by the map's
-    // presence. The online branch below keeps reading it so that "no map" is
-    // literally today's path, unchanged: whether that branch should still
-    // carry its map handling is part of the merge-the-two-branches decision
-    // this task does not take.
-    let preresolved_versions = resolution_path.preresolved();
     let selection = match resolution_path {
         LaunchResolutionPath::Preresolved(preresolved) => {
             resolve_offline_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
@@ -325,13 +319,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 &modlist,
                 &modrinth_client,
                 &target,
-                // No map on this path, by construction.
-                None,
             )
             .await?
         }
     };
-    log_resolution(&app_handle, &selection.resolution)?;
+    log_resolution(&app_handle, &selection.resolution, &selection.unavailable)?;
     // The availability pass runs before the artifact stage, so a mod it
     // disabled is gone from `selected_mods` and `report_unusable_probe` can no
     // longer see it: this is the only place that names it (A5). The pre-check
@@ -422,42 +414,23 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )
     } else {
         // DESIGN: deliberately a second pass, not a reuse of the one inside
-        // `resolve_online_selection`. That one ran on the mods the first
-        // resolution selected; this one runs on `selected_mods`, which exists
-        // only after the re-resolution and can contain alternatives the first
-        // pass never saw. Merging the two means handling that delta, and
-        // getting it wrong means a mod the re-resolution enabled that nobody
-        // looks up. Two passes still cost ~10 requests against the 52 of one
-        // request per mod per pass.
+        // `resolve_online_selection`. That one throws its version maps away
+        // round by round and keeps only the verdict; this one runs once on the
+        // final `selected_mods`. Two passes still cost ~10 requests against
+        // the 52 of one request per mod per pass.
         //
-        // With a version map from the pre-check this pass stops choosing and
-        // starts looking up: the launch installs exactly what the popup showed
-        // (D16).
-        let compatible_versions = match preresolved_versions {
-            Some(preresolved) => {
-                resolve_preresolved_versions(
-                    &app_handle,
-                    &launcher_paths,
-                    &http_client,
-                    &selected_mods,
-                    &modrinth_client,
-                    &target,
-                    preresolved,
-                )
-                .await?
-            }
-            None => {
-                resolve_compatible_versions_hybrid(
-                    &app_handle,
-                    &launcher_paths,
-                    &http_client,
-                    &selected_mods,
-                    &modrinth_client,
-                    &target,
-                )
-                .await?
-            }
-        };
+        // No version map reaches this branch: a map always takes the
+        // `Preresolved` path above (`LaunchResolutionPath::for_active_account`),
+        // so the old map handling here was unreachable (audit 101, precheck-7).
+        let compatible_versions = resolve_compatible_versions_hybrid(
+            &app_handle,
+            &launcher_paths,
+            &http_client,
+            &selected_mods,
+            &modrinth_client,
+            &target,
+        )
+        .await?;
         // The mods no version came back for keep the jar the cache already
         // holds (D29): the availability pass kept them, so this is where they
         // are actually acquired.

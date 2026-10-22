@@ -115,6 +115,11 @@ pub enum RuleOutcome {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FailureReason {
+    /// The rule itself is disabled: by the user in the editor, or by the
+    /// availability pass because nothing installable exists for it. Before
+    /// this value it came back as `ExcludedByActiveMod`, and the launch log
+    /// said "excluded by already-selected mods" with nothing excluding it.
+    Disabled,
     ExcludedByActiveMod,
     RequiredModMissing,
     IncompatibleVersion,
@@ -240,6 +245,134 @@ fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> H
     }
 }
 
+/// `resolve_modlist` with the given mods disabled wherever they appear in the
+/// tree: the re-resolution that gives alternatives their chance once a mod
+/// turns out to have nothing installable for the target.
+pub fn resolve_modlist_without(
+    modlist: &ModList,
+    unavailable: &[String],
+    target: &ResolutionTarget,
+) -> Result<ResolutionResult> {
+    fn disable(rules: &mut [Rule], unavailable: &HashSet<&str>) {
+        for rule in rules {
+            if unavailable.contains(rule.mod_id.as_str()) {
+                rule.enabled = false;
+            }
+            disable(&mut rule.alternatives, unavailable);
+        }
+    }
+
+    let unavailable = unavailable
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut patched = modlist.clone();
+    disable(&mut patched.rules, &unavailable);
+    resolve_modlist(&patched, target)
+}
+
+/// La disponibilità e la ri-risoluzione iterate fino al punto fisso (audit
+/// 101, risoluzione-2).
+///
+/// Interrogare una volta sola la prima selezione lasciava fuori la catena di
+/// fallback: con «sodium» e le alternative [embeddium, rubidium], se sodium
+/// non ha versione la ri-risoluzione sceglie embeddium senza chiedere se
+/// esiste, e rubidium non viene mai interrogato. Qui ogni mod che una
+/// risoluzione seleziona viene chiesto prima che la selezione valga: chi non è
+/// disponibile si disabilita, si risolve di nuovo, e si chiedono i mod nuovi
+/// che la ri-risoluzione ha portato dentro, finché non ne arrivano più.
+///
+/// Termina: ogni giro chiede almeno un mod mai chiesto, e i mod dell'albero
+/// sono finiti. È deterministico: l'ordine è quello della risoluzione, e un mod
+/// già chiesto non si richiede (la risposta non cambia dentro un lancio).
+///
+/// La domanda — rete, cache, o tutte e due — è del chiamante: questo tipo
+/// sa solo chi chiedere (`pending`) e cosa fare della risposta (`record`), così
+/// il lancio online, quello offline, il pre-check e l'editor fanno la stessa
+/// sequenza (D146).
+#[derive(Debug, Clone)]
+pub struct AvailabilityFixpoint<'a> {
+    modlist: &'a ModList,
+    target: &'a ResolutionTarget,
+    first: ResolutionResult,
+    current: ResolutionResult,
+    unavailable: Vec<String>,
+    asked: HashSet<String>,
+}
+
+impl<'a> AvailabilityFixpoint<'a> {
+    pub fn new(modlist: &'a ModList, target: &'a ResolutionTarget) -> Result<Self> {
+        let first = resolve_modlist(modlist, target)?;
+        Ok(Self {
+            modlist,
+            target,
+            current: first.clone(),
+            first,
+            unavailable: Vec::new(),
+            asked: HashSet::new(),
+        })
+    }
+
+    /// The Modrinth mods the current resolution selects and whose availability
+    /// nobody asked yet, once each, in resolution order. Empty means the fixed
+    /// point: every selected mod has been asked and none was unavailable.
+    pub fn pending(&self) -> Vec<String> {
+        let mut pending = Vec::new();
+        for (index, resolved) in self.current.resolved_rules.iter().enumerate() {
+            let RuleOutcome::Resolved { resolved_id } = &resolved.outcome else {
+                continue;
+            };
+            let is_modrinth = self
+                .modlist
+                .find_rule(resolved_id)
+                .or_else(|| self.modlist.rules.get(index))
+                .is_some_and(|rule| rule.source == ModSource::Modrinth);
+            if is_modrinth && !self.asked.contains(resolved_id) && !pending.contains(resolved_id) {
+                pending.push(resolved_id.clone());
+            }
+        }
+        pending
+    }
+
+    /// The answer for `asked`: `unavailable` are the ones among them with
+    /// nothing installable. Anything new re-resolves with every unavailable mod
+    /// so far disabled.
+    pub fn record(&mut self, asked: &[String], unavailable: &[String]) -> Result<()> {
+        self.asked.extend(asked.iter().cloned());
+        let mut changed = false;
+        for mod_id in unavailable {
+            if !self.unavailable.contains(mod_id) {
+                self.unavailable.push(mod_id.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.current = resolve_modlist_without(self.modlist, &self.unavailable, self.target)?;
+        }
+        Ok(())
+    }
+
+    /// The resolution before any mod was found unavailable.
+    pub fn first(&self) -> &ResolutionResult {
+        &self.first
+    }
+
+    /// The resolution the target actually loads.
+    pub fn current(&self) -> &ResolutionResult {
+        &self.current
+    }
+
+    /// Every mod found unavailable, in the order it was found.
+    pub fn unavailable(&self) -> &[String] {
+        &self.unavailable
+    }
+
+    /// `(first, final, unavailable)`.
+    pub fn into_parts(self) -> (ResolutionResult, ResolutionResult, Vec<String>) {
+        (self.first, self.current, self.unavailable)
+    }
+}
+
 /// Every `(mod_id, requires)` pair of the rule tree, plus each mod's enabled state.
 type CollectedRequires = (Vec<(String, Vec<String>)>, HashMap<String, bool>);
 
@@ -299,12 +432,7 @@ fn try_resolve(
 ) -> RuleOutcome {
     // 0. Disabled mods are treated as if they don't exist — skip to alternatives.
     if !rule.enabled {
-        return try_alternatives(
-            rule,
-            active_mods,
-            target,
-            FailureReason::ExcludedByActiveMod,
-        );
+        return try_alternatives(rule, active_mods, target, FailureReason::Disabled);
     }
 
     // 1. Check exclude_if
@@ -1706,6 +1834,120 @@ mod tests {
 
         assert_consistent(&ml, &result);
         assert_eq!(result.active_mods, HashSet::from(["B".to_string()]));
+    }
+
+    /// Il punto fisso con una disponibilità scritta a mano: restituisce i mod
+    /// caricati e quante volte è stata fatta la domanda per ciascun mod.
+    fn run_fixpoint(
+        ml: &ModList,
+        target: &ResolutionTarget,
+        unavailable: &[&str],
+    ) -> (HashSet<String>, HashMap<String, usize>, Vec<String>) {
+        let mut pass = AvailabilityFixpoint::new(ml, target).unwrap();
+        let mut asked = HashMap::<String, usize>::new();
+        loop {
+            let pending = pass.pending();
+            if pending.is_empty() {
+                break;
+            }
+            for mod_id in &pending {
+                *asked.entry(mod_id.clone()).or_default() += 1;
+            }
+            let missing = pending
+                .iter()
+                .filter(|mod_id| unavailable.contains(&mod_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            pass.record(&pending, &missing).unwrap();
+        }
+        let (_, last, unavailable) = pass.into_parts();
+        (last.active_mods, asked, unavailable)
+    }
+
+    #[test]
+    fn the_fallback_chain_goes_past_an_unavailable_first_alternative() {
+        // Report 101, risoluzione-2: «sodium» con alternative [embeddium,
+        // rubidium] su forge 1.16.5, sodium ed embeddium senza versione. Prima
+        // embeddium entrava senza verifica e il gioco partiva senza nessun mod
+        // della catena; rubidium non veniva mai chiesto.
+        let mut sodium = simple_rule("sodium");
+        sodium.alternatives = vec![simple_rule("embeddium"), simple_rule("rubidium")];
+        let ml = modlist(vec![sodium, simple_rule("lithium")]);
+        let target = ResolutionTarget {
+            minecraft_version: "1.16.5".into(),
+            mod_loader: ModLoader::Forge,
+        };
+
+        let (loaded, asked, unavailable) = run_fixpoint(&ml, &target, &["sodium", "embeddium"]);
+
+        assert_eq!(
+            loaded,
+            HashSet::from(["rubidium".to_string(), "lithium".to_string()])
+        );
+        assert_eq!(unavailable, vec!["sodium", "embeddium"]);
+        // Ogni mod si chiede una volta sola, anche se la risoluzione gira tre volte.
+        assert!(asked.values().all(|count| *count == 1), "{asked:?}");
+        assert_eq!(asked.len(), 4);
+    }
+
+    #[test]
+    fn a_chain_with_nothing_available_loads_nothing_of_it() {
+        let mut sodium = simple_rule("sodium");
+        sodium.alternatives = vec![simple_rule("embeddium"), simple_rule("rubidium")];
+        let ml = modlist(vec![sodium]);
+
+        let (loaded, _, _) = run_fixpoint(&ml, &target(), &["sodium", "embeddium", "rubidium"]);
+
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn a_fixpoint_with_everything_available_asks_once_and_keeps_the_first_resolution() {
+        let mut sodium = simple_rule("sodium");
+        sodium.alternatives = vec![simple_rule("embeddium")];
+        let mut local = simple_rule("my-jar");
+        local.source = ModSource::Local;
+        let ml = modlist(vec![sodium, local]);
+
+        let (loaded, asked, unavailable) = run_fixpoint(&ml, &target(), &[]);
+
+        assert_eq!(
+            loaded,
+            HashSet::from(["sodium".to_string(), "my-jar".to_string()])
+        );
+        // Un mod locale non si chiede a Modrinth; un'alternativa non selezionata nemmeno.
+        assert_eq!(asked, HashMap::from([("sodium".to_string(), 1)]));
+        assert!(unavailable.is_empty());
+    }
+
+    #[test]
+    fn an_unavailable_mod_is_disabled_everywhere_it_appears_in_the_tree() {
+        // Lo stesso id come alternativa di due regole: disabilitarne solo la
+        // prima occorrenza lo lasciava rientrare dalla seconda senza domanda.
+        let mut first = simple_rule("sodium");
+        first.alternatives = vec![simple_rule("embeddium")];
+        let mut second = simple_rule("rubidium");
+        second.alternatives = vec![simple_rule("embeddium")];
+        let ml = modlist(vec![first, second]);
+
+        let without = resolve_modlist_without(
+            &ml,
+            &[
+                "sodium".to_string(),
+                "rubidium".to_string(),
+                "embeddium".to_string(),
+            ],
+            &target(),
+        )
+        .unwrap();
+
+        assert!(without.active_mods.is_empty());
+        assert_eq!(
+            without.resolved_rules[1].outcome,
+            RuleOutcome::Unresolved {
+                reason: FailureReason::Disabled,
+            }
+        );
     }
 
     #[test]

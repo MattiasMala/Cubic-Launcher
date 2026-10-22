@@ -374,8 +374,6 @@ pub(super) async fn run_update_precheck(
         &modlist,
         &modrinth_client,
         &target,
-        // The pre-check is the thing that decides: it has nothing handed down.
-        None,
     )
     .await?;
 
@@ -1034,6 +1032,118 @@ mod tests {
             .iter()
             .any(|lost| lost.mod_id == "sodium"));
 
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
+    }
+
+    /// Audit 101, risoluzione-3 (D138 con le alternative): il primario e la
+    /// sua prima alternativa hanno la riga registrata e il jar sparito. Prima
+    /// le sonde si facevano solo sulla prima selezione, l'alternativa entrava
+    /// senza essere sondata e il lancio offline la riscaricava dalla CDN. Ora
+    /// ogni giro sonda i mod nuovi: la catena va avanti fino a un'alternativa
+    /// col jar sul disco, e senza di essa il mod esce col suo motivo.
+    #[test]
+    fn offline_an_alternative_whose_jar_is_gone_is_probed_and_never_selected() {
+        use super::super::DropReason;
+
+        let launcher_paths = offline_root("alternatives", true);
+        let connection =
+            rusqlite::Connection::open(launcher_paths.database_path()).expect("open database");
+        let repository = crate::mod_cache::SqliteModCacheRepository::new(
+            &connection,
+            launcher_paths.mods_cache_dir(),
+        );
+        let register = |mod_id: &str, jar_on_disk: bool| {
+            let mut version = candidate(mod_id, &format!("{mod_id}-v1"), "1.0.0");
+            version.project_id = mod_id.into();
+            version.files = vec![crate::modrinth::ModrinthFile {
+                hashes: HashMap::from([("sha1".to_string(), format!("{mod_id}-sha1"))]),
+                url: format!("https://cdn.modrinth.com/data/{mod_id}/{mod_id}.jar"),
+                filename: format!("{mod_id}.jar"),
+                primary: true,
+                size: 100,
+            }];
+            repository
+                .upsert_modrinth_version(&version, &target())
+                .expect("register the mod for the target");
+            if jar_on_disk {
+                let record = repository
+                    .find_registered_by_project_or_alias(mod_id, &target())
+                    .expect("read the row back")
+                    .expect("the row was just written");
+                let path = crate::mod_cache::cached_artifact_path_for_record(
+                    launcher_paths.mods_cache_dir(),
+                    &record,
+                );
+                std::fs::create_dir_all(path.parent().unwrap()).expect("jar directory");
+                std::fs::write(&path, b"jar").expect("write the jar");
+            }
+        };
+        // `sodium` è già registrato da `offline_root`, col jar sparito.
+        register("embeddium", false);
+        register("rubidium", true);
+
+        let alternative = |mod_id: &str| Rule {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives: vec![],
+        };
+        let chain = |alternatives: Vec<Rule>| ModList {
+            modlist_name: "Offline Pack".into(),
+            author: "Author".into(),
+            description: "Test".into(),
+            rules: vec![Rule {
+                alternatives,
+                ..alternative("sodium")
+            }],
+        };
+        let selected = |selection: &super::super::TargetSelection| {
+            selection
+                .selected_mods
+                .iter()
+                .map(|selected| selected.mod_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Con rubidium sul disco la catena arriva fin lì, e nessuno è perso.
+        let reaches_rubidium = resolve_offline_selection(
+            &launcher_paths,
+            &chain(vec![alternative("embeddium"), alternative("rubidium")]),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
+        assert_eq!(selected(&reaches_rubidium), vec!["rubidium".to_string()]);
+        assert!(reaches_rubidium.dropped.is_empty());
+        assert_eq!(
+            reaches_rubidium.unavailable,
+            vec!["sodium".to_string(), "embeddium".to_string()]
+        );
+
+        // Senza rubidium embeddium non entra (niente download offline), e il
+        // mod esce col motivo del jar sparito.
+        let nothing_on_disk = resolve_offline_selection(
+            &launcher_paths,
+            &chain(vec![alternative("embeddium")]),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
+        assert!(selected(&nothing_on_disk).is_empty());
+        assert_eq!(
+            nothing_on_disk
+                .dropped
+                .iter()
+                .map(|lost| (lost.mod_id.as_str(), lost.reason))
+                .collect::<Vec<_>>(),
+            vec![("sodium", DropReason::RegisteredJarGoneOffline)]
+        );
+
+        drop(connection);
         std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
     }
 
