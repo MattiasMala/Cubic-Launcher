@@ -111,10 +111,9 @@ import { PinVersionDialog } from "./components/PinVersionDialog";
 /**
  * The Advanced checkbox that governs one pre-check category.
  *
- * The three settings were written and read by nobody until now
- * (`app_shell.rs:59` said so in a comment); this table is the whole of
- * "reading" them. A category with no entry here — there is none today — is
- * treated as on, because silence must not hide an update.
+ * This table is the only place that reads the three settings. A category with
+ * no entry here — there is none today — is treated as on, because silence
+ * must not hide an update.
  */
 const CONTENT_CATEGORY_SETTINGS: Record<string, "updateNotificationsResourcePacks" | "updateNotificationsDataPacks" | "updateNotificationsShaders"> = {
   resourcepack: "updateNotificationsResourcePacks",
@@ -1120,7 +1119,7 @@ export default function App() {
         new Map(precheck.contentLookupFailures.map(failure => [`${failure.category}/${failure.entryId}`, failure.error])),
       );
 
-      // The three Advanced checkboxes, finally read. A category that is off
+      // The three Advanced checkboxes. A category that is off
       // keeps its rows out of the popup **and** out of the accepted set, so
       // its entries stay at the version on disk — D30's rule, per category
       // instead of globally. An entry that was never installed has no row, so

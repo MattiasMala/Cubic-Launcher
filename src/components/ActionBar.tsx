@@ -134,7 +134,7 @@ export function ActionBar(props: ActionBarProps) {
 
   const NormalBar = () => (
     <div class="px-6 py-2 bg-bgPanel border-b border-borderColor shrink-0 flex items-center justify-between gap-3">
-      {/* Left: Add Content + Sort + Tags dropdown + Links + Clear */}
+      {/* Left: Add Mods + Tags dropdown + Links + Clear */}
       <div class="flex items-center gap-2 flex-wrap">
         {/* Add Mods */}
         <button
@@ -204,12 +204,12 @@ export function ActionBar(props: ActionBarProps) {
           </button>
         </Show>
 
-        {/* Clear filters */}
+        {/* Clear the tag filter */}
         <Show when={hasActiveFilters()}>
           <button
             onClick={() => setTagFilter(new Set<string>())}
             class="flex items-center gap-1 px-2 py-0.5 rounded-md text-xs text-textMuted hover:text-white hover:bg-muted/40 border border-dashed border-borderColor transition-colors duration-75"
-            title="Reset all filters and sort"
+            title="Clear the tag filter"
           >
             <XIcon class="h-3 w-3" />
             Clear

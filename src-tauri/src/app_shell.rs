@@ -89,8 +89,9 @@ pub struct ShellGlobalSettings {
     /// be installed.
     pub update_notifications_enabled: bool,
     /// The content categories the popup may report on. Mods are always
-    /// included and have no flag. Persisted only: the content-pack side of the
-    /// pre-check is C4, so nothing reads these three yet.
+    /// included and have no flag. The frontend reads these three: a category
+    /// switched off keeps its rows out of the update popup and its entries at
+    /// the version on disk.
     pub update_notifications_resource_packs: bool,
     pub update_notifications_data_packs: bool,
     pub update_notifications_shaders: bool,

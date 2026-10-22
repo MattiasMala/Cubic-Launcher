@@ -207,10 +207,11 @@ pub fn select_java_for_requirement(
         })
 }
 
-/// Select only an *exact* major match, never a higher one. Used as the
-/// pre-download gate so a legacy launch that genuinely needs an EOL-adjacent
-/// major (e.g. Java 8) still triggers the exact download instead of silently
-/// reusing a newer installed runtime.
+/// Select only an *exact* major match, never a higher one. The launch asks
+/// this before deciding to download a Java runtime from Adoptium, so a legacy
+/// launch that genuinely needs an EOL-adjacent major (e.g. Java 8) still gets
+/// the exact download instead of silently reusing a newer installed runtime
+/// (offline, where nothing is downloaded, D158 falls back to a newer one).
 pub fn select_exact_java_for_requirement(
     installations: &[JavaInstallation],
     required_version: u32,
