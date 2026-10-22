@@ -1,4 +1,4 @@
-import type { AestheticGroup, FunctionalGroup, ModRow } from "../lib/types";
+import type { AestheticGroup, FunctionalGroup, IncompatibilityRule, LinkRule, ModRow } from "../lib/types";
 
 export function rebuildRowIds(rows: ModRow[]): ModRow[] {
   const rebuildAlternatives = (alternatives: ModRow[], ruleIndex: number, parentPath: string): ModRow[] =>
@@ -157,26 +157,135 @@ export function collectRowIds(rows: ModRow[]): Set<string> {
   return ids;
 }
 
-export function remapIds(ids: string[], idRemap: Map<string, string>, validIds: Set<string>): string[] {
+/**
+ * Old row id → new row id, or `null` when the row is gone.
+ *
+ * Row ids are positional, so after a reorder or a delete every state keyed by
+ * them has to go through the same translation (audit 101, `modlist-5`,
+ * `editor-logica-3`). `removedIds` are the rows just deleted: their entries are
+ * dropped, never remapped, even if a surviving row now has the same id.
+ */
+export type RowIdResolver = (id: string) => string | null;
+
+export function rowIdResolver(
+  idRemap: Map<string, string>,
+  validIds: Set<string>,
+  removedIds: ReadonlySet<string> = new Set(),
+): RowIdResolver {
+  return id => {
+    if (removedIds.has(id)) return null;
+    const next = idRemap.get(id) ?? id;
+    return validIds.has(next) ? next : null;
+  };
+}
+
+export function remapIds(ids: string[], resolve: RowIdResolver): string[] {
   return ids
-    .map(id => idRemap.get(id) ?? id)
-    .filter(id => validIds.has(id))
+    .map(resolve)
+    .filter((id): id is string => id !== null)
     .filter((id, index, all) => all.indexOf(id) === index);
 }
 
-export function remapAestheticGroups(groups: AestheticGroup[], idRemap: Map<string, string>, validIds: Set<string>): AestheticGroup[] {
+export function remapAestheticGroups(groups: AestheticGroup[], resolve: RowIdResolver): AestheticGroup[] {
+  return groups
+    // A group scoped to the alternatives of a deleted row goes with it, instead
+    // of turning into a top-level group.
+    .filter(group => !group.scopeRowId || resolve(group.scopeRowId) !== null)
+    .map(group => ({
+      ...group,
+      blockIds: remapIds(group.blockIds, resolve),
+      scopeRowId: group.scopeRowId ? resolve(group.scopeRowId) : group.scopeRowId,
+    }));
+}
+
+export function remapFunctionalGroups(groups: FunctionalGroup[], resolve: RowIdResolver): FunctionalGroup[] {
   return groups.map(group => ({
     ...group,
-    blockIds: remapIds(group.blockIds, idRemap, validIds),
-    scopeRowId: group.scopeRowId ? (idRemap.get(group.scopeRowId) ?? group.scopeRowId) : group.scopeRowId,
+    modIds: remapIds(group.modIds, resolve),
   }));
 }
 
-export function remapFunctionalGroups(groups: FunctionalGroup[], idRemap: Map<string, string>, validIds: Set<string>): FunctionalGroup[] {
-  return groups.map(group => ({
-    ...group,
-    modIds: remapIds(group.modIds, idRemap, validIds),
-  }));
+export function remapLinks(links: LinkRule[], resolve: RowIdResolver): LinkRule[] {
+  return links.flatMap(link => {
+    const fromId = resolve(link.fromId);
+    const toId = resolve(link.toId);
+    return fromId && toId ? [{ fromId, toId }] : [];
+  });
+}
+
+export function remapIncompatibilities(rules: IncompatibilityRule[], resolve: RowIdResolver): IncompatibilityRule[] {
+  return rules.flatMap(rule => {
+    const winnerId = resolve(rule.winnerId);
+    const loserId = resolve(rule.loserId);
+    return winnerId && loserId ? [{ winnerId, loserId }] : [];
+  });
+}
+
+/** Version rules and custom configs: both say which row they belong to in `modId`. */
+export function remapByRowId<T extends { modId: string }>(items: T[], resolve: RowIdResolver): T[] {
+  return items.flatMap(item => {
+    const modId = resolve(item.modId);
+    if (modId === null) return [];
+    return [modId === item.modId ? item : { ...item, modId }];
+  });
+}
+
+/** The row and every alternative below it, at any depth. */
+export function collectSubtreeIds(row: ModRow, into: Set<string> = new Set()): Set<string> {
+  into.add(row.id);
+  for (const alt of row.alternatives ?? []) collectSubtreeIds(alt, into);
+  return into;
+}
+
+/**
+ * Drop the rows in `ids` wherever they sit in the tree (the backend deletes at
+ * every depth, `editor_data.rs::delete_rules_from_root`). Untouched branches
+ * keep their object identity.
+ */
+export function removeRowsDeep(rows: ModRow[], ids: ReadonlySet<string>): ModRow[] {
+  let changed = false;
+  const next: ModRow[] = [];
+  for (const row of rows) {
+    if (ids.has(row.id)) { changed = true; continue; }
+    const alternatives = row.alternatives?.length ? removeRowsDeep(row.alternatives, ids) : row.alternatives;
+    if (alternatives !== row.alternatives) {
+      changed = true;
+      next.push({ ...row, alternatives });
+    } else {
+      next.push(row);
+    }
+  }
+  return changed ? next : rows;
+}
+
+/**
+ * Set `enabled` on the rows in `ids` and on everything below them, at any
+ * depth — what `toggle_rules_enabled_command` does on disk
+ * (`editor_data.rs::set_enabled_recursive`).
+ */
+export function setEnabledDeep(rows: ModRow[], ids: ReadonlySet<string>, enabled: boolean): ModRow[] {
+  const setSubtree = (row: ModRow): ModRow => {
+    const alternatives = row.alternatives ?? [];
+    const nextAlternatives = alternatives.map(setSubtree);
+    const altsChanged = nextAlternatives.some((alt, index) => alt !== alternatives[index]);
+    if (row.enabled === enabled && !altsChanged) return row;
+    return { ...row, enabled, alternatives: altsChanged ? nextAlternatives : row.alternatives };
+  };
+  let changed = false;
+  const next = rows.map(row => {
+    let updated: ModRow;
+    if (ids.has(row.id)) {
+      updated = setSubtree(row);
+    } else if (row.alternatives?.length) {
+      const alternatives = setEnabledDeep(row.alternatives, ids, enabled);
+      updated = alternatives === row.alternatives ? row : { ...row, alternatives };
+    } else {
+      updated = row;
+    }
+    if (updated !== row) changed = true;
+    return updated;
+  });
+  return changed ? next : rows;
 }
 
 export function serializeGroupsLayout(groups: FunctionalGroup[]) {

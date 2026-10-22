@@ -20,7 +20,7 @@ import {
   modRowsState, setModRowsState, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
   setLaunchLogs,
-  modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
+  selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
@@ -35,6 +35,7 @@ import {
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
   alternativesPanelParent, setAlternativesPanelParentId,
   setAdvancedPanelModId, rowMap, setOnToggleEnabled,
+  setVersionRules, setCustomConfigs,
   launchState, selectedModList,
   setUpdateInfo,
   updateCheckRunning, setUpdateCheckRunning, pendingUpdatePrecheck, setPendingUpdatePrecheck,
@@ -48,26 +49,34 @@ import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } 
 import {
   buildIdRemap,
   collectRowIds,
+  collectSubtreeIds,
   findRowIdByNamePath,
   findRowNamePath,
   rebuildRowIds,
   remapAestheticGroups,
+  remapByRowId,
   remapFunctionalGroups,
   remapIds,
+  remapIncompatibilities,
+  remapLinks,
+  removeRowsDeep,
   reorderAlternativesInRows,
+  rowIdResolver,
+  setEnabledDeep,
 } from "./app/row-state";
 import {
+  defaultMinecraftVersion,
   fetchModMetadata,
   fetchMetadataForIds,
   seedModName,
   isTauri,
-  loadAllCardIcons,
   loadEditorSnapshot,
   loadModlistGroups,
   loadModlistPresentation,
   loadShellSnapshot,
   modlistVersionLoaderCache,
   runResolution,
+  saveModlistTarget,
 } from "./app/backend-loaders";
 import { useAppBootstrap } from "./app/use-app-bootstrap";
 import { useAppPersistence } from "./app/persistence-effects";
@@ -152,12 +161,41 @@ export default function App() {
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
+  /**
+   * Row ids are positional (`rule-<i>[-alternative-<n>]*-<name>`): after the
+   * rows moved or some were deleted, rebuild them and carry every state keyed
+   * by them along — groups, tags, links, incompatibilities, version rules,
+   * custom configs, selection, panels. Entries of `removedIds` are dropped.
+   * Without it the advanced save sent ids of rows that had moved, and the
+   * backend refused every later save (audit 101, modlist-5, editor-logica-3).
+   */
+  const rebuildRowIdsAndRemap = (removedIds: ReadonlySet<string> = new Set()) => {
+    const currentRows = modRowsState();
+    const rebuiltRows = rebuildRowIds(currentRows);
+    const resolve = rowIdResolver(buildIdRemap(currentRows, rebuiltRows), collectRowIds(rebuiltRows), removedIds);
+    batch(() => {
+      setModRowsState(rebuiltRows);
+      setAestheticGroups(groups => remapAestheticGroups(groups, resolve));
+      setFunctionalGroups(groups => remapFunctionalGroups(groups, resolve));
+      setSavedIncompatibilities(rules => remapIncompatibilities(rules, resolve));
+      setSavedLinks(links => remapLinks(links, resolve));
+      setVersionRules(rules => remapByRowId(rules, resolve));
+      setCustomConfigs(configs => remapByRowId(configs, resolve));
+      setSelectedIds(ids => remapIds(ids, resolve));
+      setExpandedRows(ids => remapIds(ids, resolve));
+      setAlternativesPanelParentId(id => (id ? resolve(id) : id));
+      setAdvancedPanelModId(id => (id ? resolve(id) : id));
+    });
+  };
+
   const handleSelectModList = async (name: string) => {
     logger.info("App", "handleSelectModList started", { name });
     appendDebugTrace("modlist.select", { name });
+    // First: the persistence effects must not see the new name with the old
+    // list's state, or they save it there.
+    resetPersistenceState();
     setSelectedModListName(name);
     setSelectedIds([]);
-    resetPersistenceState();
 
     // Immediately show cached presentation data so there's no flicker
     const cached = modListCards().find(c => c.name === name);
@@ -191,27 +229,7 @@ export default function App() {
       await invoke("reorder_rules_command", {
         input: { modlistName: selectedModListName(), orderedModIds: orderedIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
       });
-      const currentRows = modRowsState();
-      const rebuiltRows = rebuildRowIds(currentRows);
-      const idRemap = buildIdRemap(currentRows, rebuiltRows);
-      const validIds = collectRowIds(rebuiltRows);
-      batch(() => {
-        setModRowsState(rebuiltRows);
-        setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-        setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-        setSavedIncompatibilities(rules => rules.map(r => ({
-          winnerId: idRemap.get(r.winnerId) ?? r.winnerId,
-          loserId:  idRemap.get(r.loserId)  ?? r.loserId,
-        })));
-        setSavedLinks(links => links.map(l => ({
-          fromId: idRemap.get(l.fromId) ?? l.fromId,
-          toId:   idRemap.get(l.toId)   ?? l.toId,
-        })).filter(l => validIds.has(l.fromId) && validIds.has(l.toId)));
-        setSelectedIds(ids => remapIds(ids, idRemap, validIds));
-        setExpandedRows(ids => remapIds(ids, idRemap, validIds));
-        setAlternativesPanelParentId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
-        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
-      });
+      rebuildRowIdsAndRemap();
       void runResolution();
     } catch (err) {
       logger.error("App", "handleReorderRules failed", err);
@@ -221,23 +239,32 @@ export default function App() {
   };
 
   const handleSaveAlternativeOrder = async (parentId: string, orderedAltIds: string[]) => {
-    if (!selectedModListName()) return;
-    appendDebugTrace("alts.reorder.frontend", { parentId, orderedAltIds, modlistName: selectedModListName() });
+    const modlistName = selectedModListName();
+    if (!modlistName) return;
+    appendDebugTrace("alts.reorder.frontend", { parentId, orderedAltIds, modlistName });
 
-    // Optimistic: reorder alternatives in local state immediately, at any depth.
+    // The mod ids are read before the row ids are rebuilt below.
+    const parentModId = rowMap().get(parentId)?.primaryModId ?? parentId;
+    const orderedAltModIds = orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id);
+
+    // Optimistic: reorder alternatives in local state immediately, at any depth,
+    // then renumber their positional ids so tags and groups follow them.
     setModRowsState(cur => reorderAlternativesInRows(cur, parentId, orderedAltIds));
+    rebuildRowIdsAndRemap();
 
     if (!isTauri()) { logger.warn("App", "handleSaveAlternativeOrder skipped — no backend"); return; }
     try {
       await invoke("save_alternative_order_command", {
-        input: { modlistName: selectedModListName(), parentModId: rowMap().get(parentId)?.primaryModId ?? parentId, orderedAltIds: orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
+        input: { modlistName, parentModId, orderedAltIds: orderedAltModIds },
       });
       void runResolution();
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "saved" });
     } catch (err) {
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "error", detail: String(err) });
       pushUiError({ title: "Could not save alternative order", message: "The fallback order could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
-      await loadEditorSnapshot(selectedModListName()); // restore on failure
+      // Restore on failure: the order on disk, and the groups that follow it.
+      await loadEditorSnapshot(modlistName);
+      await loadModlistGroups(modlistName, modRowsState());
     }
   };
 
@@ -409,20 +436,32 @@ export default function App() {
       return;
     }
 
+    // The target a new list starts on is written with it, so it never follows
+    // the next Mojang release (audit 101, r2-primo-avvio-ambiente-degradato-1).
+    const minecraftVersion = defaultMinecraftVersion();
+    const modLoader = normalizeModLoader(null);
     try {
       await invoke("create_modlist_command", {
         input: {
           name,
           author: activeAccount()?.gamertag ?? "Author",
           description: createModlistDescription().trim(),
+          minecraftVersion,
+          modLoader,
         },
       });
       setCreateModlistModalOpen(false);
-      await loadShellSnapshot(name);
-      await loadEditorSnapshot(name);
-      await loadModlistPresentation(name);
-      await loadModlistGroups(name, modRowsState());
-      primePersistenceState();
+      // Also saved on its own: it does not depend on the create command
+      // knowing the two fields.
+      try {
+        await saveModlistTarget(name, minecraftVersion, modLoader);
+      } catch (err) {
+        pushUiError({ title: "Version not saved", message: `'${name}' was created, but its Minecraft version and loader could not be saved.`, detail: String(err), severity: "warning", scope: "launch" });
+      }
+      // The same path as picking a list in the sidebar: the persistence state
+      // of the previous list is dropped before anything of the new one loads
+      // (audit 101, contratto-4).
+      await handleSelectModList(name);
 
       logger.debug("App", "handleCreateModlist completed", { name });
     } catch (err) {
@@ -597,34 +636,21 @@ export default function App() {
 
     // Capture real mod IDs BEFORE the optimistic removal clears them from rowMap.
     const backendModIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
+    // Every row that goes away: the selected ones and what sits below them.
+    const removedIds = new Set<string>();
+    for (const id of ids) {
+      const row = rowMap().get(id);
+      if (row) collectSubtreeIds(row, removedIds);
+      else removedIds.add(id);
+    }
 
-    // Optimistic update: remove top-level rules AND nested alternatives.
-    setModRowsState(cur =>
-      cur
-        .filter(r => !idSet.has(r.id))
-        .map(r => {
-          if (!r.alternatives?.length) return r;
-          const filteredAlts = r.alternatives.filter(a => !idSet.has(a.id));
-          // Preserve reference if nothing changed.
-          return filteredAlts.length === r.alternatives.length
-            ? r
-            : { ...r, alternatives: filteredAlts };
-        })
-    );
+    // Optimistic update: remove the rows at any depth, as the backend does.
+    setModRowsState(cur => removeRowsDeep(cur, idSet));
     setSelectedIds([]);
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleDeleteSelected skipped — no backend"); return; }
     try {
       await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), modIds: backendModIds } });
-      const currentRows = modRowsState();
-      const rebuiltRows = rebuildRowIds(currentRows);
-      const idRemap = buildIdRemap(currentRows, rebuiltRows);
-      const validIds = collectRowIds(rebuiltRows);
-      batch(() => {
-        setModRowsState(rebuiltRows);
-        setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-        setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : (id && validIds.has(id) ? id : null)));
-      });
+      rebuildRowIdsAndRemap(removedIds);
       void runResolution();
       logger.debug("App", "handleDeleteSelected completed");
     } catch (err) {
@@ -683,40 +709,57 @@ export default function App() {
     }
   };
 
-  const saveVersionLoader = async (modlistName: string, version: string, loader: string) => {
+  /**
+   * Write the version and loader just picked. Only those two keys: the RAM,
+   * JVM and wrapper overrides on screen may still be another list's, and
+   * sending them copied them onto this one (todo.md:1618). A failed save is
+   * shown and the previous pick comes back, instead of the dropdown claiming a
+   * target that the next reload forgets (audit 101 "Noto 1", 069 M3).
+   */
+  const saveVersionLoader = async (
+    modlistName: string,
+    version: string,
+    loader: string,
+    previous: { version: string; loader: string },
+  ) => {
     if (!isTauri() || !modlistName) { logger.warn("App", "saveVersionLoader skipped — no backend"); return; }
-    const ov = modlistOverrides();
-    await invoke("save_modlist_overrides_command", {
-      overrides: {
-        modlistName,
-        minRamMb: ov.minRamEnabled ? ov.minRamMb : null,
-        maxRamMb: ov.maxRamEnabled ? ov.maxRamMb : null,
-        customJvmArgs: ov.customArgsEnabled ? ov.customJvmArgs : null,
-        profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
-        wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
-        minecraftVersion: version || null,
-        modLoader: normalizeModLoader(loader) || null,
-      },
-    }).catch(() => {});
+    try {
+      await saveModlistTarget(modlistName, version, loader);
+    } catch (err) {
+      logger.error("App", "saveVersionLoader failed", err);
+      pushUiError({ title: "Version not saved", message: `The Minecraft version and loader of '${modlistName}' could not be saved, so the previous ones are back.`, detail: String(err), severity: "error", scope: "launch" });
+      // Undo only what this save set: a later pick has its own save.
+      const cached = modlistVersionLoaderCache.get(modlistName);
+      if (cached?.version !== version || cached.loader !== loader) return;
+      modlistVersionLoaderCache.set(modlistName, previous);
+      setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: previous.version, modLoader: previous.loader } : c));
+      if (selectedModListName() === modlistName) {
+        setSelectedMcVersion(previous.version);
+        setSelectedModLoader(previous.loader);
+        void runResolution(modlistName, previous.version, previous.loader);
+      }
+    }
   };
 
   const handleVersionChange = (version: string) => {
     const modlistName = selectedModListName();
-    setSelectedMcVersion(version);
     const loader = normalizeModLoader(selectedModLoader());
+    const previous = { version: selectedMcVersion(), loader };
+    setSelectedMcVersion(version);
     modlistVersionLoaderCache.set(modlistName, { version, loader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: version } : c));
-    void saveVersionLoader(modlistName, version, loader);
+    void saveVersionLoader(modlistName, version, loader, previous);
     void runResolution(modlistName, version, loader);
   };
 
   const handleLoaderChange = (loader: string) => {
     const modlistName = selectedModListName();
     const normalizedLoader = normalizeModLoader(loader);
+    const previous = { version: selectedMcVersion(), loader: normalizeModLoader(selectedModLoader()) };
     setSelectedModLoader(normalizedLoader);
     modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader: normalizedLoader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: normalizedLoader } : c));
-    void saveVersionLoader(modlistName, selectedMcVersion(), normalizedLoader);
+    void saveVersionLoader(modlistName, selectedMcVersion(), normalizedLoader, previous);
     void runResolution(modlistName, selectedMcVersion(), normalizedLoader);
   };
 
@@ -758,38 +801,36 @@ export default function App() {
   const handleToggleEnabled = async (rowId: string | string[], enabled: boolean) => {
     const ids = Array.isArray(rowId) ? rowId : [rowId];
     const modIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
-    if (!isTauri() || !selectedModListName()) return;
+    const modlistName = selectedModListName();
+    if (!isTauri() || !modlistName) return;
 
-    // Lock scroll position across all re-renders (optimistic + resolution).
+    // Lock the scroll position across the optimistic re-render and the save,
+    // which is a local file write. Not across the resolution: that one can hit
+    // the network, and the list stayed frozen until it returned (audit 101,
+    // stato-frontend-9).
     const scrollEl = document.querySelector<HTMLElement>(".flex-1.p-4");
     const savedScroll = scrollEl?.scrollTop ?? 0;
     let scrollGuardId = 0;
     const guardScroll = () => { if (scrollEl) scrollEl.scrollTop = savedScroll; scrollGuardId = requestAnimationFrame(guardScroll); };
     scrollGuardId = requestAnimationFrame(guardScroll);
 
-    // Optimistic update — toggle all target IDs and their alternatives.
-    const idSet = new Set(ids);
-    const setEnabledDeep = (r: ModRow, en: boolean): ModRow => {
-      const next = r.enabled === en ? r : { ...r, enabled: en };
-      if (!next.alternatives?.length) return next;
-      const alts = next.alternatives.map(a => setEnabledDeep(a, en));
-      return alts === next.alternatives ? next : { ...next, alternatives: alts };
-    };
-    setModRowsState(cur => cur.map(r =>
-      idSet.has(r.id) ? setEnabledDeep(r, enabled) : r
-    ));
+    // Optimistic update — the target rows at any depth (an alternative has its
+    // own switch too) and everything below them, as the backend does.
+    setModRowsState(cur => setEnabledDeep(cur, new Set(ids), enabled));
+    let saved = false;
     try {
-      await Promise.all(modIds.map(modId =>
-        invoke("toggle_rule_enabled_command", { input: { modlistName: selectedModListName(), modId, enabled } })
-      ));
-      await runResolution();
+      // One command for the whole set: a group toggle used to be one full
+      // read and write of rules.json per mod (r2-scala-mod-list-grandi-4).
+      await invoke("toggle_rules_enabled_command", { input: { modlistName, modIds, enabled } });
+      saved = true;
     } catch (err) {
       pushUiError({ title: "Toggle failed", message: `Could not ${enabled ? "enable" : "disable"} the mod(s).`, detail: String(err), severity: "error", scope: "launch" });
-      await loadEditorSnapshot(selectedModListName());
+      await loadEditorSnapshot(modlistName);
     } finally {
       cancelAnimationFrame(scrollGuardId);
       if (scrollEl) scrollEl.scrollTop = savedScroll;
     }
+    if (saved) void runResolution();
   };
 
   setOnToggleEnabled(() => handleToggleEnabled);
@@ -832,29 +873,31 @@ export default function App() {
 
     try {
       await invoke("delete_modlist_command", { modlistName: name });
+      // The deleted list's tags, groups and rules must not be saved under the
+      // next one's name (audit 101, ui-schermate-1).
+      resetPersistenceState();
       setInstancePresentationOpen(false);
-      // Reload shell to refresh mod-list sidebar
-      const snap: any = await invoke("load_shell_snapshot_command");
-      const cards = (snap.modlists ?? []).map((m: any) => ({
-        name: m.name,
-        status: "Ready" as const,
-        accent: "from-primary/30 via-primary/10 to-transparent",
-        description: m.description || (m.rule_count > 0 ? `${m.rule_count} rules` : "Empty mod list"),
-      }));
-      setModListCards(cards);
-      void loadAllCardIcons(cards.map((c: { name: string }) => c.name));
-      const next = cards[0]?.name ?? null;
+      modlistVersionLoaderCache.delete(name);
+      const next = modListCards().find(card => card.name !== name)?.name ?? null;
       if (next) {
-        setSelectedModListName(next);
-        await loadEditorSnapshot(next, true);
-        await loadModlistPresentation(next);
-        await loadModlistGroups(next, modRowsState());
-        primePersistenceState();
-
+        // The same path as the sidebar: shell snapshot (cards, target and
+        // overrides of the next list), editor, presentation, groups.
+        await handleSelectModList(next);
       } else {
-        setSelectedModListName("");
-        setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
-        setModRowsState([]);
+        await loadShellSnapshot(null);
+        batch(() => {
+          setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+          setModRowsState([]);
+          setFunctionalGroups([]);
+          setAestheticGroups([]);
+          setSavedLinks([]);
+          setSavedIncompatibilities([]);
+          setVersionRules([]);
+          setCustomConfigs([]);
+          setExpandedRows([]);
+          setSelectedIds([]);
+        });
+        void runResolution("");
       }
     } catch (err) {
       pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: String(err), severity: "error", scope: "launch" });
