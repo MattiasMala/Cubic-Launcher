@@ -5,9 +5,19 @@
 # under llvmpipe (no GPU) is a known flake source and is confined to local/GPU
 # runs (see scripts/launch-harness/launch-harness-design intent).
 #
-# continue-on-error keeps this advisory: it never blocks a PR. Promote to a gate
-# only once it has demonstrated stability. Triggers: manual + weekly, NOT on
-# every push (a full real-launch matrix is far too costly for per-push CI).
+# continue-on-error keeps this advisory: it never blocks a PR. Why advisory:
+# - it only runs weekly or by hand, so there is no PR for it to block;
+# - a red combo can come from the runner rather than the launcher (Xvfb,
+#   llvmpipe software GL, LWJGL2 on the oldest versions, Mojang/loader servers
+#   being slow), and that has not been told apart yet: in September 2026
+#   1.12.2 and 1.14.4 stayed red here for a month without a launcher bug
+#   pinned on them;
+# - whether it should become a gate is an open decision (wiki todo.md:1468).
+# The price: the workflow shows green even when the matrix is red. Read the
+# "API pass: N/M green" line of the run step, or the uploaded report, not the
+# badge. Promote to a gate only once it has demonstrated stability.
+# Triggers: manual + weekly, NOT on every push (a full real-launch matrix is far
+# too costly for per-push CI).
 name: launch-harness
 
 on:
