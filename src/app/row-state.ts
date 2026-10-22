@@ -43,6 +43,11 @@ export function smartSetModRows(current: ModRow[], next: ModRow[]): ModRow[] {
 
     if (
       currentRow.name === nextRow.name &&
+      currentRow.primaryModId === nextRow.primaryModId &&
+      // The backend's word on a pin (review-frontend-stato-20): an "Only when"
+      // rule added or removed on a local jar makes or unmakes a legacy pin
+      // with nothing else of the row changing.
+      currentRow.pin?.ownsJar === nextRow.pin?.ownsJar &&
       currentRow.kind === nextRow.kind &&
       currentRow.enabled === nextRow.enabled &&
       currentRow.area === nextRow.area &&

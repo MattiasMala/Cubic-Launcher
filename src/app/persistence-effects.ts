@@ -6,6 +6,7 @@ import {
   customConfigs,
   expandedRows,
   functionalGroups,
+  modRowsState,
   pushUiError,
   rowMap,
   savedIncompatibilities,
@@ -14,7 +15,7 @@ import {
   versionRules,
 } from "../store";
 import type { CustomConfig, LinkRule, VersionRule } from "../lib/types";
-import { isTauri, runResolution } from "./backend-loaders";
+import { isTauri, loadEditorSnapshot, runResolution } from "./backend-loaders";
 import {
   serializeExpandedRows,
   serializeGroupsLayout,
@@ -151,6 +152,12 @@ function buildAdvancedPayload(links: LinkRule[], vr: VersionRule[], cc: CustomCo
   return { payload: { requiresEntries, versionRulesEntries, customConfigsEntries }, skipped };
 }
 
+/** Some row has the shape of a pin made before the marker: local, one Modrinth alternative. */
+function mayBeLegacyPin(): boolean {
+  return modRowsState().some(row =>
+    row.kind === "local" && row.alternatives?.length === 1 && row.alternatives[0].kind === "modrinth");
+}
+
 export function useAppPersistence() {
   const [groupLayoutReady, setGroupLayoutReady] = createSignal(false);
   const [lastSavedGroupLayout, setLastSavedGroupLayout] = createSignal("");
@@ -278,7 +285,12 @@ export function useAppPersistence() {
       input: { modlistName, ...payload },
     }).then(() => {
       advancedRetry.succeeded();
-      void runResolution();
+      // A local jar with one Modrinth alternative is a pin or not depending on
+      // its "Only when" rule (`mod_version_pin::pin_kind`): the rows are read
+      // again so the pin the editor shows is the backend's
+      // (review-frontend-stato-20). Otherwise the resolution is enough.
+      if (untrack(mayBeLegacyPin)) void loadEditorSnapshot(modlistName);
+      else void runResolution();
     }).catch(error => advancedRetry.failed(serialized, () =>
       pushUiError({ title: "Could not save rule config", message: "Failed to persist advanced config.", detail: String(error), severity: "error", scope: "launch" })));
   });
