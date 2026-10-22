@@ -30,6 +30,9 @@ export function Header() {
     void (async () => {
       const stop = await listen("close-requested-while-running", async () => {
         try {
+          // Heard: the next close asks again instead of going through
+          // (review-frontend-shell-30).
+          await invoke("close_request_received_command");
           const close = await ask(CLOSE_WHILE_RUNNING_MESSAGE, {
             title: "Close Cubic Launcher?",
             kind: "warning",
@@ -42,7 +45,12 @@ export function Header() {
         }
       });
       if (disposed) stop();
-      else unlisten = stop;
+      else {
+        unlisten = stop;
+        // Listening now: a close request lost while the window reloaded does
+        // not count as one nobody answers.
+        void invoke("close_request_received_command").catch(() => {});
+      }
     })();
     onCleanup(() => {
       disposed = true;

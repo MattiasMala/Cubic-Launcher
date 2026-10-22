@@ -56,15 +56,57 @@ const CLOSE_WHILE_RUNNING_EVENT: &str = "close-requested-while-running";
 /// [`close_launcher_anyway_command`]. Vale per ogni strada — il bottone della
 /// testata, Alt+F4, il menu della barra delle applicazioni — perché passano
 /// tutte da `CloseRequested`.
+///
+/// Se il frontend non risponde — JavaScript bloccato, la testata mai montata —
+/// la finestra non si chiuderebbe più con nessuna strada (review-frontend-shell-30).
+/// Per questo il frontend conferma subito di aver ricevuto l'evento
+/// ([`close_request_received_command`]): una chiusura che arriva quando la
+/// precedente è senza risposta da [`CLOSE_ANSWER_WAIT`] passa. Prima di quel
+/// tempo (un doppio clic) si ferma e basta. Un ricaricamento della finestra
+/// azzera il segno quando la testata si rimonta, così il suo clic perso non
+/// conta.
 fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     use tauri::Emitter;
 
     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
         if window.label() == "main" && launch_preview::current_minecraft_pid().is_some() {
-            api.prevent_close();
-            let _ = window.emit(CLOSE_WHILE_RUNNING_EVENT, ());
+            let mut unanswered = unanswered_close_request();
+            match *unanswered {
+                Some(since) if since.elapsed() >= CLOSE_ANSWER_WAIT => {
+                    eprintln!(
+                        "[close] the window did not answer the last close request while Minecraft runs: closing"
+                    );
+                    *unanswered = None;
+                    return;
+                }
+                Some(_) => api.prevent_close(),
+                None => {
+                    *unanswered = Some(std::time::Instant::now());
+                    api.prevent_close();
+                    let _ = window.emit(CLOSE_WHILE_RUNNING_EVENT, ());
+                }
+            }
         }
     }
+}
+
+/// Quanto la finestra ha per dire di aver sentito una richiesta di chiusura.
+const CLOSE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Da quando una richiesta di chiusura col gioco aperto aspetta che il
+/// frontend dica di averla ricevuta.
+fn unanswered_close_request() -> std::sync::MutexGuard<'static, Option<std::time::Instant>> {
+    static UNANSWERED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    UNANSWERED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Il frontend ha ricevuto la richiesta di chiusura (o si è appena montato, e
+/// quindi la ascolta): la prossima chiusura chiede di nuovo conferma.
+#[tauri::command]
+fn close_request_received_command() {
+    *unanswered_close_request() = None;
 }
 
 /// La chiusura confermata: `destroy` non ripassa da `CloseRequested`.
@@ -196,7 +238,8 @@ pub fn run() {
             shared_worlds::unshare_world_from_instance_command,
             updater::check_for_updates,
             updater::install_update,
-            close_launcher_anyway_command
+            close_launcher_anyway_command,
+            close_request_received_command
         ])
         .run(context)
         .expect("error while running tauri application");
