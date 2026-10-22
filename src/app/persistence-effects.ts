@@ -81,13 +81,20 @@ function createSaveRetry(label: string, lastSaved: Accessor<string>, setLastSave
 }
 
 /**
- * Il batch avanzato in termini di mod id, cioè quello che va al backend.
+ * Il batch avanzato in termini di mod id, cioè quello che va al backend, e le
+ * righe che le voci nominano ma che `rowMap` non ha più.
  *
- * Una voce la cui riga non c'è più (cancellata) viene scartata invece di
- * mandare l'id di riga come mod id: il backend rifiuterebbe l'intero batch con
- * «unknown rule id in advanced batch» (audit 101, `modlist-5`). `rowMap` è
- * letto senza tracciarlo: l'effetto riparte quando cambiano link, version rule
- * o custom config, non a ogni modifica delle righe.
+ * Una voce la cui riga non c'è più non manda l'id di riga come mod id: il
+ * backend rifiuterebbe l'intero batch con «unknown rule id in advanced batch»
+ * (audit 101, `modlist-5`). Ma il backend tratta il batch come lo stato intero
+ * — svuota requires, version rule e custom config di ogni regola e riscrive
+ * solo quello che arriva — quindi un batch senza quelle voci le cancellerebbe
+ * dal disco: chi lo riceve con `skipped` non vuoto non lo manda
+ * (review-frontend-stato-19). Succede solo in un intervallo (la cancellazione
+ * ottimistica prima che il backend risponda, un editor che non si è caricato),
+ * e il batch giusto parte quando link, version rule e config tornano allineati
+ * alle righe. `rowMap` è letto senza tracciarlo: l'effetto riparte quando
+ * cambiano link, version rule o custom config, non a ogni modifica delle righe.
  */
 function buildAdvancedPayload(links: LinkRule[], vr: VersionRule[], cc: CustomConfig[]) {
   const rows = untrack(rowMap);
@@ -141,10 +148,7 @@ function buildAdvancedPayload(links: LinkRule[], vr: VersionRule[], cc: CustomCo
     })),
   }));
 
-  if (skipped.size > 0) {
-    logger.warn("App", "advanced batch: dropped entries of rows that no longer exist", { rowIds: [...skipped] });
-  }
-  return { requiresEntries, versionRulesEntries, customConfigsEntries };
+  return { payload: { requiresEntries, versionRulesEntries, customConfigsEntries }, skipped };
 }
 
 export function useAppPersistence() {
@@ -247,7 +251,7 @@ export function useAppPersistence() {
 
   // Confrontato in termini di mod id: un riordino che rinumera solo gli id di
   // riga produce lo stesso batch e non riscrive rules.json.
-  const serializeAdvanced = () => JSON.stringify(buildAdvancedPayload(savedLinks(), versionRules(), customConfigs()));
+  const serializeAdvanced = () => JSON.stringify(buildAdvancedPayload(savedLinks(), versionRules(), customConfigs()).payload);
 
   createEffect(() => {
     const modlistName = selectedModListName();
@@ -257,7 +261,13 @@ export function useAppPersistence() {
 
     if (!linksReady() || !advancedReady() || !modlistName || !isTauri()) return;
 
-    const payload = buildAdvancedPayload(links, vr, cc);
+    const { payload, skipped } = buildAdvancedPayload(links, vr, cc);
+    if (skipped.size > 0) {
+      // Not saved, and `lastSavedAdvanced` stays: a partial batch would wipe
+      // the advanced data of those rows on disk (review-frontend-stato-19).
+      logger.warn("App", "advanced batch not saved: entries name rows the editor no longer has", { rowIds: [...skipped] });
+      return;
+    }
     const serialized = JSON.stringify(payload);
     if (serialized === lastSavedAdvanced()) return;
 
