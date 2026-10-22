@@ -1086,7 +1086,13 @@ export default function App() {
     // A list shown with the placeholder version waits for the real default,
     // or Play would launch the placeholder's (empty) instance
     // (review-frontend-shell-21).
-    await settleProvisionalTarget(selectedModListName());
+    // Play stays disabled meanwhile, as during the pre-check.
+    setUpdateCheckRunning(true);
+    try {
+      await settleProvisionalTarget(selectedModListName());
+    } finally {
+      setUpdateCheckRunning(false);
+    }
     const target: LaunchTarget = {
       modlistName: selectedModListName(),
       minecraftVersion: selectedMcVersion(),
