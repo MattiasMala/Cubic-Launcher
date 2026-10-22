@@ -138,7 +138,6 @@ export const [createModlistModalOpen, setCreateModlistModalOpen] = createSignal(
 export const [createModlistName, setCreateModlistName] = createSignal("");
 export const [createModlistDescription, setCreateModlistDescription] = createSignal("");
 export const [createModlistBusy, setCreateModlistBusy] = createSignal(false);
-export const [localJarRuleName, setLocalJarRuleName] = createSignal("");
 export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
 /** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */

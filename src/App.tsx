@@ -24,7 +24,7 @@ import {
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
-  setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
+  setSettingsModalOpen,
   globalSettings, setGlobalSettings, setModlistOverrides,
   pushUiError, resetLaunchUiState,
   setAestheticGroups, setFunctionalGroups,
@@ -548,6 +548,32 @@ export default function App() {
   };
 
   /**
+   * Copy a local `.jar` into the mod list's `local-jars/` and add its rule
+   * (`copy_local_jar_command`). The rule is named after the file, as every
+   * local rule is: the launch finds the jar as `local-jars/<mod_id>.jar`.
+   *
+   * Like `importLocalContentPack`, a refusal comes back to the Upload tab
+   * instead of going to the notice banner the dialog covers.
+   */
+  const copyLocalJar = async (sourcePath: string): Promise<LocalImportFailure | null> => {
+    const modlistName = selectedModListName();
+    if (!modlistName) return null;
+    try {
+      await invoke("copy_local_jar_command", { input: { sourcePath, modlistName } });
+    } catch (err) {
+      logger.error("App", "copyLocalJar failed", err);
+      return {
+        title: "Failed to upload JAR",
+        message: `The JAR could not be copied into the local-jars folder of '${modlistName}'.`,
+        detail: String(err),
+      };
+    }
+    setAddModModalOpen(false);
+    await loadEditorSnapshot(modlistName);
+    return null;
+  };
+
+  /**
    * The Browse buttons of the Upload tab.
    *
    * A mod is a `.jar` and keeps the local-JAR command. A pack is a `.zip` or a
@@ -575,20 +601,11 @@ export default function App() {
       try {
         const selected = await open({ title: "Select a mod JAR", filters: [{ name: "JAR files", extensions: ["jar"] }], multiple: false, directory: false });
         if (!selected || !selectedModListName()) return null;
-        await invoke("copy_local_jar_command", {
-          input: {
-            sourcePath: selected as string,
-            ruleName: localJarRuleName().trim(),
-            modlistName: selectedModListName(),
-          },
-        });
-        setLocalJarRuleName("");
-        setAddModModalOpen(false);
-        await loadEditorSnapshot(selectedModListName());
+        return await copyLocalJar(selected as string);
       } catch (err) {
-        pushUiError({ title: "Failed to upload JAR", message: "The file could not be copied to the mod cache.", detail: String(err), severity: "error", scope: "launch" });
+        logger.error("App", "handleUploadLocal picker failed", err);
+        return { title: "The JAR picker could not be opened", message: "The file dialog did not open, so nothing was added.", detail: String(err) };
       }
-      return null;
     }
 
     const noun = CONTENT_TYPE_NOUN[contentType] ?? "pack";
@@ -615,17 +632,7 @@ export default function App() {
   ): Promise<LocalImportFailure | null> => {
     if (!selectedModListName()) return null;
     if (contentType !== "mod") return await importLocalContentPack(path, contentType);
-    try {
-      await invoke("copy_local_jar_command", {
-        input: { sourcePath: path, ruleName: localJarRuleName().trim(), modlistName: selectedModListName() },
-      });
-      setLocalJarRuleName("");
-      setAddModModalOpen(false);
-      await loadEditorSnapshot(selectedModListName());
-    } catch (err) {
-      pushUiError({ title: "Failed to upload JAR", message: "The dropped file could not be added.", detail: String(err), severity: "error", scope: "launch" });
-    }
-    return null;
+    return await copyLocalJar(path);
   };
 
   const handleDeleteSelected = async () => {
