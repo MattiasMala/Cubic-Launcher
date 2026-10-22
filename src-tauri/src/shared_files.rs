@@ -380,7 +380,16 @@ pub fn forget_modlist(connection: &Connection, modlist_name: &str) -> Result<()>
         write_groups(connection, &updated)?;
     }
 
-    let mut options = load_file_options(connection);
+    // Una riga degli interruttori illeggibile non si riscrive: perderebbe le
+    // scelte delle altre mod list, e finché resta così non si condivide niente
+    // comunque. La creazione e la cancellazione non si fermano per lei.
+    let mut options = match load_file_options(connection) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("[shared] the switches of '{modlist_name}' were left in place: {error:#}");
+            return Ok(());
+        }
+    };
     if options.remove(modlist_name).is_some() {
         let value =
             serde_json::to_string(&options).context("failed to serialize the file options")?;

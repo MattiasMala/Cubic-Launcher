@@ -1348,7 +1348,9 @@ fn deleting_the_holder_hands_the_bytes_over_and_leaves_no_trace_in_the_groups() 
         }]
     );
     assert!(
-        !load_file_options(&fixture.connection).contains_key("A"),
+        !load_file_options(&fixture.connection)
+            .expect("the switches should be readable")
+            .contains_key("A"),
         "gli interruttori di A non passano a una A nuova"
     );
 }
