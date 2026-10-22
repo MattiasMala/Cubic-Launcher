@@ -125,7 +125,15 @@ export function LaunchPanel(props: LaunchPanelProps) {
     setLaunchStopRequested(true);
     try {
       await invoke("stop_minecraft_command");
-    } catch { /* already exited */ }
+    } catch (error) {
+      const detail = String(error);
+      // Nothing running: the game already exited, and its exit event took the flag.
+      if (detail.includes("No Minecraft process is running")) return;
+      // The game is still running: a crash of it later is a crash, not this STOP
+      // (review-lancio-3).
+      setLaunchStopRequested(false);
+      pushUiError({ title: "Minecraft did not stop", message: "The launcher could not close the game. It may still be running.", detail, severity: "warning", scope: "launch" });
+    }
   };
 
   const handleRevealProfile = async (path: string) => {
