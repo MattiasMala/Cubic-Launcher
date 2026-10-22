@@ -94,7 +94,24 @@ pub fn load_content_list(modlist_dir: &Path, content_type: &str) -> Result<Conte
     }
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    let mut list: ContentList = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    normalize_rule_versions(&mut list);
+    Ok(list)
+}
+
+/// `mc_versions: [""]` is what the Advanced panel's «Any version» used to save
+/// (`ui-schermate-5`), and it reads as "a version called nothing": an «Only
+/// when» rule then matched no target and a «Exclude when» rule excluded
+/// nothing. An empty string names no version, so it is dropped on load, and
+/// `[""]` becomes `[]` — any version, which is what the user chose.
+fn normalize_rule_versions(list: &mut ContentList) {
+    for entry in &mut list.entries {
+        for rule in &mut entry.version_rules {
+            rule.mc_versions
+                .retain(|version| !version.trim().is_empty());
+        }
+    }
 }
 
 pub fn save_content_list(modlist_dir: &Path, list: &ContentList) -> Result<()> {
@@ -363,7 +380,8 @@ pub fn save_content_version_rules_command(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_content_modlist_name;
+    use super::{load_content_list, validate_content_modlist_name};
+    use crate::rules::VersionRuleKind;
 
     #[test]
     fn content_command_rejects_traversal_modlist_name() {
@@ -372,5 +390,39 @@ mod tests {
         assert!(validate_content_modlist_name(r"nested\x").is_err());
         assert!(validate_content_modlist_name("/absolute").is_err());
         assert!(validate_content_modlist_name("safe modlist").is_ok());
+    }
+
+    /// ui-schermate-5: the file the old «Any version» wrote. Loaded, the rule
+    /// says "any version" again, and a real version next to an empty one
+    /// survives.
+    #[test]
+    fn an_empty_version_in_a_rule_reads_as_any_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "cubic-launcher-content-rules-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mod-list dir");
+        std::fs::write(
+            dir.join("resourcepacks.json"),
+            r#"{"content_type":"resourcepack","entries":[
+                {"id":"a","source":"modrinth","version_rules":[{"kind":"only","mc_versions":[""],"loader":"any"}]},
+                {"id":"b","source":"modrinth","version_rules":[{"kind":"exclude","mc_versions":["1.20.1",""],"loader":"any"}]}
+            ]}"#,
+        )
+        .expect("list file");
+
+        let list = load_content_list(&dir, "resourcepack").expect("the list loads");
+
+        assert_eq!(list.entries[0].version_rules[0].kind, VersionRuleKind::Only);
+        assert!(list.entries[0].version_rules[0].mc_versions.is_empty());
+        assert_eq!(
+            list.entries[1].version_rules[0].mc_versions,
+            vec!["1.20.1".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
