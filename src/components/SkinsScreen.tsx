@@ -192,17 +192,29 @@ export function SkinsScreen() {
     setConfirmRemove(false);
   }));
 
+  /**
+   * The last read of the screen asked for (review-frontend-shell-24): a slow
+   * answer for the account as it was — online, or the one before a switch —
+   * must not land over the one for the account as it is now. A command run
+   * from the screen counts as a read too.
+   */
+  let viewSeq = 0;
+
   async function load() {
+    const seq = ++viewSeq;
     setLoading(true);
     try {
-      setView(await invoke<SkinsView>("load_skins_command"));
+      const next = await invoke<SkinsView>("load_skins_command");
+      if (seq !== viewSeq) return;
+      setView(next);
       setLoadError(null);
       setPendingCape(null);
     } catch (error) {
+      if (seq !== viewSeq) return;
       setView(null);
       setLoadError(asSkinError(error));
     } finally {
-      setLoading(false);
+      if (seq === viewSeq) setLoading(false);
     }
   }
   // Reloaded whenever the accounts are read back after a change — a switch,
@@ -223,9 +235,10 @@ export function SkinsScreen() {
   async function run(label: string, command: string, args: Record<string, unknown> = {}): Promise<SkinsView | null> {
     if (busy()) return null;
     setBusy(label);
+    const seq = ++viewSeq;
     try {
       const next = await invoke<SkinsView>(command, args);
-      setView(next);
+      if (seq === viewSeq) setView(next);
       setActionError(null);
       return next;
     } catch (error) {
@@ -236,7 +249,8 @@ export function SkinsScreen() {
         setRetryAt(Date.now() + (skinError.retryAfterSeconds ?? 60) * 1000);
       }
       try {
-        setView(await invoke<SkinsView>("load_skins_command"));
+        const current = await invoke<SkinsView>("load_skins_command");
+        if (seq === viewSeq) setView(current);
       } catch {
         // The screen keeps what it showed; the banner already says why.
       }
