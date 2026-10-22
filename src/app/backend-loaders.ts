@@ -2,7 +2,7 @@ import { batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
 import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
-import { normalizeModLoader, type AccountSummary, type ShellAccount, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
+import { normalizeModLoader, type AccountSummary, type ShellAccount, type ShellSnapshot, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   setModRowsState, setAccounts, setActiveAccountId, setAccountsRevision, activePlaysOffline,
@@ -189,13 +189,13 @@ export async function loadShellSnapshot(preferredName?: string | null) {
   // fails must not leave the launcher without its account list.
   const accountsLoaded = loadAccounts();
   try {
-    const snap: any = await invoke("load_shell_snapshot_command", {
+    const snap = await invoke<ShellSnapshot>("load_shell_snapshot_command", {
       selectedModlistName: preferredName ?? null,
     });
     reportUnreadableModlists(snap.unreadable_modlists ?? []);
 
     const existing = modListCards();
-    const cards = (snap.modlists ?? []).map((modlist: any) => {
+    const cards = (snap.modlists ?? []).map(modlist => {
       const prev = existing.find(card => card.name === modlist.name);
       return {
         name: modlist.name,

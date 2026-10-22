@@ -137,6 +137,7 @@ export type LaunchResolutionStage = {
 export type ShellAccount = {
   microsoft_id: string;
   xbox_gamertag?: string | null;
+  minecraft_uuid?: string | null;
   avatar_url?: string | null;
   status: "online" | "offline";
   last_mode: "microsoft" | "offline";
@@ -147,12 +148,15 @@ export type ShellAccount = {
   is_active: boolean;
 };
 
+/** `load_shell_snapshot_command`'s payload (`ShellSnapshot` in `app_shell.rs`). */
 export type ShellSnapshot = {
   modlists: Array<{
     name: string;
     description: string;
     author?: string | null;
     rule_count: number;
+    minecraft_version?: string | null;
+    mod_loader?: string | null;
   }>;
   /** Folders whose rules.json can't be read: left out of `modlists`, not fatal. */
   unreadable_modlists?: Array<{ folder: string; error: string }>;
@@ -179,30 +183,6 @@ export type ShellSnapshot = {
     minecraft_version?: string | null;
     mod_loader?: string | null;
   };
-};
-
-export type EditorSnapshot = {
-  modlist_name: string;
-  rows: ModRow[];
-  incompatibilities: IncompatibilityRule[];
-  groups: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
-};
-
-export type LaunchProgressEvent = {
-  state: "idle" | "resolving" | "ready" | "running";
-  progress: number;
-  stage: string;
-  detail: string;
-};
-
-export type ProcessLogEvent = {
-  stream: "stdout" | "stderr";
-  line: string;
-};
-
-export type ProcessExitEvent = {
-  success: boolean;
-  exitCode?: number | null;
 };
 
 /** One row of `update_precheck_command`'s `updates` (`launch_preview_precheck.rs:40-58`). */
