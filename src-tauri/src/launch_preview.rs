@@ -21,7 +21,9 @@ use crate::minecraft_downloader::{
 };
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
-use crate::process_streaming::ProcessLogStream;
+use crate::process_streaming::{
+    stop_process, ProcessExitSignal, ProcessLogStream, StopOutcome, GRACEFUL_STOP_TIMEOUT,
+};
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 use crate::worlds::quick_play_arguments;
@@ -82,8 +84,15 @@ use runtime::*;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 
-/// Tracks the PID of the currently running Minecraft process so it can be killed.
-static ACTIVE_MC_PID: Mutex<Option<u32>> = Mutex::new(None);
+/// The currently running Minecraft process, so that it can be stopped. The
+/// monitor clears it when the process exits, and only then (windows-1): a STOP
+/// that fails leaves it there, and the next STOP can try again.
+static ACTIVE_MC: Mutex<Option<RunningMinecraft>> = Mutex::new(None);
+
+pub(super) struct RunningMinecraft {
+    pub(super) pid: u32,
+    pub(super) exit_signal: ProcessExitSignal,
+}
 
 #[tauri::command]
 pub fn start_launch_command(
@@ -131,15 +140,41 @@ pub async fn update_precheck_command(
         .map_err(|error| format!("{error:#}"))
 }
 
-/// Kills the currently running Minecraft process, if any.
+/// Stops the currently running Minecraft process, if any: first by asking it
+/// to close, so that the world is saved, and only after
+/// `GRACEFUL_STOP_TIMEOUT` by force (windows-1).
+///
+/// `async` because the wait can last seconds, and a synchronous command runs on
+/// the main thread, which would freeze the window meanwhile.
 #[tauri::command]
-pub fn stop_minecraft_command() -> Result<(), String> {
-    let pid = ACTIVE_MC_PID.lock().unwrap().take();
-    if let Some(pid) = pid {
-        terminate_minecraft_pid(pid).map_err(|error| error.to_string())
-    } else {
-        Err("No Minecraft process is running.".into())
-    }
+pub async fn stop_minecraft_command(app_handle: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stop_active_minecraft(&app_handle))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn stop_active_minecraft(app_handle: &tauri::AppHandle) -> Result<()> {
+    let Some(pid) = current_minecraft_pid() else {
+        bail!("No Minecraft process is running.");
+    };
+    let _ = emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[Launch] STOP: asking Minecraft (PID {pid}) to close and save"),
+    );
+    let outcome = terminate_minecraft_pid(pid)?;
+    let line = match outcome {
+        StopOutcome::AlreadyExited | StopOutcome::Graceful => {
+            "[Launch] Minecraft closed after STOP".to_string()
+        }
+        StopOutcome::Forced => format!(
+            "[Launch] Minecraft did not close within {} s of STOP and was forced to stop; the last minutes of an open world may not be saved",
+            GRACEFUL_STOP_TIMEOUT.as_secs()
+        ),
+    };
+    let _ = emit_log(app_handle, ProcessLogStream::Stdout, line);
+    Ok(())
 }
 
 /// Il file JFR dell'ultimo lancio, se esiste sul disco (D109). Il frontend lo chiede quando
@@ -151,7 +186,11 @@ pub fn last_profile_recording_command() -> Option<String> {
 }
 
 pub(super) fn current_minecraft_pid() -> Option<u32> {
-    *ACTIVE_MC_PID.lock().unwrap()
+    ACTIVE_MC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|running| running.pid)
 }
 
 pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
@@ -177,41 +216,20 @@ pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -
     )
 }
 
-pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let output = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .with_context(|| format!("failed to terminate Minecraft PID {pid}"))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            bail!(
-                "failed to terminate Minecraft PID {pid}: {}",
-                if stderr.is_empty() {
-                    "taskkill returned a non-zero exit code"
-                } else {
-                    &stderr
-                }
-            )
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            Ok(())
-        } else {
-            bail!("failed to terminate Minecraft PID {pid}")
-        }
-    }
+/// Ferma `pid` se è ancora il Minecraft in corso: prima con garbo, poi con la
+/// forza (windows-1). Un PID che non è più tracciato è già uscito.
+pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<StopOutcome> {
+    let exit_signal = ACTIVE_MC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|running| running.pid == pid)
+        .map(|running| running.exit_signal.clone());
+    let Some(exit_signal) = exit_signal else {
+        return Ok(StopOutcome::AlreadyExited);
+    };
+    stop_process(pid, &exit_signal, GRACEFUL_STOP_TIMEOUT)
+        .with_context(|| format!("failed to stop Minecraft PID {pid}"))
 }
 
 pub(in crate::launch_preview) async fn run_launch_pipeline(
