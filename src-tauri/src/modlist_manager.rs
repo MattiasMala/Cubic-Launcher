@@ -101,6 +101,108 @@ pub fn modlist_in_use(modlist_name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Il gioco che gira oltre la vita del launcher (review-decisioni-36)
+// ---------------------------------------------------------------------------
+
+/// `MODLISTS_IN_USE` vive in memoria: un launcher chiuso con «Close anyway»
+/// (D152) e riaperto non sa più che il gioco di quella mod list è aperto, e
+/// D153 promette il rifiuto comunque. Allo spawn il lancio scrive qui il PID e
+/// l'istanza del gioco, e all'uscita lo toglie; la cancellazione guarda anche
+/// questo file, e conta il gioco come aperto solo se quel PID è ancora un
+/// processo che lavora in quell'istanza (un PID riusato da altro non blocca).
+const RUNNING_GAME_FILENAME: &str = "running-game.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RunningGame {
+    pid: u32,
+    instance_root: std::path::PathBuf,
+}
+
+fn running_game_path(modlist_dir: &Path) -> std::path::PathBuf {
+    modlist_dir.join(".cubic").join(RUNNING_GAME_FILENAME)
+}
+
+/// Allo spawn del gioco. Un errore non ferma il gioco: chi chiama lo dice.
+pub fn record_running_game(modlist_dir: &Path, pid: u32, instance_root: &Path) -> Result<()> {
+    let path = running_game_path(modlist_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(&RunningGame {
+        pid,
+        instance_root: instance_root.to_path_buf(),
+    })
+    .context("failed to serialize the running game")?;
+    crate::atomic_write::write_atomically(&path, json)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// All'uscita del gioco: solo se il file nomina ancora quel PID, non quello di
+/// un lancio venuto dopo.
+pub fn clear_running_game(modlist_dir: &Path, pid: u32) {
+    let path = running_game_path(modlist_dir);
+    if read_running_game(&path).is_some_and(|game| game.pid == pid) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn read_running_game(path: &Path) -> Option<RunningGame> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Il gioco registrato per la mod list è ancora aperto?
+fn recorded_game_running(modlist_dir: &Path) -> bool {
+    read_running_game(&running_game_path(modlist_dir))
+        .is_some_and(|game| process_is_game_in(game.pid, &game.instance_root))
+}
+
+/// Linux: la cartella di lavoro del processo è l'istanza (il lancio la usa
+/// come `current_dir`), quindi un PID riusato da un altro programma non conta.
+#[cfg(target_os = "linux")]
+fn process_is_game_in(pid: u32, instance_root: &Path) -> bool {
+    let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+        return false;
+    };
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
+    canonical(&cwd) == canonical(instance_root)
+}
+
+/// Windows: il processo con quel PID è una Java.
+#[cfg(target_os = "windows")]
+fn process_is_game_in(pid: u32, _instance_root: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.to_ascii_lowercase().starts_with("\"java")
+                    && line.contains(&format!("\"{pid}\""))
+            })
+        })
+}
+
+/// Gli altri unix: il PID esiste.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_game_in(pid: u32, _instance_root: &Path) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: il segnale 0 non manda niente, controlla solo che il PID esista.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// La mod list ha un gioco aperto: lanciato da questo launcher, o da uno di
+/// prima che è stato chiuso col gioco aperto.
+fn game_open(modlist_dir: &Path, modlist_name: &str) -> bool {
+    modlist_in_use(modlist_name) || recorded_game_running(modlist_dir)
+}
+
+// ---------------------------------------------------------------------------
 // Create Mod-list
 // ---------------------------------------------------------------------------
 
@@ -310,7 +412,12 @@ pub fn modlist_delete_preview_from_root(
     Ok(ModlistDeletePreview {
         worlds,
         screenshots,
-        running: modlist_in_use(modlist_name),
+        running: game_open(
+            &LauncherPaths::new(root_dir.to_path_buf())
+                .modlists_dir()
+                .join(modlist_name),
+            modlist_name,
+        ),
         trash_supported: crate::screenshots::trash_supported(),
     })
 }
@@ -419,7 +526,7 @@ fn delete_modlist_with(
     // Held to the end: a launch of this mod list that starts now waits, and
     // then finds it gone.
     let in_use = modlists_in_use();
-    if in_use.contains_key(name) {
+    if in_use.contains_key(name) || recorded_game_running(&modlist_dir) {
         bail!(
             "'{name}' is being launched or played right now. Close the game, then delete the mod list."
         );
@@ -2032,6 +2139,52 @@ mod tests {
         );
         delete_modlist_with(&root, &connection, &name, true, None).unwrap();
         assert!(!root.join("mod-lists").join(&name).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// review-decisioni-36: a game left open by a launcher that was closed is
+    /// still refused, as long as that PID is a process working in the
+    /// instance. Here the "game" is this test process, whose working directory
+    /// is the instance it names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_is_refused_while_a_game_of_an_earlier_launcher_runs() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        let name = format!("Left open {}", root.file_name().unwrap().to_string_lossy());
+        make_modlist(&root, &name);
+        let modlist_dir = root.join("mod-lists").join(&name);
+        let this_process_cwd = env::current_dir().unwrap();
+
+        super::record_running_game(&modlist_dir, std::process::id(), &this_process_cwd).unwrap();
+        assert!(
+            modlist_delete_preview_from_root(&root, &name)
+                .unwrap()
+                .running
+        );
+        let error = delete_modlist_with(&root, &connection, &name, true, None)
+            .expect_err("a mod list whose game runs must not be deleted");
+        assert!(error.to_string().contains("Close the game"), "{error}");
+
+        // The same PID working elsewhere is not the game of this mod list.
+        super::record_running_game(&modlist_dir, std::process::id(), &root).unwrap();
+        assert!(
+            !modlist_delete_preview_from_root(&root, &name)
+                .unwrap()
+                .running
+        );
+
+        // The exit of that game clears it; another PID does not.
+        super::record_running_game(&modlist_dir, std::process::id(), &this_process_cwd).unwrap();
+        super::clear_running_game(&modlist_dir, std::process::id().wrapping_add(1));
+        assert!(
+            modlist_delete_preview_from_root(&root, &name)
+                .unwrap()
+                .running
+        );
+        super::clear_running_game(&modlist_dir, std::process::id());
+        delete_modlist_with(&root, &connection, &name, true, None).unwrap();
+        assert!(!modlist_dir.exists());
         fs::remove_dir_all(&root).unwrap();
     }
 

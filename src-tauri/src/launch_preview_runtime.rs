@@ -510,6 +510,21 @@ pub(super) fn spawn_minecraft_process(
 
     let pid = process.pid;
     ACTIVE_LAUNCH.set_running(pid, process.exit_signal());
+    // D153 anche dopo un «Close anyway» (review-decisioni-36): il PID su disco
+    // dice a un launcher riaperto che il gioco di questa mod list è aperto.
+    let modlist_dir = shared_files
+        .launcher_paths
+        .modlists_dir()
+        .join(&shared_files.modlist_name);
+    if let Err(error) =
+        crate::modlist_manager::record_running_game(&modlist_dir, pid, &shared_files.instance_root)
+    {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Launch] Could not record the running game for this mod list: {error:#}"),
+        )?;
+    }
 
     emit_progress(
         &app_handle,
@@ -543,6 +558,7 @@ pub(super) fn spawn_minecraft_process(
             ProcessLogStream::Stdout,
             format!("[shared] {}", copy_shared_files_back(&shared_files)),
         );
+        crate::modlist_manager::clear_running_game(&modlist_dir, pid);
         drop(in_use);
         let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
     });
