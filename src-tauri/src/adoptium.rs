@@ -16,16 +16,17 @@ pub struct AdoptiumClient {
 }
 
 impl AdoptiumClient {
+    /// The download client of the launch (review-lancio-4, rete-4): a
+    /// connect timeout and an inactivity timeout, so a server that accepts the
+    /// connection and then goes silent fails the launch instead of holding the
+    /// "preparing" slot until the app restarts.
     pub fn new() -> Self {
-        Self {
-            http_client: reqwest::Client::new(),
-            base_url: ADOPTIUM_API_BASE_URL.to_string(),
-        }
+        Self::with_base_url(ADOPTIUM_API_BASE_URL)
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: crate::modrinth::build_download_client(),
             base_url: base_url.into(),
         }
     }
@@ -37,10 +38,7 @@ impl AdoptiumClient {
         architecture: &str,
     ) -> Result<Option<AdoptiumPackage>> {
         let url = build_latest_assets_url(&self.base_url, java_version, os, architecture)?;
-        let response = self
-            .http_client
-            .get(url)
-            .send()
+        let response = crate::modrinth::send_with_retry(|| self.http_client.get(url.clone()))
             .await
             .with_context(|| {
                 format!(
@@ -363,6 +361,44 @@ mod tests {
             }
           }
         ]"#
+    }
+
+    /// review-lancio-4: the Adoptium client is the launch's download client
+    /// (its User-Agent shows it), so it has the connect and inactivity
+    /// timeouts of rete-4 instead of none.
+    #[tokio::test]
+    async fn the_adoptium_client_is_the_download_client_with_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let _ = sent.send(String::from_utf8_lossy(&request[..read]).to_string());
+            let body = b"[]";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.write_all(body).expect("body");
+        });
+
+        let client = AdoptiumClient::with_base_url(format!("http://127.0.0.1:{port}"));
+        let package = client
+            .fetch_latest_jre_package(21, "linux", "x64")
+            .await
+            .expect("an empty answer is no package");
+        assert!(package.is_none());
+        let request = received.recv().expect("the request").to_lowercase();
+        assert!(
+            request.contains(&format!(
+                "user-agent: {}",
+                crate::modrinth::USER_AGENT.to_lowercase()
+            )),
+            "{request}"
+        );
     }
 
     #[test]
