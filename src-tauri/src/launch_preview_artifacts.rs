@@ -54,12 +54,24 @@ pub(super) enum RemoteArtifact {
 /// they throw away. One comparator, two accessors, so the two cannot drift
 /// (D56).
 fn preferred_version_index(versions: &[ModrinthVersion]) -> Option<usize> {
+    preferred_version_index_by(versions, |_| 0)
+}
+
+/// The same comparator with a loader rank between channel and date: for a mod
+/// on NeoForge 1.20.1 a `neoforge` build wins over a `forge` one at equal
+/// channel (D148), and a `forge` release still wins over a `neoforge` beta.
+/// Every other target has one loader, so the rank is constant there.
+fn preferred_version_index_by(
+    versions: &[ModrinthVersion],
+    loader_rank: impl Fn(&ModrinthVersion) -> u8,
+) -> Option<usize> {
     versions
         .iter()
         .enumerate()
         .max_by(|(_, left), (_, right)| {
             left.channel_rank()
                 .cmp(&right.channel_rank())
+                .then_with(|| loader_rank(left).cmp(&loader_rank(right)))
                 .then_with(|| left.date_published.cmp(&right.date_published))
         })
         .map(|(index, _)| index)
@@ -75,6 +87,18 @@ pub(super) fn select_preferred_version(
     mut versions: Vec<ModrinthVersion>,
 ) -> Option<ModrinthVersion> {
     preferred_version_index(&versions).map(|index| versions.swap_remove(index))
+}
+
+/// The preferred version of a **mod** for `target`: the loader the target is
+/// counts too (`crate::modrinth::loader_affinity`).
+pub(super) fn select_preferred_mod_version(
+    mut versions: Vec<ModrinthVersion>,
+    target: &ResolutionTarget,
+) -> Option<ModrinthVersion> {
+    preferred_version_index_by(&versions, |version| {
+        crate::modrinth::loader_affinity(version, target)
+    })
+    .map(|index| versions.swap_remove(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +177,7 @@ pub(super) async fn prefetch_compatible_versions_for_selected(
             .await
         {
             Ok(candidate_versions) => {
-                if let Some(version) = select_preferred_version(candidate_versions) {
+                if let Some(version) = select_preferred_mod_version(candidate_versions, target) {
                     versions.insert(selected.mod_id.clone(), version);
                 }
             }
@@ -1846,6 +1870,45 @@ mod tests {
             files: Vec::new(),
             date_published: date_published.into(),
         }
+    }
+
+    #[test]
+    fn on_neoforge_1_20_1_a_neoforge_build_wins_at_equal_channel_only() {
+        let target = ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::NeoForge,
+        };
+        let with_loader = |id: &str, date: &str, channel: &str, loader: &str| ModrinthVersion {
+            loaders: vec![loader.into()],
+            ..test_version_with_channel(id, date, channel)
+        };
+        let forge_newer = with_loader("forge-newer", "2026-03-01T00:00:00Z", "release", "forge");
+        let neoforge_older = with_loader(
+            "neoforge-older",
+            "2026-01-01T00:00:00Z",
+            "release",
+            "neoforge",
+        );
+        let neoforge_beta =
+            with_loader("neoforge-beta", "2026-05-01T00:00:00Z", "beta", "neoforge");
+
+        // D148: a parità di canale vince «neoforge», anche se più vecchia...
+        assert_eq!(
+            select_preferred_mod_version(
+                vec![
+                    forge_newer.clone(),
+                    neoforge_older.clone(),
+                    neoforge_beta.clone()
+                ],
+                &target,
+            ),
+            Some(neoforge_older)
+        );
+        // ...ma il canale viene prima: una release «forge» batte una beta «neoforge».
+        assert_eq!(
+            select_preferred_mod_version(vec![neoforge_beta, forge_newer.clone()], &target),
+            Some(forge_newer)
+        );
     }
 
     #[test]

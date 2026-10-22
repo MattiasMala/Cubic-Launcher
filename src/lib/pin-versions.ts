@@ -25,6 +25,18 @@ type ModrinthVersionPayload = {
 };
 
 /**
+ * The loaders a Modrinth lookup for this target accepts — the same rule as
+ * `ResolutionTarget::modrinth_query_loaders` in the backend (D148): NeoForge
+ * on Minecraft 1.20.1 is the fork of Forge 47.1 and loads Forge 1.20.1 mods,
+ * so its list carries the `forge` builds too. Every other target asks for its
+ * own loader only.
+ */
+export function modrinthQueryLoaders(mcVersion: string, loader: string): string[] {
+  const own = loader.toLowerCase();
+  return own === "neoforge" && mcVersion.trim() === "1.20.1" ? ["neoforge", "forge"] : [own];
+}
+
+/**
  * Releases of `slug` compatible with `mcVersion` + `loader`, newest first.
  *
  * The loader filter is never omitted: an absent filter is not "no filter
@@ -37,7 +49,7 @@ export async function fetchPinReleases(
   loader: string
 ): Promise<PinRelease[]> {
   const params = new URLSearchParams({
-    loaders: JSON.stringify([loader.toLowerCase()]),
+    loaders: JSON.stringify(modrinthQueryLoaders(mcVersion, loader)),
     game_versions: JSON.stringify([mcVersion]),
   });
 
