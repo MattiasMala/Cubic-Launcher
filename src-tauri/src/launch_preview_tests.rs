@@ -160,8 +160,8 @@ fn global_settings() -> ShellGlobalSettings {
 fn modlist_overrides() -> ShellModListOverrides {
     ShellModListOverrides {
         modlist_name: Some("Pack".into()),
-        min_ram_mb: Some(8192),
-        max_ram_mb: None,
+        min_ram_mb: Some(3072),
+        max_ram_mb: Some(6144),
         custom_jvm_args: Some("-Dmodlist=true".into()),
         profiler_enabled: Some(false),
         wrapper_command: Some("mangohud".into()),
@@ -183,14 +183,122 @@ fn effective_launch_settings_prefer_modlist_overrides() {
     let settings =
         EffectiveLaunchSettings::from_shell_settings(&global_settings(), &modlist_overrides());
 
-    assert_eq!(settings.min_ram_mb, 8192);
-    assert_eq!(settings.max_ram_mb, 4096);
+    assert_eq!(settings.min_ram_mb, 3072);
+    assert_eq!(settings.max_ram_mb, 6144);
     assert_eq!(settings.custom_jvm_args, "-Dmodlist=true");
     assert_eq!(settings.wrapper_command, Some("mangohud".into()));
     assert_eq!(
         settings.java_path_override,
         Some(PathBuf::from("/custom/java"))
     );
+}
+
+/// shell-5 (audit 101): min e max si combinano ognuno per conto suo, quindi
+/// il controllo guarda la coppia effettiva. Globali 2048/4096 con il solo
+/// «Max RAM» della mod list a 1536 è il caso dell'audit; l'errore dice da dove
+/// viene ciascun valore.
+#[test]
+fn effective_ram_is_validated_as_a_pair_of_global_and_override_values() {
+    use crate::app_shell::validate_effective_ram;
+
+    let error = validate_effective_ram(2048, 4096, None, Some(1536))
+        .expect_err("an override max below the global min is invalid");
+    assert_eq!(
+        error.to_string(),
+        "Minimum RAM (2048 MB, from the global settings) cannot exceed maximum RAM (1536 MB, set for this mod list). Change one of them in Settings."
+    );
+    let error = validate_effective_ram(2048, 4096, Some(8192), None)
+        .expect_err("an override min above the global max is invalid");
+    assert!(error.to_string().contains("8192 MB, set for this mod list"));
+    let error =
+        validate_effective_ram(2048, 4096, Some(0), None).expect_err("zero minimum RAM is invalid");
+    assert!(error.to_string().contains("greater than zero"), "{error}");
+    let error =
+        validate_effective_ram(2048, 4096, None, Some(0)).expect_err("zero maximum RAM is invalid");
+    assert!(error.to_string().contains("Maximum RAM"), "{error}");
+
+    validate_effective_ram(2048, 4096, None, None).expect("the globals alone are valid");
+    validate_effective_ram(2048, 4096, Some(4096), None).expect("min equal to max is valid");
+    validate_effective_ram(2048, 4096, Some(8192), Some(12288))
+        .expect("both overrides, consistent, are valid");
+    let settings =
+        EffectiveLaunchSettings::from_shell_settings(&global_settings(), &modlist_overrides());
+    validate_effective_ram(
+        global_settings().min_ram_mb,
+        global_settings().max_ram_mb,
+        modlist_overrides().min_ram_mb,
+        modlist_overrides().max_ram_mb,
+    )
+    .expect("the fixture is a valid launch");
+    assert!(settings.min_ram_mb <= settings.max_ram_mb);
+}
+
+/// shell-5: il salvataggio degli override rifiuta una coppia effettiva
+/// sbagliata e non scrive niente; una coppia giusta si salva.
+#[test]
+fn saving_modlist_overrides_rejects_an_invalid_effective_ram_pair() {
+    use crate::app_shell::{
+        save_global_settings, save_modlist_overrides, ShellGlobalSettingsInput,
+        ShellModListOverridesInput,
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let database_path = std::env::temp_dir().join(format!(
+        "cubic-shell-5-{}-{timestamp}.db",
+        std::process::id()
+    ));
+    crate::database::initialize_database(&database_path).expect("initialize database");
+    let connection = rusqlite::Connection::open(&database_path).expect("open database");
+    save_global_settings(
+        &connection,
+        &ShellGlobalSettingsInput {
+            min_ram_mb: 2048,
+            max_ram_mb: 4096,
+            custom_jvm_args: String::new(),
+            profiler_enabled: false,
+            update_notifications_enabled: true,
+            update_notifications_resource_packs: true,
+            update_notifications_data_packs: true,
+            update_notifications_shaders: true,
+            wrapper_command: String::new(),
+            java_path_override: String::new(),
+        },
+    )
+    .expect("global settings");
+    let overrides = |min_ram_mb, max_ram_mb| ShellModListOverridesInput {
+        modlist_name: "Pack".into(),
+        min_ram_mb,
+        max_ram_mb,
+        custom_jvm_args: Some("-Dkept=true".into()),
+        profiler_enabled: None,
+        wrapper_command: None,
+        minecraft_version: None,
+        mod_loader: None,
+    };
+    let stored = || -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM modlist_settings WHERE modlist_name = 'Pack'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+    };
+
+    let error = save_modlist_overrides(&connection, &overrides(None, Some(1536)))
+        .expect_err("max override below the global min");
+    assert!(error.to_string().contains("cannot exceed"), "{error}");
+    assert_eq!(stored(), 0, "nothing is written when the pair is invalid");
+
+    save_modlist_overrides(&connection, &overrides(None, Some(3072)))
+        .expect("max override above the global min");
+    assert_eq!(stored(), 2);
+
+    drop(connection);
+    std::fs::remove_file(database_path).ok();
 }
 
 /// r2-percorsi-non-ascii-e-limiti-windows-5 (audit 101): «Copia come percorso»

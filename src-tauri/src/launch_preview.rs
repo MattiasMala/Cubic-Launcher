@@ -282,6 +282,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &shell_snapshot.global_settings,
         &shell_snapshot.selected_modlist_overrides,
     );
+    // shell-5: la RAM sbagliata si dice qui, prima di risolvere e scaricare
+    // qualunque cosa, e non alla fine della preparazione.
+    crate::app_shell::validate_effective_ram(
+        shell_snapshot.global_settings.min_ram_mb,
+        shell_snapshot.global_settings.max_ram_mb,
+        shell_snapshot.selected_modlist_overrides.min_ram_mb,
+        shell_snapshot.selected_modlist_overrides.max_ram_mb,
+    )?;
     // D115: read once, before anything is chosen, so that the identity and
     // the resolution path of this launch come from the same reading of the
     // active account's row. The vanilla pipeline needs it for the identity.
