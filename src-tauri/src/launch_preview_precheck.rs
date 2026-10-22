@@ -170,10 +170,9 @@ pub struct UpdatePrecheckResult {
 /// A vanilla target loads no mods: an empty payload, not an error, and no
 /// mod-list read at all. `None` means the target needs the full selection.
 ///
-/// Empty covers the packs too, and that is not an omission: the vanilla
-/// pipeline installs none (`launch_preview_vanilla.rs:31-35`, "skipping mod
-/// resolution, mod downloads and content packs"), so a pack row would promise
-/// something no launch would do.
+/// Empty covers the packs too. Since audit 101 (contentpack-3) the vanilla
+/// pipeline installs resource packs and data packs; without a pre-checked
+/// version it resolves them at launch, as a modded launch with no map does.
 pub(super) fn empty_precheck_for_loaderless_target(
     target: &ResolutionTarget,
 ) -> Option<UpdatePrecheckResult> {

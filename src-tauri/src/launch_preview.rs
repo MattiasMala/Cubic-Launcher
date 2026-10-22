@@ -28,6 +28,7 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 use crate::worlds::quick_play_arguments;
 
+use std::path::Path;
 use std::sync::Mutex;
 
 #[path = "launch_preview_fabric.rs"]
@@ -235,6 +236,75 @@ pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<StopOutcome> {
         .with_context(|| format!("failed to stop Minecraft PID {pid}"))
 }
 
+/// Primo avvio di questa istanza: si semina da `options.txt` della modlist, e
+/// mai più (D66). Il "mai più" non ha bisogno di uno stato nostro — dal secondo
+/// avvio il file c'è, perché l'abbiamo scritto noi o perché il gioco l'ha
+/// riscritto — e la semina lascia comunque una riga nel log, anche quando non
+/// fa niente. Uguale per il percorso moddato e per Vanilla (condivisi-5).
+fn seed_instance_options(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    instance_root: &Path,
+) {
+    let options_seed = crate::options_share::seed_instance_from_modlist(
+        launcher_paths,
+        modlist_name,
+        instance_root,
+    );
+    let _ = emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[options] {}", options_seed.describe()),
+    );
+}
+
+/// Download and install content packs (resource packs, data packs, shaders),
+/// at the versions the pre-check named when it named any (D58). The same step
+/// for the modded and the Vanilla pipeline (contentpack-3); with Vanilla the
+/// shaders are skipped inside, since no loader would read them.
+///
+/// D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
+/// Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
+/// i file del lancio precedente. Il lookup fallito lasciava già lo stesso
+/// risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
+/// funzionante un account offline si vedeva aggiornare i pack.
+// Nove input distinti di un passo del lancio, gli stessi di
+// `resolve_and_install_content_packs` più la scelta dell'account: il lint è
+// sospeso solo qui, come là (D120).
+#[allow(clippy::too_many_arguments)]
+async fn install_launch_content_packs(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    modrinth_client: &ModrinthClient,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+    instance_root: &Path,
+    resolved_content: Option<&ResolvedContentVersions>,
+    plays_offline: bool,
+) -> Result<()> {
+    if plays_offline {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
+        )?;
+        return Ok(());
+    }
+    resolve_and_install_content_packs(
+        app_handle,
+        launcher_paths,
+        http_client,
+        modrinth_client,
+        modlist_name,
+        target,
+        instance_root,
+        resolved_content,
+    )
+    .await
+}
+
 pub(in crate::launch_preview) async fn run_launch_pipeline(
     app_handle: tauri::AppHandle,
     launcher_paths: LauncherPaths,
@@ -322,6 +392,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             effective_settings,
             http_client,
             request.quick_play_singleplayer.clone(),
+            request.resolved_content.clone(),
             launch_account,
         )
         .await;
@@ -684,21 +755,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     std::fs::create_dir_all(&instance_natives_dir)
         .with_context(|| format!("failed to create {}", instance_natives_dir.display()))?;
 
-    // Primo avvio di questa istanza: si semina da `options.txt` della modlist,
-    // e mai più (D66). Il "mai più" non ha bisogno di uno stato nostro — dal
-    // secondo avvio il file c'è, perché l'abbiamo scritto noi o perché il
-    // gioco l'ha riscritto — e la semina lascia comunque una riga nel log,
-    // anche quando non fa niente.
-    let options_seed = crate::options_share::seed_instance_from_modlist(
-        &launcher_paths,
-        &modlist_name,
-        &instance_root,
-    );
-    let _ = emit_log(
-        &app_handle,
-        ProcessLogStream::Stdout,
-        format!("[options] {}", options_seed.describe()),
-    );
+    seed_instance_options(&app_handle, &launcher_paths, &modlist_name, &instance_root);
 
     let cached_mod_jars = build_cached_mod_jars(
         &app_handle,
@@ -752,33 +809,18 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
 
-    // Download and install content packs (resource packs, data packs, shaders),
-    // at the versions the pre-check named when it named any (D58).
-    //
-    // D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
-    // Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
-    // i file del lancio precedente. Il lookup fallito lasciava già lo stesso
-    // risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
-    // funzionante un account offline si vedeva aggiornare i pack.
-    if plays_offline {
-        emit_log(
-            &app_handle,
-            ProcessLogStream::Stdout,
-            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
-        )?;
-    } else {
-        resolve_and_install_content_packs(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &modrinth_client,
-            &modlist_name,
-            &target,
-            &instance_root,
-            request.resolved_content.as_ref(),
-        )
-        .await?;
-    }
+    install_launch_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &modrinth_client,
+        &modlist_name,
+        &target,
+        &instance_root,
+        request.resolved_content.as_ref(),
+        plays_offline,
+    )
+    .await?;
 
     let mut loader_library_paths =
         materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;

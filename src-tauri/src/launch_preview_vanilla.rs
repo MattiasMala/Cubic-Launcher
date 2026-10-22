@@ -9,19 +9,21 @@ use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::LoaderMetadataClient;
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::ModAcquisitionPlan;
+use crate::modrinth::ModrinthClient;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::worlds::quick_play_arguments;
 
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
-    launch_profiler, load_player_identity, merge_minecraft_and_loader_jvm_arguments,
-    minecraft_cache_policy, select_or_download_java, spawn_minecraft_process,
-    substitute_loader_placeholders, EffectiveLaunchSettings, LaunchDirectories, LaunchLogSession,
-    LaunchPlaceholders, SelectedMod, StartedLaunch,
+    install_launch_content_packs, launch_profiler, load_player_identity,
+    merge_minecraft_and_loader_jvm_arguments, minecraft_cache_policy, seed_instance_options,
+    select_or_download_java, spawn_minecraft_process, substitute_loader_placeholders,
+    EffectiveLaunchSettings, LaunchDirectories, LaunchLogSession, LaunchPlaceholders,
+    ResolvedContentVersions, SelectedMod, StartedLaunch,
 };
 
-// Nove input distinti di un passo del lancio. Una struct di parametri
+// Dieci input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
 #[allow(clippy::too_many_arguments)]
@@ -34,6 +36,8 @@ pub(super) async fn run_vanilla_launch_pipeline(
     effective_settings: EffectiveLaunchSettings,
     http_client: reqwest::Client,
     quick_play_singleplayer: Option<String>,
+    // The pre-check's content-pack versions (D58), when it named any.
+    resolved_content: Option<ResolvedContentVersions>,
     // The active account's row, read once by the caller (D115, concorrenza-8):
     // its play-offline choice and its identity come from this one reading.
     launch_account: Option<crate::microsoft_auth::AccountRecord>,
@@ -44,8 +48,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        "[Launch] Vanilla loader selected; skipping mod resolution, mod downloads and content packs."
-            .to_string(),
+        "[Launch] Vanilla loader selected; skipping mod resolution and mod downloads.".to_string(),
     )?;
 
     let selected_mods: Vec<SelectedMod> = Vec::new();
@@ -109,7 +112,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         "resolving",
         74,
         "Prepare Instance",
-        "Preparing a clean vanilla instance without mod or content-pack materialization.",
+        "Preparing the vanilla instance: game settings and content packs, no mods.",
     )?;
 
     let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
@@ -125,6 +128,24 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &cached_mod_jars,
     )?;
     extract_natives(&mc_data.native_paths, &instance_natives_dir)?;
+
+    // condivisi-5: le impostazioni di gioco della mod list valgono anche per
+    // un'istanza Vanilla, con la stessa riga `[options]` del percorso moddato.
+    seed_instance_options(&app_handle, &launcher_paths, &modlist_name, &instance_root);
+    // contentpack-3: resource pack e data pack anche con Vanilla, con lo stesso
+    // cancello dell'account offline del percorso moddato; gli shader no.
+    install_launch_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &ModrinthClient::new(),
+        &modlist_name,
+        &target,
+        &instance_root,
+        resolved_content.as_ref(),
+        plays_offline,
+    )
+    .await?;
 
     let mut loader_metadata = LoaderMetadataClient::new()
         .fetch_loader_metadata(&target.minecraft_version, ModLoader::Vanilla)
