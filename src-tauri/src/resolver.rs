@@ -10,7 +10,7 @@ use tauri::State;
 use tokio::sync::Semaphore;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::mod_cache::SqliteModCacheRepository;
+use crate::mod_cache::{CacheProbe, SqliteModCacheRepository};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::rules::{ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
 
@@ -547,6 +547,14 @@ pub(crate) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
 }
 
 /// Returns the set of active (resolved) mod IDs for a given modlist + version + loader.
+///
+/// Il verde e il rosso dell'editor sono quello che il lancio carica (D146,
+/// audit 101 editor-logica-4): la stessa sequenza del lancio online —
+/// `AvailabilityFixpoint`, cioè disponibilità, ri-risoluzione, e di nuovo
+/// finché la selezione non cambia — e quindi solo la prima alternativa
+/// viabile di ogni catena, mai tutte. Prima l'editor toglieva gli
+/// indisponibili senza ri-risolvere e poi coloriva verde ogni alternativa
+/// viabile, mentre il lancio ne carica una.
 #[tauri::command]
 pub async fn resolve_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
@@ -570,149 +578,117 @@ pub async fn resolve_modlist_command(
         return Ok(Vec::new());
     }
 
-    let result = resolve_modlist(&modlist, &target).map_err(|e| e.to_string())?;
+    let client = ModrinthClient::new();
+    let mut pass = AvailabilityFixpoint::new(&modlist, &target).map_err(|e| e.to_string())?;
+    loop {
+        let pending = pass.pending();
+        if pending.is_empty() {
+            break;
+        }
+        let check_client = client.clone();
+        let check_target = target.clone();
+        let unavailable = editor_unavailable_mods(
+            &launcher_paths,
+            &pending,
+            &target,
+            &mod_loader,
+            move |mod_id| {
+                let client = check_client.clone();
+                let target = check_target.clone();
+                async move {
+                    client
+                        .fetch_project_versions(&mod_id, &target)
+                        .await
+                        .map(|versions| !versions.is_empty())
+                }
+            },
+        )
+        .await;
+        pass.record(&pending, &unavailable)
+            .map_err(|e| e.to_string())?;
+    }
 
-    let mut ids = result.active_mods;
+    Ok(pass.current().active_mods.iter().cloned().collect())
+}
 
-    // ── Modrinth availability check ─────────────────────────────────────────
-    // For each resolved mod sourced from Modrinth, verify that a compatible
-    // version actually exists for the target MC version + loader.
-    let modrinth_ids: Vec<String> = ids
+/// The editor's availability verdict for `mod_ids`, the mods one round of the
+/// fixed point selected: the ones with nothing installable, in input order.
+///
+/// Same meaning as the online launch: a compatible version on Modrinth, or a
+/// jar for this exact target already on disk (D29, `CacheBacking::JarOnDisk`).
+/// The Modrinth half reads `modrinth_availability` first and asks `check` only
+/// for the mods with no row, persisting the answers. A failed question is not
+/// an answer: the mod stays available and nothing is cached, as before — an
+/// editor that turns red because the network blinked would say something the
+/// next launch may well not do.
+async fn editor_unavailable_mods<Check, Fut>(
+    launcher_paths: &LauncherPaths,
+    mod_ids: &[String],
+    target: &ResolutionTarget,
+    loader_key: &str,
+    check: Check,
+) -> Vec<String>
+where
+    Check: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
+{
+    let db_path = launcher_paths.database_path();
+    let cached = db_availability_get(db_path, mod_ids, &target.minecraft_version, loader_key);
+    let cached_ids = cached
         .iter()
-        .filter(|id| {
-            modlist
-                .find_rule(id)
-                .is_some_and(|rule| rule.source == ModSource::Modrinth)
-        })
+        .map(|(mod_id, _)| mod_id.as_str())
+        .collect::<HashSet<_>>();
+    let uncached = mod_ids
+        .iter()
+        .filter(|mod_id| !cached_ids.contains(mod_id.as_str()))
         .cloned()
-        .collect();
+        .collect::<Vec<_>>();
 
-    if !modrinth_ids.is_empty() {
-        let db_path = launcher_paths.database_path();
-        let loader_str = mod_loader.clone();
-
-        // Check database cache first
-        let cached = db_availability_get(
-            db_path,
-            &modrinth_ids,
-            &target.minecraft_version,
-            &loader_str,
-        );
-        let cached_ids: HashSet<String> = cached.iter().map(|(id, _)| id.clone()).collect();
-        for (mod_id, available) in &cached {
-            if !available {
-                ids.remove(mod_id);
-            }
-        }
-
-        // Only call Modrinth API for mods not in the database
-        let uncached_ids: Vec<String> = modrinth_ids
-            .into_iter()
-            .filter(|id| !cached_ids.contains(id))
-            .collect();
-
-        if !uncached_ids.is_empty() {
-            let client = ModrinthClient::new();
-            let mut tasks = tokio::task::JoinSet::new();
-            let semaphore = Arc::new(Semaphore::new(10));
-
-            for mod_id in uncached_ids {
-                let client = client.clone();
-                let target = target.clone();
-                let permit_source = semaphore.clone();
-                tasks.spawn(async move {
-                    let _permit = permit_source.acquire_owned().await.ok()?;
-                    let result = client.fetch_project_versions(&mod_id, &target).await;
-                    match result {
-                        Ok(v) => Some((mod_id, !v.is_empty())),
-                        Err(_) => None, // on network error, skip — don't cache failures
-                    }
-                });
-            }
-
-            let mut to_persist = Vec::new();
-            while let Some(join_result) = tasks.join_next().await {
-                if let Ok(Some((mod_id, available))) = join_result {
-                    if !available {
-                        ids.remove(&mod_id);
-                    }
-                    to_persist.push((
-                        mod_id,
-                        target.minecraft_version.clone(),
-                        loader_str.clone(),
-                        available,
-                    ));
-                }
-            }
-
-            // Persist API results to database for future lookups
-            if !to_persist.is_empty() {
-                db_availability_set(db_path, &to_persist);
-            }
-        }
-    }
-
-    // ── Cascade: remove mods whose requires are unsatisfied ────────────────
-    // The Modrinth check (or version rules) may have removed a mod that
-    // others depend on.  Iteratively remove any mod whose original requires
-    // are no longer fully satisfied.
-    let mut cascade_changed = true;
-    while cascade_changed {
-        cascade_changed = false;
-        let snapshot: Vec<String> = ids.iter().cloned().collect();
-        for mod_id in &snapshot {
-            if let Some(rule) = modlist.find_rule(mod_id) {
-                if rule.requires.iter().any(|req| !ids.contains(req)) {
-                    ids.remove(mod_id);
-                    cascade_changed = true;
-                }
-            }
-        }
-    }
-
-    // ── Alt viability for UI ────────────────────────────────────────────────
-    // After all checks (Modrinth availability, cascade), show which
-    // alternatives are viable for rules whose primary is no longer in `ids`.
-    // This runs last so it sees the final state of which mods survived.
-    let before_alts: HashSet<String> = ids.clone();
-    for rule in &modlist.rules {
-        if !ids.contains(&rule.mod_id) {
-            check_viable_alts(rule, &mut ids, &target);
-        }
-    }
-
-    // check_viable_alts only tests user-defined constraints (version_rules,
-    // requires, exclude_if).  Modrinth-sourced alternatives still need an
-    // availability check — remove those the cache marks as unavailable.
-    {
-        let new_alt_modrinth_ids: Vec<String> = ids
+    let mut answers = cached.clone();
+    if !uncached.is_empty() {
+        let checked = check_availability_concurrently(uncached, 10, check).await;
+        let to_persist = checked
             .iter()
-            .filter(|id| !before_alts.contains(*id))
-            .filter(|id| {
-                modlist
-                    .find_rule(id)
-                    .is_some_and(|r| r.source == ModSource::Modrinth)
+            .map(|(mod_id, available)| {
+                (
+                    mod_id.clone(),
+                    target.minecraft_version.clone(),
+                    loader_key.to_string(),
+                    *available,
+                )
             })
-            .cloned()
-            .collect();
-
-        if !new_alt_modrinth_ids.is_empty() {
-            let db_path = launcher_paths.database_path();
-            let cached = db_availability_get(
-                db_path,
-                &new_alt_modrinth_ids,
-                &target.minecraft_version,
-                &mod_loader,
-            );
-            for (mod_id, available) in &cached {
-                if !available {
-                    ids.remove(mod_id);
-                }
-            }
+            .collect::<Vec<_>>();
+        if !to_persist.is_empty() {
+            db_availability_set(db_path, &to_persist);
         }
+        answers.extend(checked);
     }
 
-    Ok(ids.into_iter().collect())
+    let no_version = answers
+        .into_iter()
+        .filter(|(_, available)| !available)
+        .map(|(mod_id, _)| mod_id)
+        .collect::<HashSet<_>>();
+    if no_version.is_empty() {
+        return Vec::new();
+    }
+
+    // D29: un jar per questo target sul disco tiene il mod nel lancio, qualunque
+    // cosa dica Modrinth. Una cache illeggibile non tiene niente.
+    let connection = Connection::open(db_path).ok();
+    let jar_on_disk = |mod_id: &str| {
+        connection.as_ref().is_some_and(|connection| {
+            SqliteModCacheRepository::new(connection, launcher_paths.mods_cache_dir())
+                .probe_project(mod_id, target)
+                .is_ok_and(|probe| matches!(probe, CacheProbe::Ready(_)))
+        })
+    };
+
+    mod_ids
+        .iter()
+        .filter(|mod_id| no_version.contains(mod_id.as_str()) && !jar_on_disk(mod_id))
+        .cloned()
+        .collect()
 }
 
 /// What one backfill pass decided. The command itself discards it: the pass
@@ -1051,41 +1027,6 @@ pub async fn backfill_availability_command(
     )
     .await?;
     Ok(())
-}
-
-/// Recursively check every alternative in the tree and add viable ones to `ids`.
-/// Only recurses into an alt's children when the alt itself is NOT viable
-/// (its sub-alternatives are only relevant as fallbacks when it fails).
-fn check_viable_alts(rule: &Rule, ids: &mut HashSet<String>, target: &ResolutionTarget) {
-    for alt in &rule.alternatives {
-        if ids.contains(&alt.mod_id) {
-            continue;
-        }
-        if alt_itself_viable(alt, ids, target) {
-            ids.insert(alt.mod_id.clone());
-        } else {
-            check_viable_alts(alt, ids, target);
-        }
-    }
-}
-
-/// Returns true only if this specific rule passes all checks (exclude_if, requires,
-/// version_rules) — ignores its own alternatives.
-fn alt_itself_viable(
-    rule: &Rule,
-    active_mods: &HashSet<String>,
-    target: &ResolutionTarget,
-) -> bool {
-    if !rule.enabled {
-        return false;
-    }
-    if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
-        return false;
-    }
-    if rule.requires.iter().any(|id| !active_mods.contains(id)) {
-        return false;
-    }
-    !version_rules_conflict(&rule.version_rules, target)
 }
 
 #[cfg(test)]
@@ -1948,6 +1889,130 @@ mod tests {
                 reason: FailureReason::Disabled,
             }
         );
+    }
+
+    #[test]
+    fn the_editor_colours_the_loser_of_an_incompatibility_the_launch_loads() {
+        // Report 101, editor-logica-4, primo caso: «W vince su L» (L exclude_if
+        // [W]) con W senza release per il target. L'editor toglieva W senza
+        // ri-risolvere e coloriva verde L2, l'alternativa di L; il lancio
+        // disabilita W e installa L. Con il punto fisso l'editor carica L.
+        let mut loser = simple_rule("L");
+        loser.exclude_if = vec!["W".into()];
+        loser.alternatives = vec![simple_rule("L2")];
+        let ml = modlist(vec![simple_rule("W"), loser]);
+
+        let (loaded, _, _) = run_fixpoint(&ml, &target(), &["W"]);
+
+        assert_eq!(loaded, HashSet::from(["L".to_string()]));
+    }
+
+    #[test]
+    fn the_editor_colours_only_the_first_viable_fallback() {
+        // Secondo caso: P non disponibile, A1 e A2 tutte e due valide.
+        // L'editor le coloriva verdi tutte e due, il lancio installa solo A1.
+        let mut primary = simple_rule("P");
+        primary.alternatives = vec![simple_rule("A1"), simple_rule("A2")];
+        let ml = modlist(vec![primary]);
+
+        let (loaded, asked, _) = run_fixpoint(&ml, &target(), &["P"]);
+
+        assert_eq!(loaded, HashSet::from(["A1".to_string()]));
+        assert!(!asked.contains_key("A2"));
+    }
+
+    #[tokio::test]
+    async fn the_editor_availability_reads_the_cache_and_keeps_a_jar_on_disk() {
+        let db_path = temp_db_path("editor-availability");
+        let launcher_paths = LauncherPaths::new(db_path.parent().unwrap());
+        std::fs::create_dir_all(launcher_paths.mods_cache_dir()).expect("mods cache");
+        crate::database::initialize_database(launcher_paths.database_path())
+            .expect("initialize database");
+        let target = target();
+        db_availability_set(
+            launcher_paths.database_path(),
+            &[
+                ("sodium".into(), "1.21.1".into(), "fabric".into(), true),
+                ("iris".into(), "1.21.1".into(), "fabric".into(), false),
+                ("lithium".into(), "1.21.1".into(), "fabric".into(), false),
+            ],
+        );
+        // `lithium` non ha versione per Modrinth, ma il suo jar per questo
+        // target è sul disco: il lancio lo carica (D29), quindi è verde.
+        {
+            let connection =
+                Connection::open(launcher_paths.database_path()).expect("open database");
+            let repository =
+                SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+            let mut version = modrinth_version("lithium-v1");
+            version.project_id = "lithium".into();
+            version.files = vec![crate::modrinth::ModrinthFile {
+                hashes: HashMap::from([("sha1".to_string(), "lithium-sha1".to_string())]),
+                url: "https://cdn.modrinth.com/data/lithium/lithium.jar".into(),
+                filename: "lithium.jar".into(),
+                primary: true,
+                size: 3,
+            }];
+            repository
+                .upsert_modrinth_version(&version, &target)
+                .expect("register lithium");
+            let record = repository
+                .find_registered_by_project_or_alias("lithium", &target)
+                .expect("read the row")
+                .expect("the row exists");
+            let path = crate::mod_cache::cached_artifact_path_for_record(
+                launcher_paths.mods_cache_dir(),
+                &record,
+            );
+            std::fs::create_dir_all(path.parent().unwrap()).expect("jar directory");
+            std::fs::write(&path, b"jar").expect("write the jar");
+        }
+
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        let unavailable = editor_unavailable_mods(
+            &launcher_paths,
+            &[
+                "sodium".to_string(),
+                "iris".to_string(),
+                "lithium".to_string(),
+                "polytone".to_string(),
+                "broken".to_string(),
+            ],
+            &target,
+            "fabric",
+            move |mod_id| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(mod_id.clone());
+                    match mod_id.as_str() {
+                        "polytone" => Ok(false),
+                        _ => Err(anyhow::anyhow!("connection reset")),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            unavailable,
+            vec!["iris".to_string(), "polytone".to_string()]
+        );
+        // Solo i mod senza riga vanno a Modrinth; la risposta si salva, l'errore no.
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["broken".to_string(), "polytone".to_string()]);
+        assert_eq!(
+            db_availability_get(
+                launcher_paths.database_path(),
+                &["polytone".to_string(), "broken".to_string()],
+                "1.21.1",
+                "fabric"
+            ),
+            vec![("polytone".to_string(), false)]
+        );
+
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove temp dir");
     }
 
     #[test]
