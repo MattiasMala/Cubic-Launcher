@@ -139,6 +139,8 @@ export type ShellAccount = {
   credentials: AccountCredentials;
   credentials_detail?: string | null;
   plays_offline: boolean;
+  /** The row the launch uses: the list alone says which account is active. */
+  is_active: boolean;
 };
 
 export type ShellSnapshot = {
@@ -148,6 +150,8 @@ export type ShellSnapshot = {
     author?: string | null;
     rule_count: number;
   }>;
+  /** Folders whose rules.json can't be read: left out of `modlists`, not fatal. */
+  unreadable_modlists?: Array<{ folder: string; error: string }>;
   active_account?: ShellAccount | null;
   global_settings: {
     min_ram_mb: number;

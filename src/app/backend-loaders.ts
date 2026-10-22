@@ -4,7 +4,7 @@ import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
 import { normalizeModLoader, type AccountSummary, type ShellAccount, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
-  setModRowsState, setAccounts, setActiveAccountId,
+  setModRowsState, setAccounts, setActiveAccountId, setAccountsRevision,
   setGlobalSettings, setModlistOverrides,
   pushUiError,
   setAestheticGroups, setFunctionalGroups,
@@ -72,17 +72,46 @@ export async function loadAccounts() {
   try {
     const list = await invoke<ShellAccount[]>("list_accounts_command");
     setAccounts(list.map(toAccountSummary));
+    // The active account is the backend's word too (todo.md:1390): after a
+    // removal the backend may have activated another row.
+    setActiveAccountId(list.find(account => account.is_active)?.microsoft_id ?? "");
+    setAccountsRevision(revision => revision + 1);
   } catch (error) {
     logger.error("App", "loadAccounts failed", error);
     pushUiError({ title: "Could not load saved accounts", message: "The backend could not list the saved accounts.", detail: String(error), severity: "error", scope: "account" });
   }
 }
 
+/** Folder → error of the unreadable mod lists already reported, so that every reload doesn't repeat them. */
+const reportedUnreadableModlists = new Map<string, string>();
+
+function reportUnreadableModlists(unreadable: Array<{ folder: string; error: string }>) {
+  const current = new Set(unreadable.map(entry => entry.folder));
+  for (const folder of [...reportedUnreadableModlists.keys()]) {
+    if (!current.has(folder)) reportedUnreadableModlists.delete(folder);
+  }
+  for (const { folder, error } of unreadable) {
+    if (reportedUnreadableModlists.get(folder) === error) continue;
+    reportedUnreadableModlists.set(folder, error);
+    pushUiError({
+      title: "Mod list skipped",
+      message: `The rules.json of '${folder}' can't be read, so that mod list is not shown. The other mod lists are not affected.`,
+      detail: error,
+      severity: "warning",
+      scope: "launch",
+    });
+  }
+}
+
 export async function loadShellSnapshot(preferredName?: string | null) {
+  // The accounts are a call of their own (todo.md:1414): a snapshot that
+  // fails must not leave the launcher without its account list.
+  const accountsLoaded = loadAccounts();
   try {
     const snap: any = await invoke("load_shell_snapshot_command", {
       selectedModlistName: preferredName ?? null,
     });
+    reportUnreadableModlists(snap.unreadable_modlists ?? []);
 
     const existing = modListCards();
     const cards = (snap.modlists ?? []).map((modlist: any) => {
@@ -114,8 +143,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
       setSelectedModListName("");
     }
 
-    setActiveAccountId(snap.active_account?.microsoft_id ?? "");
-    await loadAccounts();
+    await accountsLoaded;
 
     const gs = snap.global_settings;
     if (gs) {
@@ -162,6 +190,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
   } catch (error) {
     logger.error("App", "loadShellSnapshot failed", error);
     pushUiError({ title: "Could not load launcher state", message: "The backend returned an error on startup.", detail: String(error), severity: "error", scope: "launch" });
+    await accountsLoaded;
     return null;
   }
 }

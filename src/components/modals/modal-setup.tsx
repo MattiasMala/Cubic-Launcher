@@ -1,5 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
 import type { AccountCredentials } from "../../lib/types";
 import { loadAccounts, loadShellSnapshot } from "../../app/backend-loaders";
@@ -7,7 +9,8 @@ import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
-  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, setActiveAccountId, activeAccount,
+  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, activeAccount,
+  accountAvatarUrl,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
   createModlistModalOpen, setCreateModlistModalOpen,
@@ -302,9 +305,21 @@ const CREDENTIALS_PILL: Record<AccountCredentials, string> = {
   keyring_unavailable: "keyring unavailable",
 };
 
+// What `microsoft_login_command` answers after Cancel (`MICROSOFT_LOGIN_CANCELLED`
+// in app_shell.rs): not an error to show.
+const MICROSOFT_LOGIN_CANCELLED = "Microsoft sign-in cancelled";
+
 export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<void> }) {
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
+  // The row a "Sign in again" belongs to while it runs, and the row its error
+  // belongs to after: `null` is the "Login with Microsoft" box at the top.
+  const [loginRowId, setLoginRowId] = createSignal<string | null>(null);
+  const [loginErrorRowId, setLoginErrorRowId] = createSignal<string | null>(null);
+  // The Microsoft page the browser was sent to (account-3): shown as a link so
+  // that a browser in the wrong profile, or none at all, is not a dead end.
+  const [loginUrl, setLoginUrl] = createSignal<string | null>(null);
+  const [linkCopied, setLinkCopied] = createSignal(false);
   const [savingOffline, setSavingOffline] = createSignal(false);
   // D134: "Remove" asks before deleting, one row at a time: the id of the row
   // waiting for confirmation, or null. Opening or closing the modal drops it.
@@ -317,10 +332,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
     if (removing()) return;
     setRemoving(true);
     try {
+      // Removing the active account activates another one in the database
+      // (todo.md:1390); the reload reads which one.
       await invoke("delete_account_command", { microsoftId });
-      if (activeAccountId() === microsoftId) setActiveAccountId("");
       await loadAccounts();
     } catch (err) {
+      setLoginErrorRowId(null);
       setLoginError(String(err));
     } finally {
       setRemoving(false);
@@ -336,6 +353,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
       await invoke("set_account_plays_offline_command", { microsoftId, playsOffline });
       await loadAccounts();
     } catch (err) {
+      setLoginErrorRowId(null);
       setLoginError(String(err));
     } finally {
       setSavingOffline(false);
@@ -344,19 +362,89 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
 
   // `replaceUnreadable` is the explicit "Sign in again" (F1): only that button
   // lets the backend discard saved sign-ins the keyring says nobody can read.
-  const signIn = async (replaceUnreadable: boolean) => {
+  // `rowId` is the row it was pressed on: the backend refuses, and says so, a
+  // sign-in that comes back with another Microsoft account (todo.md:1417).
+  const signIn = async (replaceUnreadable: boolean, rowId: string | null = null) => {
+    if (loggingIn()) return;
     setLoggingIn(true);
     setLoginError(null);
+    setLoginErrorRowId(rowId);
+    setLoginRowId(rowId);
+    setLoginUrl(null);
+    setLinkCopied(false);
+    const unlisten = await listen<string>("microsoft-login-url", event => setLoginUrl(event.payload));
     try {
-      await invoke("microsoft_login_command", { replaceUnreadable });
+      await invoke("microsoft_login_command", { replaceUnreadable, expectedMicrosoftId: rowId });
       setAccountsModalOpen(false);
       await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
-      setLoginError(String(err));
+      if (String(err) !== MICROSOFT_LOGIN_CANCELLED) setLoginError(String(err));
     } finally {
+      unlisten();
       setLoggingIn(false);
+      setLoginRowId(null);
+      setLoginUrl(null);
     }
   };
+
+  const cancelSignIn = () => {
+    void invoke("cancel_microsoft_login_command").catch(err => setLoginError(String(err)));
+  };
+
+  const copyLoginLink = async () => {
+    const url = loginUrl();
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 2000);
+    } catch (err) {
+      setLoginError(`Could not copy the link: ${String(err)}`);
+    }
+  };
+
+  /** While a sign-in waits for the browser: the link, and the ways out of it. */
+  const loginProgress = () => (
+    <div class="mt-3 rounded-md border border-border bg-background p-3 text-xs" data-testid="microsoft-login-progress">
+      <p class="text-foreground">Waiting for you to finish signing in in your browser…</p>
+      <Show
+        when={loginUrl()}
+        fallback={<p class="mt-1 text-muted-foreground">Opening your browser…</p>}
+      >
+        {url => (
+          <>
+            <p class="mt-1 text-muted-foreground">
+              If no browser opened, or it opened the wrong profile, copy this link into the browser
+              you want to use:
+            </p>
+            <p class="mt-1 max-h-16 overflow-y-auto break-all rounded bg-muted/40 p-2 font-mono text-[10px] text-muted-foreground select-all">
+              {url()}
+            </p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
+                onClick={() => void copyLoginLink()}
+              >
+                {linkCopied() ? "Copied" : "Copy link"}
+              </button>
+              <button
+                class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
+                onClick={() => void openUrl(url()).catch(err => setLoginError(String(err)))}
+              >
+                Open browser again
+              </button>
+            </div>
+          </>
+        )}
+      </Show>
+      <button
+        class="mt-2 rounded-md border border-destructive/40 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10"
+        onClick={cancelSignIn}
+      >
+        Cancel sign-in
+      </button>
+    </div>
+  );
 
   return (
     <Show when={accountsModalOpen()}>
@@ -376,8 +464,11 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
             >
               {loggingIn() ? "Logging in..." : "Login with Microsoft"}
             </button>
-            <Show when={loginError()}>
-              <p class="mt-2 text-xs text-destructive break-all">{loginError()}</p>
+            <Show when={loggingIn() && loginRowId() === null}>
+              {loginProgress()}
+            </Show>
+            <Show when={loginErrorRowId() === null && loginError()}>
+              <p class="mt-2 text-xs text-destructive break-words">{loginError()}</p>
             </Show>
           </div>
           <p class="text-xs text-muted-foreground">Saved accounts - click to switch</p>
@@ -389,12 +480,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     onClick={() => void props.onSwitchAccount(acc.id)}
                     class="flex items-start gap-3 text-left flex-1 min-w-0"
                   >
-                    <Show when={acc.avatarUrl} fallback={
+                    <Show when={accountAvatarUrl(acc)} fallback={
                       <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/20 text-sm font-semibold text-primary">
                         {acc.gamertag.slice(0, 2).toUpperCase()}
                       </div>
                     }>
-                      <img src={acc.avatarUrl} alt="" class="h-10 w-10 shrink-0 rounded-md" loading="lazy" />
+                      {url => <img src={url()} alt="" class="h-10 w-10 shrink-0 rounded-md" loading="lazy" />}
                     </Show>
                     <div class="min-w-0">
                       <p class="font-medium text-foreground truncate">{acc.gamertag}</p>
@@ -482,9 +573,9 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                           <button
                             class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
                             disabled={loggingIn()}
-                            onClick={() => void signIn(true)}
+                            onClick={() => void signIn(true, acc.id)}
                           >
-                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                            {loggingIn() && loginRowId() === acc.id ? "Signing in..." : "Sign in again"}
                           </button>
                         </Match>
                         <Match when={credentials() === "signed_out"}>
@@ -497,9 +588,9 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                           <button
                             class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
                             disabled={loggingIn()}
-                            onClick={() => void signIn(true)}
+                            onClick={() => void signIn(true, acc.id)}
                           >
-                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                            {loggingIn() && loginRowId() === acc.id ? "Signing in..." : "Sign in again"}
                           </button>
                         </Match>
                         <Match when={credentials() === "keyring_unavailable"}>
@@ -516,6 +607,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                       </Switch>
                     </div>
                   )}
+                </Show>
+                <Show when={loggingIn() && loginRowId() === acc.id}>
+                  {loginProgress()}
+                </Show>
+                <Show when={loginErrorRowId() === acc.id && loginError()}>
+                  <p class="mt-2 text-xs text-destructive break-words">{loginError()}</p>
                 </Show>
               </div>
             )}

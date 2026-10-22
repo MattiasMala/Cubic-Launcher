@@ -17,7 +17,7 @@ import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   activeRailView, setActiveRailView, setQuickPlayWorldFolder, quickPlayWorldFolder,
-  modRowsState, setModRowsState, setActiveAccountId,
+  modRowsState, setModRowsState, activeAccountId, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
   setLaunchLogs,
   modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
@@ -382,14 +382,18 @@ export default function App() {
   };
 
   const handleSwitchAccount = async (id: string) => {
+    const previousId = activeAccountId();
     setActiveAccountId(id);
     if (!isTauri()) { logger.warn("App", "handleSwitchAccount skipped — no backend"); return; }
     try {
       await invoke("switch_active_account_command", { microsoftId: id });
-      await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
+      // The backend kept the previous account: so does the interface.
+      setActiveAccountId(previousId);
       pushUiError({ title: "Account switch failed", message: "Could not activate the selected account.", detail: String(err), severity: "error", scope: "account" });
+      return;
     }
+    await loadShellSnapshot(selectedModListName() || null);
   };
 
   const handleCreateModlist = async () => {
