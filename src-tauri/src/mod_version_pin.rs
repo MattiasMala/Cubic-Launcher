@@ -36,7 +36,9 @@ use crate::mod_cache::SqliteModCacheRepository;
 use crate::modlist_manager::{
     copy_local_jar_from_root, local_mod_id_from_jar_filename, CopyLocalJarInput,
 };
-use crate::modrinth::{build_http_client, is_version_compatible, ModrinthClient, ModrinthVersion};
+use crate::modrinth::{
+    build_download_client, is_version_compatible, ModrinthClient, ModrinthVersion,
+};
 use crate::path_safety::validate_path_component;
 use crate::resolver::{parse_mod_loader, ResolutionTarget};
 use crate::rules::{ModList, ModSource, Rule, VersionRuleKind, RULES_FILENAME};
@@ -254,7 +256,11 @@ pub async fn pin_mod_version_from_root(
         .with_context(|| format!("failed to create {}", temp_dir.display()))?;
     let temp_jar = temp_dir.join(&file.filename);
 
-    let pinned = match download_file_verified(&build_http_client(), &file.url, &temp_jar, &sha1)
+    // The download client, not the API one (audit 101, rete-3): the 20 s
+    // timeout of `build_http_client` bounds the body too, and on a slow line a
+    // jar of a few MB never arrived. The launch fetches the same jar with this
+    // same client.
+    let pinned = match download_file_verified(&build_download_client(), &file.url, &temp_jar, &sha1)
         .await
         .with_context(|| format!("failed to download '{}'", file.filename))
     {
