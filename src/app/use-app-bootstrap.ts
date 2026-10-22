@@ -24,6 +24,7 @@ import {
   loadModlistGroups,
   loadModlistPresentation,
   loadShellSnapshot,
+  markMinecraftVersionsKnown,
   runResolution,
 } from "./backend-loaders";
 
@@ -46,7 +47,10 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
               releases: payload.releases.length,
               withSnapshots: payload.withSnapshots.length,
             });
-            if (payload.releases.length > 0) setMinecraftVersions(payload.releases);
+            if (payload.releases.length > 0) {
+              setMinecraftVersions(payload.releases);
+              markMinecraftVersionsKnown();
+            }
             if (payload.withSnapshots.length > 0) setMcWithSnapshots(payload.withSnapshots);
           } catch (error) {
             logger.warn("App", "failed to fetch minecraft versions, using defaults", error);
