@@ -810,6 +810,7 @@ pub(super) fn resolve_cache_fallback_artifacts(
         );
     }
 
+    let mut lost = Vec::new();
     for (mod_id, probe) in &probes {
         if resolved.contains_key(mod_id) {
             continue;
@@ -823,27 +824,24 @@ pub(super) fn resolve_cache_fallback_artifacts(
                     app_handle,
                     ProcessLogStream::Stderr,
                     format!(
-                        "[Cache] the cached jar of '{}' is gone ({}) and no version came back from Modrinth to fetch it with; the mod is skipped",
-                        mod_id, record.jar_filename
+                        "[Cache] the cached jar of '{}' is gone ({}, version {}) and no version came back from Modrinth to fetch it with; the mod is skipped",
+                        mod_id, record.jar_filename, record.modrinth_version_id
                     ),
                 );
-                let _ = emit_launcher_issue(
-                    app_handle,
-                    "Mod left out of the launch",
-                    &format!(
-                        "The jar of '{mod_id}' is gone from the cache and Modrinth gave no version to fetch it with."
-                    ),
-                    &format!(
-                        "{} (version {}) would have to be downloaded again, and this launch got no answer for it.",
-                        record.jar_filename, record.modrinth_version_id
-                    ),
-                    "warning",
-                    "launch",
-                );
+                lost.push(DroppedMod {
+                    mod_id: mod_id.clone(),
+                    reason: DropReason::NoVersionAndNoCachedJar,
+                });
             }
-            _ => report_unusable_probe(app_handle, mod_id, probe),
+            _ => lost.extend(log_unusable_probe(
+                app_handle,
+                mod_id,
+                probe,
+                DropReason::NoVersionAndNoCachedJar,
+            )),
         }
     }
+    report_dropped_notices(app_handle, &lost, target);
 
     let artifacts = fallback
         .into_iter()
@@ -881,54 +879,52 @@ fn report_restored_jar(app_handle: &tauri::AppHandle, mod_id: &str, record: &Mod
     );
 }
 
-/// A mod the cache cannot serve and nothing can restore, with the reason.
+/// A mod the cache cannot serve and nothing can restore: the log line, with
+/// the jar and the version, and the reason the banner will say.
 ///
 /// Both selection passes treat it as unavailable — today's behaviour — and
 /// this is the one case where the mod is **not** in the game: the log names it
 /// and the banner says so, because a mod missing in silence is the worst
-/// failure this pipeline has.
-fn report_unusable_probe(app_handle: &tauri::AppHandle, mod_id: &str, probe: &CacheProbe) {
-    let (message, detail) = match probe {
+/// failure this pipeline has. The banner is not emitted here: the caller
+/// collects the losses of the whole stage and says them one notice per reason
+/// (`report_dropped_notices`), the same shape as the availability pass (D47,
+/// todo.md «Due forme per lo stesso avviso»). `not_cached` is the reason of a
+/// mod with no row at all, which depends on the path.
+fn log_unusable_probe(
+    app_handle: &tauri::AppHandle,
+    mod_id: &str,
+    probe: &CacheProbe,
+    not_cached: DropReason,
+) -> Option<DroppedMod> {
+    let (message, reason) = match probe {
         CacheProbe::JarMissingUnrecoverable(record) if record.is_local => (
             format!(
                 "[Cache] the cached jar of local mod '{}' is gone ({}); a locally copied jar has no Modrinth download url, so it cannot be restored and the mod is skipped",
                 mod_id, record.jar_filename
             ),
-            format!(
-                "{} was copied in by hand, so there is no download url to restore it from. Add the jar again to get the mod back.",
-                record.jar_filename
-            ),
+            DropReason::LocalJarGone,
         ),
         CacheProbe::JarMissingUnrecoverable(record) => (
             format!(
                 "[Cache] the cached jar of '{}' is gone ({}, version {}) and its cache row has no download url, so it cannot be restored and the mod is skipped",
                 mod_id, record.jar_filename, record.modrinth_version_id
             ),
-            format!(
-                "{} (version {}) is missing and its cache row has no download url.",
-                record.jar_filename, record.modrinth_version_id
-            ),
+            DropReason::RegisteredRowWithoutUrl,
         ),
         CacheProbe::NotCached => (
             format!(
-                "[Cache] '{mod_id}' has never been cached for this target and this launch has no chosen version to fetch it with; the mod is skipped"
+                "[Cache] '{mod_id}' has never been cached for this target and this launch has no version to fetch it with; the mod is skipped"
             ),
-            "The mod has never been downloaded for this Minecraft version and loader, and this launch had no chosen version to fetch it with.".to_string(),
+            not_cached,
         ),
-        CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return,
+        CacheProbe::Ready(_) | CacheProbe::JarMissing(_) => return None,
     };
 
     let _ = emit_log(app_handle, ProcessLogStream::Stderr, message);
-    let _ = emit_launcher_issue(
-        app_handle,
-        "Mod left out of the launch",
-        &format!(
-            "'{mod_id}' is not in this launch: its jar is not in the cache and cannot be fetched."
-        ),
-        &detail,
-        "warning",
-        "launch",
-    );
+    Some(DroppedMod {
+        mod_id: mod_id.to_string(),
+        reason,
+    })
 }
 
 /// What the launch installs for the selected mods when it may not choose
@@ -1056,6 +1052,14 @@ pub(super) async fn resolve_selected_remote_artifacts(
         }
     }
 
+    // Senza mappa l'account gioca offline: un mod senza riga non ha niente da
+    // scaricare e non si scarica niente (todo.md:1341, la frase del motivo).
+    let not_cached = if preresolved.is_some() {
+        DropReason::NoChosenVersionAndNothingCached
+    } else {
+        DropReason::NothingCachedOffline
+    };
+    let mut lost = Vec::new();
     for mod_id in &by_project {
         if artifacts.contains_key(mod_id) {
             continue;
@@ -1066,23 +1070,28 @@ pub(super) async fn resolve_selected_remote_artifacts(
             CacheProbe::Ready(record) => {
                 artifacts.insert(mod_id.clone(), RemoteArtifact::Cached(record));
             }
-            CacheProbe::JarMissing(_) if preresolved.is_none() => {
-                report_dropped_mods(
+            CacheProbe::JarMissing(record) if preresolved.is_none() => {
+                let _ = emit_log(
                     app_handle,
-                    &[DroppedMod {
-                        mod_id: mod_id.clone(),
-                        reason: DropReason::RegisteredJarGoneOffline,
-                    }],
-                    target,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Cache] the cached jar of '{}' is gone ({}, version {}) and the active account plays offline, so it is not downloaded again; the mod is skipped",
+                        mod_id, record.jar_filename, record.modrinth_version_id
+                    ),
                 );
+                lost.push(DroppedMod {
+                    mod_id: mod_id.clone(),
+                    reason: DropReason::RegisteredJarGoneOffline,
+                });
             }
             CacheProbe::JarMissing(record) => {
                 report_restored_jar(app_handle, mod_id, &record);
                 artifacts.insert(mod_id.clone(), RemoteArtifact::MissingJar(record));
             }
-            other => report_unusable_probe(app_handle, mod_id, &other),
+            other => lost.extend(log_unusable_probe(app_handle, mod_id, &other, not_cached)),
         }
     }
+    report_dropped_notices(app_handle, &lost, target);
 
     Ok(artifacts)
 }
@@ -1183,6 +1192,12 @@ pub(super) enum DropReason {
     /// The pre-checked path: no version was chosen for it before the launch
     /// and the cache cannot produce a jar either.
     NoChosenVersionAndNothingCached,
+    /// Il percorso offline senza mappa, per un mod che non ha nessuna riga per
+    /// questo target: nessuna versione viene scelta né scaricata. Un valore
+    /// suo perché la frase «this launch had no version chosen» è il
+    /// vocabolario del percorso con la mappa, e offline suonava storta
+    /// (todo.md:1341).
+    NothingCachedOffline,
     /// D-b (onda 8a): il percorso offline senza mappa, per un mod che ha la
     /// riga registrata per questo target ma il cui jar non è più sul disco.
     /// Ripristinarlo è un download, e l'account attivo gioca offline: il mod
@@ -1191,6 +1206,12 @@ pub(super) enum DropReason {
     /// `NoChosenVersionAndNothingCached`, perché «la cache non ha un jar» qui
     /// è falso: ha la riga, non il file.
     RegisteredJarGoneOffline,
+    /// Lo stadio degli artefatti: il jar di un mod copiato a mano è sparito, e
+    /// un jar copiato a mano non ha un url da cui riscaricarlo.
+    LocalJarGone,
+    /// Lo stadio degli artefatti: la riga registrata ha perso il jar e non ha
+    /// un url da cui riscaricarlo.
+    RegisteredRowWithoutUrl,
     /// A mod it `requires` was the one nothing could install
     /// (`FailureReason::RequiredModMissing` after the pass). Leaving this one
     /// silent would reopen the hole one rule further down.
@@ -1341,6 +1362,11 @@ pub(super) fn dropped_reason_clause(
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ),
+        DropReason::NothingCachedOffline => format!(
+            "your cache has no jar of {object} for Minecraft {} / {}, and an account that plays offline does not download {object}",
+            target.minecraft_version,
+            target.mod_loader.as_modrinth_loader()
+        ),
         DropReason::RegisteredJarGoneOffline => {
             let (its, jar_is, it) = if many {
                 ("their", "jars are", "them")
@@ -1350,6 +1376,23 @@ pub(super) fn dropped_reason_clause(
             format!(
                 "{its} {jar_is} registered but no longer on disk, and an account that plays offline does not download {it} again"
             )
+        }
+        DropReason::LocalJarGone => {
+            let (its, jar_was, is, it) = if many {
+                ("their", "jars were", "are", "them")
+            } else {
+                ("its", "jar was", "is", "it")
+            };
+            format!(
+                "{its} {jar_was} copied in by hand and {is} gone from the cache, so there is nothing to restore {it} from"
+            )
+        }
+        DropReason::RegisteredRowWithoutUrl => {
+            if many {
+                "their jars are gone from the cache and their cache rows have no download url".to_string()
+            } else {
+                "its jar is gone from the cache and its cache row has no download url".to_string()
+            }
         }
         DropReason::RequiredModLeftOut => {
             format!("a mod {subject} need{verb_s} is not in this launch either")
@@ -1377,6 +1420,22 @@ pub(super) fn dropped_reason_detail(reason: DropReason, many: bool) -> String {
         }
         DropReason::NoChosenVersionAndNothingCached => format!(
             "The versions chosen before this launch do not cover {it}, and the cache has no jar for this Minecraft version and loader."
+        ),
+        DropReason::NothingCachedOffline => format!(
+            "The cache has no jar of {it} for this Minecraft version and loader, and the active account plays offline, so nothing is downloaded."
+        ),
+        DropReason::LocalJarGone => {
+            let (jars, them_again) = if many {
+                ("jars", "the jars again to get the mods back")
+            } else {
+                ("jar", "the jar again to get the mod back")
+            };
+            format!(
+                "A {jars} copied in by hand has no download url, so the launcher cannot fetch {it} again. Add {them_again}."
+            )
+        }
+        DropReason::RegisteredRowWithoutUrl => format!(
+            "The launcher registered a version of {it} for this Minecraft version and loader, but the jar is missing and the cache row does not say where to download it again."
         ),
         DropReason::RegisteredJarGoneOffline => {
             let (jars, files_are, they_are) = if many {
@@ -1419,21 +1478,19 @@ fn dropped_mod_names(mod_ids: &[&str]) -> String {
     }
 }
 
-/// One notice per reason, in the order the reasons first appear; empty when
+/// One notice per reason, in the fixed order of `DropReason`; empty when
 /// nothing was lost.
 ///
-/// A notice per mod is what `report_unusable_probe` does, and it is the wrong
-/// shape here: this pass decides about the whole selection at once, so a
-/// Modrinth that does not answer drops every mod with no jar on disk — 24 of
-/// them on this repository's own mod-list — and the banner shows three at a
-/// time (`NoticeBanner.tsx:19`). Aggregating is what A3 already chose for the
-/// cache fallback. Grouping by reason rather than into one line is the price
-/// of not lying: the mods a dropped dependency took with it are out for a
-/// different reason than the mods nothing could install, and one sentence
-/// cannot be true of both. At most three notices, one per `DropReason`.
-///
-/// The title is `report_unusable_probe`'s, so that two stages reporting the
-/// same kind of loss do not look like two different problems.
+/// A notice per mod is the wrong shape: the availability pass decides about
+/// the whole selection at once, so a Modrinth that does not answer drops every
+/// mod with no jar on disk — 24 of them on this repository's own mod-list —
+/// and the banner shows three at a time (`NoticeBanner.tsx:19`). Aggregating
+/// is what A3 already chose for the cache fallback, and D47 chose it over one
+/// line per mod; the artifact stage now says its losses the same way
+/// (`report_dropped_notices`). Grouping by reason rather than into one line is
+/// the price of not lying: the mods a dropped dependency took with it are out
+/// for a different reason than the mods nothing could install, and one
+/// sentence cannot be true of both. At most one notice per `DropReason` value.
 fn dropped_mods_notices(
     dropped: &[DroppedMod],
     target: &ResolutionTarget,
@@ -1443,7 +1500,10 @@ fn dropped_mods_notices(
     for reason in [
         DropReason::NoVersionAndNoCachedJar,
         DropReason::NoChosenVersionAndNothingCached,
+        DropReason::NothingCachedOffline,
         DropReason::RegisteredJarGoneOffline,
+        DropReason::LocalJarGone,
+        DropReason::RegisteredRowWithoutUrl,
         DropReason::RequiredModLeftOut,
         DropReason::ExcludedByReplacement,
         DropReason::RulesLeftItOut,
@@ -1497,6 +1557,16 @@ pub(super) fn report_dropped_mods(
         );
     }
 
+    report_dropped_notices(app_handle, dropped, target);
+}
+
+/// The banner half of `report_dropped_mods`, for the artifact stage, whose log
+/// lines name the jar and the version and are written where the loss is found.
+fn report_dropped_notices(
+    app_handle: &tauri::AppHandle,
+    dropped: &[DroppedMod],
+    target: &ResolutionTarget,
+) {
     for (title, message, detail) in dropped_mods_notices(dropped, target) {
         let _ = emit_launcher_issue(app_handle, title, &message, &detail, "warning", "launch");
     }
@@ -1665,8 +1735,10 @@ pub(super) fn resolve_offline_selection(
     Ok(finish_selection(modlist, target, pass, &|mod_id| {
         if jar_gone.contains(mod_id) {
             DropReason::RegisteredJarGoneOffline
-        } else {
+        } else if preresolved.is_some() {
             DropReason::NoChosenVersionAndNothingCached
+        } else {
+            DropReason::NothingCachedOffline
         }
     }))
 }
@@ -2565,6 +2637,74 @@ mod tests {
         assert_eq!(
             plural(DropReason::RegisteredJarGoneOffline),
             "2 mods are not in this launch (one, two): their jars are registered but no longer on disk, and an account that plays offline does not download them again."
+        );
+        assert_eq!(
+            plural(DropReason::NothingCachedOffline),
+            "2 mods are not in this launch (one, two): your cache has no jar of them for Minecraft 1.20.1 / forge, and an account that plays offline does not download them."
+        );
+        assert_eq!(
+            plural(DropReason::LocalJarGone),
+            "2 mods are not in this launch (one, two): their jars were copied in by hand and are gone from the cache, so there is nothing to restore them from."
+        );
+        assert_eq!(
+            plural(DropReason::RegisteredRowWithoutUrl),
+            "2 mods are not in this launch (one, two): their jars are gone from the cache and their cache rows have no download url."
+        );
+    }
+
+    /// todo.md:1671 e D47: lo stadio degli artefatti dava un avviso per mod con
+    /// parole sue, la passata di disponibilità uno per motivo. Ora tutti e due
+    /// passano da `dropped_mods_notices`: stesso titolo, stessa forma, e i mod
+    /// persi per lo stesso motivo stanno in un avviso solo.
+    #[test]
+    fn the_artifact_stage_losses_share_the_aggregated_notice_shape() {
+        let notices = dropped_mods_notices(
+            &[
+                DroppedMod {
+                    mod_id: "my-sodium".into(),
+                    reason: DropReason::LocalJarGone,
+                },
+                DroppedMod {
+                    mod_id: "lithium".into(),
+                    reason: DropReason::RegisteredRowWithoutUrl,
+                },
+                DroppedMod {
+                    mod_id: "iris".into(),
+                    reason: DropReason::RegisteredRowWithoutUrl,
+                },
+                DroppedMod {
+                    mod_id: "polytone".into(),
+                    reason: DropReason::NothingCachedOffline,
+                },
+            ],
+            &a5_target(),
+        );
+
+        assert_eq!(
+            notices
+                .iter()
+                .map(|(title, message, _)| (*title, message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Mod left out of the launch",
+                    "'polytone' is not in this launch: your cache has no jar of it for Minecraft 1.20.1 / forge, and an account that plays offline does not download it.",
+                ),
+                (
+                    "Mod left out of the launch",
+                    "'my-sodium' is not in this launch: its jar was copied in by hand and is gone from the cache, so there is nothing to restore it from.",
+                ),
+                (
+                    "Mods left out of the launch",
+                    "2 mods are not in this launch (lithium, iris): their jars are gone from the cache and their cache rows have no download url.",
+                ),
+            ]
+        );
+        // L'offline non parla più di una versione «scelta» (todo.md:1341).
+        assert!(!notices[0].2.contains("chosen"));
+        assert_eq!(
+            notices[1].2,
+            "A jar copied in by hand has no download url, so the launcher cannot fetch it again. Add the jar again to get the mod back. Nothing took its place, so the game starts without it."
         );
     }
 }

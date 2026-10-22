@@ -1011,7 +1011,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("sodium", DropReason::RegisteredJarGoneOffline),
-                ("lithium", DropReason::NoChosenVersionAndNothingCached),
+                ("lithium", DropReason::NothingCachedOffline),
             ]
         );
         assert!(!offline

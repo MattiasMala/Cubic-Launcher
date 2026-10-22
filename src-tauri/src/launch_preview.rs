@@ -325,7 +325,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     };
     log_resolution(&app_handle, &selection.resolution, &selection.unavailable)?;
     // The availability pass runs before the artifact stage, so a mod it
-    // disabled is gone from `selected_mods` and `report_unusable_probe` can no
+    // disabled is gone from `selected_mods` and `log_unusable_probe` can no
     // longer see it: this is the only place that names it (A5). The pre-check
     // calls the same pass and does not report — it decides what the popup
     // shows, and a notice there would say it twice for one launch.
