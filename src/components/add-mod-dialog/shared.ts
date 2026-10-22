@@ -1,6 +1,7 @@
 import type { ModrinthResult } from "../../lib/types";
 import { MODRINTH_HEADERS } from "../../lib/modrinth-user-agent";
 import type { LocalImportFailure } from "../../lib/contentImportErrors";
+import { modrinthQueryLoaders } from "../../lib/pin-versions";
 
 /**
  * What the Upload tab is uploading. `mod` keeps the local-JAR path; the other
@@ -116,16 +117,14 @@ export function categoryLabel(category: string): string {
 
 /**
  * The Modrinth loaders a mod must declare to run on the mod list's loader
- * (D149). Vanilla has none to filter on. NeoForge on 1.20.1 also takes the
- * builds marked `forge`, as the resolver does (D148).
+ * (D149). Vanilla has none to filter on. Every other loader asks what the
+ * resolver and the pin ask (`modrinthQueryLoaders`, D148): NeoForge on 1.20.1
+ * also takes the builds marked `forge`.
  */
 export function compatibleSearchLoaders(modLoader: string, mcVersion: string): string[] {
-  switch (modLoader.toLowerCase()) {
-    case "fabric": return ["fabric"];
-    case "forge": return ["forge"];
-    case "neoforge": return mcVersion === "1.20.1" ? ["neoforge", "forge"] : ["neoforge"];
-    default: return [];
-  }
+  const loader = modLoader.trim().toLowerCase();
+  if (!loader || loader === "vanilla") return [];
+  return modrinthQueryLoaders(mcVersion, loader);
 }
 
 export const SORT_OPTIONS = [

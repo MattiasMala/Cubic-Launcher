@@ -477,14 +477,10 @@ export default function App() {
           modLoader,
         },
       });
+      // The create command saves the two fields itself, before the folder is
+      // born: if the database refuses them nothing is created, and there is
+      // no second write that could fail on its own.
       setCreateModlistModalOpen(false);
-      // Also saved on its own: it does not depend on the create command
-      // knowing the two fields.
-      try {
-        await saveModlistTarget(name, minecraftVersion, modLoader);
-      } catch (err) {
-        pushUiError({ title: "Version not saved", message: `'${name}' was created, but its Minecraft version and loader could not be saved.`, detail: String(err), severity: "warning", scope: "launch" });
-      }
       // The same path as picking a list in the sidebar: the persistence state
       // of the previous list is dropped before anything of the new one loads
       // (audit 101, contratto-4).
@@ -1229,6 +1225,19 @@ export default function App() {
     await handleLaunch(openTheWorld ? through.folderName : null);
   };
 
+  /**
+   * A mod list just imported (modlist-3): opened like a sidebar pick. While a
+   * launch is being prepared the selection stays where it is (precheck-1), but
+   * the sidebar still learns the new list.
+   */
+  const handleImportedModList = async (modlistName: string) => {
+    if (refuseWhileLaunchPreparing(`'${modlistName}' was imported; the open mod list`)) {
+      await loadShellSnapshot(selectedModListName() || null);
+      return;
+    }
+    await selectModList(modlistName);
+  };
+
   const handleOpenModlist = async (modlistName: string) => {
     setActiveRailView("modlist");
     await handleSelectModList(modlistName);
@@ -1265,7 +1274,7 @@ export default function App() {
             <div class="flex flex-col flex-1 min-w-0">
               <ModListEditor
                 onAddMod={() => setAddModModalOpen(true)}
-                onImported={handleSelectModList}
+                onImported={handleImportedModList}
                 onDeleteSelected={handleDeleteSelected}
                 onReorder={orderedIds => void handleReorderRules(orderedIds)}
                 onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}

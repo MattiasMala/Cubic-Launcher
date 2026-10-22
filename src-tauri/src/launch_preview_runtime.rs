@@ -756,14 +756,12 @@ pub(super) fn decrypt_launch_account<S: crate::token_storage::SecretStore>(
     )
 }
 
-/// Whether the active account plays offline (D115), from its database row.
-/// The update pre-check reads it to know it must not run; the launch takes it
-/// from `load_launch_account`, the same reading its identity comes from. Both
+/// Whether the active account plays offline (D115), from its database row:
+/// the one helper the app's own requests use too (D140). The update pre-check
+/// reads it to know it must not run; the launch takes it from
+/// `load_launch_account`, the same reading its identity comes from. Both
 /// decisions come from the row, never from an argument the frontend passes.
-/// No active account plays online, as before.
-pub(super) fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
-    Ok(load_launch_account(launcher_paths)?.is_some_and(|account| account.plays_offline))
-}
+pub(super) use crate::app_shell::active_account_plays_offline;
 
 /// Saves the tokens of the launch's refresh on the row of `microsoft_id` only
 /// (concorrenza-8): an `UPDATE` of the token columns, never an upsert with

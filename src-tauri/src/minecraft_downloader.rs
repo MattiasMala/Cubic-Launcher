@@ -10,7 +10,9 @@ use tokio::task::JoinSet;
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::{contained_join, validate_path_component};
 
-const VERSION_MANIFEST_URL: &str =
+/// Mojang's version manifest: the launch reads it here, the version list in
+/// `minecraft_versions`.
+pub(crate) const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const MC_ASSETS_BASE_URL: &str = "https://resources.download.minecraft.net";
 

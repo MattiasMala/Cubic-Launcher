@@ -28,9 +28,7 @@ use tauri::State;
 
 use crate::atomic_write::write_atomically;
 use crate::launcher_paths::LauncherPaths;
-
-const VERSION_MANIFEST_URL: &str =
-    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+use crate::minecraft_downloader::VERSION_MANIFEST_URL;
 
 /// The whole request, body included: the manifest is about 200 KB.
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(20);

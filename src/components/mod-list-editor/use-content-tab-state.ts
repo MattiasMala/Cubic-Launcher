@@ -137,6 +137,8 @@ export function useContentTabState(props: ContentTabViewProps) {
       setEditingGroupId(null);
       setGroupNameDraft("");
       setAdvancedEntryId(null);
+      // The previous tab's unreadable list (contentpack-11) is not this one's.
+      setLoadError(null);
     });
   }, { defer: true }));
 
