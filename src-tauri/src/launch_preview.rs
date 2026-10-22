@@ -78,6 +78,9 @@ use content::*;
 mod vanilla;
 use vanilla::*;
 
+#[path = "launch_preview_loader_cache.rs"]
+mod loader_cache;
+
 #[path = "launch_preview_runtime.rs"]
 mod runtime;
 use runtime::*;
@@ -349,8 +352,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     // lancio-11: i metadati del loader prima di risolvere e scaricare
     // qualunque cosa. Una coppia versione/loader che non esiste (NeoForge
     // 1.19.2) si ferma qui, invece che dopo centinaia di MB di mod e di
-    // Minecraft.
-    let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
+    // Minecraft. Con l'account offline vengono dalla cache scritta dall'ultimo
+    // lancio online della combinazione (D137): senza la voce il lancio si
+    // ferma qui, prima di toccare mods/ e i config dell'istanza.
+    let mut loader_metadata =
+        fetch_launch_loader_metadata(&app_handle, &launcher_paths, &target, plays_offline).await?;
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let modrinth_client = ModrinthClient::new();

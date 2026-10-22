@@ -149,6 +149,13 @@ impl LauncherPaths {
         self.mc_cache_dir().join("assets")
     }
 
+    /// `<root>/cache/loader-metadata/`: i metadati del loader dell'ultimo
+    /// lancio online di ogni combinazione, `<minecraft>/<loader>.json` (D137).
+    /// La crea il primo lancio online che scrive, non l'avvio.
+    pub fn loader_metadata_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("loader-metadata")
+    }
+
     pub fn create_required_directories(&self) -> Result<()> {
         for directory in [
             &self.root_dir,

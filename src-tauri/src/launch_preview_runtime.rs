@@ -430,12 +430,28 @@ pub(super) fn minecraft_cache_policy(plays_offline: bool) -> MinecraftCachePolic
     }
 }
 
+/// I metadati del loader del lancio modded: online dalla rete, scritti in
+/// cache appena arrivano; offline dalla cache, senza richieste (D137).
 pub(super) async fn fetch_launch_loader_metadata(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
     target: &ResolutionTarget,
+    plays_offline: bool,
 ) -> Result<LoaderMetadata> {
-    LoaderMetadataClient::new()
-        .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
-        .await
+    super::loader_cache::loader_metadata_for_launch(
+        &launcher_paths.loader_metadata_cache_dir(),
+        target,
+        plays_offline,
+        || async {
+            LoaderMetadataClient::new()
+                .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
+                .await
+        },
+        |line| {
+            let _ = emit_log(app_handle, ProcessLogStream::Stdout, line);
+        },
+    )
+    .await
 }
 
 /// Quello che serve dopo l'uscita del gioco per riportare i tre file
