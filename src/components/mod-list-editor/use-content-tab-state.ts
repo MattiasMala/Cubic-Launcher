@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { batch, createEffect, createMemo, createSignal } from "solid-js";
-import { selectedMcVersion, selectedModLoader } from "../../store";
+import { batch, createEffect, createMemo, createSignal, on } from "solid-js";
+import { pushUiError, selectedMcVersion, selectedModLoader } from "../../store";
 import { useDragEngine, type DragItem } from "../../lib/dragEngine";
 import { computePreviewTranslates } from "../../lib/dragUtils";
 import type {
@@ -55,12 +55,18 @@ export function useContentTabState(props: ContentTabViewProps) {
 
   const label = () => CONTENT_TAB_LABELS[props.type] ?? props.type;
 
+  // Un solo ContentTabView serve le tre schede: la lettura di una scheda
+  // lasciata nel frattempo non deve scrivere sopra quella nuova.
+  let loadSeq = 0;
+
   const load = async () => {
     if (!props.modlistName) return;
+    const seq = ++loadSeq;
     try {
       const snap = await invoke<ContentSnapshotPayload>("load_content_list_command", {
         input: { modlistName: props.modlistName, contentType: props.type },
       });
+      if (seq !== loadSeq) return;
       const list: ContentEntry[] = (snap.entries ?? []).map(entry => ({
         id: entry.id,
         source: entry.source,
@@ -94,6 +100,7 @@ export function useContentTabState(props: ContentTabViewProps) {
       if (modrinthIds.length === 0) return;
       await fetchContentProjects(modrinthIds);
     } catch {
+      if (seq !== loadSeq) return;
       setEntries([]);
       setGroups([]);
     }
@@ -103,6 +110,23 @@ export function useContentTabState(props: ContentTabViewProps) {
     contentVersion();
     if (props.modlistName) void load();
   });
+
+  // Righe, selezione, rinomina in corso e pannello Advanced appartengono alla
+  // scheda e alla mod list che li hanno aperti: al cambio si azzerano, o
+  // «N selected» (e una Delete sulle righe vecchie ancora disegnate) agirebbe
+  // sul JSON della scheda nuova con gli id della vecchia (audit 101,
+  // contentpack-13). La lettura della scheda nuova è già partita qui sopra.
+  createEffect(on(() => [props.type, props.modlistName], () => {
+    batch(() => {
+      setEntries([]);
+      setGroups([]);
+      setLocalMeta(new Map());
+      setSelectedIds(new Set<string>());
+      setEditingGroupId(null);
+      setGroupNameDraft("");
+      setAdvancedEntryId(null);
+    });
+  }, { defer: true }));
 
   const groupByEntryId = () => {
     const map = new Map<string, string>();
@@ -143,13 +167,21 @@ export function useContentTabState(props: ContentTabViewProps) {
     return items;
   });
 
+  // L'interfaccia mostra subito lo stato nuovo; se il disco lo rifiuta lo si
+  // dice e si ricarica quello vero, invece di lasciar credere che sia salvato
+  // e farlo sparire al prossimo load() (audit 101, § 1 errori ingoiati).
+  const reportAndReload = (title: string, message: string, error: unknown) => {
+    pushUiError({ title, message, detail: String(error), severity: "error", scope: "launch" });
+    void load();
+  };
+
   const saveGroups = async (nextGroups: ContentGroupData[]) => {
     try {
       await invoke("save_content_groups_command", {
         input: { modlistName: props.modlistName, contentType: props.type, groups: nextGroups },
       });
-    } catch {
-      // ignore persistence failures for optimistic UI
+    } catch (error) {
+      reportAndReload("Could not save groups", `The ${label()} groups could not be saved; the saved layout was reloaded.`, error);
     }
   };
 
@@ -158,33 +190,61 @@ export function useContentTabState(props: ContentTabViewProps) {
       await invoke("reorder_content_command", {
         input: { modlistName: props.modlistName, contentType: props.type, orderedIds: ordered.map(entry => entry.id) },
       });
-    } catch {
-      // ignore persistence failures for optimistic UI
+    } catch (error) {
+      reportAndReload("Could not save order", `The ${label()} order could not be saved; the saved order was reloaded.`, error);
     }
   };
 
-  const removeEntry = async (id: string) => {
+  /** Toglie una voce; restituisce l'errore se il backend l'ha rifiutata (la riga resta), `null` se è andata. */
+  const removeEntryQuietly = async (id: string): Promise<unknown | null> => {
     try {
       await invoke("remove_content_command", {
         input: { modlistName: props.modlistName, contentType: props.type, id },
       });
-      setEntries(current => current.filter(entry => entry.id !== id));
-      setGroups(current => current
-        .map(group => ({ ...group, entryIds: group.entryIds.filter(entryId => entryId !== id) }))
-        .filter(group => group.entryIds.length > 0));
-      setSelectedIds(current => {
-        const next = new Set(current);
-        next.delete(id);
-        return next;
-      });
-    } catch {
-      // ignore remove failures
+    } catch (error) {
+      return error ?? "unknown error";
+    }
+    setEntries(current => current.filter(entry => entry.id !== id));
+    setGroups(current => current
+      .map(group => ({ ...group, entryIds: group.entryIds.filter(entryId => entryId !== id) }))
+      .filter(group => group.entryIds.length > 0));
+    setSelectedIds(current => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+    return null;
+  };
+
+  const removeEntry = async (id: string) => {
+    const error = await removeEntryQuietly(id);
+    if (error !== null) {
+      const name = meta().get(id)?.name ?? id;
+      reportAndReload("Could not remove pack", `'${name}' could not be removed from ${label()}.`, error);
     }
   };
 
-  const removeSelectedEntries = () => {
-    for (const id of selectedIds()) void removeEntry(id);
-    setSelectedIds(new Set<string>());
+  // Le rimozioni partono una dopo l'altra (ognuna riscrive lo stesso JSON) e
+  // la selezione perde solo le voci tolte davvero: quelle rifiutate restano
+  // selezionate, così si vede cosa non è andato.
+  const removeSelectedEntries = async () => {
+    const ids = [...selectedIds()];
+    const failed: string[] = [];
+    let lastError: unknown = null;
+    for (const id of ids) {
+      const error = await removeEntryQuietly(id);
+      if (error !== null) {
+        failed.push(meta().get(id)?.name ?? id);
+        lastError = error;
+      }
+    }
+    if (failed.length > 0) {
+      reportAndReload(
+        "Could not remove packs",
+        `${failed.length} of ${ids.length} selected item${ids.length === 1 ? "" : "s"} could not be removed from ${label()}: ${failed.join(", ")}.`,
+        lastError,
+      );
+    }
   };
 
   const createContentGroup = () => {
@@ -624,6 +684,7 @@ export function useContentTabState(props: ContentTabViewProps) {
     meta,
     previewGroupRowTranslates,
     previewTranslates,
+    reload: load,
     removeContentGroup,
     removeEntry,
     removeSelectedEntries,

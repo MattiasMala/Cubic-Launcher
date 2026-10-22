@@ -27,6 +27,7 @@ export function ContentTabView(props: ContentTabViewProps) {
           contentType={props.type}
           onClose={() => state.setAdvancedEntryId(null)}
           onUpdate={state.updateEntryRules}
+          onReload={state.reload}
         />
       </Show>
 
@@ -55,7 +56,7 @@ export function ContentTabView(props: ContentTabViewProps) {
                 Create Group
               </button>
               <button
-                onClick={state.removeSelectedEntries}
+                onClick={() => void state.removeSelectedEntries()}
                 class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
               >
                 <MaterialIcon name="delete" size="md" />
