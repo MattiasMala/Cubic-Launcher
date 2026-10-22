@@ -208,7 +208,12 @@ export function ModListEditor(props: Props) {
             />
           }
         >
-          <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
+          <ActionBar
+            onAddMod={props.onAddMod}
+            onDeleteSelected={props.onDeleteSelected}
+            onReorder={props.onReorder}
+            onReorderAlts={props.onReorderAlts}
+          />
 
           <div class="flex-1 p-4" ref={setScrollContainerRef} style={{ overflow: "auto" }}>
             <Show when={hasContent()} fallback={<ModListEditorEmptyState onAddMod={props.onAddMod} />}>

@@ -145,6 +145,45 @@ export function reorderAlternativesInRows(rows: ModRow[], parentId: string, orde
   });
 }
 
+/**
+ * The order the editor draws one level in: every visual group at the place of
+ * its first member, with all its members together in `blockIds` order; rows
+ * outside groups keep their place. Rules saved in this order are tried in the
+ * order the editor shows, and a drop "before the group" lands where it is
+ * drawn (audit 101, editor-logica-8).
+ */
+export function contiguousGroupOrder(
+  ids: readonly string[],
+  groups: ReadonlyArray<{ blockIds: readonly string[] }>,
+): string[] {
+  const present = new Set(ids);
+  const groupOf = new Map<string, readonly string[]>();
+  for (const group of groups) {
+    for (const id of group.blockIds) {
+      if (!groupOf.has(id)) groupOf.set(id, group.blockIds);
+    }
+  }
+
+  const ordered: string[] = [];
+  const placed = new Set<string>();
+  for (const id of ids) {
+    if (placed.has(id)) continue;
+    const members = groupOf.get(id);
+    if (!members) {
+      ordered.push(id);
+      placed.add(id);
+      continue;
+    }
+    for (const member of members) {
+      if (present.has(member) && !placed.has(member) && groupOf.get(member) === members) {
+        ordered.push(member);
+        placed.add(member);
+      }
+    }
+  }
+  return ordered;
+}
+
 export function collectRowIds(rows: ModRow[]): Set<string> {
   const ids = new Set<string>();
   const collect = (items: ModRow[]) => {

@@ -13,6 +13,9 @@ import { MaterialIcon, XIcon } from "./icons";
 interface ActionBarProps {
   onAddMod: () => void;
   onDeleteSelected: () => void;
+  // Creating a group can move its members next to each other: the new order is saved through these.
+  onReorder?: (orderedIds: string[]) => void;
+  onReorderAlts?: (parentId: string, orderedIds: string[]) => void;
 }
 
 export function ActionBar(props: ActionBarProps) {
@@ -27,7 +30,7 @@ export function ActionBar(props: ActionBarProps) {
         </span>
         <div class="flex items-center gap-2">
           <button
-            onClick={createGroup}
+            onClick={() => createGroup({ onReorder: props.onReorder, onReorderAlts: props.onReorderAlts })}
             class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
           >
             <MaterialIcon name="folder_open" size="md" />

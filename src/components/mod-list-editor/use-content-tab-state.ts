@@ -13,6 +13,7 @@ import type {
 } from "./content-types";
 import { CONTENT_TAB_LABELS } from "./content-types";
 import { contentProjects, fetchContentProjects, mcVersionMatches } from "../../lib/content-meta";
+import { contiguousGroupOrder } from "../../app/row-state";
 
 const [contentVersion, setContentVersion] = createSignal(0);
 
@@ -187,20 +188,34 @@ export function useContentTabState(props: ContentTabViewProps) {
   };
 
   const createContentGroup = () => {
-    const selected = [...selectedIds()];
-    if (selected.length === 0) return;
+    const selectedSet = selectedIds();
+    if (selectedSet.size === 0) return;
+    // Members in list order, not click order, and next to each other at the
+    // place of the first one, where the group is drawn (audit 101, editor-logica-8).
+    const currentEntries = entries();
     const nextGroup: ContentGroupData = {
       id: `cg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name: "New Group",
       collapsed: false,
-      entryIds: selected,
+      entryIds: currentEntries.filter(entry => selectedSet.has(entry.id)).map(entry => entry.id),
     };
+    if (nextGroup.entryIds.length === 0) return;
     const nextGroups = groups()
-      .map(group => ({ ...group, entryIds: group.entryIds.filter(id => !selectedIds().has(id)) }))
+      .map(group => ({ ...group, entryIds: group.entryIds.filter(id => !selectedSet.has(id)) }))
       .filter(group => group.entryIds.length > 0);
     nextGroups.push(nextGroup);
-    setGroups(nextGroups);
-    setSelectedIds(new Set<string>());
+
+    const currentIds = currentEntries.map(entry => entry.id);
+    const nextOrder = contiguousGroupOrder(currentIds, nextGroups.map(group => ({ blockIds: group.entryIds })));
+    const orderChanged = nextOrder.some((id, index) => id !== currentIds[index]);
+    const entryById = new Map(currentEntries.map(entry => [entry.id, entry]));
+    const nextEntries = nextOrder.map(id => entryById.get(id)!);
+    batch(() => {
+      setGroups(nextGroups);
+      if (orderChanged) setEntries(nextEntries);
+      setSelectedIds(new Set<string>());
+    });
+    if (orderChanged) void saveOrder(nextEntries);
     void saveGroups(nextGroups);
   };
 
