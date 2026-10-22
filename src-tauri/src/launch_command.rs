@@ -206,8 +206,25 @@ impl FlightRecording {
     pub fn to_jvm_arg(&self) -> String {
         format!(
             "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename={}",
-            self.output_file.display()
+            jfr_option_value(&self.output_file.to_string_lossy())
         )
+    }
+}
+
+/// Un valore per le opzioni di `-XX:StartFlightRecording`, che JFR separa con «,».
+///
+/// todo.md:1812: con una virgola nel percorso dei dati (una home «Rossi, Mario») il nome
+/// del file si spezzava: la JVM partiva ma scriveva il file altrove, e il bottone Profile
+/// non compariva. Il parser delle opzioni JFR (quello dei comandi diagnostici) accetta un
+/// valore fra virgolette doppie o semplici, e dentro la virgola non separa più: provato su
+/// Java 17 e 25. Senza virgola il valore resta com'era.
+fn jfr_option_value(value: &str) -> String {
+    if !value.contains(',') {
+        value.to_string()
+    } else if !value.contains('"') {
+        format!("\"{value}\"")
+    } else {
+        format!("'{value}'")
     }
 }
 
@@ -273,6 +290,29 @@ mod tests {
         build_launch_command, join_classpath_entries, split_argument_string, FlightRecording,
         JavaLaunchRequest, JavaLaunchSettings, PreparedLaunchCommand,
     };
+
+    /// todo.md:1812: con una virgola nel percorso il nome del file va fra virgolette, o
+    /// JFR prende il pezzo dopo la virgola per un'altra opzione.
+    #[test]
+    fn a_comma_in_the_jfr_path_is_quoted_and_a_plain_path_is_not() {
+        let plain = FlightRecording {
+            output_file: PathBuf::from("/home/mario/logs/launches/1-pack/profile.jfr"),
+        };
+        assert_eq!(
+            plain.to_jvm_arg(),
+            "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=/home/mario/logs/launches/1-pack/profile.jfr"
+        );
+
+        let with_comma = FlightRecording {
+            output_file: PathBuf::from("/home/Rossi, Mario/logs/launches/1-pack/profile.jfr"),
+        };
+        assert_eq!(
+            with_comma.to_jvm_arg(),
+            "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=\"/home/Rossi, Mario/logs/launches/1-pack/profile.jfr\""
+        );
+
+        assert_eq!(super::jfr_option_value("a,\"b"), "'a,\"b'");
+    }
 
     fn sample_loader_metadata() -> LoaderMetadata {
         LoaderMetadata {
