@@ -701,21 +701,34 @@ pub(super) fn build_instance_root(
         )))
 }
 
-pub(super) fn load_active_account_for_launch_with_diagnostics<
-    S: crate::token_storage::SecretStore,
->(
-    connection: &Connection,
+/// The active account's row as the launch reads it: once, at the start
+/// (concorrenza-8). The resolution path, the content step and the identity all
+/// come from this one reading; before audit 101 the identity re-read the row at
+/// ~90%, so an account switched to during the download was refreshed and
+/// launched online, against D115 and D132. `None` when no account is active.
+pub(super) fn load_launch_account(
+    launcher_paths: &LauncherPaths,
+) -> Result<Option<crate::microsoft_auth::AccountRecord>> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    crate::microsoft_auth::AccountsRepository::new(&connection).load_active_account()
+}
+
+/// The non-secret identity of `account`, with its refresh token decrypted when
+/// the keyring allows it, and the decryption error otherwise.
+pub(super) fn decrypt_launch_account<S: crate::token_storage::SecretStore>(
+    account: &crate::microsoft_auth::AccountRecord,
     secret_store: S,
-) -> Result<(
-    Option<crate::token_storage::PlaintextAccountRecord>,
+) -> (
+    crate::token_storage::PlaintextAccountRecord,
     Option<anyhow::Error>,
-)> {
-    use crate::microsoft_auth::AccountsRepository;
+) {
     use crate::token_storage::{AccountTokenCipher, PlaintextAccountRecord};
 
-    let Some(account) = AccountsRepository::new(connection).load_active_account()? else {
-        return Ok((None, None));
-    };
     let token_cipher = AccountTokenCipher::new(secret_store);
     let (refresh_token, refresh_token_error) = match account.refresh_token_enc.as_deref() {
         Some(payload) => match token_cipher.decrypt_token(payload) {
@@ -725,48 +738,57 @@ pub(super) fn load_active_account_for_launch_with_diagnostics<
         None => (None, None),
     };
 
-    Ok((
-        Some(PlaintextAccountRecord {
-            microsoft_id: account.microsoft_id,
-            xbox_gamertag: account.xbox_gamertag,
-            minecraft_uuid: account.minecraft_uuid,
+    (
+        PlaintextAccountRecord {
+            microsoft_id: account.microsoft_id.clone(),
+            xbox_gamertag: account.xbox_gamertag.clone(),
+            minecraft_uuid: account.minecraft_uuid.clone(),
             access_token: None,
             refresh_token,
-            profile_data: account.profile_data,
+            profile_data: account.profile_data.clone(),
             is_active: account.is_active,
-        }),
+        },
         refresh_token_error,
-    ))
+    )
 }
 
 /// Whether the active account plays offline (D115), from its database row.
-/// The launch reads it once, before it chooses anything, and the update
-/// pre-check reads it to know it must not run: both decisions come from the
-/// row, never from an argument the frontend passes. No active account plays
-/// online, as before.
+/// The update pre-check reads it to know it must not run; the launch takes it
+/// from `load_launch_account`, the same reading its identity comes from. Both
+/// decisions come from the row, never from an argument the frontend passes.
+/// No active account plays online, as before.
 pub(super) fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    Ok(crate::microsoft_auth::AccountsRepository::new(&connection)
-        .load_active_account()?
-        .is_some_and(|account| account.plays_offline))
+    Ok(load_launch_account(launcher_paths)?.is_some_and(|account| account.plays_offline))
 }
 
-fn persist_rotated_refresh_token<S: crate::token_storage::SecretStore>(
+/// Saves the tokens of the launch's refresh on the row of `microsoft_id` only
+/// (concorrenza-8): an `UPDATE` of the token columns, never an upsert with
+/// `is_active: true`. `identity` is the fresh sign-in's uuid and profile data,
+/// when the whole chain ran. Returns whether the row still existed: an account
+/// removed during the launch stays removed.
+fn persist_refreshed_session<S: crate::token_storage::SecretStore>(
     connection: &Connection,
     secret_store: S,
-    account: &crate::token_storage::PlaintextAccountRecord,
+    microsoft_id: &str,
     refresh_token: &str,
-) -> Result<()> {
-    use crate::token_storage::EncryptedAccountsRepository;
+    access_token: Option<&str>,
+    identity: Option<(&str, &str)>,
+) -> Result<bool> {
+    use crate::microsoft_auth::{AccountsRepository, SessionTokenUpdate};
+    use crate::token_storage::AccountTokenCipher;
 
-    let mut refreshed_account = account.clone();
-    refreshed_account.refresh_token = Some(refresh_token.to_string());
-    EncryptedAccountsRepository::new(connection, secret_store).upsert_account(&refreshed_account)
+    // The launch decrypted a refresh token with the key: it exists, and no
+    // new key is ever born here (only the explicit «Sign in again» does that).
+    let token_cipher = AccountTokenCipher::new(secret_store);
+    let update = SessionTokenUpdate {
+        refresh_token_enc: token_cipher.encrypt_token_with_key_creation(refresh_token, false)?,
+        access_token_enc: access_token
+            .map(|token| token_cipher.encrypt_token_with_key_creation(token, false))
+            .transpose()?,
+        minecraft_uuid: identity.map(|(uuid, _)| uuid.to_string()),
+        profile_data: identity.map(|(_, profile_data)| profile_data.to_string()),
+    };
+    AccountsRepository::new(connection).update_session_tokens(microsoft_id, &update)
 }
 
 fn emit_auth_log(app_handle: &tauri::AppHandle, detail: impl AsRef<str>) {
@@ -777,287 +799,347 @@ fn emit_auth_log(app_handle: &tauri::AppHandle, detail: impl AsRef<str>) {
     }
 }
 
-/// `plays_offline` is the active account's choice, read once by the launch
-/// (`active_account_plays_offline`): with it the identity is offline even
+fn offline_identity(username: String, uuid: String) -> PlayerIdentity {
+    PlayerIdentity {
+        username,
+        uuid,
+        access_token: "0".to_string(),
+        user_type: "offline".to_string(),
+        version_type: "Cubic".to_string(),
+    }
+}
+
+/// What the user is told when a launch that should have been online starts
+/// offline (D143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OfflineFallback {
+    /// The session could not be refreshed this time (network, Xbox, keyring):
+    /// the saved sign-in stays, and the next launch tries again.
+    SessionNotRefreshed,
+    /// The saved sign-in is gone (refused by Microsoft, or never saved): only
+    /// «Sign in again» brings the account back online.
+    SignInAgain,
+}
+
+impl OfflineFallback {
+    /// Title and message of the launcher issue. `reason` goes in its detail.
+    pub(super) fn issue_text(self) -> (&'static str, &'static str) {
+        match self {
+            OfflineFallback::SessionNotRefreshed => (
+                "Playing offline",
+                "Your Microsoft session could not be refreshed, so the game starts in offline mode. Online-mode servers will refuse to connect; the next launch tries again.",
+            ),
+            OfflineFallback::SignInAgain => (
+                "Sign in again to play online",
+                "Your Microsoft sign-in is no longer valid, so the game starts in offline mode. Sign in again from Manage Accounts to play online.",
+            ),
+        }
+    }
+}
+
+/// Every branch where an online launch falls back to offline goes through
+/// here (audit 101, account-1, D143): the launch log line as before, and a
+/// visible warning, because the account pill still said «online». `reason`
+/// is an error chain or a sentence of ours, never a token.
+fn fall_back_to_offline(
+    app_handle: &tauri::AppHandle,
+    username: String,
+    uuid: String,
+    fallback: OfflineFallback,
+    reason: &str,
+) -> PlayerIdentity {
+    emit_auth_log(
+        app_handle,
+        format!("{reason}; launch continues in offline mode"),
+    );
+    let (title, message) = fallback.issue_text();
+    if let Err(error) =
+        emit_launcher_issue(app_handle, title, message, reason, "warning", "account")
+    {
+        eprintln!("[Auth] Failed to report the offline fallback: {error:#}");
+    }
+    offline_identity(username, uuid)
+}
+
+/// D143: Microsoft refused the saved refresh token for good. The row drops it,
+/// so Manage Accounts shows the account as signed out with «Sign in again»,
+/// instead of «online» at every launch that then plays offline.
+fn forget_rejected_refresh_token(
+    app_handle: &tauri::AppHandle,
+    db_path: &Path,
+    account: &crate::microsoft_auth::AccountRecord,
+) {
+    let Some(rejected) = account.refresh_token_enc.as_deref() else {
+        return;
+    };
+    let cleared = Connection::open(db_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|connection| {
+            crate::microsoft_auth::AccountsRepository::new(&connection)
+                .clear_rejected_refresh_token(&account.microsoft_id, rejected)
+        });
+    match cleared {
+        Ok(true) => emit_auth_log(
+            app_handle,
+            "Microsoft refused the saved sign-in; the account now needs «Sign in again»",
+        ),
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "Microsoft refused the saved sign-in, but the account changed during the launch; left as it is",
+        ),
+        Err(error) => emit_auth_log(
+            app_handle,
+            format!("Could not mark the account as needing sign-in again: {error:#}"),
+        ),
+    }
+}
+
+/// `launch_account` is the active account's row, read once by the launch
+/// (`load_launch_account`): the identity comes from it, never from a second
+/// reading (concorrenza-8). When it plays offline the identity is offline even
 /// when the saved sign-in works, and no token refresh is attempted, because a
 /// refresh is network.
 pub(super) async fn load_player_identity(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
-    plays_offline: bool,
+    launch_account: Option<&crate::microsoft_auth::AccountRecord>,
 ) -> Result<PlayerIdentity> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
+    let Some(account) = launch_account else {
+        emit_auth_log(
+            app_handle,
+            "No active Microsoft account is available; launch continues in offline mode",
+        );
+        // No active account at all: no session to refresh, fully offline mode.
+        return Ok(offline_identity(
+            "CubicPlayer".to_string(),
+            deterministic_offline_uuid("CubicPlayer").to_string(),
+        ));
+    };
 
     // SECURITY (C1): profile_data no longer carries tokens. Preserve the
     // non-secret identity fields even when the OS keyring is unavailable or a
     // token blob is corrupt; only the refresh token needs decryption here.
-    // Extract everything BEFORE async work (Connection is not Send).
-    let (raw_account, refresh_token_error) = match load_active_account_for_launch_with_diagnostics(
-        &connection,
-        crate::token_storage::KeyringSecretStore::new(),
-    ) {
-        Ok(account) => account,
-        Err(error) => {
-            emit_auth_log(
-                app_handle,
-                format!(
-                    "Failed to load active account metadata: {error:#}; launch continues in offline mode"
-                ),
-            );
-            (None, None)
-        }
-    };
-    if let Some(error) = refresh_token_error.as_ref() {
+    let (raw, refresh_token_error) =
+        decrypt_launch_account(account, crate::token_storage::KeyringSecretStore::new());
+    let db_path = launcher_paths.database_path().to_path_buf();
+
+    let profile = raw
+        .profile_data
+        .as_deref()
+        .and_then(|pd| serde_json::from_str::<serde_json::Value>(pd).ok());
+
+    let username = profile
+        .as_ref()
+        .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
+        .or(raw.xbox_gamertag.clone())
+        .unwrap_or_else(|| "CubicPlayer".to_string());
+
+    let uuid = format_uuid_with_dashes(
+        &raw.minecraft_uuid
+            .clone()
+            .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
+    );
+
+    if account.plays_offline {
         emit_auth_log(
             app_handle,
-            format!("Refresh-token decryption failed: {error:#}; launch continues in offline mode"),
+            "The active account is set to play offline; no token refresh, launching in offline mode",
         );
+        return Ok(offline_identity(username, uuid));
     }
-    let db_path = launcher_paths.database_path().to_path_buf();
-    drop(connection); // Release connection before async work.
 
-    if let Some(raw) = raw_account {
-        let profile = raw
-            .profile_data
-            .as_deref()
-            .and_then(|pd| serde_json::from_str::<serde_json::Value>(pd).ok());
-
-        let username = profile
-            .as_ref()
-            .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
-            .or(raw.xbox_gamertag.clone())
-            .unwrap_or_else(|| "CubicPlayer".to_string());
-
-        let uuid = format_uuid_with_dashes(
-            &raw.minecraft_uuid
-                .clone()
-                .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
-        );
-
-        let microsoft_id = raw.microsoft_id.clone();
-
-        if plays_offline {
-            emit_auth_log(
-                app_handle,
-                "The active account is set to play offline; no token refresh, launching in offline mode",
-            );
-            return Ok(PlayerIdentity {
-                username,
-                uuid,
-                access_token: "0".to_string(),
-                user_type: "offline".to_string(),
-                version_type: "Cubic".to_string(),
-            });
-        }
-
-        // Refresh the Minecraft access token using the decrypted MS refresh token.
-        let ms_refresh = raw.refresh_token.clone();
-
-        if let Some(refresh_token) = ms_refresh {
-            if !refresh_token.is_empty() {
-                eprintln!("[Auth] Has refresh token, attempting refresh...");
-
-                let env_path = launcher_paths.root_dir().join(".env");
-                let client_id = match crate::microsoft_auth::configured_microsoft_client_id(
-                    &env_path,
-                ) {
-                    Ok(Some(client_id)) => client_id,
-                    Ok(None) => {
-                        emit_auth_log(
-                                app_handle,
-                                "Microsoft token refresh failed because MICROSOFT_CLIENT_ID is not configured; launch continues in offline mode",
-                            );
-                        return Ok(PlayerIdentity {
-                            username,
-                            uuid,
-                            access_token: "0".to_string(),
-                            user_type: "offline".to_string(),
-                            version_type: "Cubic".to_string(),
-                        });
-                    }
-                    Err(error) => {
-                        emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Microsoft token refresh configuration failed: {error:#}; launch continues in offline mode"
-                                ),
-                            );
-                        return Ok(PlayerIdentity {
-                            username,
-                            uuid,
-                            access_token: "0".to_string(),
-                            user_type: "offline".to_string(),
-                            version_type: "Cubic".to_string(),
-                        });
-                    }
-                };
-
-                let config = crate::microsoft_auth::MicrosoftOAuthConfig {
-                    client_id,
-                    redirect_uri: crate::microsoft_auth::REGISTERED_LOOPBACK_REDIRECT_URI
-                        .to_string(),
-                    scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
-                };
-                let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
-
-                match oauth_client
-                    .refresh_access_token(&config, &refresh_token)
-                    .await
-                {
-                    Ok(ms_tokens) => {
-                        let rotated_refresh = ms_tokens
-                            .refresh_token
-                            .clone()
-                            .unwrap_or_else(|| refresh_token.clone());
-                        let persistence_result = (|| -> Result<()> {
-                            let connection = Connection::open(&db_path).with_context(|| {
-                                format!(
-                                    "failed to reopen launcher database at {}",
-                                    db_path.display()
-                                )
-                            })?;
-                            persist_rotated_refresh_token(
-                                &connection,
-                                crate::token_storage::KeyringSecretStore::new(),
-                                &raw,
-                                &rotated_refresh,
-                            )
-                        })();
-                        if let Err(error) = persistence_result {
-                            emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Rotated-token persistence failed: {error:#}; launch continues in offline mode"
-                                ),
-                            );
-                            return Ok(PlayerIdentity {
-                                username,
-                                uuid,
-                                access_token: "0".to_string(),
-                                user_type: "offline".to_string(),
-                                version_type: "Cubic".to_string(),
-                            });
-                        }
-
-                        eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
-                        let chain = crate::microsoft_auth::MinecraftAuthChain::new();
-                        match chain
-                            .authenticate(
-                                &ms_tokens.access_token,
-                                ms_tokens.refresh_token.as_deref(),
-                                ms_tokens.user_id.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(login) => {
-                                eprintln!(
-                                    "[Auth] Full auth chain OK: username={}",
-                                    login.minecraft_username
-                                );
-                                // SECURITY (C1): persist refreshed access and identity
-                                // data into encrypted/token-free columns.
-                                let new_profile = crate::app_shell::account_profile_data_json(
-                                    &login.minecraft_username,
-                                    &login.minecraft_uuid,
-                                );
-                                let persistence_result = (|| -> Result<()> {
-                                    use crate::token_storage::{
-                                        EncryptedAccountsRepository, KeyringSecretStore,
-                                        PlaintextAccountRecord,
-                                    };
-
-                                    let connection =
-                                        Connection::open(&db_path).with_context(|| {
-                                            format!(
-                                                "failed to reopen launcher database at {}",
-                                                db_path.display()
-                                            )
-                                        })?;
-                                    EncryptedAccountsRepository::new(
-                                        &connection,
-                                        KeyringSecretStore::new(),
-                                    )
-                                    .upsert_account(&PlaintextAccountRecord {
-                                        microsoft_id: microsoft_id.clone(),
-                                        xbox_gamertag: raw.xbox_gamertag.clone(),
-                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
-                                        access_token: Some(login.minecraft_access_token.clone()),
-                                        refresh_token: Some(rotated_refresh),
-                                        profile_data: Some(new_profile),
-                                        is_active: true,
-                                    })
-                                })();
-                                if let Err(error) = persistence_result {
-                                    emit_auth_log(
-                                        app_handle,
-                                        format!(
-                                            "Authenticated account persistence failed: {error:#}; this launch remains online, but the saved account may require sign-in again"
-                                        ),
-                                    );
-                                }
-
-                                return Ok(PlayerIdentity {
-                                    username: login.minecraft_username,
-                                    uuid: format_uuid_with_dashes(&login.minecraft_uuid),
-                                    access_token: login.minecraft_access_token,
-                                    user_type: "msa".to_string(),
-                                    version_type: "Cubic".to_string(),
-                                });
-                            }
-                            Err(error) => emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Minecraft auth chain failed: {error:#}; launch continues in offline mode"
-                                ),
-                            ),
-                        }
-                    }
-                    Err(error) => emit_auth_log(
-                        app_handle,
-                        format!(
-                            "Microsoft token refresh failed: {error:#}; launch continues in offline mode"
-                        ),
-                    ),
-                }
-            } else {
-                emit_auth_log(
-                    app_handle,
-                    "Stored Microsoft refresh token is empty; launch continues in offline mode",
-                );
-            }
-        } else if refresh_token_error.is_none() {
-            emit_auth_log(
-                app_handle,
-                "No stored Microsoft refresh token is available; launch continues in offline mode",
-            );
-        }
-
-        emit_auth_log(app_handle, "Falling back to offline mode");
-        // No refresh token or refresh failed; use offline mode with the correct name.
-        return Ok(PlayerIdentity {
+    if let Some(error) = refresh_token_error.as_ref() {
+        return Ok(fall_back_to_offline(
+            app_handle,
             username,
             uuid,
-            access_token: "0".to_string(),
-            user_type: "offline".to_string(),
-            version_type: "Cubic".to_string(),
-        });
+            OfflineFallback::SessionNotRefreshed,
+            &format!("Refresh-token decryption failed: {error:#}"),
+        ));
     }
 
-    emit_auth_log(
-        app_handle,
-        "No active Microsoft account is available; launch continues in offline mode",
+    // Refresh the Minecraft access token using the decrypted MS refresh token.
+    let refresh_token = match raw.refresh_token.clone() {
+        Some(refresh_token) if !refresh_token.is_empty() => refresh_token,
+        Some(_) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SignInAgain,
+                "Stored Microsoft refresh token is empty",
+            ));
+        }
+        None => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SignInAgain,
+                "No stored Microsoft refresh token is available",
+            ));
+        }
+    };
+    eprintln!("[Auth] Has refresh token, attempting refresh...");
+
+    let env_path = launcher_paths.root_dir().join(".env");
+    let client_id = match crate::microsoft_auth::configured_microsoft_client_id(&env_path) {
+        Ok(Some(client_id)) => client_id,
+        Ok(None) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                "Microsoft token refresh failed because MICROSOFT_CLIENT_ID is not configured",
+            ));
+        }
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Microsoft token refresh configuration failed: {error:#}"),
+            ));
+        }
+    };
+
+    let config = crate::microsoft_auth::MicrosoftOAuthConfig {
+        client_id,
+        redirect_uri: crate::microsoft_auth::REGISTERED_LOOPBACK_REDIRECT_URI.to_string(),
+        scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
+    };
+    let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
+
+    let ms_tokens = match oauth_client
+        .refresh_access_token(&config, &refresh_token)
+        .await
+    {
+        Ok(ms_tokens) => ms_tokens,
+        Err(error) => {
+            let fallback = if crate::microsoft_auth::refresh_needs_sign_in_again(&error) {
+                forget_rejected_refresh_token(app_handle, &db_path, account);
+                OfflineFallback::SignInAgain
+            } else {
+                OfflineFallback::SessionNotRefreshed
+            };
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                fallback,
+                &format!("Microsoft token refresh failed: {error:#}"),
+            ));
+        }
+    };
+
+    let rotated_refresh = ms_tokens
+        .refresh_token
+        .clone()
+        .unwrap_or_else(|| refresh_token.clone());
+    let persistence_result = Connection::open(&db_path)
+        .with_context(|| {
+            format!(
+                "failed to reopen launcher database at {}",
+                db_path.display()
+            )
+        })
+        .and_then(|connection| {
+            persist_refreshed_session(
+                &connection,
+                crate::token_storage::KeyringSecretStore::new(),
+                &account.microsoft_id,
+                &rotated_refresh,
+                None,
+                None,
+            )
+        });
+    match persistence_result {
+        Ok(true) => {}
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "The account was removed during the launch; the refreshed sign-in is not saved",
+        ),
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Rotated-token persistence failed: {error:#}"),
+            ));
+        }
+    }
+
+    eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
+    let chain = crate::microsoft_auth::MinecraftAuthChain::new();
+    let login = match chain
+        .authenticate(
+            &ms_tokens.access_token,
+            ms_tokens.refresh_token.as_deref(),
+            ms_tokens.user_id.as_deref(),
+        )
+        .await
+    {
+        Ok(login) => login,
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Minecraft auth chain failed: {error:#}"),
+            ));
+        }
+    };
+    eprintln!(
+        "[Auth] Full auth chain OK: username={}",
+        login.minecraft_username
     );
-    // No active account at all; use fully offline mode.
+
+    // SECURITY (C1): persist refreshed access and identity data into
+    // encrypted/token-free columns, on this account's row only.
+    let new_profile = crate::app_shell::account_profile_data_json(
+        &login.minecraft_username,
+        &login.minecraft_uuid,
+    );
+    let persistence_result = Connection::open(&db_path)
+        .with_context(|| {
+            format!(
+                "failed to reopen launcher database at {}",
+                db_path.display()
+            )
+        })
+        .and_then(|connection| {
+            persist_refreshed_session(
+                &connection,
+                crate::token_storage::KeyringSecretStore::new(),
+                &account.microsoft_id,
+                &rotated_refresh,
+                Some(&login.minecraft_access_token),
+                Some((&login.minecraft_uuid, &new_profile)),
+            )
+        });
+    match persistence_result {
+        Ok(true) => {}
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "The account was removed during the launch; this launch remains online, the refreshed sign-in is not saved",
+        ),
+        Err(error) => emit_auth_log(
+            app_handle,
+            format!(
+                "Authenticated account persistence failed: {error:#}; this launch remains online, but the saved account may require sign-in again"
+            ),
+        ),
+    }
+
     Ok(PlayerIdentity {
-        username: "CubicPlayer".to_string(),
-        uuid: deterministic_offline_uuid("CubicPlayer").to_string(),
-        access_token: "0".to_string(),
-        user_type: "offline".to_string(),
+        username: login.minecraft_username,
+        uuid: format_uuid_with_dashes(&login.minecraft_uuid),
+        access_token: login.minecraft_access_token,
+        user_type: "msa".to_string(),
         version_type: "Cubic".to_string(),
     })
 }
@@ -1536,8 +1618,8 @@ mod tests {
     use crate::token_storage::{EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore};
 
     use super::{
-        extract_java_archive, forge_profile_libraries_from_json, persist_rotated_refresh_token,
-        read_forge_installer_profile_libraries,
+        extract_java_archive, forge_profile_libraries_from_json, persist_refreshed_session,
+        read_forge_installer_profile_libraries, OfflineFallback,
     };
 
     #[derive(Clone, Default)]
@@ -1596,19 +1678,18 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("old refresh blob should load");
-        let account = repository
-            .load_active_account()
-            .expect("account should load")
-            .expect("active account should exist");
         drop(repository);
 
-        persist_rotated_refresh_token(
+        let saved = persist_refreshed_session(
             &connection,
             secret_store.clone(),
-            &account,
+            "account-a",
             "refresh-after-rotation",
+            None,
+            None,
         )
         .expect("rotated refresh token should persist");
+        assert!(saved);
 
         let new_blob: Vec<u8> = connection
             .query_row(
@@ -1629,6 +1710,130 @@ mod tests {
 
         drop(connection);
         std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    fn temporary_accounts_database(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let database_path =
+            std::env::temp_dir().join(format!("cubic-{label}-{unique}-{}.db", std::process::id()));
+        initialize_database(&database_path).expect("database should initialize");
+        database_path
+    }
+
+    fn signed_in(microsoft_id: &str, is_active: bool) -> PlaintextAccountRecord {
+        PlaintextAccountRecord {
+            microsoft_id: microsoft_id.into(),
+            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+            access_token: Some(format!("{microsoft_id}-access")),
+            refresh_token: Some(format!("{microsoft_id}-refresh")),
+            profile_data: Some(r#"{"username":"Before"}"#.into()),
+            is_active,
+        }
+    }
+
+    /// concorrenza-8: the launch refreshed A, but during the download the user
+    /// switched to B. Saving A's new tokens leaves B active; before audit 101
+    /// the upsert with `is_active: true` made A active again.
+    #[test]
+    fn a_refresh_saved_after_an_account_switch_does_not_reactivate_the_old_account() {
+        let database_path = temporary_accounts_database("refresh-after-switch");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        let repository = EncryptedAccountsRepository::new(&connection, secret_store.clone());
+        repository
+            .upsert_account(&signed_in("account-a", true))
+            .expect("account A should store");
+        repository
+            .upsert_account(&signed_in("account-b", true))
+            .expect("account B should store and become active");
+        drop(repository);
+
+        let saved = persist_refreshed_session(
+            &connection,
+            secret_store.clone(),
+            "account-a",
+            "account-a-rotated",
+            Some("account-a-minecraft-access"),
+            Some(("account-a-new-uuid", r#"{"username":"After"}"#)),
+        )
+        .expect("A's tokens should save");
+        assert!(saved);
+
+        let accounts = EncryptedAccountsRepository::new(&connection, secret_store);
+        let active = accounts
+            .load_active_account()
+            .expect("active account should load")
+            .expect("one account should be active");
+        assert_eq!(active.microsoft_id, "account-b");
+        let account_a = crate::microsoft_auth::AccountsRepository::new(&connection)
+            .list_accounts()
+            .expect("accounts should list")
+            .into_iter()
+            .find(|account| account.microsoft_id == "account-a")
+            .expect("A should still exist");
+        assert!(!account_a.is_active);
+        assert_eq!(
+            account_a.minecraft_uuid.as_deref(),
+            Some("account-a-new-uuid")
+        );
+        assert_eq!(
+            account_a.profile_data.as_deref(),
+            Some(r#"{"username":"After"}"#)
+        );
+
+        drop(accounts);
+        drop(connection);
+        std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    /// concorrenza-8: an account removed during the launch is not re-created by
+    /// the refresh that the launch had already started for it.
+    #[test]
+    fn a_refresh_saved_after_the_account_was_removed_does_not_recreate_it() {
+        let database_path = temporary_accounts_database("refresh-after-remove");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        EncryptedAccountsRepository::new(&connection, secret_store.clone())
+            .upsert_account(&signed_in("account-a", true))
+            .expect("account A should store");
+        crate::microsoft_auth::AccountsRepository::new(&connection)
+            .delete_account("account-a")
+            .expect("account A should delete");
+
+        let saved = persist_refreshed_session(
+            &connection,
+            secret_store,
+            "account-a",
+            "account-a-rotated",
+            None,
+            None,
+        )
+        .expect("a missing row is not an error");
+        assert!(!saved);
+        assert!(crate::microsoft_auth::AccountsRepository::new(&connection)
+            .list_accounts()
+            .expect("accounts should list")
+            .is_empty());
+
+        drop(connection);
+        std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    /// D143: the two warnings say different things, and only one sends the
+    /// user to «Sign in again».
+    #[test]
+    fn the_offline_fallback_warning_says_whether_to_sign_in_again() {
+        let (_, not_refreshed) = OfflineFallback::SessionNotRefreshed.issue_text();
+        let (title, sign_in_again) = OfflineFallback::SignInAgain.issue_text();
+        assert!(not_refreshed.contains("offline mode"));
+        assert!(!not_refreshed.contains("Sign in again"));
+        assert!(sign_in_again.contains("offline mode"));
+        assert!(sign_in_again.contains("Sign in again"));
+        assert!(title.contains("Sign in again"));
     }
 
     fn forge_version_json() -> &'static str {

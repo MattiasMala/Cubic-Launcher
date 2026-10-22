@@ -34,9 +34,13 @@ pub(super) async fn run_vanilla_launch_pipeline(
     effective_settings: EffectiveLaunchSettings,
     http_client: reqwest::Client,
     quick_play_singleplayer: Option<String>,
-    // The active account's choice (D115), read once by the caller.
-    plays_offline: bool,
+    // The active account's row, read once by the caller (D115, concorrenza-8):
+    // its play-offline choice and its identity come from this one reading.
+    launch_account: Option<crate::microsoft_auth::AccountRecord>,
 ) -> Result<StartedLaunch> {
+    let plays_offline = launch_account
+        .as_ref()
+        .is_some_and(|account| account.plays_offline);
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -138,7 +142,8 @@ pub(super) async fn run_vanilla_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
+    let player_identity =
+        load_player_identity(&app_handle, &launcher_paths, launch_account.as_ref()).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,

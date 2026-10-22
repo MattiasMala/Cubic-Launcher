@@ -8,17 +8,17 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     active_account_plays_offline, automation_exit_code, build_instance_root,
-    build_modded_classpath_entries, contained_loader_library_path, embedded_min_java_requirement,
-    fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, installed_java_for_launch,
-    load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
-    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
-    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
-    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
-    split_installations_by_host_architecture, substitute_known_placeholders,
-    validate_content_filename, EffectiveLaunchSettings, EmbeddedFabricRequirementSet,
-    EmbeddedFabricRequirements, LaunchDirectories, LaunchPlaceholders, LaunchRequest,
-    LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
+    build_modded_classpath_entries, contained_loader_library_path, decrypt_launch_account,
+    embedded_min_java_requirement, fabric_dependency_predicates_match,
+    filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
+    installed_java_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
+    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
+    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
+    relative_loader_library_path, split_installations_by_host_architecture,
+    substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
+    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchDirectories,
+    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath, LaunchVerificationRequest,
+    LaunchVerificationResult, PlayerIdentity,
 };
 use crate::java_runtime::{JavaInstallation, JavaInstallationSource};
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -60,10 +60,11 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
         })
         .expect("insert active account");
 
-    let (loaded, refresh_token_error) =
-        load_active_account_for_launch_with_diagnostics(&connection, UnavailableSecretStore)
-            .expect("load active account");
-    let loaded = loaded.expect("active account");
+    let row = crate::microsoft_auth::AccountsRepository::new(&connection)
+        .load_active_account()
+        .expect("load active account")
+        .expect("active account");
+    let (loaded, refresh_token_error) = decrypt_launch_account(&row, UnavailableSecretStore);
 
     assert_eq!(loaded.xbox_gamertag.as_deref(), Some("StoredPlayer"));
     assert_eq!(

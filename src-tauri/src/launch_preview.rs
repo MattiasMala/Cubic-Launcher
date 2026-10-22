@@ -293,10 +293,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         shell_snapshot.selected_modlist_overrides.min_ram_mb,
         shell_snapshot.selected_modlist_overrides.max_ram_mb,
     )?;
-    // D115: read once, before anything is chosen, so that the identity and
-    // the resolution path of this launch come from the same reading of the
-    // active account's row. The vanilla pipeline needs it for the identity.
-    let plays_offline = active_account_plays_offline(&launcher_paths)?;
+    // D115, concorrenza-8: the active account's row, read once, before
+    // anything is chosen. The resolution path, the content step and the
+    // identity of this launch all come from this one reading: an account
+    // switched to or removed during the launch does not change any of them.
+    let launch_account = load_launch_account(&launcher_paths)?;
+    let plays_offline = launch_account
+        .as_ref()
+        .is_some_and(|account| account.plays_offline);
     if plays_offline {
         emit_log(
             &app_handle,
@@ -318,7 +322,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             effective_settings,
             http_client,
             request.quick_play_singleplayer.clone(),
-            plays_offline,
+            launch_account,
         )
         .await;
     }
@@ -854,7 +858,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
+    let player_identity =
+        load_player_identity(&app_handle, &launcher_paths, launch_account.as_ref()).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
