@@ -713,6 +713,57 @@ pub fn retire_legacy_content_dir(
     Ok(removals)
 }
 
+/// The manifest category of the data packs one instance put into a world
+/// (review-decisioni-33): `datapacks-<16 hex>`, from the mod list and the
+/// instance folder. A shared world is opened by the instances of several mod
+/// lists (D99), and with one manifest per world every launch removed the packs
+/// another list had put there; with one per instance a launch removes only
+/// what its own instance put there and has since dropped.
+pub fn world_datapacks_category(instance_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let instance = instance_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let modlist = instance_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let digest = Sha256::digest(format!("{modlist}\0{instance}").as_bytes());
+    let hex = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("datapacks-{hex}")
+}
+
+/// The data packs the other instances recorded in this world: every
+/// `managed-datapacks*.json` of `<world>/.cubic/` but `own_category`. The one
+/// manifest per world written before review-decisioni-33 counts as another
+/// instance's: whose packs it lists is not known, so they are kept.
+pub fn world_datapacks_of_others(world_dir: &Path, own_category: &str) -> BTreeSet<String> {
+    let own = manifest_path(world_dir, own_category);
+    let Ok(entries) = fs::read_dir(world_dir.join(".cubic")) else {
+        return BTreeSet::new();
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if path == own
+            || !file_name.starts_with("managed-datapacks")
+            || !file_name.ends_with(".json")
+        {
+            continue;
+        }
+        names.extend(read_manifest_files(&path));
+    }
+    names
+}
+
 /// The worlds of one instance: every entry of its `saves/` that is a world
 /// directory (it has a `level.dat`), a shared world's link included (D144).
 ///

@@ -1254,6 +1254,7 @@ pub(super) fn link_datapacks_into_worlds(
         )?;
     }
 
+    let own_category = crate::instance_content::world_datapacks_category(instance_root);
     for world_dir in worlds {
         let world_name = world_dir
             .file_name()
@@ -1262,7 +1263,14 @@ pub(super) fn link_datapacks_into_worlds(
         let label = format!("saves/{world_name}/{WORLD_DATAPACKS_DIR}");
         // One world that cannot be updated — a file held open on Windows, a
         // read-only folder — must not stop the launch nor the other worlds.
-        if let Err(error) = sync_world_datapacks(log, &world_dir, prepared, &label, &mut report) {
+        if let Err(error) = sync_world_datapacks(
+            log,
+            &world_dir,
+            &own_category,
+            prepared,
+            &label,
+            &mut report,
+        ) {
             log(
                 ProcessLogStream::Stderr,
                 format!("[Content] Could not update the data packs of {label}: {error:#}"),
@@ -1279,36 +1287,44 @@ const WORLD_DATAPACKS_DIR: &str = "datapacks";
 /// The instance-root folder data packs went to before D144.
 const LEGACY_DATAPACKS_DIR: &str = "datapacks";
 
+/// One world's data packs, with this instance's own manifest
+/// (review-decisioni-33): a pack another instance recorded in the world is the
+/// launcher's, so this launch replaces it instead of skipping it as the
+/// user's, but only that instance removes it.
 fn sync_world_datapacks(
     log: &mut ContentLog<'_>,
     world_dir: &Path,
+    own_category: &str,
     prepared: &PreparedCategory,
     label: &str,
     report: &mut WorldDatapacksReport,
 ) -> Result<()> {
     let datapacks_dir = world_dir.join(WORLD_DATAPACKS_DIR);
     // No adoption here: no launcher before D144 wrote into a world, so a file
-    // in it that the manifest does not name is the user's.
-    let previous = crate::instance_content::previous_content(
-        world_dir,
-        WORLD_DATAPACKS_DIR,
-        &datapacks_dir,
-        None,
-    );
+    // in it that no manifest names is the user's.
+    let own =
+        crate::instance_content::previous_content(world_dir, own_category, &datapacks_dir, None);
+    let others = crate::instance_content::world_datapacks_of_others(world_dir, own_category);
+    let mut launcher_owned = own.clone();
+    launcher_owned
+        .files
+        .extend(others.iter().filter(|name| !own.owns(name)).cloned());
     let linked = link_prepared_packs(
         log,
         &prepared.packs,
         &datapacks_dir,
-        &previous,
+        &launcher_owned,
         label,
         crate::instance_content::LinkKind::NoSymlink,
     );
+    let mut removable = own;
+    removable.files.retain(|name| !others.contains(name));
     // contentpack-6, as for the instance's own folders: recorded first.
     let synced = crate::instance_content::sync_managed_content(
         world_dir,
-        WORLD_DATAPACKS_DIR,
+        own_category,
         &datapacks_dir,
-        &previous,
+        &removable,
         &linked.installed,
         prepared.lookups_complete && linked.interrupted.is_none(),
     );
@@ -2047,10 +2063,12 @@ mod tests {
                     "Minecraft refuses a world with a symlink inside: {name} must be a real file"
                 );
             }
-            let manifest = crate::instance_content::read_manifest(
-                &crate::instance_content::manifest_path(world, "datapacks"),
-            )
-            .expect("each world has its own manifest");
+            let manifest =
+                crate::instance_content::read_manifest(&crate::instance_content::manifest_path(
+                    world,
+                    &crate::instance_content::world_datapacks_category(&instance_root),
+                ))
+                .expect("each world has this instance's manifest");
             assert_eq!(
                 manifest
                     .origins
@@ -2101,6 +2119,62 @@ mod tests {
             b"user",
             "a data pack the manifest does not name is never touched"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// review-decisioni-33: a shared world opened by two mod lists. B has no
+    /// data packs: launching it leaves A's Terralith where it is, and A
+    /// dropping a pack B also uses does not take it from B.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_world_keeps_the_packs_of_the_other_mod_list() {
+        let root = unique_test_root("datapacks-two-lists");
+        let cache = root.join("cache/content-packs");
+        let list_a = root.join("mod-lists/A");
+        let list_b = root.join("mod-lists/B");
+        let instance_a = list_a.join("instances/1.20.1-fabric");
+        let instance_b = list_b.join("instances/1.20.1-fabric");
+        let shared_world = root.join("worlds/Shared");
+        make_world(&shared_world);
+        for instance in [&instance_a, &instance_b] {
+            fs::create_dir_all(instance.join("saves")).expect("saves");
+            std::os::unix::fs::symlink(&shared_world, instance.join("saves/Shared"))
+                .expect("the shared world's link");
+        }
+        assert_ne!(
+            crate::instance_content::world_datapacks_category(&instance_a),
+            crate::instance_content::world_datapacks_category(&instance_b)
+        );
+
+        link_into_worlds(
+            &instance_a,
+            vec![
+                modrinth_pack(&cache, "terralith", "VerA0001", "Terralith.zip"),
+                local_pack(&list_a, "shared-pack.zip"),
+            ],
+            true,
+        );
+        // B: nothing of its own, then the pack A also has.
+        let lines = link_into_worlds(&instance_b, vec![], true);
+        assert!(
+            shared_world.join("datapacks/Terralith.zip").exists(),
+            "launching B removed A's pack: {lines:?}"
+        );
+        let lines = link_into_worlds(
+            &instance_b,
+            vec![local_pack(&list_b, "shared-pack.zip")],
+            true,
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("Skipped")),
+            "a pack another instance placed is the launcher's, not the user's: {lines:?}"
+        );
+
+        // A drops both: Terralith goes, the pack B also placed stays.
+        link_into_worlds(&instance_a, vec![], true);
+        assert!(fs::symlink_metadata(shared_world.join("datapacks/Terralith.zip")).is_err());
+        assert!(shared_world.join("datapacks/shared-pack.zip").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

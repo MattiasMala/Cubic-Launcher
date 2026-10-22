@@ -120,14 +120,26 @@ pub(super) struct InstalledPacks {
 /// instance root, and for data packs every world as well (D144). The instance
 /// root stays in for data packs because a launch before D144 linked them
 /// there, and the installed version is the one the user has.
-pub(super) fn category_manifest_roots(category: &str, instance_root: &Path) -> Vec<PathBuf> {
+///
+/// Each root comes with the category of its manifest: in a world it is this
+/// instance's own (review-decisioni-33), not the packs another mod list put
+/// into a shared world.
+pub(super) fn category_manifest_roots(
+    category: &str,
+    instance_subdir: &str,
+    instance_root: &Path,
+) -> Vec<(PathBuf, String)> {
     let mut roots = Vec::new();
     if category == DATAPACK_CATEGORY {
+        let own = crate::instance_content::world_datapacks_category(instance_root);
         roots.extend(
-            crate::instance_content::instance_world_dirs(instance_root).unwrap_or_default(),
+            crate::instance_content::instance_world_dirs(instance_root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|world| (world, own.clone())),
         );
     }
-    roots.push(instance_root.to_path_buf());
+    roots.push((instance_root.to_path_buf(), instance_subdir.to_string()));
     roots
 }
 
@@ -144,13 +156,13 @@ pub(super) fn category_manifest_roots(category: &str, instance_root: &Path) -> V
 /// what D17 already covers.
 pub(super) fn installed_content_versions(
     cache_dir: &Path,
-    manifest_roots: &[PathBuf],
+    manifest_roots: &[(PathBuf, String)],
     instance_subdir: &str,
 ) -> InstalledPacks {
     let mut installed = InstalledPacks::default();
 
-    for root in manifest_roots {
-        let manifest_path = crate::instance_content::manifest_path(root, instance_subdir);
+    for (root, manifest_category) in manifest_roots {
+        let manifest_path = crate::instance_content::manifest_path(root, manifest_category);
         let Some(manifest) = crate::instance_content::read_manifest(&manifest_path) else {
             continue;
         };
@@ -323,7 +335,7 @@ pub(super) async fn run_content_precheck(
 
         let installed = installed_content_versions(
             cache_dir,
-            &category_manifest_roots(category, &instance_root),
+            &category_manifest_roots(category, instance_subdir, &instance_root),
             instance_subdir,
         );
         let mut versions_by_entry: HashMap<&str, Vec<ModrinthVersion>> = HashMap::new();
@@ -698,7 +710,7 @@ mod tests {
 
         let found = installed_content_versions(
             &cache_dir,
-            std::slice::from_ref(&instance_root),
+            &[(instance_root.clone(), "resourcepacks".to_string())],
             "resourcepacks",
         );
 
@@ -735,7 +747,7 @@ mod tests {
 
         let found = installed_content_versions(
             &cache_dir,
-            std::slice::from_ref(&instance_root),
+            &[(instance_root.clone(), "shaderpacks".to_string())],
             "shaderpacks",
         );
 
@@ -803,23 +815,37 @@ mod tests {
         let world = instance_root.join("saves/Survival");
         fs::create_dir_all(world.join(".cubic")).expect("world manifest dir");
         fs::write(world.join("level.dat"), b"nbt").expect("level.dat");
+        let own = crate::instance_content::world_datapacks_category(&instance_root);
         fs::write(
-            crate::instance_content::manifest_path(&world, "datapacks"),
+            crate::instance_content::manifest_path(&world, &own),
             r#"{"version":1,"category":"datapacks","files":["Terralith.zip"],"origins":{"Terralith.zip":{"entryId":"terralith","versionId":"dataZip1"}}}"#,
         )
         .expect("world manifest");
+        // Another mod list's packs in the same (shared) world are not ours.
+        fs::write(
+            crate::instance_content::manifest_path(&world, "datapacks-0000000000000000"),
+            r#"{"version":1,"category":"datapacks","files":["Other.zip"],"origins":{"Other.zip":{"entryId":"other","versionId":"otherZip"}}}"#,
+        )
+        .expect("another instance's manifest");
 
-        let roots = category_manifest_roots("datapack", &instance_root);
+        let roots = category_manifest_roots("datapack", "datapacks", &instance_root);
         let found = installed_content_versions(&root.join("cache"), &roots, "datapacks");
 
-        assert_eq!(roots, vec![world.clone(), instance_root.clone()]);
+        assert_eq!(
+            roots,
+            vec![
+                (world.clone(), own.clone()),
+                (instance_root.clone(), "datapacks".to_string())
+            ]
+        );
         assert_eq!(
             found.by_entry.get("terralith").map(String::as_str),
             Some("dataZip1")
         );
+        assert!(!found.by_entry.contains_key("other"));
         assert_eq!(
-            category_manifest_roots("resourcepack", &instance_root),
-            vec![instance_root.clone()]
+            category_manifest_roots("resourcepack", "resourcepacks", &instance_root),
+            vec![(instance_root.clone(), "resourcepacks".to_string())]
         );
 
         let _ = fs::remove_dir_all(&root);
