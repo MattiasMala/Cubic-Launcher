@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::token_storage::{AccountTokenCipher, SecretStore};
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub const DATABASE_FILENAME: &str = "launcher_data.db";
 
@@ -149,16 +149,22 @@ fn migrate_accounts_plays_offline(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
-    let table_sql: Option<String> = connection
+/// The `CREATE TABLE` of `mod_cache`, or `None` when the table does not
+/// exist. Only "no such row" means a missing table: any other SQLite error
+/// (a locked or damaged database) is returned, so a migration is never
+/// skipped as if there were nothing to migrate (audit 101, todo.md:1738).
+fn mod_cache_table_sql(connection: &Connection) -> Result<Option<String>> {
+    Ok(connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
             [],
             |row| row.get(0),
         )
-        .ok();
+        .optional()?)
+}
 
-    let Some(table_sql) = table_sql else {
+fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
+    let Some(table_sql) = mod_cache_table_sql(connection)? else {
         return Ok(());
     };
 
@@ -218,15 +224,7 @@ fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
 }
 
 fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
-    let table_sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(table_sql) = table_sql else {
+    let Some(table_sql) = mod_cache_table_sql(connection)? else {
         return Ok(());
     };
 
@@ -389,7 +387,10 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME};
+    use super::{
+        initialize_database, migrate_account_tokens_from_profile_data, migrate_mod_cache_schema,
+        migrate_mod_cache_target_key, DATABASE_FILENAME,
+    };
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     #[derive(Clone, Default)]
@@ -520,6 +521,45 @@ mod tests {
         drop(connection);
         fs::remove_dir_all(database_path.parent().expect("database directory"))
             .expect("temporary database directory should be removable");
+    }
+
+    /// todo.md:1738: a database with no `mod_cache` table has nothing to
+    /// migrate, and both migrations say so without an error.
+    #[test]
+    fn mod_cache_migrations_skip_a_missing_table() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+
+        migrate_mod_cache_schema(&connection).expect("no table, nothing to migrate");
+        migrate_mod_cache_target_key(&connection).expect("no table, nothing to migrate");
+    }
+
+    /// todo.md:1738: a SQLite error while reading the schema is not a missing
+    /// table. Before, `.ok()` turned it into "nothing to migrate" and the
+    /// launcher went on with a `mod_cache` of the old shape.
+    #[test]
+    fn mod_cache_migrations_report_a_schema_read_error() {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("temporary directory");
+        fs::write(&database_path, vec![0x5a; 4096]).expect("a file that is not a database");
+        let connection = Connection::open(&database_path).expect("opening is lazy");
+
+        let schema = migrate_mod_cache_schema(&connection)
+            .expect_err("a damaged database is an error, not a missing table");
+        let target_key = migrate_mod_cache_target_key(&connection)
+            .expect_err("a damaged database is an error, not a missing table");
+        for error in [schema, target_key] {
+            assert!(
+                format!("{error:#}").contains("not a database"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
     }
 
     #[test]
