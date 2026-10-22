@@ -1005,13 +1005,20 @@ pub(super) async fn select_or_download_java(
     persist_java_installations(&connection, &installations)?;
     let installations = installations_for_this_computer(app_handle, installations)?;
 
-    if let Some(path) = installed_java_for_launch(
+    if let Some(installation) = installed_java_for_launch(
         &installations,
         required_version,
         plays_offline,
         launcher_paths.java_runtimes_dir(),
     )? {
-        return Ok(path);
+        if installation.version != required_version {
+            emit_offline_java_substitution_notice(
+                app_handle,
+                required_version,
+                installation.version,
+            )?;
+        }
+        return Ok(installation.path);
     }
 
     let adoptium = AdoptiumClient::new();
@@ -1141,18 +1148,26 @@ pub(super) fn split_installations_by_host_architecture(
 /// comunque un fallimento, solo più lento e con un messaggio che parla di rete
 /// invece di dire quale Java manca. Conseguenza voluta: un account offline con
 /// la rete funzionante non si vede più scaricare Java da solo.
+///
+/// D158: offline, senza la major esatta si usa la più vicina superiore già
+/// installata (il chiamante mostra l'avviso «Java version substituted»);
+/// l'errore resta solo se non c'è niente da quella major in su. Online la
+/// sostituzione la decide Adoptium, che non serve le major EOL.
 pub(super) fn installed_java_for_launch(
     installations: &[JavaInstallation],
     required_version: u32,
     plays_offline: bool,
     java_runtimes_dir: &Path,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<JavaInstallation>> {
     if let Some(installation) = select_exact_java_for_requirement(installations, required_version) {
-        return Ok(Some(installation.path));
+        return Ok(Some(installation));
     }
     if plays_offline {
+        if let Some(installation) = select_java_for_requirement(installations, required_version) {
+            return Ok(Some(installation));
+        }
         bail!(
-            "No Java {required_version} runtime is installed (looked in {} and on the system), and the active account plays offline, so it is not downloaded. Install Java {required_version} there, set a Java path in the settings, or switch the account to online for one launch.",
+            "No Java {required_version} or newer runtime is installed (looked in {} and on the system), and the active account plays offline, so it is not downloaded. Install Java {required_version} there, set a Java path in the settings, or switch the account to online for one launch.",
             java_runtimes_dir.display()
         );
     }
@@ -1203,6 +1218,27 @@ fn emit_java_substitution_notice(
         ),
         &format!(
             "This Minecraft version targets Java {required_version}, which Adoptium no longer distributes (end-of-life). The launcher selected the nearest available runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
+        ),
+        "warning",
+        "launch",
+    )
+}
+
+/// D158: the same notice when an offline launch runs on a newer installed
+/// major because the exact one is not installed and is not downloaded.
+fn emit_offline_java_substitution_notice(
+    app_handle: &tauri::AppHandle,
+    required_version: u32,
+    effective_version: u32,
+) -> Result<()> {
+    emit_launcher_issue(
+        app_handle,
+        "Java version substituted",
+        &format!(
+            "Java {required_version} is not installed; using the installed Java {effective_version} instead."
+        ),
+        &format!(
+            "This Minecraft version targets Java {required_version}, which is not installed, and the active account plays offline, so it is not downloaded. The launcher selected the nearest newer installed runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
         ),
         "warning",
         "launch",

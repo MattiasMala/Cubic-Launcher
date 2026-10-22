@@ -1145,36 +1145,50 @@ fn a_launch_request_without_a_version_map_is_the_request_of_today() {
     );
 }
 
-/// D-d (onda 8a): offline e nessun runtime della major richiesta è un errore che
-/// nomina la major, la cartella dei runtime e la scelta dell'account — non una
-/// richiesta ad Adoptium. Una Java più nuova installata non basta: la selezione
-/// prima del download è a major esatta (`select_exact_java_for_requirement`).
-/// Online la stessa situazione resta un download (`Ok(None)`).
+/// D-d (onda 8a): offline e nessun runtime della major richiesta né di una
+/// più alta è un errore che nomina la major, la cartella dei runtime e la
+/// scelta dell'account — non una richiesta ad Adoptium. Online la stessa
+/// situazione resta un download (`Ok(None)`).
+///
+/// D158: offline, una Java più nuova installata basta: si usa la più vicina
+/// superiore, e il chiamante avvisa della sostituzione.
 #[test]
-fn offline_with_no_runtime_of_the_required_major_is_a_clear_error() {
+fn offline_with_no_runtime_of_the_required_major_or_newer_is_a_clear_error() {
     let runtimes_dir = Path::new("/launcher/java-runtimes");
-    let installed = vec![JavaInstallation {
-        path: PathBuf::from("/launcher/java-runtimes/java-21/bin/java"),
-        version: 21,
+    let java = |version: u32| JavaInstallation {
+        path: PathBuf::from(format!("/launcher/java-runtimes/java-{version}/bin/java")),
+        version,
         auto_detected: true,
         architecture: "x64".into(),
         source: JavaInstallationSource::LauncherManaged,
-    }];
+    };
+    let installed = vec![java(25), java(21)];
 
-    let error = installed_java_for_launch(&installed, 17, true, runtimes_dir)
-        .expect_err("offline, a missing Java 17 must stop the launch, not reach Adoptium");
+    let error = installed_java_for_launch(&installed, 26, true, runtimes_dir)
+        .expect_err("offline, nothing from Java 26 up must stop the launch, not reach Adoptium");
     let message = error.to_string();
-    assert!(message.contains("Java 17"), "{message}");
+    assert!(message.contains("Java 26"), "{message}");
     assert!(message.contains("/launcher/java-runtimes"), "{message}");
     assert!(message.contains("plays offline"), "{message}");
 
+    // Online the exact major is downloaded instead.
     assert_eq!(
         installed_java_for_launch(&installed, 17, false, runtimes_dir).expect("online"),
         None
     );
+    // Offline, exact major installed: that one.
     assert_eq!(
-        installed_java_for_launch(&installed, 21, true, runtimes_dir).expect("offline, installed"),
-        Some(PathBuf::from("/launcher/java-runtimes/java-21/bin/java"))
+        installed_java_for_launch(&installed, 21, true, runtimes_dir)
+            .expect("offline, installed")
+            .map(|java| java.version),
+        Some(21)
+    );
+    // D158: offline, 17 missing → the nearest higher installed, 21, not 25.
+    assert_eq!(
+        installed_java_for_launch(&installed, 17, true, runtimes_dir)
+            .expect("offline, newer installed")
+            .map(|java| java.version),
+        Some(21)
     );
 }
 
