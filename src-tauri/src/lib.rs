@@ -58,6 +58,7 @@ pub fn run() {
             launcher_paths
                 .create_required_directories()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+            debug_trace::reset_debug_trace_at_startup(launcher_paths.root_dir());
 
             database::initialize_database(launcher_paths.database_path())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -102,7 +103,6 @@ pub fn run() {
             app_shell::save_global_settings_command,
             app_shell::save_modlist_overrides_command,
             debug_trace::append_debug_trace_command,
-            debug_trace::clear_debug_trace_command,
             editor_data::load_modlist_editor_command,
             editor_data::add_mod_rule_command,
             editor_data::delete_rules_command,

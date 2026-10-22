@@ -2,18 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
-export async function clearDebugTrace() {
-  if (!isTauri()) return null;
-
-  try {
-    return await invoke<string>("clear_debug_trace_command");
-  } catch {
-    return null;
-  }
-}
-
+// The trace is a development tool (shell-10): a production build does not
+// even make the call, and the backend writes nothing in release either.
 export function appendDebugTrace(scope: string, payload: unknown) {
-  if (!isTauri()) return;
+  if (!import.meta.env.DEV || !isTauri()) return;
 
   const detail =
     typeof payload === "string"
