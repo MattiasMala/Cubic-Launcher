@@ -659,12 +659,23 @@ pub async fn resolve_modlist_command(
         &launcher_paths.modlists_dir().join(&modlist_name),
         &modlist,
     );
-    // D140: with the active account playing offline only the cache answers;
-    // a mod it knows nothing about stays as the rules resolved it.
+    // D140, D146: with the active account playing offline only the cache
+    // answers, and with the launch's own rule: a mod is available when its jar
+    // for this target is on disk (review-risoluzione-7). The availability rows
+    // describe Modrinth, not what an offline launch can install.
     let plays_offline = crate::app_shell::active_account_plays_offline(&launcher_paths)
         .map_err(|e| e.to_string())?;
+    if plays_offline {
+        return crate::launch_preview::offline_active_mods(
+            &launcher_paths,
+            &modlist,
+            &pins,
+            &target,
+        )
+        .map_err(|e| e.to_string());
+    }
     let client = ModrinthClient::new();
-    let _one_check_at_a_time = availability_check_guard(&modlist_name, &target).await;
+    let mut reach = availability_check_guard(&modlist_name, &target).await;
     let mut pass =
         AvailabilityFixpoint::pinned(&modlist, pins, &target).map_err(|e| e.to_string())?;
     loop {
@@ -674,12 +685,15 @@ pub async fn resolve_modlist_command(
         }
         let check_client = client.clone();
         let check_target = target.clone();
-        let unavailable = editor_unavailable_mods(
+        // review-risoluzione-9: once a round met no connection, the rest of
+        // this fixed point (and the checks queued behind it, for a minute)
+        // answer from the cache.
+        let (unavailable, unreachable) = editor_unavailable_mods(
             &launcher_paths,
             &pending,
             &target,
             &mod_loader,
-            !plays_offline,
+            reach.may_ask(),
             move |mod_id| {
                 let client = check_client.clone();
                 let target = check_target.clone();
@@ -692,6 +706,9 @@ pub async fn resolve_modlist_command(
             },
         )
         .await;
+        if unreachable {
+            reach.mark_unreachable();
+        }
         pass.record(&pending, &unavailable)
             .map_err(|e| e.to_string())?;
     }
@@ -708,9 +725,10 @@ pub async fn resolve_modlist_command(
 /// for the mods with no row, persisting the answers. A failed question is not
 /// an answer: the mod stays available and nothing is cached, as before — an
 /// editor that turns red because the network blinked would say something the
-/// next launch may well not do. Without `ask_modrinth` (D140: the active
-/// account plays offline) only the cached rows answer, and a mod with no row
-/// stays available.
+/// next launch may well not do. Without `ask_modrinth` (Modrinth was just
+/// found out of reach, review-risoluzione-9) only the cached rows answer, and
+/// a mod with no row stays available. The second value says whether this call
+/// found Modrinth out of reach.
 async fn editor_unavailable_mods<Check, Fut>(
     launcher_paths: &LauncherPaths,
     mod_ids: &[String],
@@ -718,7 +736,7 @@ async fn editor_unavailable_mods<Check, Fut>(
     loader_key: &str,
     ask_modrinth: bool,
     check: Check,
-) -> Vec<String>
+) -> (Vec<String>, bool)
 where
     Check: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
@@ -736,6 +754,7 @@ where
         .collect::<Vec<_>>();
 
     let mut answers = cached.clone();
+    let mut unreachable = false;
     if !uncached.is_empty() && ask_modrinth {
         let checked = check_availability_persisting(uncached, 10, check, |mod_id, available| {
             persist_availability_answer(
@@ -747,7 +766,8 @@ where
             )
         })
         .await;
-        answers.extend(checked);
+        unreachable = checked.unreachable;
+        answers.extend(checked.answers);
     }
 
     let no_version = answers
@@ -756,7 +776,7 @@ where
         .map(|(mod_id, _)| mod_id)
         .collect::<HashSet<_>>();
     if no_version.is_empty() {
-        return Vec::new();
+        return (Vec::new(), unreachable);
     }
 
     // D29: un jar per questo target sul disco tiene il mod nel lancio, qualunque
@@ -770,11 +790,12 @@ where
         })
     };
 
-    mod_ids
+    let unavailable = mod_ids
         .iter()
         .filter(|mod_id| no_version.contains(mod_id.as_str()) && !jar_on_disk(mod_id))
         .cloned()
-        .collect()
+        .collect();
+    (unavailable, unreachable)
 }
 
 /// What one backfill pass decided. The command itself discards it: the pass
@@ -922,7 +943,18 @@ where
     Check: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
 {
-    check_availability_persisting(mod_ids, permits, check, |_, _| {}).await
+    check_availability_persisting(mod_ids, permits, check, |_, _| {})
+        .await
+        .answers
+}
+
+/// What one round of availability questions answered.
+#[derive(Debug, Default)]
+struct AvailabilityAnswers {
+    answers: Vec<(String, bool)>,
+    /// A question met no connection at all, and the round stopped there
+    /// (review-risoluzione-9).
+    unreachable: bool,
 }
 
 /// `check_availability_concurrently`, handing each answer to `on_answer` as
@@ -930,12 +962,16 @@ where
 /// whole batch at the end left a second check that started meanwhile — a
 /// toggle during the first resolution — with an empty cache, and it asked
 /// every mod again.
+///
+/// The first question that finds no connection — refused, unresolved, silent —
+/// stops the round, as precheck-5 does for the launch (review-risoluzione-9):
+/// the next three hundred would each pay the same ~14 s of retries.
 async fn check_availability_persisting<Check, Fut, OnAnswer>(
     mod_ids: Vec<String>,
     permits: usize,
     check: Check,
     mut on_answer: OnAnswer,
-) -> Vec<(String, bool)>
+) -> AvailabilityAnswers
 where
     Check: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
@@ -949,21 +985,28 @@ where
         let permit_source = semaphore.clone();
         tasks.spawn(async move {
             let _permit = permit_source.acquire_owned().await.ok()?;
-            match check(mod_id.clone()).await {
-                Ok(available) => Some((mod_id, available)),
-                Err(_) => None,
-            }
+            Some(match check(mod_id.clone()).await {
+                Ok(available) => Ok((mod_id, available)),
+                Err(error) => Err(crate::modrinth::is_connection_failure(&error)),
+            })
         });
     }
 
-    let mut results = Vec::new();
+    let mut outcome = AvailabilityAnswers::default();
     while let Some(join_result) = tasks.join_next().await {
-        if let Ok(Some(result)) = join_result {
-            on_answer(&result.0, result.1);
-            results.push(result);
+        match join_result {
+            Ok(Some(Ok(result))) => {
+                on_answer(&result.0, result.1);
+                outcome.answers.push(result);
+            }
+            Ok(Some(Err(true))) => {
+                outcome.unreachable = true;
+                tasks.abort_all();
+            }
+            _ => {}
         }
     }
-    results
+    outcome
 }
 
 /// One availability check per (mod list, target) at a time (audit 101,
@@ -972,12 +1015,17 @@ where
 /// each read the cache before the others had written it and asked Modrinth
 /// for everything, 2×N requests and more against a limit of 300 a minute.
 /// Serialised, the second one finds the first one's answers in the cache.
+///
+/// The lock also remembers when Modrinth was last found out of reach for this
+/// (mod list, target) (review-risoluzione-9). The checks queued behind one
+/// that met no connection then answer from the cache for a short while,
+/// instead of each paying the same storm of retries.
 async fn availability_check_guard(
     modlist_name: &str,
     target: &ResolutionTarget,
-) -> tokio::sync::OwnedMutexGuard<()> {
+) -> tokio::sync::OwnedMutexGuard<ModrinthReach> {
     static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<ModrinthReach>>>>,
     > = std::sync::OnceLock::new();
 
     let key = format!(
@@ -993,6 +1041,28 @@ async fn availability_check_guard(
         locks.entry(key).or_default().clone()
     };
     lock.lock_owned().await
+}
+
+/// How long the availability checks of one (mod list, target) stop asking
+/// after one found no connection (review-risoluzione-9).
+const UNREACHABLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the availability checks may ask Modrinth, kept under the lock of
+/// `availability_check_guard`.
+#[derive(Debug, Default)]
+struct ModrinthReach {
+    unreachable_until: Option<std::time::Instant>,
+}
+
+impl ModrinthReach {
+    fn may_ask(&self) -> bool {
+        self.unreachable_until
+            .is_none_or(|until| std::time::Instant::now() >= until)
+    }
+
+    fn mark_unreachable(&mut self) {
+        self.unreachable_until = Some(std::time::Instant::now() + UNREACHABLE_PAUSE);
+    }
 }
 
 /// The (mod, target) pairs Modrinth was asked about since the app started.
@@ -1105,7 +1175,12 @@ pub async fn backfill_availability(
         minecraft_version: mc_version.to_string(),
         mod_loader: parsed_loader,
     };
-    let _one_check_at_a_time = availability_check_guard(modlist_name, &target).await;
+    let mut reach = availability_check_guard(modlist_name, &target).await;
+    // review-risoluzione-9: a check that just met no connection; the cache is
+    // what there is until the pause ends.
+    if !reach.may_ask() {
+        return Ok(BackfillOutcome::default());
+    }
 
     let db_path = launcher_paths.database_path();
     let cached = db_availability_get(db_path, &all_modrinth_ids, mc_version, mod_loader);
@@ -1135,15 +1210,37 @@ pub async fn backfill_availability(
     let bulk_hash_count = split.hashed.len();
     // Availability only asks whether a compatible version exists, so the
     // release → beta → alpha installation preference does not apply here.
+    let bulk_unreachable = std::sync::atomic::AtomicBool::new(false);
     let bulk_outcome = resolve_bulk_availability(&split, |hashes| {
         let target = &target;
+        let bulk_unreachable = &bulk_unreachable;
         async move {
-            client
+            let answer = client
                 .fetch_versions_by_hash_any_channel(&hashes, target)
-                .await
+                .await;
+            if answer
+                .as_ref()
+                .is_err_and(crate::modrinth::is_connection_failure)
+            {
+                bulk_unreachable.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            answer
         }
     })
     .await;
+    if bulk_unreachable.load(std::sync::atomic::Ordering::Relaxed) {
+        // No connection: the per-project fallback would pay the same retries
+        // once per mod (review-risoluzione-9).
+        reach.mark_unreachable();
+        eprintln!(
+            "[Backfill] Modrinth could not be reached; the editor uses the cached availability"
+        );
+        return Ok(BackfillOutcome {
+            bulk_hash_count,
+            bulk_error: bulk_outcome.bulk_error,
+            ..BackfillOutcome::default()
+        });
+    }
 
     // The endpoint reports neither "unknown hash" nor "no version for this
     // target": both are omissions. Naming them is the only diagnostic it
@@ -1201,6 +1298,10 @@ pub async fn backfill_availability(
         },
     )
     .await;
+    if per_project.unreachable {
+        reach.mark_unreachable();
+    }
+    let per_project = per_project.answers;
     let persisted = merge_backfill_entries(&bulk_outcome.available_mod_ids, &per_project);
 
     Ok(BackfillOutcome {
@@ -1520,13 +1621,79 @@ mod tests {
 
         let mut handed = seen.lock().unwrap().clone();
         handed.sort();
-        let mut returned = answers;
+        assert!(
+            !answers.unreachable,
+            "a request error is not a dead network"
+        );
+        let mut returned = answers.answers;
         returned.sort();
         assert_eq!(handed, returned);
         assert_eq!(
             handed,
             vec![("iris".to_string(), false), ("sodium".to_string(), true)]
         );
+    }
+
+    /// A real connection failure: a request to a port nobody listens on.
+    async fn refused_connection() -> anyhow::Error {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        anyhow::Error::new(error).context("failed to query Modrinth")
+    }
+
+    /// review-risoluzione-9: the first question that finds no connection stops
+    /// the round; the rest are never asked.
+    #[tokio::test]
+    async fn a_connection_failure_stops_the_round() {
+        let refused = Arc::new(tokio::sync::Mutex::new(Some(refused_connection().await)));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let mod_ids = (0..50).map(|n| format!("mod-{n}")).collect::<Vec<_>>();
+        let answers = check_availability_persisting(
+            mod_ids,
+            1,
+            move |_mod_id| {
+                let refused = refused.clone();
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    match refused.lock().await.take() {
+                        Some(error) => Err(error),
+                        None => {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            Ok(true)
+                        }
+                    }
+                }
+            },
+            |_, _| {},
+        )
+        .await;
+
+        assert!(answers.unreachable);
+        assert!(
+            asked.load(Ordering::SeqCst) < 5,
+            "asked {} mods after the network was found down",
+            asked.load(Ordering::SeqCst)
+        );
+    }
+
+    /// review-risoluzione-9: after a round that found no connection, the
+    /// checks of that (mod list, target) answer from the cache for a while.
+    #[test]
+    fn a_dead_network_pauses_the_questions() {
+        let mut reach = ModrinthReach::default();
+        assert!(reach.may_ask());
+        reach.mark_unreachable();
+        assert!(!reach.may_ask());
+        reach.unreachable_until = Some(std::time::Instant::now());
+        assert!(reach.may_ask());
     }
 
     /// Two checks of one mod list on one target run one after the other; on
@@ -2297,7 +2464,7 @@ mod tests {
 
         assert_eq!(
             unavailable,
-            vec!["iris".to_string(), "polytone".to_string()]
+            (vec!["iris".to_string(), "polytone".to_string()], false)
         );
         // Solo i mod senza riga vanno a Modrinth; la risposta si salva, l'errore no.
         let mut asked = asked.lock().unwrap().clone();

@@ -84,6 +84,25 @@ pub use slot::LaunchStatus;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 
+/// The mods an offline launch of `modlist` on `target` loads: the selection
+/// `resolve_offline_selection` makes with no map, jar on disk or nothing.
+/// The editor asks this one function when the active account plays offline,
+/// so its green and red are what the launch loads (D146, review-risoluzione-7).
+pub(crate) fn offline_active_mods(
+    launcher_paths: &LauncherPaths,
+    modlist: &crate::rules::ModList,
+    pins: &crate::resolver::PinAliases,
+    target: &ResolutionTarget,
+) -> Result<Vec<String>> {
+    Ok(
+        resolve_offline_selection(launcher_paths, modlist, pins, target, None)?
+            .resolution
+            .active_mods
+            .into_iter()
+            .collect(),
+    )
+}
+
 /// The launch of this process: preparing, then the PID of the running game
 /// and its exit signal (concorrenza-4). The exit monitor clears it when the
 /// process has really exited, and only then (windows-1): a STOP that fails
