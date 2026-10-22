@@ -432,6 +432,24 @@ pub fn link_local_pack(
     target: &Path,
     target_is_ours: bool,
 ) -> Result<PackLinkOutcome> {
+    link_local_pack_as(
+        source,
+        target,
+        target_is_ours,
+        crate::instance_content::LinkKind::Symlink,
+    )
+}
+
+/// [`link_local_pack`] with the shape chosen by the caller. With
+/// [`crate::instance_content::LinkKind::NoSymlink`] — a world's `datapacks/`
+/// (D144) — a file is hard-linked or copied and a folder is always copied:
+/// Minecraft refuses to open a world with a symlink inside.
+pub fn link_local_pack_as(
+    source: &Path,
+    target: &Path,
+    target_is_ours: bool,
+    kind: crate::instance_content::LinkKind,
+) -> Result<PackLinkOutcome> {
     let source_is_dir = fs::metadata(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .is_dir();
@@ -446,6 +464,15 @@ pub fn link_local_pack(
     }
 
     remove_existing_target(target)?;
+
+    if kind == crate::instance_content::LinkKind::NoSymlink {
+        if source_is_dir {
+            copy_directory_recursive(source, target)?;
+            return Ok(PackLinkOutcome::Copied);
+        }
+        crate::instance_content::place_file_without_symlink(source, target)?;
+        return Ok(PackLinkOutcome::Linked);
+    }
 
     if !source_is_dir {
         crate::instance_mods::create_file_link(source, target)?;
