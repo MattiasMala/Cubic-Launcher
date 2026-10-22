@@ -812,6 +812,7 @@ mod tests {
                 resource_packs: false,
                 data_packs: false,
                 shaders: false,
+                selected_content_paths: Vec::new(),
                 other_files: false,
                 selected_other_paths: Vec::new(),
             },

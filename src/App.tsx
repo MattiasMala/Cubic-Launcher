@@ -888,6 +888,7 @@ export default function App() {
           resourcePacks: options.resourcePacks,
           dataPacks: options.dataPacks,
           shaders: options.shaders,
+          selectedContentPaths: options.selectedContentPaths,
           otherFiles: options.otherFiles,
           selectedOtherPaths: options.selectedOtherPaths,
         },
