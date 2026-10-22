@@ -4,6 +4,7 @@ import { ContentEntryRow } from "./ContentEntryRow";
 import type { ContentTabViewProps } from "./content-types";
 import { useContentTabState } from "./use-content-tab-state";
 import {
+  AlertTriangleIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   FolderOpenIcon,
@@ -86,6 +87,22 @@ export function ContentTabView(props: ContentTabViewProps) {
 
       <div class="flex-1 p-4" style={{ overflow: "auto" }}>
         <Show when={state.entries().length > 0} fallback={
+          <Show when={state.loadError() === null} fallback={
+            // contentpack-11: an unreadable list is not an empty one. The
+            // launch leaves these packs as they are until the file is fixed.
+            <div class="flex flex-col items-center justify-center py-16 text-center">
+              <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-destructive/10">
+                <AlertTriangleIcon class="h-8 w-8 text-destructive" />
+              </div>
+              <h3 class="mb-2 text-lg font-semibold text-foreground">The {state.label().toLowerCase()} list could not be read</h3>
+              <p class="mb-2 max-w-md text-sm text-muted-foreground">
+                The file that holds this tab is damaged or unreadable, so nothing is shown and nothing can be changed
+                here. Until it is fixed or restored, Play leaves the instance's {state.label().toLowerCase()} exactly
+                as they are.
+              </p>
+              <p class="max-w-md break-all font-mono text-xs text-muted-foreground">{state.loadError()}</p>
+            </div>
+          }>
           <div class="flex flex-col items-center justify-center py-16 text-center">
             <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
               <PackageIcon class="h-8 w-8 text-muted-foreground" />
@@ -101,6 +118,7 @@ export function ContentTabView(props: ContentTabViewProps) {
               Add Your First {state.label().replace(/s$/, "")}
             </button>
           </div>
+          </Show>
         }>
           <>
             <Show when={state.engine.draggingId() && state.engine.dragPointer()}>

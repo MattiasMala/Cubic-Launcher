@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::content_packs::{load_content_list, ContentEntry, ContentList};
+use crate::content_packs::{load_content_list, ContentEntry};
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
@@ -292,13 +292,21 @@ pub(super) async fn run_content_precheck(
     let mut precheck = ContentPrecheck::default();
 
     for (category, instance_subdir) in CONTENT_CATEGORIES {
-        // A missing category file is an empty list, not an error, exactly as
-        // it is for the launch (`content_packs.rs:86-94`).
-        let list = load_content_list(&modlist_dir, category).unwrap_or_else(|_| ContentList {
-            content_type: category.to_string(),
-            entries: vec![],
-            groups: vec![],
-        });
+        // A missing category file is an empty list, exactly as it is for the
+        // launch. One that cannot be read offers no row and promises nothing:
+        // the launch leaves that category as it is and reports it as an
+        // error the user sees (contentpack-11), so one notice, not two.
+        let list = match load_content_list(&modlist_dir, category) {
+            Ok(list) => list,
+            Err(error) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!("[Precheck] could not read the {category} list; no update is offered for it ({error:#})"),
+                );
+                continue;
+            }
+        };
         let active_entries: Vec<&ContentEntry> = list
             .entries
             .iter()

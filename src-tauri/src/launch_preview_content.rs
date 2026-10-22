@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::content_packs::{load_content_list, ContentEntry, ContentList};
+use crate::content_packs::{load_content_list, ContentEntry};
 use crate::launcher_paths::LauncherPaths;
 use crate::local_content_packs::{link_local_pack_as, plan_local_pack_installs, PackLinkOutcome};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
@@ -12,7 +12,7 @@ use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::VersionRuleKind;
 
-use super::{download_file, emit_log, select_preferred_version};
+use super::{download_file, emit_launcher_issue, emit_log, select_preferred_version};
 
 /// The three content categories, each with the subdirectory its packs are
 /// linked into: of the instance, or for data packs of each world (D144).
@@ -668,23 +668,59 @@ pub(super) fn link_prepared_packs(
     Ok(installed)
 }
 
-/// The active entries of one category list. A missing or unreadable file is
-/// an empty list, exactly as it has always been for the launch.
-fn active_category_entries(
+/// The active entries of one category list. A missing file is an empty
+/// list; one that cannot be read is an error (contentpack-11). It used to be
+/// an empty list too, and the sync then removed every pack the launcher had
+/// put in the instance for that category, saying so only in the log.
+pub(super) fn active_category_entries(
     modlist_dir: &Path,
     content_type: &str,
     mc_version: &str,
     loader: &str,
-) -> Vec<ContentEntry> {
-    let list = load_content_list(modlist_dir, content_type).unwrap_or_else(|_| ContentList {
-        content_type: content_type.to_string(),
-        entries: vec![],
-        groups: vec![],
-    });
-    list.entries
+) -> Result<Vec<ContentEntry>> {
+    let list = load_content_list(modlist_dir, content_type)?;
+    Ok(list
+        .entries
         .into_iter()
         .filter(|entry| is_content_entry_active(entry, mc_version, loader))
-        .collect()
+        .collect())
+}
+
+/// How a sentence the user reads names one category's packs.
+pub(super) fn category_noun(content_type: &str) -> &'static str {
+    match content_type {
+        "resourcepack" => "resource pack",
+        "shader" => "shader",
+        "datapack" => "data pack",
+        _ => "content pack",
+    }
+}
+
+/// A category list that cannot be read: the launch leaves that category as it
+/// is — nothing installed, nothing removed — and says so as an error the user
+/// sees, not only as a log line (contentpack-11, todo.md:1755).
+fn report_unreadable_list(
+    app_handle: &tauri::AppHandle,
+    content_type: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let noun = category_noun(content_type);
+    let file = crate::content_packs::filename_for_type(content_type);
+    emit_log(
+        app_handle,
+        ProcessLogStream::Stderr,
+        format!("[Content] Could not read {file}; the {noun}s of the instance are left as they are: {error:#}"),
+    )?;
+    emit_launcher_issue(
+        app_handle,
+        &format!("Could not read the {noun} list"),
+        &format!(
+            "{file} of this mod list could not be read, so this launch left the instance's {noun}s exactly as they were: none installed, none removed."
+        ),
+        &format!("{error:#}. Fix or restore the file; the editor shows the same error on its tab."),
+        "error",
+        "launch",
+    )
 }
 
 /// Resolve, download and install content packs into the instance.
@@ -778,7 +814,14 @@ pub(super) async fn resolve_and_install_content_packs(
         .filter(|(content_type, _)| *content_type != DATAPACK_CATEGORY)
         .copied()
     {
-        let entries = active_category_entries(&modlist_dir, content_type, mc_version, loader_str);
+        let entries =
+            match active_category_entries(&modlist_dir, content_type, mc_version, loader_str) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    report_unreadable_list(app_handle, content_type, &error)?;
+                    continue;
+                }
+            };
         let active_entries: Vec<&ContentEntry> = entries.iter().collect();
         let prepared = prepare_category_packs(
             app_handle,
@@ -946,7 +989,11 @@ async fn install_datapacks(
         )?,
     }
 
-    let entries = active_category_entries(modlist_dir, DATAPACK_CATEGORY, mc_version, loader_str);
+    let entries =
+        match active_category_entries(modlist_dir, DATAPACK_CATEGORY, mc_version, loader_str) {
+            Ok(entries) => entries,
+            Err(error) => return report_unreadable_list(app_handle, DATAPACK_CATEGORY, &error),
+        };
     let active_entries: Vec<&ContentEntry> = entries.iter().collect();
     let prepared = prepare_category_packs(
         app_handle,
@@ -1605,6 +1652,24 @@ mod tests {
         );
         assert!(!resolutions[0].preresolved);
         assert_eq!(requests.lock().expect("recorder").len(), 1);
+    }
+
+    /// contentpack-11: an unreadable list stops the category, it does not
+    /// empty it — an empty list made the sync remove every managed pack.
+    #[test]
+    fn an_unreadable_category_list_is_an_error_not_an_empty_list() {
+        let modlist = unique_test_root("broken-list");
+        fs::create_dir_all(&modlist).expect("mod-list dir");
+        fs::write(modlist.join("shaders.json"), b"{ not json").expect("broken list");
+
+        assert!(active_category_entries(&modlist, "shader", "1.20.1", "fabric").is_err());
+        assert!(
+            active_category_entries(&modlist, "resourcepack", "1.20.1", "fabric")
+                .expect("a missing list is empty")
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&modlist).ok();
     }
 
     #[test]

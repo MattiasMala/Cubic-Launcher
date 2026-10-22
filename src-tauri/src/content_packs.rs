@@ -83,17 +83,26 @@ pub fn filename_for_type(content_type: &str) -> &'static str {
 
 // ── Read / Write ────────────────────────────────────────────────────────────
 
+/// The category's list. Only a file that does not exist is an empty list: one
+/// that exists and cannot be read or parsed is an error (contentpack-11), for
+/// the editor and for the launch alike. `Path::exists` is not the test because
+/// it answers `false` for a file it is not allowed to look at, and an empty
+/// list read the launch as "every managed pack was removed".
 pub fn load_content_list(modlist_dir: &Path, content_type: &str) -> Result<ContentList> {
     let path = modlist_dir.join(filename_for_type(content_type));
-    if !path.exists() {
-        return Ok(ContentList {
-            content_type: content_type.to_string(),
-            entries: vec![],
-            groups: vec![],
-        });
-    }
-    let contents =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ContentList {
+                content_type: content_type.to_string(),
+                entries: vec![],
+                groups: vec![],
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()))
+        }
+    };
     let mut list: ContentList = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     normalize_rule_versions(&mut list);
@@ -382,6 +391,33 @@ pub fn save_content_version_rules_command(
 mod tests {
     use super::{load_content_list, validate_content_modlist_name};
     use crate::rules::VersionRuleKind;
+
+    /// contentpack-11: a missing list is an empty one, a broken one is an
+    /// error — never an empty list the launch would read as "remove all".
+    #[test]
+    fn only_a_missing_list_is_empty_and_a_broken_one_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "cubic-launcher-content-broken-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mod-list dir");
+
+        let missing = load_content_list(&dir, "shader").expect("a missing list loads");
+        assert!(missing.entries.is_empty());
+
+        std::fs::write(
+            dir.join("resourcepacks.json"),
+            "{\"content_type\": \"resourcep",
+        )
+        .expect("broken list file");
+        let error = load_content_list(&dir, "resourcepack").expect_err("a broken list is an error");
+        assert!(format!("{error:#}").contains("resourcepacks.json"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn content_command_rejects_traversal_modlist_name() {

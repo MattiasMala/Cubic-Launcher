@@ -47,6 +47,9 @@ export function useContentTabState(props: ContentTabViewProps) {
   const [editingGroupId, setEditingGroupId] = createSignal<string | null>(null);
   const [groupNameDraft, setGroupNameDraft] = createSignal("");
   const [advancedEntryId, setAdvancedEntryId] = createSignal<string | null>(null);
+  // contentpack-11: the backend's reason when the list file cannot be read.
+  // Shown in place of the empty state, which would claim there is nothing.
+  const [loadError, setLoadError] = createSignal<string | null>(null);
 
   const setListContainerRef = (element: HTMLDivElement | undefined) => {
     listContainerRef = element;
@@ -56,10 +59,19 @@ export function useContentTabState(props: ContentTabViewProps) {
 
   const load = async () => {
     if (!props.modlistName) return;
+    let snap: ContentSnapshotPayload;
     try {
-      const snap = await invoke<ContentSnapshotPayload>("load_content_list_command", {
+      snap = await invoke<ContentSnapshotPayload>("load_content_list_command", {
         input: { modlistName: props.modlistName, contentType: props.type },
       });
+    } catch (err) {
+      setEntries([]);
+      setGroups([]);
+      setLoadError(String(err));
+      return;
+    }
+    setLoadError(null);
+    try {
       const list: ContentEntry[] = (snap.entries ?? []).map(entry => ({
         id: entry.id,
         source: entry.source,
@@ -93,8 +105,8 @@ export function useContentTabState(props: ContentTabViewProps) {
       if (modrinthIds.length === 0) return;
       await fetchContentProjects(modrinthIds);
     } catch {
-      setEntries([]);
-      setGroups([]);
+      // Names and icons only: the list itself is already on screen, and a
+      // row without its Modrinth title still shows its id.
     }
   };
 
@@ -613,6 +625,7 @@ export function useContentTabState(props: ContentTabViewProps) {
     isDraggingGroup,
     isEntryResolved,
     label,
+    loadError,
     meta,
     previewGroupRowTranslates,
     previewTranslates,
