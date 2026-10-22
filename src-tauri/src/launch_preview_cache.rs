@@ -30,41 +30,6 @@ use crate::rules::ModSource;
 
 use super::{emit_log, emit_progress, jar_metadata_allows_target, DownloadArtifact, SelectedMod};
 
-pub(super) async fn ensure_remote_version_cached(
-    http_client: &reqwest::Client,
-    launcher_paths: &LauncherPaths,
-    version: &ModrinthVersion,
-    target: &ResolutionTarget,
-) -> Result<PathBuf> {
-    let record = cache_record_from_version(version, target)?;
-    let destination_path =
-        cached_artifact_path_for_record(launcher_paths.mods_cache_dir(), &record);
-
-    let file = version.primary_file().with_context(|| {
-        format!(
-            "version '{}' for project '{}' does not expose a primary file",
-            version.id, version.project_id
-        )
-    })?;
-    match file.hashes.get("sha1").map(String::as_str) {
-        Some(hash) => {
-            crate::minecraft_downloader::download_file_verified(
-                http_client,
-                &file.url,
-                &destination_path,
-                hash,
-            )
-            .await?
-        }
-        None if !destination_path.exists() => {
-            download_file(http_client, &file.url, &destination_path).await?
-        }
-        None => {}
-    }
-
-    Ok(destination_path)
-}
-
 pub(super) fn load_cached_mod_record_for_target(
     launcher_paths: &LauncherPaths,
     project_id: &str,
@@ -721,34 +686,64 @@ mod tests {
         path.with_file_name(name)
     }
 
+    /// D3 on the code a launch actually runs (audit 101, risoluzione-9): a
+    /// registered jar truncated in the cache is not handed to the launch, the
+    /// probe reports it missing, and the download stage restores the
+    /// registered version over it from the row alone.
     #[tokio::test]
-    async fn a_truncated_cached_mod_is_not_returned_to_the_launch() {
+    async fn a_truncated_cached_mod_is_restored_by_the_launch_download_stage() {
         let root = scratch_root("truncated-mod");
         let paths = LauncherPaths::new(&root);
-        let complete = b"the complete mod jar";
-        let (url, requests) = fixed_server(complete);
-        let version = version(&url, complete);
-        let destination = paths.remote_mod_artifact_path(
-            target().mod_loader.as_modrinth_loader(),
-            &version.id,
-            "complete.jar",
-        );
+        crate::database::initialize_database(paths.database_path()).expect("database");
+        let complete = crate::mod_cache::test_jar_bytes("the complete mod jar");
+        let body: &'static [u8] = Box::leak(complete.clone().into_boxed_slice());
+        let (url, requests) = fixed_server(body);
+        let version = version(&url, body);
+        let connection = Connection::open(paths.database_path()).expect("database opens");
+        let repository = SqliteModCacheRepository::new(&connection, paths.mods_cache_dir());
+        let record = repository
+            .upsert_modrinth_version(&version, &target())
+            .expect("the version is registered");
+        let destination = cached_artifact_path_for_record(paths.mods_cache_dir(), &record);
         fs::create_dir_all(destination.parent().expect("cache parent")).expect("cache parent");
-        fs::write(&destination, b"the complete").expect("truncated cache fixture");
+        fs::write(&destination, &complete[..complete.len() / 2]).expect("truncated fixture");
 
-        let returned =
-            ensure_remote_version_cached(&reqwest::Client::new(), &paths, &version, &target())
-                .await
-                .expect("the corrupt cache entry should be repaired");
+        let probe = repository
+            .probe_version(&version.id, &target())
+            .expect("the probe answers");
+        let CacheProbe::JarMissing(registered) = probe else {
+            panic!("a truncated jar must not count as cached, got {probe:?}");
+        };
+        let pending = pending_download_from_record(&registered).expect("restorable from the row");
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        download_artifact_streaming(
+            &reqwest::Client::new(),
+            &DownloadArtifact {
+                filename: pending.jar_filename.clone(),
+                url: pending.download_url.clone(),
+                destination_path: crate::mod_cache::cached_artifact_path_for_pending_download(
+                    paths.mods_cache_dir(),
+                    &pending,
+                ),
+                file_hash: pending.file_hash.clone(),
+                file_size: pending.file_size,
+            },
+            progress_tx,
+        )
+        .await
+        .expect("the registered version is restored");
 
-        assert_eq!(returned, destination);
-        assert_eq!(fs::read(&returned).expect("launch-visible jar"), complete);
         assert_eq!(
-            requests.load(Ordering::SeqCst),
-            1,
-            "the truncated jar must not suppress its replacement"
+            fs::read(&destination).expect("launch-visible jar"),
+            complete
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!partial_path(&destination).exists());
+        assert!(matches!(
+            repository.probe_version(&version.id, &target()),
+            Ok(CacheProbe::Ready(_))
+        ));
+        drop(connection);
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 

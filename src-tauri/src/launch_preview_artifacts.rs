@@ -18,10 +18,8 @@ use crate::resolver::{
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
-    embedded_minecraft_requirements_match, emit_launcher_issue, emit_log,
-    ensure_remote_version_cached, load_cached_file_hashes_for_selected,
-    probe_cached_mod_for_target, probe_cached_version_for_target,
-    read_embedded_fabric_requirements, SelectedMod,
+    emit_launcher_issue, emit_log, load_cached_file_hashes_for_selected,
+    probe_cached_mod_for_target, probe_cached_version_for_target, SelectedMod,
 };
 
 pub(super) struct TopLevelVersionCandidates {
@@ -474,74 +472,6 @@ pub(super) async fn prefetch_ranked_versions_for_selected(
     }
 
     Ok(versions)
-}
-
-pub(super) async fn select_latest_launch_compatible_version(
-    app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
-    client: &ModrinthClient,
-    project_id_or_slug: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModrinthVersion>> {
-    Ok(select_launch_compatible_versions(
-        app_handle,
-        launcher_paths,
-        http_client,
-        client,
-        project_id_or_slug,
-        target,
-    )
-    .await?
-    .into_iter()
-    .next())
-}
-
-pub(super) async fn select_launch_compatible_versions(
-    app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
-    client: &ModrinthClient,
-    project_id_or_slug: &str,
-    target: &ResolutionTarget,
-) -> Result<Vec<ModrinthVersion>> {
-    let mut versions = client
-        .fetch_project_versions(project_id_or_slug, target)
-        .await?;
-    crate::modrinth::sort_versions_by_target_preference(&mut versions, target);
-
-    let mut compatible_versions = Vec::new();
-    for version in versions {
-        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, &version, target)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to cache '{}' candidate version '{}'",
-                    project_id_or_slug, version.id
-                )
-            })?;
-        let requirements = read_embedded_fabric_requirements(&jar_path)?;
-        if requirements.entries.is_empty()
-            || embedded_minecraft_requirements_match(&requirements, target)
-        {
-            compatible_versions.push(version);
-            continue;
-        }
-
-        let _ = emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            format!(
-                "[Launch] skipping remote version '{}' for '{}': embedded metadata is incompatible with {} / {}",
-                version.version_number,
-                project_id_or_slug,
-                target.minecraft_version,
-                target.mod_loader.as_modrinth_loader()
-            ),
-        );
-    }
-
-    Ok(compatible_versions)
 }
 
 /// `unavailable` are the mods the availability pass disabled: their slot

@@ -641,7 +641,20 @@ impl SqliteModCacheRepository<'_> {
 
         let artifact_path = cached_artifact_path_for_record(&self.mods_cache_dir, &record);
         if artifact_path.exists() {
-            return Ok(Some(record));
+            // Esserci non basta (audit 101, risoluzione-9; todo.md:1519): un
+            // jar troncato da un kill prima di D3, o rovinato dopo, arrivava al
+            // lancio e lo fermava a ogni avvio con «failed to read JAR
+            // metadata». Uno zip che non si apre è come un jar sparito: la
+            // riga resta, il probe dice `JarMissing`, e online il lancio lo
+            // riscarica alla versione registrata; offline il mod esce dal
+            // lancio con il suo motivo. Il file si toglie, così «sparito» è
+            // vero anche su disco; se non si riesce (un file aperto su
+            // Windows) il download lo sostituisce comunque per rename.
+            if jar_is_readable(&artifact_path) {
+                return Ok(Some(record));
+            }
+            fs::remove_file(&artifact_path).ok();
+            return Ok(None);
         }
 
         let legacy_path = legacy_cached_artifact_path(&self.mods_cache_dir, &record.jar_filename);
@@ -665,6 +678,30 @@ impl SqliteModCacheRepository<'_> {
         move_or_copy_file(&legacy_path, &artifact_path)?;
         Ok(Some(record))
     }
+}
+
+/// Whether `path` opens as a zip archive. The central directory sits at the
+/// end of the file, so a truncated jar fails here; a jar that opens is what
+/// the metadata readers of the launch need (`launch_preview_fabric.rs`).
+pub fn jar_is_readable(path: &Path) -> bool {
+    fs::File::open(path)
+        .ok()
+        .is_some_and(|file| zip::ZipArchive::new(file).is_ok())
+}
+
+/// A minimal valid jar, for the tests that put an artifact in the cache.
+#[cfg(test)]
+pub(crate) fn test_jar_bytes(marker: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file("marker.txt", zip::write::FileOptions::default())
+        .expect("zip entry should start");
+    writer
+        .write_all(marker.as_bytes())
+        .expect("zip entry should be written");
+    writer.finish().expect("zip should finish").into_inner()
 }
 
 fn legacy_file_matches_record(path: &Path, record: &ModCacheRecord) -> Result<bool> {
@@ -971,7 +1008,7 @@ mod tests {
                 .expect("artifact parent directory should exist"),
         )
         .expect("artifact parent directory should be created");
-        fs::write(&artifact_path, b"jar").expect("jar should be written");
+        fs::write(&artifact_path, super::test_jar_bytes("jar")).expect("jar should be written");
 
         let record = repository
             .find_by_version_id("version-1", &target())
@@ -980,6 +1017,41 @@ mod tests {
 
         assert_eq!(record.modrinth_project_id, "sodium");
         assert_eq!(record.jar_filename, "sodium.jar");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Audit 101, risoluzione-9: a jar that does not open is not a cache hit,
+    /// it is a jar to restore — and it does not stay in the way.
+    #[test]
+    fn an_unreadable_cached_jar_counts_as_missing_and_is_cleared() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let record = repository
+            .upsert_modrinth_version(&version("sodium", "version-1", "sodium.jar"), &target())
+            .expect("cache record should insert");
+        let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &record);
+        fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
+            .expect("artifact parent should be created");
+        let whole = super::test_jar_bytes("sodium");
+        fs::write(&artifact_path, &whole[..whole.len() - 10]).expect("truncated jar");
+
+        assert!(repository
+            .find_by_version_id("version-1", &target())
+            .expect("lookup should succeed")
+            .is_none());
+        assert!(matches!(
+            repository.probe_project("sodium", &target()),
+            Ok(CacheProbe::JarMissing(_))
+        ));
+        assert!(!artifact_path.exists(), "the unreadable jar is cleared");
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
@@ -1016,8 +1088,8 @@ mod tests {
             .expect("old artifact parent should be created");
         fs::create_dir_all(new_path.parent().expect("new parent should exist"))
             .expect("new artifact parent should be created");
-        fs::write(old_path, b"old").expect("old jar should exist");
-        fs::write(new_path, b"new").expect("new jar should exist");
+        fs::write(old_path, super::test_jar_bytes("old")).expect("old jar should exist");
+        fs::write(new_path, super::test_jar_bytes("new")).expect("new jar should exist");
 
         let record = repository
             .find_compatible_by_project("sodium", &target())
@@ -1060,7 +1132,7 @@ mod tests {
                 .expect("artifact parent should exist"),
         )
         .expect("artifact parent should be created");
-        fs::write(artifact_path, b"jar").expect("jar should exist");
+        fs::write(artifact_path, super::test_jar_bytes("jar")).expect("jar should exist");
 
         let record = repository
             .find_compatible_by_project_or_alias("sodium", &target())
@@ -1325,7 +1397,7 @@ mod tests {
                 .expect("artifact parent directory should exist"),
         )
         .expect("artifact parent directory should be created");
-        fs::write(&artifact_path, b"jar").expect("jar should be written");
+        fs::write(&artifact_path, super::test_jar_bytes("jar")).expect("jar should be written");
     }
 
     #[test]

@@ -1090,7 +1090,8 @@ mod tests {
                     &record,
                 );
                 std::fs::create_dir_all(path.parent().unwrap()).expect("jar directory");
-                std::fs::write(&path, b"jar").expect("write the jar");
+                std::fs::write(&path, crate::mod_cache::test_jar_bytes("jar"))
+                    .expect("write the jar");
             }
         };
         // `sodium` è già registrato da `offline_root`, col jar sparito.
