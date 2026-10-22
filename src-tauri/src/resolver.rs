@@ -660,6 +660,7 @@ pub async fn resolve_modlist_command(
         &modlist,
     );
     let client = ModrinthClient::new();
+    let _one_check_at_a_time = availability_check_guard(&modlist_name, &target).await;
     let mut pass =
         AvailabilityFixpoint::pinned(&modlist, pins, &target).map_err(|e| e.to_string())?;
     loop {
@@ -728,21 +729,16 @@ where
 
     let mut answers = cached.clone();
     if !uncached.is_empty() {
-        let checked = check_availability_concurrently(uncached, 10, check).await;
-        let to_persist = checked
-            .iter()
-            .map(|(mod_id, available)| {
-                (
-                    mod_id.clone(),
-                    target.minecraft_version.clone(),
-                    loader_key.to_string(),
-                    *available,
-                )
-            })
-            .collect::<Vec<_>>();
-        if !to_persist.is_empty() {
-            db_availability_set(db_path, &to_persist);
-        }
+        let checked = check_availability_persisting(uncached, 10, check, |mod_id, available| {
+            persist_availability_answer(
+                db_path,
+                mod_id,
+                &target.minecraft_version,
+                loader_key,
+                available,
+            )
+        })
+        .await;
         answers.extend(checked);
     }
 
@@ -907,6 +903,8 @@ where
     }
 }
 
+/// The answers without a sink: what the tests of the concurrency bound use.
+#[cfg(test)]
 async fn check_availability_concurrently<Check, Fut>(
     mod_ids: Vec<String>,
     permits: usize,
@@ -915,6 +913,25 @@ async fn check_availability_concurrently<Check, Fut>(
 where
     Check: Fn(String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
+{
+    check_availability_persisting(mod_ids, permits, check, |_, _| {}).await
+}
+
+/// `check_availability_concurrently`, handing each answer to `on_answer` as
+/// soon as it arrives (audit 101, r2-scala-mod-list-grandi-1). Writing the
+/// whole batch at the end left a second check that started meanwhile — a
+/// toggle during the first resolution — with an empty cache, and it asked
+/// every mod again.
+async fn check_availability_persisting<Check, Fut, OnAnswer>(
+    mod_ids: Vec<String>,
+    permits: usize,
+    check: Check,
+    mut on_answer: OnAnswer,
+) -> Vec<(String, bool)>
+where
+    Check: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
+    OnAnswer: FnMut(&str, bool),
 {
     let mut tasks = tokio::task::JoinSet::new();
     let semaphore = Arc::new(Semaphore::new(permits));
@@ -934,10 +951,92 @@ where
     let mut results = Vec::new();
     while let Some(join_result) = tasks.join_next().await {
         if let Ok(Some(result)) = join_result {
+            on_answer(&result.0, result.1);
             results.push(result);
         }
     }
     results
+}
+
+/// One availability check per (mod list, target) at a time (audit 101,
+/// r2-scala-mod-list-grandi-1). The editor starts two — the background
+/// backfill and the resolution — on the same ids, and a toggle starts a third;
+/// each read the cache before the others had written it and asked Modrinth
+/// for everything, 2×N requests and more against a limit of 300 a minute.
+/// Serialised, the second one finds the first one's answers in the cache.
+async fn availability_check_guard(
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+
+    let key = format!(
+        "{modlist_name}\u{0}{}\u{0}{}",
+        target.minecraft_version,
+        target.mod_loader.as_modrinth_loader()
+    );
+    let lock = {
+        let mut locks = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.entry(key).or_default().clone()
+    };
+    lock.lock_owned().await
+}
+
+/// The (mod, target) pairs Modrinth was asked about since the app started.
+/// The backfill re-checks a mod cached as unavailable — authors add versions
+/// later — but once per session, not at every edit that reloads the editor
+/// (audit 101, r2-scala-mod-list-grandi-1).
+fn asked_this_session() -> &'static std::sync::Mutex<HashSet<(String, String, String)>> {
+    static ASKED: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String, String)>>> =
+        std::sync::OnceLock::new();
+    ASKED.get_or_init(Default::default)
+}
+
+fn mark_asked_this_session(mod_id: &str, mc_version: &str, loader: &str) {
+    asked_this_session()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((
+            mod_id.to_string(),
+            mc_version.to_string(),
+            loader.to_string(),
+        ));
+}
+
+fn was_asked_this_session(mod_id: &str, mc_version: &str, loader: &str) -> bool {
+    asked_this_session()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(
+            mod_id.to_string(),
+            mc_version.to_string(),
+            loader.to_string(),
+        ))
+}
+
+/// Persist one answer as it arrives, and remember it was asked.
+fn persist_availability_answer(
+    db_path: &Path,
+    mod_id: &str,
+    mc_version: &str,
+    loader: &str,
+    available: bool,
+) {
+    mark_asked_this_session(mod_id, mc_version, loader);
+    db_availability_set(
+        db_path,
+        &[(
+            mod_id.to_string(),
+            mc_version.to_string(),
+            loader.to_string(),
+            available,
+        )],
+    );
 }
 
 fn merge_backfill_entries(
@@ -994,29 +1093,33 @@ pub async fn backfill_availability(
         return Ok(BackfillOutcome::default());
     }
 
+    let target = ResolutionTarget {
+        minecraft_version: mc_version.to_string(),
+        mod_loader: parsed_loader,
+    };
+    let _one_check_at_a_time = availability_check_guard(modlist_name, &target).await;
+
     let db_path = launcher_paths.database_path();
     let cached = db_availability_get(db_path, &all_modrinth_ids, mc_version, mod_loader);
     // Only skip mods that are cached as *available*. Mods cached as
     // unavailable are re-checked because mod authors frequently add
-    // version support after initial release.
+    // version support after initial release — once per session, not at every
+    // reload of the editor (audit 101, r2-scala-mod-list-grandi-1).
     let skip_ids: HashSet<String> = cached
         .iter()
-        .filter(|(_, available)| *available)
+        .filter(|(id, available)| *available || was_asked_this_session(id, mc_version, mod_loader))
         .map(|(id, _)| id.clone())
         .collect();
+    let mut seen_ids = HashSet::new();
     let ids_to_check = all_modrinth_ids
         .into_iter()
-        .filter(|id| !skip_ids.contains(id))
+        .filter(|id| !skip_ids.contains(id) && seen_ids.insert(id.clone()))
         .collect::<Vec<_>>();
 
     if ids_to_check.is_empty() {
         return Ok(BackfillOutcome::default());
     }
 
-    let target = ResolutionTarget {
-        minecraft_version: mc_version.to_string(),
-        mod_loader: parsed_loader,
-    };
     // Opening or querying mod_cache may fail; fall back to per-project requests.
     let hash_by_mod_id =
         load_cached_hashes_for_backfill(launcher_paths, &ids_to_check, &target).unwrap_or_default();
@@ -1048,12 +1151,34 @@ pub async fn backfill_availability(
         );
     }
 
+    // Each answer reaches the cache as soon as it is known (audit 101,
+    // r2-scala-mod-list-grandi-1): the bulk ones now, the per-project ones one
+    // by one, so a check that runs next finds them.
+    let bulk_entries = bulk_outcome
+        .available_mod_ids
+        .iter()
+        .map(|mod_id| {
+            mark_asked_this_session(mod_id, mc_version, mod_loader);
+            (
+                mod_id.clone(),
+                mc_version.to_string(),
+                mod_loader.to_string(),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !bulk_entries.is_empty() {
+        db_availability_set(db_path, &bulk_entries);
+    }
+
     let per_project_request_count = bulk_outcome.per_project_mod_ids.len();
     let check_client = client.clone();
     let check_target = target.clone();
     // Match resolve_modlist_command's limit so both paths share the same API pressure.
-    let per_project =
-        check_availability_concurrently(bulk_outcome.per_project_mod_ids, 10, move |mod_id| {
+    let per_project = check_availability_persisting(
+        bulk_outcome.per_project_mod_ids,
+        10,
+        move |mod_id| {
             let client = check_client.clone();
             let target = check_target.clone();
             async move {
@@ -1062,23 +1187,13 @@ pub async fn backfill_availability(
                     .await
                     .map(|versions| !versions.is_empty())
             }
-        })
-        .await;
+        },
+        |mod_id, available| {
+            persist_availability_answer(db_path, mod_id, mc_version, mod_loader, available)
+        },
+    )
+    .await;
     let persisted = merge_backfill_entries(&bulk_outcome.available_mod_ids, &per_project);
-    let entries = persisted
-        .iter()
-        .map(|(mod_id, available)| {
-            (
-                mod_id.clone(),
-                mc_version.to_string(),
-                mod_loader.to_string(),
-                *available,
-            )
-        })
-        .collect::<Vec<_>>();
-    if !entries.is_empty() {
-        db_availability_set(db_path, &entries);
-    }
 
     Ok(BackfillOutcome {
         persisted,
@@ -1368,6 +1483,94 @@ mod tests {
         assert!(!persisted
             .iter()
             .any(|(mod_id, _available)| mod_id == "broken-mod"));
+    }
+
+    /// Audit 101, r2-scala-mod-list-grandi-1: each answer reaches its sink as
+    /// it arrives, and a failed question is no answer.
+    #[tokio::test]
+    async fn every_answer_is_handed_over_as_it_arrives() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let answers = check_availability_persisting(
+            vec!["sodium".into(), "broken".into(), "iris".into()],
+            2,
+            |mod_id| async move {
+                match mod_id.as_str() {
+                    "broken" => Err(anyhow::anyhow!("request failed")),
+                    "iris" => Ok(false),
+                    _ => Ok(true),
+                }
+            },
+            move |mod_id, available| sink.lock().unwrap().push((mod_id.to_string(), available)),
+        )
+        .await;
+
+        let mut handed = seen.lock().unwrap().clone();
+        handed.sort();
+        let mut returned = answers;
+        returned.sort();
+        assert_eq!(handed, returned);
+        assert_eq!(
+            handed,
+            vec![("iris".to_string(), false), ("sodium".to_string(), true)]
+        );
+    }
+
+    /// Two checks of one mod list on one target run one after the other; on
+    /// another target they do not wait for each other.
+    #[tokio::test]
+    async fn one_availability_check_per_modlist_and_target_at_a_time() {
+        let fabric = target();
+        let first = availability_check_guard("Scale Pack", &fabric).await;
+
+        let waiting = tokio::spawn({
+            let fabric = fabric.clone();
+            async move {
+                let _second = availability_check_guard("Scale Pack", &fabric).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the second check must wait for the first"
+        );
+
+        let other_target = ResolutionTarget {
+            minecraft_version: format!("{}-other", fabric.minecraft_version),
+            ..fabric.clone()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability_check_guard("Scale Pack", &other_target),
+        )
+        .await
+        .expect("another target does not wait");
+
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the second check runs once the first is done")
+            .expect("task");
+    }
+
+    #[test]
+    fn a_mod_asked_once_is_remembered_for_the_session() {
+        assert!(!was_asked_this_session(
+            "session-mod",
+            "1.20.1",
+            "fabric-session-test"
+        ));
+        mark_asked_this_session("session-mod", "1.20.1", "fabric-session-test");
+        assert!(was_asked_this_session(
+            "session-mod",
+            "1.20.1",
+            "fabric-session-test"
+        ));
+        assert!(!was_asked_this_session(
+            "session-mod",
+            "1.21.1",
+            "fabric-session-test"
+        ));
     }
 
     /// The bug this pass exists to close: the per-project stage used to spawn
