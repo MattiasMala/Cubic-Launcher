@@ -8,12 +8,17 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::launcher_paths::LauncherPaths;
 
 /// Sits next to the database. Held for the whole life of the process; the
 /// system releases it when the process ends, crash or not.
 const INSTANCE_LOCK_FILENAME: &str = "launcher.lock";
+
+/// How long a busy lock is retried before saying another launcher has it. The
+/// restart after an update starts the new process before the old one is gone.
+const INSTANCE_LOCK_PATIENCE: Duration = Duration::from_secs(5);
 
 /// The data folder, ready for the app, and the lock that keeps a second
 /// launcher out of it (concorrenza-5).
@@ -91,6 +96,13 @@ pub(crate) fn launcher_root(identifier: &str) -> Result<PathBuf, StartupFailure>
 }
 
 pub(crate) fn prepare_launcher_data(root: PathBuf) -> Result<LauncherData, StartupFailure> {
+    prepare_launcher_data_within(root, INSTANCE_LOCK_PATIENCE)
+}
+
+fn prepare_launcher_data_within(
+    root: PathBuf,
+    lock_patience: Duration,
+) -> Result<LauncherData, StartupFailure> {
     let paths = LauncherPaths::new(root);
 
     paths.create_required_directories().map_err(|error| {
@@ -103,7 +115,7 @@ pub(crate) fn prepare_launcher_data(root: PathBuf) -> Result<LauncherData, Start
 
     // Before the database: a second launcher must not migrate it under the
     // first one. Creating the file is also the first real write in the folder.
-    let instance_lock = acquire_instance_lock(paths.root_dir())?;
+    let instance_lock = acquire_instance_lock(paths.root_dir(), lock_patience)?;
 
     crate::debug_trace::reset_debug_trace_at_startup(paths.root_dir());
 
@@ -140,7 +152,7 @@ pub(crate) fn prepare_launcher_data(root: PathBuf) -> Result<LauncherData, Start
     })
 }
 
-fn acquire_instance_lock(root: &Path) -> Result<InstanceLock, StartupFailure> {
+fn acquire_instance_lock(root: &Path, patience: Duration) -> Result<InstanceLock, StartupFailure> {
     let lock_path = root.join(INSTANCE_LOCK_FILENAME);
     let file = OpenOptions::new()
         .create(true)
@@ -155,16 +167,26 @@ fn acquire_instance_lock(root: &Path) -> Result<InstanceLock, StartupFailure> {
             )
         })?;
 
-    match file.try_lock() {
-        Ok(()) => Ok(InstanceLock { _file: file }),
-        Err(TryLockError::WouldBlock) => Err(StartupFailure::AlreadyRunning {
-            root: root.to_path_buf(),
-        }),
-        Err(TryLockError::Error(error)) => Err(StartupFailure::unusable(
-            "The launcher could not lock its data folder.",
-            &lock_path,
-            error,
-        )),
+    let deadline = Instant::now() + patience;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(InstanceLock { _file: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(StartupFailure::AlreadyRunning {
+                    root: root.to_path_buf(),
+                })
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(StartupFailure::unusable(
+                    "The launcher could not lock its data folder.",
+                    &lock_path,
+                    error,
+                ))
+            }
+        }
     }
 }
 
@@ -206,7 +228,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{prepare_launcher_data, StartupFailure};
+    use std::time::Duration;
+
+    use super::{prepare_launcher_data, prepare_launcher_data_within, StartupFailure};
 
     fn temp_root(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -234,7 +258,7 @@ mod tests {
         let root = temp_root("second");
         let first = prepare_launcher_data(root.clone()).expect("the first launcher starts");
 
-        let second = prepare_launcher_data(root.clone());
+        let second = prepare_launcher_data_within(root.clone(), Duration::from_millis(300));
         match second {
             Err(StartupFailure::AlreadyRunning { root: reported }) => assert_eq!(reported, root),
             Err(other) => panic!("expected AlreadyRunning, got {other:?}"),
@@ -245,6 +269,22 @@ mod tests {
         drop(first);
         let third = prepare_launcher_data(root.clone()).expect("the lock goes with the process");
         drop(third);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_launcher_restarting_after_an_update_waits_for_the_old_one_to_go() {
+        let root = temp_root("restart");
+        let old = prepare_launcher_data(root.clone()).expect("the old launcher starts");
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(old);
+        });
+
+        let new = prepare_launcher_data_within(root.clone(), Duration::from_secs(5))
+            .expect("the lock is free before the patience runs out");
+        leaving.join().unwrap();
+        drop(new);
         let _ = fs::remove_dir_all(&root);
     }
 
