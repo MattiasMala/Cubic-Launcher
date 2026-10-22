@@ -20,14 +20,13 @@ use crate::minecraft_downloader::{
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
 use crate::process_streaming::{
-    stop_process, ProcessExitSignal, ProcessLogStream, StopOutcome, GRACEFUL_STOP_TIMEOUT,
+    stop_process, ProcessLogStream, StopOutcome, GRACEFUL_STOP_TIMEOUT,
 };
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 use crate::worlds::quick_play_arguments;
 
 use std::path::Path;
-use std::sync::Mutex;
 
 #[path = "launch_preview_fabric.rs"]
 pub(crate) mod fabric;
@@ -84,18 +83,20 @@ mod loader_cache;
 mod runtime;
 use runtime::*;
 
+#[path = "launch_preview_slot.rs"]
+mod slot;
+pub use slot::LaunchStatus;
+
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 
-/// The currently running Minecraft process, so that it can be stopped. The
-/// monitor clears it when the process exits, and only then (windows-1): a STOP
-/// that fails leaves it there, and the next STOP can try again.
-static ACTIVE_MC: Mutex<Option<RunningMinecraft>> = Mutex::new(None);
+/// The launch of this process: preparing, then the PID of the running game
+/// and its exit signal (concorrenza-4). The exit monitor clears it when the
+/// process has really exited, and only then (windows-1): a STOP that fails
+/// leaves it there, and the next STOP can try again.
+static ACTIVE_LAUNCH: slot::LaunchSlot = slot::LaunchSlot::new();
 
-pub(super) struct RunningMinecraft {
-    pub(super) pid: u32,
-    pub(super) exit_signal: ProcessExitSignal,
-}
-
+/// Refuses a second launch while one is being prepared or its game is still
+/// running: both would work on the same instance (concorrenza-4).
 #[tauri::command]
 pub fn start_launch_command(
     app_handle: tauri::AppHandle,
@@ -103,9 +104,13 @@ pub fn start_launch_command(
     request: LaunchRequest,
 ) -> Result<(), String> {
     let launcher_paths = launcher_paths.inner().clone();
+    let preparing = ACTIVE_LAUNCH.claim()?;
 
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_launch_pipeline(app_handle.clone(), launcher_paths, request).await {
+        let outcome = run_launch_pipeline(app_handle.clone(), launcher_paths, request).await;
+        // On success the PID is already in the slot: the spawn put it there.
+        drop(preparing);
+        if let Err(error) = outcome {
             let detail = format!("{error:#}");
             let _ = emit_launch_failure(&app_handle, &detail);
             set_active_launch_log_session(None);
@@ -140,6 +145,13 @@ pub async fn update_precheck_command(
     run_update_precheck(&app_handle, &launcher_paths, request)
         .await
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Whether a launch is under way, read by the frontend at boot: after a
+/// webview reload the panel shows STOP again instead of PLAY (concorrenza-4).
+#[tauri::command]
+pub fn launch_status_command() -> LaunchStatus {
+    ACTIVE_LAUNCH.status()
 }
 
 /// Stops the currently running Minecraft process, if any: first by asking it
@@ -188,11 +200,7 @@ pub fn last_profile_recording_command() -> Option<String> {
 }
 
 pub(super) fn current_minecraft_pid() -> Option<u32> {
-    ACTIVE_MC
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|running| running.pid)
+    ACTIVE_LAUNCH.running_pid()
 }
 
 pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
@@ -221,13 +229,7 @@ pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -
 /// Ferma `pid` se è ancora il Minecraft in corso: prima con garbo, poi con la
 /// forza (windows-1). Un PID che non è più tracciato è già uscito.
 pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<StopOutcome> {
-    let exit_signal = ACTIVE_MC
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|running| running.pid == pid)
-        .map(|running| running.exit_signal.clone());
-    let Some(exit_signal) = exit_signal else {
+    let Some(exit_signal) = ACTIVE_LAUNCH.exit_signal_of(pid) else {
         return Ok(StopOutcome::AlreadyExited);
     };
     stop_process(pid, &exit_signal, GRACEFUL_STOP_TIMEOUT)

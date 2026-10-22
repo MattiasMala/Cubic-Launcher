@@ -5,7 +5,7 @@
 // put the write path in `store-actions.ts` or a feature-level handler.
 
 import { createMemo } from "solid-js";
-import type { FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
+import type { AccountSummary, FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
 import {
   downloadItems,
   accounts,
@@ -29,7 +29,15 @@ import {
   selectedModListName,
   tagFilter,
   advancedPanelModId,
+  updateCheckRunning,
 } from "./store-state";
+
+/**
+ * From Play to the spawn: the pre-check and the launch work on the selection
+ * Play was pressed with, so the version, the loader, the mod list and the
+ * account cannot change under them (precheck-1).
+ */
+export const launchPreparing = () => updateCheckRunning() || launchState() === "resolving";
 
 function collectRowsRecursive(rows: ModRow[], map: Map<string, ModRow>) {
   for (const row of rows) {
@@ -48,9 +56,25 @@ export const selectedModList = createMemo(() =>
   modListCards().find(card => card.name === selectedModListName()) ?? modListCards()[0] ?? null
 );
 
+// No fallback to the first row: the launch uses the active row and nothing
+// else, so with no active row the interface must not show one either
+// (todo.md:1390).
 export const activeAccount = createMemo(() =>
-  accounts().find(account => account.id === activeAccountId()) ?? accounts()[0] ?? null
+  accounts().find(account => account.id === activeAccountId()) ?? null
 );
+
+/**
+ * The active account plays offline (D115), so the app makes no request of its
+ * own (D140): no metadata, no search, no avatars. The backend checks the same
+ * choice for the requests it makes, from the database.
+ */
+export const activePlaysOffline = createMemo(() => activeAccount()?.playsOffline ?? false);
+
+/** An account's avatar, or none while the active account plays offline (D140): the initials stand in. */
+export function accountAvatarUrl(account: AccountSummary | null | undefined): string | undefined {
+  if (!account || activePlaysOffline()) return undefined;
+  return account.avatarUrl;
+}
 
 export const selectedCount = createMemo(() => selectedIds().length);
 

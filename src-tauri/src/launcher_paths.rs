@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::database::DATABASE_FILENAME;
 
@@ -170,7 +170,8 @@ impl LauncherPaths {
             &self.skins_dir,
             &self.worlds_dir,
         ] {
-            fs::create_dir_all(directory)?;
+            fs::create_dir_all(directory)
+                .with_context(|| format!("failed to create {}", directory.display()))?;
         }
 
         Ok(())

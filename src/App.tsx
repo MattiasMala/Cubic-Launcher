@@ -17,16 +17,16 @@ import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   activeRailView, setActiveRailView, setQuickPlayWorldFolder, quickPlayWorldFolder,
-  modRowsState, setModRowsState, setActiveAccountId,
+  modRowsState, setModRowsState, activeAccountId, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
-  setLaunchLogs,
+  appendLaunchLog,
   modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   globalSettings, setGlobalSettings, setModlistOverrides,
-  pushUiError, resetLaunchUiState,
+  pushUiError, resetLaunchUiState, launchPreparing, activePlaysOffline,
   setAestheticGroups, setFunctionalGroups,
   setSavedIncompatibilities,
   setSavedLinks,
@@ -132,6 +132,8 @@ export default function App() {
 
     void (async () => {
       try {
+        // With the active account playing offline the backend asks nobody
+        // and answers `offline` (D140), which needs nothing here.
         const result = await invoke<UpdateCheckResponse>("check_for_updates");
         if (result.status === "available" && result.version) {
           setUpdateInfo({
@@ -152,7 +154,17 @@ export default function App() {
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
+  // precheck-1: from Play to the spawn the launch works on the selection Play
+  // was pressed with. Switching version, loader, mod list or account in the
+  // meantime installed the builds of one target into the instance of another.
+  const refuseWhileLaunchPreparing = (what: string) => {
+    if (!launchPreparing()) return false;
+    pushUiError({ title: "Launch in progress", message: `${what} can change once the game has started or the launch has stopped.`, detail: "", severity: "warning", scope: "launch" });
+    return true;
+  };
+
   const handleSelectModList = async (name: string) => {
+    if (refuseWhileLaunchPreparing("The mod list")) return;
     logger.info("App", "handleSelectModList started", { name });
     appendDebugTrace("modlist.select", { name });
     setSelectedModListName(name);
@@ -382,14 +394,19 @@ export default function App() {
   };
 
   const handleSwitchAccount = async (id: string) => {
+    if (refuseWhileLaunchPreparing("The account")) return;
+    const previousId = activeAccountId();
     setActiveAccountId(id);
     if (!isTauri()) { logger.warn("App", "handleSwitchAccount skipped — no backend"); return; }
     try {
       await invoke("switch_active_account_command", { microsoftId: id });
-      await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
+      // The backend kept the previous account: so does the interface.
+      setActiveAccountId(previousId);
       pushUiError({ title: "Account switch failed", message: "Could not activate the selected account.", detail: String(err), severity: "error", scope: "account" });
+      return;
     }
+    await loadShellSnapshot(selectedModListName() || null);
   };
 
   const handleCreateModlist = async () => {
@@ -701,6 +718,7 @@ export default function App() {
   };
 
   const handleVersionChange = (version: string) => {
+    if (refuseWhileLaunchPreparing("The Minecraft version")) return;
     const modlistName = selectedModListName();
     setSelectedMcVersion(version);
     const loader = normalizeModLoader(selectedModLoader());
@@ -711,6 +729,7 @@ export default function App() {
   };
 
   const handleLoaderChange = (loader: string) => {
+    if (refuseWhileLaunchPreparing("The mod loader")) return;
     const modlistName = selectedModListName();
     const normalizedLoader = normalizeModLoader(loader);
     setSelectedModLoader(normalizedLoader);
@@ -915,7 +934,17 @@ export default function App() {
     }
   };
 
+  /**
+   * What Play was pressed on, read once before the pre-check's `await` and
+   * handed to the pre-check, the popup and the launch (precheck-1). Reading
+   * the signals again after the await launched whatever the selectors showed
+   * by then.
+   */
+  type LaunchTarget = { modlistName: string; minecraftVersion: string; modLoader: string };
+  let pendingLaunchTarget: LaunchTarget | null = null;
+
   const startLaunch = async (
+    target: LaunchTarget,
     resolvedVersions?: Record<string, string>,
     resolvedContent?: Record<string, Record<string, string>>,
   ) => {
@@ -923,9 +952,9 @@ export default function App() {
     try {
       await invoke("start_launch_command", {
         request: {
-          modlistName: selectedModListName(),
-          minecraftVersion: selectedMcVersion(),
-          modLoader: normalizeModLoader(selectedModLoader()),
+          modlistName: target.modlistName,
+          minecraftVersion: target.minecraftVersion,
+          modLoader: target.modLoader,
           // Omitted, not `undefined`: a request without the field is the
           // pre-feature request, and the backend reads its absence (D19).
           ...(resolvedVersions ? { resolvedVersions } : {}),
@@ -959,28 +988,41 @@ export default function App() {
       return;
     }
     resetLaunchUiState();
+    const target: LaunchTarget = {
+      modlistName: selectedModListName(),
+      minecraftVersion: selectedMcVersion(),
+      modLoader: normalizeModLoader(selectedModLoader()),
+    };
+    // Read with the target: the account cannot change before the launch
+    // starts (precheck-1), and the message below has to describe this one.
+    const playsOffline = activePlaysOffline();
 
     if (isTauri()) {
-      // The pre-check runs before every launch: making it conditional on a
-      // setting is A3. Two commands instead of one widen the double-click
+      // The pre-check command runs before every launch. With an account that
+      // plays online it asks Modrinth whatever the notification setting says
+      // (the setting only decides whether the popup may stop the launch);
+      // with one that plays offline it asks nothing and reads the cache
+      // (D115, D116). Two commands instead of one widen the double-click
       // window, hence the guard above and the disabled Play button.
       setUpdateCheckRunning(true);
       let precheck: UpdatePrecheckResult;
       try {
-        precheck = await invoke<UpdatePrecheckResult>("update_precheck_command", {
-          request: {
-            modlistName: selectedModListName(),
-            minecraftVersion: selectedMcVersion(),
-            modLoader: normalizeModLoader(selectedModLoader()),
-          },
-        });
+        precheck = await invoke<UpdatePrecheckResult>("update_precheck_command", { request: target });
       } catch (err) {
         // D19: an update check must never be the reason the game does not
         // start. No map means the launch picks versions exactly as it did
-        // before this feature existed.
-        pushUiError({ title: "Update check failed", message: "Launching with the versions already in your cache.", detail: String(err), severity: "warning", scope: "launch" });
-        setLaunchLogs(current => [...current, `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`]);
-        await startLaunch();
+        // before this feature existed — and the message says what that is
+        // (todo.md:1492). An account that plays offline reads the cache
+        // (D115); any other resolves again online, and a mod with a newer
+        // build is updated without the popup.
+        const message = playsOffline
+          ? "Launching with the versions already in your cache."
+          : "The launch looks the mods up again and may install newer versions without asking.";
+        pushUiError({ title: "Update check failed", message, detail: String(err), severity: "warning", scope: "launch" });
+        appendLaunchLog(playsOffline
+          ? `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`
+          : `[Launcher] WARN update check failed, the launch resolves the mods again and may update them without asking — ${String(err)}`);
+        await startLaunch(target);
         return;
       } finally {
         setUpdateCheckRunning(false);
@@ -1024,6 +1066,7 @@ export default function App() {
       // refuses every update exactly like this branch does.
       if (!globalSettings().updateNotificationsEnabled && precheck.droppedMods.length === 0) {
         await startLaunch(
+          target,
           buildResolvedVersions(precheck.resolved, precheck.updates, new Set()),
           buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
         );
@@ -1037,6 +1080,7 @@ export default function App() {
         // that is switched off are updates nobody accepted, and handing over
         // their candidates would install them behind the checkbox's back.
         await startLaunch(
+          target,
           precheck.resolved,
           buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
         );
@@ -1045,6 +1089,7 @@ export default function App() {
       // The **whole** payload is kept: the popup shows the categories that are
       // on, and the rows of the ones that are off still have to reach
       // `buildResolvedContent` to be refused there.
+      pendingLaunchTarget = target;
       setPendingUpdatePrecheck(precheck);
       return; // the popup decides, then launches
     }
@@ -1055,7 +1100,7 @@ export default function App() {
       setLaunchProgress(stage.progress);
       setLaunchStageLabel(stage.label);
       setLaunchStageDetail(stage.detail);
-      setLaunchLogs(c => [...c, `[Resolver] ${stage.label} — ${stage.detail}`]);
+      appendLaunchLog(`[Resolver] ${stage.label} — ${stage.detail}`);
       await wait(500);
     }
     setLaunchState("ready");
@@ -1196,8 +1241,12 @@ export default function App() {
               versionNumberLookupError={notifyUpdates ? precheck.versionNumberLookupError : null}
               droppedMods={precheck.droppedMods}
               onChoose={(accepted, acceptedContent) => {
+                const target = pendingLaunchTarget;
+                pendingLaunchTarget = null;
                 setPendingUpdatePrecheck(null);
+                if (!target) return;
                 void startLaunch(
+                  target,
                   buildResolvedVersions(precheck.resolved, precheck.updates, accepted),
                   // Every row, not only the ones on screen: a category whose
                   // checkbox is off was filtered out of `contentUpdates` before
@@ -1209,7 +1258,7 @@ export default function App() {
               // "launch without updating"; closing means "I have not decided".
               // A cancelled launch also drops the world it was going to open,
               // which would otherwise sit there until the next Play took it.
-              onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
+              onCancel={() => { pendingLaunchTarget = null; setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
             />
           );
         }}

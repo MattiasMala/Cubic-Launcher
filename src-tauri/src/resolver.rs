@@ -659,6 +659,10 @@ pub async fn resolve_modlist_command(
         &launcher_paths.modlists_dir().join(&modlist_name),
         &modlist,
     );
+    // D140: with the active account playing offline only the cache answers;
+    // a mod it knows nothing about stays as the rules resolved it.
+    let plays_offline = crate::app_shell::active_account_plays_offline(&launcher_paths)
+        .map_err(|e| e.to_string())?;
     let client = ModrinthClient::new();
     let _one_check_at_a_time = availability_check_guard(&modlist_name, &target).await;
     let mut pass =
@@ -675,6 +679,7 @@ pub async fn resolve_modlist_command(
             &pending,
             &target,
             &mod_loader,
+            !plays_offline,
             move |mod_id| {
                 let client = check_client.clone();
                 let target = check_target.clone();
@@ -703,12 +708,15 @@ pub async fn resolve_modlist_command(
 /// for the mods with no row, persisting the answers. A failed question is not
 /// an answer: the mod stays available and nothing is cached, as before — an
 /// editor that turns red because the network blinked would say something the
-/// next launch may well not do.
+/// next launch may well not do. Without `ask_modrinth` (D140: the active
+/// account plays offline) only the cached rows answer, and a mod with no row
+/// stays available.
 async fn editor_unavailable_mods<Check, Fut>(
     launcher_paths: &LauncherPaths,
     mod_ids: &[String],
     target: &ResolutionTarget,
     loader_key: &str,
+    ask_modrinth: bool,
     check: Check,
 ) -> Vec<String>
 where
@@ -728,7 +736,7 @@ where
         .collect::<Vec<_>>();
 
     let mut answers = cached.clone();
-    if !uncached.is_empty() {
+    if !uncached.is_empty() && ask_modrinth {
         let checked = check_availability_persisting(uncached, 10, check, |mod_id, available| {
             persist_availability_answer(
                 db_path,
@@ -1214,6 +1222,11 @@ pub async fn backfill_availability_command(
     mc_version: String,
     mod_loader: String,
 ) -> Result<(), String> {
+    // D140: nothing to fill from Modrinth while the active account plays
+    // offline; the editor reads the availability already cached.
+    if crate::app_shell::active_account_plays_offline(&launcher_paths).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
     let client = ModrinthClient::new();
     backfill_availability(
         &launcher_paths,
@@ -2268,6 +2281,7 @@ mod tests {
             ],
             &target,
             "fabric",
+            true,
             move |mod_id| {
                 let recorded = recorded.clone();
                 async move {

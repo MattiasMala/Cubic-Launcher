@@ -20,6 +20,7 @@ pub mod loader_metadata;
 pub mod local_content_packs;
 pub mod microsoft_auth;
 pub mod minecraft_downloader;
+pub mod minecraft_versions;
 pub mod mod_cache;
 pub mod mod_icons;
 pub mod mod_version_pin;
@@ -38,6 +39,7 @@ pub mod screenshots;
 pub mod shared_files;
 pub mod shared_worlds;
 pub mod skins;
+mod startup;
 #[cfg(test)]
 mod test_client_jars;
 pub mod token_storage;
@@ -74,33 +76,26 @@ fn close_launcher_anyway_command(window: tauri::Window) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+
+    // The data folder, its lock and the database are checked before Tauri
+    // starts, so that a failure is a dialog that says where and why instead
+    // of a panic with no window (r2-primo-avvio-ambiente-degradato-4), and a
+    // second launcher on the same folder stops here (concorrenza-5).
+    let launcher_data = startup::launcher_root(&context.config().identifier)
+        .and_then(startup::prepare_launcher_data)
+        .unwrap_or_else(|failure| startup::report_and_exit(&failure));
+    let startup::LauncherData {
+        paths: launcher_paths,
+        instance_lock,
+    } = launcher_data;
+
     tauri::Builder::default()
-        .setup(|app| {
-            let launcher_root = app
-                .path()
-                .app_local_data_dir()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let launcher_paths = launcher_paths::LauncherPaths::new(launcher_root);
-
-            launcher_paths
-                .create_required_directories()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-
-            database::initialize_database(launcher_paths.database_path())
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-
-            {
-                let connection = rusqlite::Connection::open(launcher_paths.database_path())
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                database::migrate_account_tokens_from_profile_data(
-                    &connection,
-                    token_storage::KeyringSecretStore::new(),
-                )
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            }
-
+        .setup(move |app| {
+            app.manage(instance_lock);
             app.manage(launcher_paths.clone());
             app.manage(skins::SkinsState::default());
+            app.manage(app_shell::MicrosoftLoginState::default());
 
             if launch_preview::automation_mode_enabled() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -122,13 +117,13 @@ pub fn run() {
             app_shell::load_shell_snapshot_command,
             app_shell::switch_active_account_command,
             app_shell::microsoft_login_command,
+            app_shell::cancel_microsoft_login_command,
             app_shell::delete_account_command,
             app_shell::list_accounts_command,
             app_shell::set_account_plays_offline_command,
             app_shell::save_global_settings_command,
             app_shell::save_modlist_overrides_command,
             debug_trace::append_debug_trace_command,
-            debug_trace::clear_debug_trace_command,
             editor_data::load_modlist_editor_command,
             editor_data::add_mod_rule_command,
             editor_data::delete_rules_command,
@@ -162,7 +157,7 @@ pub fn run() {
             options_share::derive_option_keys_command,
             resolver::resolve_modlist_command,
             resolver::backfill_availability_command,
-            minecraft_downloader::fetch_minecraft_versions_command,
+            minecraft_versions::fetch_minecraft_versions_command,
             content_packs::load_content_list_command,
             content_packs::add_content_command,
             content_packs::remove_content_command,
@@ -174,6 +169,7 @@ pub fn run() {
             launch_preview::update_precheck_command,
             launch_preview::verify_launch_command,
             launch_preview::stop_minecraft_command,
+            launch_preview::launch_status_command,
             launch_preview::last_profile_recording_command,
             screenshots::list_screenshots_command,
             screenshots::delete_screenshot_command,
@@ -201,6 +197,6 @@ pub fn run() {
             updater::install_update,
             close_launcher_anyway_command
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

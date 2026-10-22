@@ -37,6 +37,17 @@ export function NoticeBanner() {
                   <Show when={notice.detail}>
                     <p class="mt-0.5 line-clamp-2 text-xs text-textMuted/80">{notice.detail}</p>
                   </Show>
+                  <Show when={notice.action}>
+                    {action => (
+                      <button
+                        type="button"
+                        onClick={() => action().run()}
+                        class="mt-1 text-xs font-medium text-primary underline underline-offset-2 transition-colors hover:text-white"
+                      >
+                        {action().label}
+                      </button>
+                    )}
+                  </Show>
                 </div>
                 <button
                   type="button"

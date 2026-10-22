@@ -6,6 +6,7 @@ import {
   addModMode, setAddModMode,
   modRowsState,
   activeContentTab, selectedModListName,
+  activePlaysOffline,
 } from "../store";
 import { SearchIcon, XIcon, UploadIcon, MaterialIcon } from "./icons";
 import { LocalJarTab } from "./add-mod-dialog/LocalJarTab";
@@ -81,6 +82,8 @@ export function AddModDialog(props: AddModDialogProps) {
   const hasFilters = () => selCategories().size > 0 || selLoaders().size > 0 || selVersions().size > 0 || selEnvs().size > 0;
 
   const runSearch = async (pg?: number) => {
+    // D140: the search is Modrinth's; an account that plays offline asks nobody.
+    if (activePlaysOffline()) return;
     const nextPage = pg ?? page();
     setSearching(true);
     try {
@@ -110,6 +113,8 @@ export function AddModDialog(props: AddModDialogProps) {
       setAddedIds(new Set<string>());
       setAddingIds(new Set<string>());
       setPage(0);
+      // Offline only the upload works: open on it.
+      if (activePlaysOffline()) setAddModMode("local");
       void runSearch(0);
     }
   });
@@ -204,7 +209,9 @@ export function AddModDialog(props: AddModDialogProps) {
             <div class="ml-auto flex items-center border-l border-border">
               <button
                 onClick={() => { setAddModMode("modrinth"); }}
-                class={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-colors ${addModMode() === "modrinth" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                disabled={activePlaysOffline()}
+                title={activePlaysOffline() ? "This account plays offline, and the search asks Modrinth. Turn off Play offline in Manage Accounts to search; Upload works offline." : undefined}
+                class={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${addModMode() === "modrinth" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
               >
                 <SearchIcon class="h-3.5 w-3.5" />
                 Search

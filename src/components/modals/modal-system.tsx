@@ -188,6 +188,16 @@ export function ErrorCenter() {
                       <p class={`font-medium text-sm ${err.severity === "error" ? "text-destructive" : "text-warning"}`}>{err.title}</p>
                       <p class="mt-1 text-sm text-foreground">{err.message}</p>
                       <p class="mt-1 text-xs text-muted-foreground">{err.detail}</p>
+                      <Show when={err.action}>
+                        {action => (
+                          <button
+                            onClick={() => { setErrorCenterOpen(false); action().run(); }}
+                            class="mt-2 text-xs font-medium text-primary underline underline-offset-2 hover:text-foreground"
+                          >
+                            {action().label}
+                          </button>
+                        )}
+                      </Show>
                     </div>
                   </div>
                   <button onClick={() => dismissError(err.id)} class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">

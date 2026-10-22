@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { MODRINTH_HEADERS } from "./modrinth-user-agent";
+import { activePlaysOffline } from "../store-selectors";
 
 /**
  * What Modrinth says about one content-pack project, cached for the whole app.
@@ -55,6 +56,9 @@ export function seedContentName(id: string, name: string) {
  * forever".
  */
 export async function fetchContentProjects(ids: string[]): Promise<void> {
+  // D140: nothing is asked while the active account plays offline. The rows
+  // keep what is already known, and the badge stays in its silent "pending".
+  if (activePlaysOffline()) return;
   const missing = ids.filter(id => contentProjects().get(id)?.gameVersions === undefined);
   if (missing.length === 0) return;
 

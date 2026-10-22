@@ -28,9 +28,10 @@ export type UpdateInfo = {
   notes: string | null;
   currentVersion: string;
 };
-export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error";
+export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error" | "offline";
 export type UpdateCheckResponse = {
-  status: "upToDate" | "available" | "error";
+  /** `offline`: the active account plays offline and GitHub was not asked (D140). */
+  status: "upToDate" | "available" | "error" | "offline";
   currentVersion: string;
   version: string | null;
   notes: string | null;
@@ -78,6 +79,13 @@ export const [librarySearch, setLibrarySearch] = createSignal("");
 export const [search, setSearch] = createSignal("");
 export const [minecraftVersions, setMinecraftVersions] = createSignal<string[]>(["1.21.1", "1.20.6", "1.20.4", "1.19.4"]);
 export const [mcWithSnapshots, setMcWithSnapshots] = createSignal<string[]>([]);
+/**
+ * Why the version list may be missing versions, or `null` when it is
+ * Mojang's full list as fetched now: the list was built from the last saved
+ * manifest and the versions on disk because Mojang was not asked or did not
+ * answer (r2-primo-avvio-ambiente-degradato-2).
+ */
+export const [minecraftVersionsNotice, setMinecraftVersionsNotice] = createSignal<string | null>(null);
 export const [showSnapshots, setShowSnapshots] = createSignal(false);
 export const [selectedMcVersion, setSelectedMcVersion] = createSignal("1.21.1");
 export const [selectedModLoader, setSelectedModLoader] = createSignal<string>("Fabric");
@@ -93,6 +101,8 @@ export const [launchStageDetail, setLaunchStageDetail] = createSignal(LAUNCH_STA
 export const [profileRecordingPath, setProfileRecordingPath] = createSignal<string | null>(null);
 export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
+/** Set by STOP: the exit that follows is the user's, not a crash to report (concorrenza-9). */
+export const [launchStopRequested, setLaunchStopRequested] = createSignal(false);
 export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);
 export const [launcherErrors, setLauncherErrors] = createSignal<LauncherUiError[]>([]);
 export const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);
@@ -102,6 +112,15 @@ export const [errorCenterOpen, setErrorCenterOpen] = createSignal(false);
 export const [accountsModalOpen, setAccountsModalOpen] = createSignal(false);
 export const [accounts, setAccounts] = createSignal<AccountSummary[]>([]);
 export const [activeAccountId, setActiveAccountId] = createSignal<string>("");
+/**
+ * Bumped every time the account list is read back from the backend, i.e.
+ * after every change to the accounts: a sign-in (also "Sign in again" on the
+ * same row), a switch, a removal, a «Play offline» toggle. What depends on
+ * the active account's state reloads on it, not on the id alone, which is set
+ * before the backend has switched and does not change on a new sign-in of the
+ * same account (account-6).
+ */
+export const [accountsRevision, setAccountsRevision] = createSignal(0);
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
 export const [verificationModalOpen, setVerificationModalOpen] = createSignal(false);
 export const [instancePresentation, setInstancePresentation] = createSignal({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });

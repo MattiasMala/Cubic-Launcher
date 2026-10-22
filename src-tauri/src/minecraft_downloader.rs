@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use tokio::task::JoinSet;
 
@@ -88,8 +88,6 @@ struct VersionManifest {
 struct VersionManifestEntry {
     id: String,
     url: String,
-    #[serde(rename = "type")]
-    version_type: String,
 }
 
 #[derive(Deserialize)]
@@ -400,51 +398,6 @@ pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool 
         .mc_version_dir(version)
         .join("client.jar")
         .exists()
-}
-
-// ── Tauri commands ────────────────────────────────────────────────────────────
-
-/// Payload returned to the frontend with releases and releases+snapshots lists.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MinecraftVersionsPayload {
-    pub releases: Vec<String>,
-    pub with_snapshots: Vec<String>,
-}
-
-/// Returns Minecraft versions for the UI dropdown, split into releases and releases+snapshots.
-#[tauri::command]
-pub async fn fetch_minecraft_versions_command() -> Result<MinecraftVersionsPayload, String> {
-    let http_client = reqwest::Client::new();
-    let manifest: VersionManifest = http_client
-        .get(VERSION_MANIFEST_URL)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let releases: Vec<String> = manifest
-        .versions
-        .iter()
-        .filter(|v| v.version_type == "release")
-        .map(|v| v.id.clone())
-        .collect();
-
-    let with_snapshots: Vec<String> = manifest
-        .versions
-        .iter()
-        .filter(|v| v.version_type == "release" || v.version_type == "snapshot")
-        .map(|v| v.id.clone())
-        .collect();
-
-    Ok(MinecraftVersionsPayload {
-        releases,
-        with_snapshots,
-    })
 }
 
 // ── Main public function ──────────────────────────────────────────────────────

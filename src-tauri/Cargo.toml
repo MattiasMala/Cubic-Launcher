@@ -34,6 +34,9 @@ base64 = "0.22"
 # Already compiled through `trash` with these features: the local time of the
 # game's log4j XML events (download-1), with no new crate in the build.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Already in the lock through tauri: the data folder has to be found before
+# Tauri starts (startup.rs), the same way Tauri's `app_local_data_dir` does.
+dirs = "6"
 # Already in the lock through tauri; direct for the "Open folder" commands
 # (windows-3): `fs::canonicalize` returns `\\?\C:\…` on Windows, which
 # `cmd /c start` does not accept, and `dunce::simplified` gives the plain form
@@ -55,6 +58,9 @@ png = "0.17"
 # state (E7), whose guards never need a poisoning branch.
 parking_lot = "0.12"
 rand = "0.8"
+# Already in the lock through tauri-plugin-dialog, same features: the startup
+# error dialog opens before Tauri, when the plugin cannot be used yet.
+rfd = { version = "0.16", default-features = false, features = ["gtk3", "common-controls-v6"] }
 # `multipart` for the skin upload (E7): Mojang takes the PNG as a form field.
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

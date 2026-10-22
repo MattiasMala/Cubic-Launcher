@@ -108,6 +108,8 @@ export type LauncherUiError = {
   detail: string;
   severity: "warning" | "error";
   scope: "launch" | "download" | "account";
+  /** One button next to the notice, e.g. "Show log" after a crash (concorrenza-9). */
+  action?: { label: string; run: () => void };
 };
 
 /** Why an account is online or not (F1): mirrors `CredentialState` in `token_storage.rs`. */
@@ -145,6 +147,8 @@ export type ShellAccount = {
   credentials: AccountCredentials;
   credentials_detail?: string | null;
   plays_offline: boolean;
+  /** The row the launch uses: the list alone says which account is active. */
+  is_active: boolean;
 };
 
 export type ShellSnapshot = {
@@ -154,6 +158,8 @@ export type ShellSnapshot = {
     author?: string | null;
     rule_count: number;
   }>;
+  /** Folders whose rules.json can't be read: left out of `modlists`, not fatal. */
+  unreadable_modlists?: Array<{ folder: string; error: string }>;
   active_account?: ShellAccount | null;
   global_settings: {
     min_ram_mb: number;
@@ -396,7 +402,7 @@ export type CapeCard = {
   active: boolean;
 };
 
-export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library";
+export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library" | "playsOffline" | "keyringUnavailable";
 
 /** Every skin command rejects with this object, never a string: read `kind`, not `message`. */
 export type SkinError = {
