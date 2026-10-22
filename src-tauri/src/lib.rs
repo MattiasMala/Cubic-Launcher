@@ -98,6 +98,7 @@ pub fn run() {
             app_shell::set_account_plays_offline_command,
             app_shell::save_global_settings_command,
             app_shell::save_modlist_overrides_command,
+            app_shell::save_modlist_target_command,
             debug_trace::append_debug_trace_command,
             debug_trace::clear_debug_trace_command,
             editor_data::load_modlist_editor_command,
