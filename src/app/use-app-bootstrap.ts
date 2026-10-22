@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { onCleanup, onMount } from "solid-js";
 import { logger } from "../lib/logger";
 import {
+  launchState,
   modRowsState,
   pushUiError,
   selectedMcVersion,
@@ -79,10 +80,36 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
       }),
     ]);
 
+    // The launch lives in the backend, not in these signals: after a webview
+    // reload the panel must show STOP over a running game, not a PLAY that
+    // would start a second one on the same instance (concorrenza-4). Only
+    // from "idle": an event that arrived first is newer than this reading.
+    const restoreLaunchState = async () => {
+      try {
+        const status = await invoke<{ preparing: boolean; runningPid: number | null }>("launch_status_command");
+        if (launchState() !== "idle") return;
+        if (status.runningPid !== null) {
+          setLaunchState("running");
+          setLaunchProgress(100);
+          setLaunchStageLabel("Minecraft running");
+          setLaunchStageDetail(`Minecraft is running (PID ${status.runningPid}).`);
+        } else if (status.preparing) {
+          setLaunchState("resolving");
+          setLaunchStageLabel("Preparing launch");
+          setLaunchStageDetail("A launch started before the window was reloaded is still being prepared.");
+        }
+      } catch (error) {
+        logger.warn("App", "launch_status_command failed", error);
+      }
+    };
+
     const boot = async () => {
       logger.info("App", "boot started");
       try {
-        if (isTauri()) unlisteners.push(...await registerListeners());
+        if (isTauri()) {
+          unlisteners.push(...await registerListeners());
+          await restoreLaunchState();
+        }
 
         // Not awaited: Mojang's version list must never hold up the mod lists
         // and the accounts. It has its own timeout and falls back to disk.

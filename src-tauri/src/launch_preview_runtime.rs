@@ -28,7 +28,7 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use super::artifacts::extract_artifact_name;
 use super::{
     download_file, emit_launcher_issue, emit_log, emit_progress, EffectiveLaunchSettings,
-    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
+    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_LAUNCH,
 };
 
 /// Main class of the modern ForgeWrapper installer (Forge 1.13+ and NeoForge).
@@ -382,7 +382,7 @@ pub(super) fn spawn_minecraft_process(
     let process = spawn_and_stream_process(prepared_command, sink)?;
 
     let pid = process.pid;
-    *ACTIVE_MC_PID.lock().unwrap() = Some(pid);
+    ACTIVE_LAUNCH.set_running(pid);
 
     emit_progress(
         &app_handle,
@@ -400,7 +400,8 @@ pub(super) fn spawn_minecraft_process(
     let app_for_wait = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _ = process.wait();
-        *ACTIVE_MC_PID.lock().unwrap() = None;
+        // Only its own PID: never the one of a launch that came after.
+        ACTIVE_LAUNCH.clear_running_if(pid);
         super::set_active_launch_log_session(None);
         // Il gioco è uscito: da adesso nessuno sta più scrivendo i tre file
         // condivisi, e quello che l'istanza ha in mano può tornare alla

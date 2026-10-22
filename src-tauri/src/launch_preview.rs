@@ -24,8 +24,6 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 use crate::worlds::quick_play_arguments;
 
-use std::sync::Mutex;
-
 #[path = "launch_preview_fabric.rs"]
 pub(crate) mod fabric;
 use fabric::*;
@@ -78,11 +76,18 @@ use vanilla::*;
 mod runtime;
 use runtime::*;
 
+#[path = "launch_preview_slot.rs"]
+mod slot;
+pub use slot::LaunchStatus;
+
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 
-/// Tracks the PID of the currently running Minecraft process so it can be killed.
-static ACTIVE_MC_PID: Mutex<Option<u32>> = Mutex::new(None);
+/// The launch of this process: preparing, then the PID of the running game
+/// so it can be killed (concorrenza-4).
+static ACTIVE_LAUNCH: slot::LaunchSlot = slot::LaunchSlot::new();
 
+/// Refuses a second launch while one is being prepared or its game is still
+/// running: both would work on the same instance (concorrenza-4).
 #[tauri::command]
 pub fn start_launch_command(
     app_handle: tauri::AppHandle,
@@ -90,9 +95,13 @@ pub fn start_launch_command(
     request: LaunchRequest,
 ) -> Result<(), String> {
     let launcher_paths = launcher_paths.inner().clone();
+    let preparing = ACTIVE_LAUNCH.claim()?;
 
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_launch_pipeline(app_handle.clone(), launcher_paths, request).await {
+        let outcome = run_launch_pipeline(app_handle.clone(), launcher_paths, request).await;
+        // On success the PID is already in the slot: the spawn put it there.
+        drop(preparing);
+        if let Err(error) = outcome {
             let detail = format!("{error:#}");
             let _ = emit_launch_failure(&app_handle, &detail);
             set_active_launch_log_session(None);
@@ -129,11 +138,18 @@ pub async fn update_precheck_command(
         .map_err(|error| format!("{error:#}"))
 }
 
-/// Kills the currently running Minecraft process, if any.
+/// Whether a launch is under way, read by the frontend at boot: after a
+/// webview reload the panel shows STOP again instead of PLAY (concorrenza-4).
+#[tauri::command]
+pub fn launch_status_command() -> LaunchStatus {
+    ACTIVE_LAUNCH.status()
+}
+
+/// Kills the currently running Minecraft process, if any. The PID stays in the
+/// slot until the process is really gone: the exit handler clears it.
 #[tauri::command]
 pub fn stop_minecraft_command() -> Result<(), String> {
-    let pid = ACTIVE_MC_PID.lock().unwrap().take();
-    if let Some(pid) = pid {
+    if let Some(pid) = ACTIVE_LAUNCH.running_pid() {
         terminate_minecraft_pid(pid).map_err(|error| error.to_string())
     } else {
         Err("No Minecraft process is running.".into())
@@ -149,7 +165,7 @@ pub fn last_profile_recording_command() -> Option<String> {
 }
 
 pub(super) fn current_minecraft_pid() -> Option<u32> {
-    *ACTIVE_MC_PID.lock().unwrap()
+    ACTIVE_LAUNCH.running_pid()
 }
 
 pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
