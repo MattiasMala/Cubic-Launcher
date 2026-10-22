@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { batch, createEffect, createMemo, createSignal, on } from "solid-js";
-import { pushUiError, selectedMcVersion, selectedModLoader } from "../../store";
+import { offlineSafeImageUrl, pushUiError, selectedMcVersion, selectedModLoader } from "../../store";
 import { useDragEngine, type DragItem } from "../../lib/dragEngine";
 import { computePreviewTranslates } from "../../lib/dragUtils";
 import type {
@@ -643,7 +643,7 @@ export function useContentTabState(props: ContentTabViewProps) {
 
   const draggingEntryIcon = () => {
     const entry = draggingEntry();
-    return entry ? meta().get(entry.id)?.iconUrl : undefined;
+    return entry ? offlineSafeImageUrl(meta().get(entry.id)?.iconUrl) : undefined;
   };
 
   const draggingGroupItem = () => {

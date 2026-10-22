@@ -1,6 +1,6 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { MaterialIcon, PackageIcon } from "../icons";
-import { contentLookupFailures, selectedMcVersion } from "../../store";
+import { contentLookupFailures, offlineSafeImageUrl, selectedMcVersion } from "../../store";
 import { contentCompatibility, contentProjects } from "../../lib/content-meta";
 import type { ContentEntry, ContentMeta } from "./content-types";
 
@@ -82,8 +82,8 @@ export function ContentEntryRow(props: ContentEntryRowProps) {
       onPointerDown={handlePointerDown}
     >
       <div class="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-md bg-muted">
-        <Show when={props.info?.iconUrl} fallback={<PackageIcon class="h-4 w-4 text-muted-foreground" />}>
-          <img src={props.info!.iconUrl} alt="" class="h-8 w-8 object-cover" loading="lazy" />
+        <Show when={offlineSafeImageUrl(props.info?.iconUrl)} fallback={<PackageIcon class="h-4 w-4 text-muted-foreground" />}>
+          {iconUrl => <img src={iconUrl()} alt="" class="h-8 w-8 object-cover" loading="lazy" />}
         </Show>
       </div>
       <div class="min-w-0 flex-1">

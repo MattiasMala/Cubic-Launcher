@@ -7,6 +7,7 @@ import {
   instancePresentation,
   modIcons,
   modListCards,
+  offlineSafeImageUrl,
   modRowsState,
   onToggleEnabled,
   pushUiError,
@@ -316,9 +317,9 @@ export function ModListEditor(props: Props) {
                                 groupId={group.id}
                                 name={group.name}
                                 blockCount={group.blocks.length}
-                                iconUrls={group.blocks.slice(0, 4).map(row =>
+                                iconUrls={group.blocks.slice(0, 4).map(row => offlineSafeImageUrl(
                                   (row.modrinth_id ? modIcons().get(row.modrinth_id) : undefined) ?? row.iconImage
-                                )}
+                                ))}
                                 collapsed={group.collapsed}
                                 onStartDrag={(event) => handleStartDrag(group.id, "group", event)}
                                 enabled={group.blocks.every((row) => row.enabled)}

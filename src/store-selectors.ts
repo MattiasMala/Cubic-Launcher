@@ -74,6 +74,20 @@ export function accountAvatarUrl(account: AccountSummary | null | undefined): st
   return account.avatarUrl;
 }
 
+/**
+ * An image URL as the page may draw it: a remote one (the Modrinth CDN) only
+ * while the active account plays online (D140). The icons fetched earlier in
+ * the session stay in their maps, so switching to «Play offline» mid-session
+ * no longer lets a row scrolled into view ask cdn.modrinth.com
+ * (review-frontend-shell-28); a local `data:` or `asset:` icon is drawn
+ * either way.
+ */
+export function offlineSafeImageUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  if (activePlaysOffline() && /^https?:/i.test(url)) return undefined;
+  return url;
+}
+
 export const selectedCount = createMemo(() => selectedIds().length);
 
 export function rowOrDescendantMatchesTag(row: ModRow, fGroups: FunctionalGroup[], tf: Set<string>): boolean {

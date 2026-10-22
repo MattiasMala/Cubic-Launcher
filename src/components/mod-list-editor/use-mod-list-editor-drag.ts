@@ -7,6 +7,7 @@ import {
   aestheticGroups,
   modIcons,
   modRowsState,
+  offlineSafeImageUrl,
   setAestheticGroups,
   setModRowsState,
   topLevelItems,
@@ -96,7 +97,7 @@ export function useModListEditorDrag(options: ModListEditorDragOptions) {
 
   const draggingRowIcon = () => {
     const row = draggingRow();
-    return row?.modrinth_id ? modIcons().get(row.modrinth_id) : undefined;
+    return offlineSafeImageUrl(row?.modrinth_id ? modIcons().get(row.modrinth_id) : undefined);
   };
 
   const groupByRowId = () => {

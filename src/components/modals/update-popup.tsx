@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
-import { modIcons, modNames } from "../../store";
+import { modIcons, modNames, offlineSafeImageUrl } from "../../store";
 import { contentProjects } from "../../lib/content-meta";
 import { contentRowKey } from "../../lib/update-selection";
 import { CONTENT_TAB_LABELS } from "../mod-list-editor/content-types";
@@ -70,9 +70,9 @@ export function UpdatePopup(props: {
   const allAccepted = () => hasUpdates() && accepted().size === allKeys().length;
   const someAccepted = () => accepted().size > 0;
   const displayName = (row: ModUpdateRow) => modNames().get(row.projectId) ?? row.modId;
-  const iconUrl = (row: ModUpdateRow) => modIcons().get(row.projectId);
+  const iconUrl = (row: ModUpdateRow) => offlineSafeImageUrl(modIcons().get(row.projectId));
   const contentName = (row: ContentUpdateRow) => contentProjects().get(row.entryId)?.name ?? row.entryId;
-  const contentIcon = (row: ContentUpdateRow) => contentProjects().get(row.entryId)?.iconUrl;
+  const contentIcon = (row: ContentUpdateRow) => offlineSafeImageUrl(contentProjects().get(row.entryId)?.iconUrl);
 
   const toggleRow = (key: string, checked: boolean) => {
     const next = new Set(accepted());
@@ -161,7 +161,7 @@ export function UpdatePopup(props: {
                 {modId => (
                   <div class="flex items-center gap-3 px-2 py-1.5 pl-6">
                     <div class="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded bg-muted">
-                      <Show when={modIcons().get(modId)} fallback={<PackageIcon class="h-3.5 w-3.5 text-muted-foreground" />}>
+                      <Show when={offlineSafeImageUrl(modIcons().get(modId))} fallback={<PackageIcon class="h-3.5 w-3.5 text-muted-foreground" />}>
                         {icon => (
                           <img
                             src={icon()}

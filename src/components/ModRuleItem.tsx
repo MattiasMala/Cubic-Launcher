@@ -7,7 +7,7 @@
 import { For, Show, createSignal, onMount, onCleanup } from "solid-js";
 import type { ModRow } from "../lib/types";
 import {
-  selectedIds, expandedRows, modIcons,
+  selectedIds, expandedRows, modIcons, offlineSafeImageUrl,
   functionalGroupsByBlockId, conflictModIds, conflictPairsForId, rowMap,
   aestheticGroups, removeRowsFromAestheticGroups,
   toggleSelected, toggleExpanded, functionalGroupTagClass, functionalGroupTagStyle,
@@ -45,8 +45,8 @@ export function ModRuleItem(props: ModRuleItemProps) {
   const fGroups       = () => functionalGroupsByBlockId().get(props.row.id) ?? [];
   // A Modrinth row draws the CDN icon; a local row draws the icon extracted from
   // its jar (mod_icons.rs). A local jar without an icon keeps the PackageIcon.
-  const iconUrl    = () =>
-    (props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row.iconImage;
+  const iconUrl    = () => offlineSafeImageUrl(
+    (props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row.iconImage);
   const containingGroup = () =>
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
   const isResolved = () => {
