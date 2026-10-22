@@ -626,3 +626,84 @@ fn import_custom_config_files_does_not_replace_a_listed_file_with_different_byte
 
     fs::remove_dir_all(&root).unwrap();
 }
+
+fn rule_with_alternatives(mod_id: &str, alternatives: Vec<Rule>) -> Rule {
+    Rule {
+        alternatives,
+        ..simple_rule(mod_id)
+    }
+}
+
+fn enabled_of(modlist: &ModList, mod_id: &str) -> bool {
+    modlist.find_rule(mod_id).expect("rule exists").enabled
+}
+
+/// Il toggle di un gruppo: più regole, a ogni profondità, in una sola
+/// scrittura; sotto ciascuna si spengono anche le alternative, come per il
+/// toggle singolo (audit 101, r2-scala-mod-list-grandi-4 e ui-schermate-4).
+#[test]
+fn toggle_rules_enabled_switches_every_listed_rule_at_any_depth() {
+    let root = unique_test_root();
+    setup_modlist(
+        &root,
+        "Pack",
+        vec![
+            rule_with_alternatives(
+                "sodium",
+                vec![rule_with_alternatives(
+                    "rubidium",
+                    vec![simple_rule("embeddium")],
+                )],
+            ),
+            simple_rule("lithium"),
+            simple_rule("iris"),
+        ],
+    );
+
+    toggle_rules_enabled_from_root(
+        &root,
+        &ToggleRulesEnabledInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["rubidium".into(), "lithium".into()],
+            enabled: false,
+        },
+    )
+    .unwrap();
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    assert!(enabled_of(&modlist, "sodium"));
+    assert!(!enabled_of(&modlist, "rubidium"));
+    assert!(!enabled_of(&modlist, "embeddium"));
+    assert!(!enabled_of(&modlist, "lithium"));
+    assert!(enabled_of(&modlist, "iris"));
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Un id che non c'è: errore, e nessuna delle altre regole cambia.
+#[test]
+fn toggle_rules_enabled_with_an_unknown_id_writes_nothing() {
+    let root = unique_test_root();
+    setup_modlist(
+        &root,
+        "Pack",
+        vec![simple_rule("sodium"), simple_rule("lithium")],
+    );
+
+    let error = toggle_rules_enabled_from_root(
+        &root,
+        &ToggleRulesEnabledInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["sodium".into(), "missing".into()],
+            enabled: false,
+        },
+    )
+    .expect_err("an unknown id must be refused");
+    assert!(error.to_string().contains("missing"), "{error:#}");
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    assert!(enabled_of(&modlist, "sodium"));
+    assert!(enabled_of(&modlist, "lithium"));
+
+    fs::remove_dir_all(&root).unwrap();
+}

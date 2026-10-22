@@ -111,6 +111,7 @@ pub fn run() {
             editor_data::remove_alternative_command,
             editor_data::save_incompatibilities_command,
             editor_data::toggle_rule_enabled_command,
+            editor_data::toggle_rules_enabled_command,
             editor_data::save_rule_advanced_command,
             editor_data::save_advanced_batch_command,
             editor_data::import_custom_config_files_command,

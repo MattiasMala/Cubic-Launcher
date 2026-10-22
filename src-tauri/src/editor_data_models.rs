@@ -189,6 +189,16 @@ pub struct ToggleRuleEnabledInput {
     pub enabled: bool,
 }
 
+/// The switch of several rules at once — a group of the editor — written with
+/// one read and one write of rules.json (audit 101, r2-scala-mod-list-grandi-4).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToggleRulesEnabledInput {
+    pub modlist_name: String,
+    pub mod_ids: Vec<String>,
+    pub enabled: bool,
+}
+
 /// The files picked for one custom config, to be copied into the mod list
 /// (D112). `current_files` are the names the config already lists, so a pick
 /// cannot replace one of them with different bytes without saying so.

@@ -130,12 +130,35 @@ pub fn toggle_rule_enabled_command(
     toggle_rule_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn toggle_rules_enabled_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ToggleRulesEnabledInput,
+) -> Result<(), String> {
+    toggle_rules_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
+}
+
 fn toggle_rule_enabled_from_root(root_dir: &Path, input: &ToggleRuleEnabledInput) -> Result<()> {
+    toggle_rules_enabled_from_root(
+        root_dir,
+        &ToggleRulesEnabledInput {
+            modlist_name: input.modlist_name.clone(),
+            mod_ids: vec![input.mod_id.clone()],
+            enabled: input.enabled,
+        },
+    )
+}
+
+/// Un solo giro di lettura e scrittura di rules.json per tutto l'insieme. Se
+/// un id manca non si scrive niente: o cambiano tutti, o nessuno.
+fn toggle_rules_enabled_from_root(root_dir: &Path, input: &ToggleRulesEnabledInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
-    let rule = modlist
-        .find_rule_mut(&input.mod_id)
-        .with_context(|| format!("rule '{}' not found", input.mod_id))?;
-    set_enabled_recursive(rule, input.enabled);
+    for mod_id in &input.mod_ids {
+        let rule = modlist
+            .find_rule_mut(mod_id)
+            .with_context(|| format!("rule '{}' not found", mod_id))?;
+        set_enabled_recursive(rule, input.enabled);
+    }
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
 
