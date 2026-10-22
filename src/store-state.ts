@@ -102,6 +102,15 @@ export const [errorCenterOpen, setErrorCenterOpen] = createSignal(false);
 export const [accountsModalOpen, setAccountsModalOpen] = createSignal(false);
 export const [accounts, setAccounts] = createSignal<AccountSummary[]>([]);
 export const [activeAccountId, setActiveAccountId] = createSignal<string>("");
+/**
+ * Bumped every time the account list is read back from the backend, i.e.
+ * after every change to the accounts: a sign-in (also "Sign in again" on the
+ * same row), a switch, a removal, a «Play offline» toggle. What depends on
+ * the active account's state reloads on it, not on the id alone, which is set
+ * before the backend has switched and does not change on a new sign-in of the
+ * same account (account-6).
+ */
+export const [accountsRevision, setAccountsRevision] = createSignal(0);
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
 export const [verificationModalOpen, setVerificationModalOpen] = createSignal(false);
 export const [instancePresentation, setInstancePresentation] = createSignal({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });

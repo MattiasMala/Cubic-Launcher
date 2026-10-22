@@ -390,7 +390,7 @@ export type CapeCard = {
   active: boolean;
 };
 
-export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library";
+export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library" | "playsOffline" | "keyringUnavailable";
 
 /** Every skin command rejects with this object, never a string: read `kind`, not `message`. */
 export type SkinError = {
