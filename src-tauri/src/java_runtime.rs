@@ -186,6 +186,19 @@ pub fn select_java_for_minecraft(
     select_java_for_requirement(installations, required_version)
 }
 
+/// Which source wins between two Javas of the same major: the runtime the
+/// launcher installed from Adoptium first, the one found on `PATH` last.
+/// A system Java 8 older than 8u191 turns the Log4Shell lookup of 1.7–1.16
+/// into remote code execution (download-1); the launcher's runtime is current.
+/// The derived `Ord` of the enum is the display order, not this one.
+fn selection_rank(source: JavaInstallationSource) -> u8 {
+    match source {
+        JavaInstallationSource::LauncherManaged => 0,
+        JavaInstallationSource::PlatformDirectory => 1,
+        JavaInstallationSource::SystemPath => 2,
+    }
+}
+
 pub fn select_java_for_requirement(
     installations: &[JavaInstallation],
     required_version: u32,
@@ -202,7 +215,7 @@ pub fn select_java_for_requirement(
         .min_by(|left, right| {
             left.version
                 .cmp(&right.version)
-                .then(left.source.cmp(&right.source))
+                .then(selection_rank(left.source).cmp(&selection_rank(right.source)))
                 .then(left.path.cmp(&right.path))
         })
 }
@@ -221,8 +234,8 @@ pub fn select_exact_java_for_requirement(
         .filter(|installation| installation.version == required_version)
         .cloned()
         .min_by(|left, right| {
-            left.source
-                .cmp(&right.source)
+            selection_rank(left.source)
+                .cmp(&selection_rank(right.source))
                 .then(left.path.cmp(&right.path))
         })
 }
@@ -723,7 +736,7 @@ mod tests {
         let inspector = FakeInspector {
             probes: HashMap::from([
                 (
-                    managed_path,
+                    managed_path.clone(),
                     JavaProbe {
                         version: 17,
                         architecture: "x64".into(),
@@ -743,8 +756,17 @@ mod tests {
         let selected = select_java_for_minecraft(&installations, "1.20.4")
             .expect("matching installation should exist");
 
-        assert_eq!(selected.path, system_path);
+        // download-1: at the same major the launcher's own runtime wins over
+        // the Java on PATH, which may be an old, vulnerable Java 8.
+        assert_eq!(selected.path, managed_path);
         assert_eq!(selected.version, 17);
+        assert_eq!(
+            select_exact_java_for_requirement(&installations, 17)
+                .expect("exact runtime")
+                .path,
+            managed_path
+        );
+        assert_ne!(selected.path, system_path);
     }
 
     #[test]

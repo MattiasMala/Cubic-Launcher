@@ -483,14 +483,14 @@ async fn ensure_minecraft_version_files(
     .await?;
 
     // 6. The log4j configuration of `logging.client` (download-1).
-    let logging_argument =
+    let logging_arguments =
         ensure_logging_config(http_client, &version_json, &assets_dir, policy, on_progress).await?;
 
     // 7. Extract arguments. `game_arguments` is unfiltered on purpose (the
     //    launch strips the feature-gated entries later), which is also what
     //    makes it the honest place to read Quick Play support from.
     let (game_arguments, mut jvm_arguments) = extract_arguments(&version_json);
-    jvm_arguments.extend(logging_argument);
+    jvm_arguments.extend(logging_arguments);
     let supports_quick_play_singleplayer = declares_quick_play_singleplayer(&game_arguments);
 
     Ok(MinecraftVersionData {
@@ -853,29 +853,54 @@ fn materialize_virtual_assets(
     Ok(())
 }
 
-/// The JVM argument of `logging.client`, with its configuration file in the
-/// cache (download-1), or `None` when the version declares none.
+/// Mojang's two client log4j configurations, the only ones `logging.client`
+/// has ever named: `client-1.7.xml` (1.7–1.11) and `client-1.12.xml` (1.12
+/// on). Shipped in the binary so that an offline launch of a version whose
+/// file was never downloaded is still protected (review-lancio-2). Matched by
+/// the SHA-1 the version.json declares, never by name.
+const EMBEDDED_LOG_CONFIGS: [&[u8]; 2] = [
+    include_bytes!("../assets/log_configs/client-1.7.xml"),
+    include_bytes!("../assets/log_configs/client-1.12.xml"),
+];
+
+/// Turns off message lookups in log4j 2.10+ (1.17–1.18.0): the second fence,
+/// for when the configuration file is not there. Older log4j ignores it.
+const LOG4J_NO_LOOKUPS_ARGUMENT: &str = "-Dlog4j2.formatMsgNoLookups=true";
+
+fn embedded_log_config(expected_sha1: &str) -> Option<&'static [u8]> {
+    EMBEDDED_LOG_CONFIGS.into_iter().find(|bytes| {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_sha1)
+    })
+}
+
+/// The JVM arguments of `logging.client` (download-1): the configuration file
+/// in the cache, plus `-Dlog4j2.formatMsgNoLookups=true`. Empty when the
+/// version declares no `logging.client`.
 ///
 /// The file goes to `assets/log_configs/<id>`, shared by every version that
 /// names the same id (the official launcher's layout), downloaded with its
-/// SHA-1. Offline (D142) a file that is not there yet is not requested: the
-/// launch goes on without it and says so, because a version played before
-/// this file was handled would otherwise stop playing offline at all.
+/// SHA-1. Offline (D142) nothing is requested: a file that is not there yet is
+/// written from the copy in the binary when the SHA-1 matches. Only a file
+/// Mojang has never published goes without, said in the log, and the launch
+/// still carries the no-lookups switch.
 async fn ensure_logging_config(
     client: &reqwest::Client,
     version_json: &VersionJson,
     assets_dir: &Path,
     policy: MinecraftCachePolicy,
     on_progress: &impl Fn(&str, &str),
-) -> Result<Option<String>> {
+) -> Result<Vec<String>> {
     let Some(logging) = version_json
         .logging
         .as_ref()
         .and_then(|logging| logging.client.as_ref())
     else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let config_path = log_config_path(assets_dir, &logging.file.id)?;
+    let no_lookups = LOG4J_NO_LOOKUPS_ARGUMENT.to_string();
 
     match policy {
         MinecraftCachePolicy::Download => {
@@ -891,19 +916,37 @@ async fn ensure_logging_config(
         }
         MinecraftCachePolicy::CacheOnly => {
             if !file_matches_sha1(&config_path, &logging.file.sha1) {
+                let Some(bytes) = embedded_log_config(&logging.file.sha1) else {
+                    on_progress(
+                        "Logging configuration not in the cache",
+                        &format!(
+                            "'{}' is not downloaded while the account plays offline and is not one the launcher carries; this launch runs without Mojang's log4j configuration, with message lookups turned off, until the next online launch",
+                            logging.file.id
+                        ),
+                    );
+                    return Ok(vec![no_lookups]);
+                };
+                if let Some(parent) = config_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                crate::atomic_write::write_atomically(&config_path, bytes)
+                    .with_context(|| format!("failed to write {}", config_path.display()))?;
                 on_progress(
-                    "Logging configuration not in the cache",
+                    "Logging configuration from the launcher",
                     &format!(
-                        "'{}' is not downloaded while the account plays offline; this launch runs without Mojang's log4j configuration (the Log4Shell filter) until the next online launch",
+                        "'{}' was not downloaded yet; the copy the launcher carries is used",
                         logging.file.id
                     ),
                 );
-                return Ok(None);
             }
         }
     }
 
-    Ok(Some(logging_jvm_argument(&logging.argument, &config_path)))
+    Ok(vec![
+        logging_jvm_argument(&logging.argument, &config_path),
+        no_lookups,
+    ])
 }
 
 /// Where the configuration file `file_id` of `logging.client` lives.
@@ -1504,11 +1547,61 @@ mod tests {
             .jvm_arguments
             .iter()
             .any(|argument| argument.starts_with("-Dlog4j.configurationFile=")));
+        // review-lancio-2: never without a fence.
+        assert!(data
+            .jvm_arguments
+            .contains(&LOG4J_NO_LOOKUPS_ARGUMENT.to_string()));
         assert!(notes
             .lock()
             .unwrap()
             .iter()
             .any(|note| note.contains("client-1.12.xml") && note.contains("offline")));
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// review-lancio-2: offline, the real Mojang file that was never downloaded
+    /// comes from the copy in the binary, with no request, and the launch
+    /// carries it.
+    #[tokio::test]
+    async fn cache_only_writes_the_embedded_log_config_when_its_sha1_matches() {
+        let root = scratch_root("cache-only-embedded-log-config");
+        let paths = complete_cache(&root, false);
+        let version_json_path = paths.mc_version_dir("1.12.2").join("version.json");
+        let mojang = include_bytes!("../assets/log_configs/client-1.12.xml");
+        assert_eq!(sha1_hex(mojang), "bd65e7d2e3c237be76cfbef4c2405033d7f91521");
+        assert_eq!(
+            sha1_hex(include_bytes!("../assets/log_configs/client-1.7.xml")),
+            "50c9cc4af6d853d9fc137c84bcd153e2bd3a9a82"
+        );
+        let rewritten = fs::read_to_string(&version_json_path)
+            .expect("version.json")
+            .replace(&sha1_hex(b"<Configuration/>"), &sha1_hex(mojang));
+        fs::write(&version_json_path, rewritten).expect("version.json");
+        let (client, listener) = counting_offline_client();
+
+        let data = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &paths,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect("the embedded copy is enough");
+
+        assert!(no_request_reached(&listener));
+        let config_path = paths
+            .mc_assets_dir()
+            .join("log_configs")
+            .join("client-1.12.xml");
+        assert_eq!(fs::read(&config_path).expect("written"), mojang);
+        assert!(data.jvm_arguments.contains(&format!(
+            "-Dlog4j.configurationFile={}",
+            config_path.display()
+        )));
+        assert!(data
+            .jvm_arguments
+            .contains(&LOG4J_NO_LOOKUPS_ARGUMENT.to_string()));
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 
