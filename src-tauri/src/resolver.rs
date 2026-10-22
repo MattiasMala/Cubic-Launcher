@@ -116,7 +116,7 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
 
     // ── Pass 1: sequential resolve to build the initial active set ────────────
     let mut active_mods = HashSet::new();
-    let mut resolved_rules = Vec::with_capacity(rules.len());
+    let mut resolved_rules: Vec<ResolvedRule> = Vec::with_capacity(rules.len());
 
     for rule in &rules {
         let outcome = try_resolve(rule, &active_mods, target);
@@ -129,25 +129,100 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
         });
     }
 
-    // ── Pass 2: re-check each rule against the FULL active set ───────────────
-    let full_active = active_mods.clone();
-    let mut final_active = HashSet::new();
-
-    for (i, rule) in rules.iter().enumerate() {
-        let outcome = try_resolve(rule, &full_active, target);
-        if let RuleOutcome::Resolved { ref resolved_id } = outcome {
-            final_active.insert(resolved_id.clone());
+    // ── Pass 2..n: re-check each rule against the previous pass's set ────────
+    // Una passata sola non basta (audit 101, risoluzione-4): la passata 2
+    // confronta con l'insieme della passata 1, e un mod che entra solo nella
+    // passata 2 può far cadere l'`exclude_if` o il `requires` di un altro.
+    // Si ripete finché l'esito non cambia più: a quel punto ogni regola
+    // risolta è valutata contro l'insieme finale, che quindi è coerente. Se
+    // l'esito torna su uno già visto (un ciclo, es. A requires B e B
+    // exclude_if A) o le passate finiscono, `repair_inconsistent` toglie in
+    // ordine di regola i mod che violano i vincoli, in modo deterministico.
+    let mut history = vec![resolved_rules.clone()];
+    let mut consistent = false;
+    for _ in 0..MAX_RESOLUTION_PASSES {
+        let mut next_active = HashSet::new();
+        let mut next_rules = Vec::with_capacity(rules.len());
+        for rule in &rules {
+            let outcome = try_resolve(rule, &active_mods, target);
+            if let RuleOutcome::Resolved { ref resolved_id } = outcome {
+                next_active.insert(resolved_id.clone());
+            }
+            next_rules.push(ResolvedRule {
+                mod_id: rule.mod_id.clone(),
+                outcome,
+            });
         }
-        resolved_rules[i] = ResolvedRule {
-            mod_id: rule.mod_id.clone(),
-            outcome,
-        };
+
+        let fixed_point = next_rules == resolved_rules;
+        let cycle = !fixed_point && history.contains(&next_rules);
+        resolved_rules = next_rules;
+        active_mods = next_active;
+        if fixed_point {
+            consistent = true;
+            break;
+        }
+        if cycle {
+            break;
+        }
+        history.push(resolved_rules.clone());
+    }
+
+    if !consistent {
+        active_mods = repair_inconsistent(&rules, &mut resolved_rules);
     }
 
     Ok(ResolutionResult {
-        active_mods: final_active,
+        active_mods,
         resolved_rules,
     })
+}
+
+/// Bound on the re-check passes of `resolve_modlist`. Real mod-lists reach the
+/// fixed point in two or three; the bound only matters for a cycle that the
+/// history check has not caught yet.
+const MAX_RESOLUTION_PASSES: usize = 32;
+
+/// Ultima rete per un esito che non si è stabilizzato (un ciclo fra le
+/// regole): toglie, in ordine di regola e finché ce n'è uno, ogni mod risolto
+/// che sull'insieme corrente viola il proprio `exclude_if` o `requires`.
+/// L'insieme può solo restringersi, quindi termina, e alla fine ogni mod
+/// rimasto ha i suoi vincoli soddisfatti dall'insieme finale.
+fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> HashSet<String> {
+    let active_of = |resolved_rules: &[ResolvedRule]| {
+        resolved_rules
+            .iter()
+            .filter_map(|rule| match &rule.outcome {
+                RuleOutcome::Resolved { resolved_id } => Some(resolved_id.clone()),
+                RuleOutcome::Unresolved { .. } => None,
+            })
+            .collect::<HashSet<_>>()
+    };
+
+    let mut active = active_of(resolved_rules);
+    loop {
+        let violation = resolved_rules
+            .iter()
+            .enumerate()
+            .find_map(|(index, resolved)| {
+                let RuleOutcome::Resolved { resolved_id } = &resolved.outcome else {
+                    return None;
+                };
+                let rule = find_rule_by_id(&rules[index], resolved_id)?;
+                if rule.exclude_if.iter().any(|id| active.contains(id)) {
+                    Some((index, FailureReason::ExcludedByActiveMod))
+                } else if rule.requires.iter().any(|id| !active.contains(id)) {
+                    Some((index, FailureReason::RequiredModMissing))
+                } else {
+                    None
+                }
+            });
+        let Some((index, reason)) = violation else {
+            return active;
+        };
+        resolved_rules[index].outcome = RuleOutcome::Unresolved { reason };
+        active = active_of(resolved_rules);
+    }
 }
 
 /// Every `(mod_id, requires)` pair of the rule tree, plus each mod's enabled state.
@@ -1464,6 +1539,116 @@ mod tests {
             }
         );
     }
+    /// I vincoli di ogni mod caricato valgono sull'insieme **finale**: è la
+    /// proprietà che la passata unica violava (audit 101, risoluzione-4).
+    fn assert_consistent(ml: &ModList, result: &ResolutionResult) {
+        for id in &result.active_mods {
+            let rule = ml.find_rule(id).expect("an active mod comes from the tree");
+            for excluded_by in &rule.exclude_if {
+                assert!(
+                    !result.active_mods.contains(excluded_by),
+                    "'{id}' is loaded next to '{excluded_by}', which its exclude_if forbids"
+                );
+            }
+            for required in &rule.requires {
+                assert!(
+                    result.active_mods.contains(required),
+                    "'{id}' is loaded without '{required}', which it requires"
+                );
+            }
+        }
+    }
+
+    fn fabric_1_20_1() -> ResolutionTarget {
+        ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Fabric,
+        }
+    }
+
+    #[test]
+    fn an_excluded_mod_does_not_stay_next_to_a_mod_that_entered_in_the_second_pass() {
+        // Report 101, risoluzione-4, primo caso: [optifabric exclude_if [iris],
+        // iris requires [sodium], sodium]. La passata unica dava {optifabric,
+        // iris, sodium}: due mod incompatibili caricati insieme.
+        let mut optifabric = simple_rule("optifabric");
+        optifabric.exclude_if = vec!["iris".into()];
+        let mut iris = simple_rule("iris");
+        iris.requires = vec!["sodium".into()];
+        let ml = modlist(vec![optifabric, iris, simple_rule("sodium")]);
+
+        let result = resolve_modlist(&ml, &fabric_1_20_1()).unwrap();
+
+        assert_consistent(&ml, &result);
+        assert_eq!(
+            result.active_mods,
+            HashSet::from(["iris".to_string(), "sodium".to_string()])
+        );
+        assert_eq!(
+            result.resolved_rules[0].outcome,
+            RuleOutcome::Unresolved {
+                reason: FailureReason::ExcludedByActiveMod,
+            }
+        );
+    }
+
+    #[test]
+    fn a_mod_does_not_stay_without_a_requirement_that_left_in_the_second_pass() {
+        // Report 101, risoluzione-4, secondo caso: [iris requires sodium, sodium
+        // exclude_if [optifabric], optifabric]. La passata unica dava {iris,
+        // optifabric}: Iris senza Sodium, e il client crasha.
+        let mut iris = simple_rule("iris");
+        iris.requires = vec!["sodium".into()];
+        let mut sodium = simple_rule("sodium");
+        sodium.exclude_if = vec!["optifabric".into()];
+        let ml = modlist(vec![iris, sodium, simple_rule("optifabric")]);
+
+        let result = resolve_modlist(&ml, &fabric_1_20_1()).unwrap();
+
+        assert_consistent(&ml, &result);
+        assert_eq!(
+            result.active_mods,
+            HashSet::from(["optifabric".to_string()])
+        );
+        assert_eq!(
+            result.resolved_rules[0].outcome,
+            RuleOutcome::Unresolved {
+                reason: FailureReason::RequiredModMissing,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_between_rules_ends_in_a_consistent_set_and_always_the_same_one() {
+        // A requires B, B exclude_if A: le passate girano {B} → {A,B} → {A} →
+        // {} → {B}. Il ciclo si ferma e la riparazione dà un insieme coerente,
+        // lo stesso a ogni chiamata.
+        let mut a = simple_rule("A");
+        a.requires = vec!["B".into()];
+        let mut b = simple_rule("B");
+        b.exclude_if = vec!["A".into()];
+        let ml = modlist(vec![a, b]);
+
+        let first = resolve_modlist(&ml, &target()).unwrap();
+        let second = resolve_modlist(&ml, &target()).unwrap();
+
+        assert_consistent(&ml, &first);
+        assert_eq!(first, second);
+        assert_eq!(first.active_mods, HashSet::from(["B".to_string()]));
+    }
+
+    #[test]
+    fn a_mod_that_excludes_itself_is_left_out_instead_of_oscillating() {
+        let mut a = simple_rule("A");
+        a.exclude_if = vec!["A".into()];
+        let ml = modlist(vec![a, simple_rule("B")]);
+
+        let result = resolve_modlist(&ml, &target()).unwrap();
+
+        assert_consistent(&ml, &result);
+        assert_eq!(result.active_mods, HashSet::from(["B".to_string()]));
+    }
+
     #[test]
     fn mutual_requires_with_disabled_peer_does_not_resolve() {
         let mut a = simple_rule("A");
