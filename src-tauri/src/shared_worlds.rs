@@ -140,6 +140,27 @@ fn try_take_exclusive_lock(file: &File) -> std::io::Result<bool> {
     }
 }
 
+/// What survives of the lock while the world's folder is renamed.
+///
+/// On unix the lock stays held: an `fcntl` lock does not stop a rename, and
+/// holding it is what keeps a game from opening the world mid-move.
+///
+/// **On Windows it is released first** (condivisi-2). There a directory cannot
+/// be renamed while any handle to a file inside it is open — ours on
+/// `session.lock` included — so holding it would make every world that was
+/// ever played impossible to share. Taking it a moment before still proves no
+/// game had the world open, and the gap it leaves is closed by the same rule:
+/// a game that opens the world after the release holds `session.lock`, and
+/// the rename then fails instead of moving the world from under it.
+fn hold_across_move(lock: Option<SessionLockGuard>) -> Option<SessionLockGuard> {
+    if cfg!(windows) {
+        drop(lock);
+        None
+    } else {
+        lock
+    }
+}
+
 // ── The move ─────────────────────────────────────────────────────────────────
 
 /// Move a directory, preferring the atomic call.
@@ -483,8 +504,9 @@ pub fn share_world_with_instance(
             )?;
             let world_dir = worlds_dir.join(&shared_folder_name);
 
-            // Held across the move, not checked before it.
-            let _lock = try_hold_session_lock(&source)?;
+            // Held across the move, not checked before it — where the
+            // platform allows it (see `hold_across_move`).
+            let _lock = hold_across_move(try_hold_session_lock(&source)?);
             move_directory(&source, &world_dir)?;
 
             // The instance the world came from is an instance like the others
