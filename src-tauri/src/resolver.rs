@@ -1863,8 +1863,10 @@ mod tests {
 
     #[test]
     fn an_unavailable_mod_is_disabled_everywhere_it_appears_in_the_tree() {
-        // Lo stesso id come alternativa di due regole: disabilitarne solo la
-        // prima occorrenza lo lasciava rientrare dalla seconda senza domanda.
+        // Lo stesso id come alternativa di due regole. `rules.json` lo rifiuta
+        // in lettura, ma un `ModList` in memoria no: disabilitare solo la prima
+        // occorrenza (`find_rule_mut`) lo lascerebbe rientrare dalla seconda
+        // senza domanda.
         let mut first = simple_rule("sodium");
         first.alternatives = vec![simple_rule("embeddium")];
         let mut second = simple_rule("rubidium");
