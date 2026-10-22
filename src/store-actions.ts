@@ -21,7 +21,6 @@ import {
   setAestheticGroups,
   setAlternativesPanelParentId,
   setCustomConfigs,
-  setDownloadItems,
   setDraftIncompatibilities,
   setDraftLinks,
   setEditingGroupId,
@@ -54,21 +53,6 @@ import {
 } from "./store-selectors";
 import { contiguousGroupOrder } from "./app/row-state";
 import { LAUNCH_STAGES } from "./lib/types";
-
-export function upsertDownloadProgress(update: { filename: string; progress: number }) {
-  setDownloadItems(current => {
-    const exists = current.some(item => item.filename === update.filename);
-    const next = {
-      filename: update.filename,
-      progress: update.progress,
-      status: update.progress >= 100 ? "complete" as const : "downloading" as const,
-    };
-    if (exists) {
-      return current.map(item => item.filename === update.filename ? next : item);
-    }
-    return [...current, next];
-  });
-}
 
 // Ids have to be unique per notice, not per millisecond: a single launch can
 // push several notices inside the same tick (one per mod left out), and two
@@ -332,14 +316,6 @@ export function openLinkModal() {
   setLinkModalOpen(true);
 }
 
-export function toggleDraftLink(fromId: string, toId: string) {
-  setDraftLinks(current => {
-    const hasLink = current.some(link => link.fromId === fromId && link.toId === toId);
-    if (hasLink) return current.filter(link => !(link.fromId === fromId && link.toId === toId));
-    return [...current, { fromId, toId }];
-  });
-}
-
 export function saveDraftLinks() {
   setSavedLinks(draftLinks().map(link => ({ ...link })));
   setLinkModalOpen(false);
@@ -443,7 +419,6 @@ export function resetLaunchUiState() {
   setLaunchStageDetail(LAUNCH_STAGES[0].detail);
   pendingLaunchLogLines = [];
   setLaunchLogs([]);
-  setDownloadItems([]);
 }
 
 export function addModToFunctionalGroup(groupId: string, modId: string) {

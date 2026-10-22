@@ -7,7 +7,6 @@
 import { createMemo } from "solid-js";
 import type { AccountSummary, FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
 import {
-  downloadItems,
   accounts,
   activeAccountId,
   aestheticGroups,
@@ -16,7 +15,6 @@ import {
   functionalGroups,
   incompatibilityFocusId,
   launchProgress,
-  launcherErrors,
   launchStageDetail,
   launchStageLabel,
   launchState,
@@ -154,38 +152,11 @@ export const topLevelItems = createMemo<TopLevelItem[]>(previous => {
   return items.length === previous.length && items.every((item, index) => item === previous[index]) ? previous : items;
 }, []);
 
-export const filteredRows = createMemo(() => {
-  const query = search().trim().toLowerCase();
-  const tags = tagFilter();
-  const fGroups = functionalGroups();
-  let rows = modRowsState();
-  if (query) rows = rows.filter(row => rowMatchesQuery(row, query));
-  if (tags.size > 0) rows = rows.filter(row => rowOrDescendantMatchesTag(row, fGroups, tags));
-  return rows;
-});
-
-export const manualModRows = createMemo(() => {
-  const alternatives = modRowsState().flatMap(row => (row.alternatives ?? []).filter(alt => alt.kind === "local"));
-  return [...modRowsState().filter(row => row.kind === "local"), ...alternatives];
-});
-
-export const manualModWarningCount = createMemo(() => manualModRows().length);
-
-export const completedDownloads = createMemo(() => downloadItems().filter(item => item.status === "complete"));
-
-export const latestError = createMemo(() => launcherErrors()[0] ?? null);
-
 export const activeLaunchStage = createMemo(() => ({
   label: launchStageLabel(),
   detail: launchStageDetail(),
   progress: launchProgress(),
 }));
-
-export const playButtonLabel = createMemo(() => {
-  if (launchState() === "resolving") return `Resolving ${launchProgress()}%`;
-  if (launchState() === "ready") return "Launch Ready";
-  return "Play";
-});
 
 export const functionalGroupsByBlockId = createMemo(() => {
   const map = new Map<string, FunctionalGroup[]>();
@@ -276,14 +247,6 @@ export const linksByModId = createMemo(() => {
   return map;
 });
 
-export const groupNameByBlockId = createMemo(() => {
-  const map = new Map<string, string>();
-  for (const group of aestheticGroups()) {
-    for (const id of group.blockIds) map.set(id, group.name);
-  }
-  return map;
-});
-
 export function findDirectParentId(rows: ModRow[], targetId: string): string | null {
   for (const row of rows) {
     if ((row.alternatives ?? []).some(alt => alt.id === targetId)) return row.id;
@@ -292,20 +255,6 @@ export function findDirectParentId(rows: ModRow[], targetId: string): string | n
   }
   return null;
 }
-
-export const filteredGroupSections = createMemo(() => {
-  const query = search().trim().toLowerCase();
-  const tags = tagFilter();
-  const fGroups = functionalGroups();
-  return aestheticGroups().filter(group => !group.scopeRowId).map(group => {
-    const blocks = group.blockIds
-      .map(id => rowMap().get(id))
-      .filter((row): row is ModRow => Boolean(row))
-      .filter(row => !query || rowMatchesQuery(row, query))
-      .filter(row => tags.size === 0 || rowOrDescendantMatchesTag(row, fGroups, tags));
-    return { ...group, blocks };
-  });
-});
 
 export const tagFilterForcedExpanded = createMemo(() => {
   const tags = tagFilter();
@@ -333,16 +282,6 @@ export const tagFilterForcedExpanded = createMemo(() => {
   for (const row of modRowsState()) processRow(row);
   return forced;
 });
-
-export function resolveToTopLevelId(rowId: string): string {
-  const match = rowId.match(/^(rule-\d+)-alternative-/);
-  if (!match) return rowId;
-  const prefix = `${match[1]}-`;
-  for (const row of modRowsState()) {
-    if (row.id.startsWith(prefix) && !row.id.includes("-alternative-")) return row.id;
-  }
-  return rowId;
-}
 
 export const alternativesPanelParent = createMemo(() => {
   const id = alternativesPanelParentId();
@@ -428,14 +367,4 @@ function createsPriorityParadox(rules: IncompatibilityRule[], allIds: string[]):
     if (!visited.has(id) && dfs(id)) return true;
   }
   return false;
-}
-
-export function moveItemBefore<T extends { id: string }>(items: T[], draggedId: string, targetId: string): T[] {
-  const dragged = items.find(item => item.id === draggedId);
-  if (!dragged) return items;
-  const rest = items.filter(item => item.id !== draggedId);
-  const idx = rest.findIndex(item => item.id === targetId);
-  if (idx < 0) return items;
-  rest.splice(idx, 0, dragged);
-  return rest;
 }

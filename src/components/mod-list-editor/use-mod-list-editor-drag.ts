@@ -4,7 +4,6 @@ import { useDragEngine, type DragItem } from "../../lib/dragEngine";
 import { computePreviewTranslates } from "../../lib/dragUtils";
 import type { ModRow } from "../../lib/types";
 import {
-  activeAccount,
   aestheticGroups,
   modIcons,
   modRowsState,
@@ -407,8 +406,6 @@ export function useModListEditorDrag(options: ModListEditorDragOptions) {
     else commitRowMove(fromId, dropId);
   };
 
-  const isSignedIn = () => activeAccount()?.status === "online";
-
   return {
     draggingGroupItem,
     draggingRow,
@@ -416,7 +413,6 @@ export function useModListEditorDrag(options: ModListEditorDragOptions) {
     engine,
     handleStartDrag,
     isDraggingGroup,
-    isSignedIn,
     previewGroupRowTranslates,
     previewTranslates,
     setListContainerRef,

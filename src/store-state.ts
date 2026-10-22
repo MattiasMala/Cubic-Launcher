@@ -9,7 +9,6 @@ import type {
   AccountSummary,
   AestheticGroup,
   CustomConfig,
-  DownloadProgressItem,
   FunctionalGroup,
   IncompatibilityRule,
   LauncherUiError,
@@ -35,14 +34,6 @@ export type UpdateCheckResponse = {
   version: string | null;
   notes: string | null;
 };
-
-export const DEMO_MOD_LISTS: ModListCard[] = [
-  { name: "My First Pack", status: "Ready", accent: "from-primary/30 via-primary/10 to-transparent", description: "Create a mod list by clicking + above." },
-];
-
-export const DEMO_ACCOUNTS: AccountSummary[] = [
-  { id: "demo", gamertag: "Not logged in", email: "", status: "offline", lastMode: "offline", playsOffline: false },
-];
 
 export const [modListCards, setModListCards] = createSignal<ModListCard[]>([]);
 export const [selectedModListName, setSelectedModListName] = createSignal<string>("");
@@ -91,7 +82,6 @@ export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
 /** Set by STOP: the exit that follows is the user's, not a crash to report (concorrenza-9). */
 export const [launchStopRequested, setLaunchStopRequested] = createSignal(false);
-export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);
 export const [launcherErrors, setLauncherErrors] = createSignal<LauncherUiError[]>([]);
 export const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);
 export const [updateBusy, setUpdateBusy] = createSignal(false);
@@ -110,7 +100,6 @@ export const [activeAccountId, setActiveAccountId] = createSignal<string>("");
  */
 export const [accountsRevision, setAccountsRevision] = createSignal(0);
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
-export const [verificationModalOpen, setVerificationModalOpen] = createSignal(false);
 export const [instancePresentation, setInstancePresentation] = createSignal({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
 export const [exportModalOpen, setExportModalOpen] = createSignal(false);
 export const [exportOptions, setExportOptions] = createSignal({ rulesJson: true, configFiles: false, resourcePacks: false, dataPacks: false, shaders: false, otherFiles: false, selectedOtherPaths: [] as string[], selectedContentPaths: [] as string[] });
@@ -145,7 +134,6 @@ export const [createModlistModalOpen, setCreateModlistModalOpen] = createSignal(
 export const [createModlistName, setCreateModlistName] = createSignal("");
 export const [createModlistDescription, setCreateModlistDescription] = createSignal("");
 export const [createModlistBusy, setCreateModlistBusy] = createSignal(false);
-export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
 /** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */
 export const [modNames, setModNames] = createSignal<Map<string, string>>(new Map());

@@ -99,16 +99,6 @@ export function normalizeIdentifier(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function renameRowId(rowId: string, newName: string): string {
-  const alternativeMatch = rowId.match(/^(rule-\d+(?:-alternative-\d+)*)-/);
-  if (alternativeMatch) return `${alternativeMatch[1]}-${normalizeIdentifier(newName)}`;
-
-  const ruleMatch = rowId.match(/^(rule-\d+)-/);
-  if (ruleMatch) return `${ruleMatch[1]}-${normalizeIdentifier(newName)}`;
-
-  return rowId;
-}
-
 export function buildIdRemap(previousRows: ModRow[], nextRows: ModRow[]): Map<string, string> {
   const remap = new Map<string, string>();
 

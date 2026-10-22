@@ -11,7 +11,6 @@ import {
   selectedMcVersion,
   selectedModLoader,
   setActiveRailView,
-  setAppLoading,
   setLaunchStopRequested,
   setLaunchProgress,
   setLaunchStageDetail,
@@ -176,8 +175,6 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
           severity: "error",
           scope: "launch",
         });
-      } finally {
-        setAppLoading(false);
       }
 
       if (disposed) unlisteners.forEach((unlisten) => unlisten());

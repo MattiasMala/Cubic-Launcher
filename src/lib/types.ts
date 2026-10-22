@@ -97,12 +97,6 @@ export type CustomConfig = {
   files: string[];
 };
 
-export type DownloadProgressItem = {
-  filename: string;
-  progress: number;
-  status: "queued" | "downloading" | "complete";
-};
-
 export type LauncherUiError = {
   id: string;
   title: string;
