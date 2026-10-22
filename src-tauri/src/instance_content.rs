@@ -48,6 +48,17 @@ pub struct ManagedContentManifest {
     /// came from Modrinth. Local packs have no entry here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub origins: BTreeMap<String, ManagedFileOrigin>,
+    /// The names the launcher put here as a **real directory**: an unpacked
+    /// local pack it had to copy because the platform refused a link to a
+    /// folder, or because a world may hold no link (D144). Only these are
+    /// folders the launcher may delete (todo.md:1689): a folder the user made
+    /// under a managed name is theirs, and it stays.
+    ///
+    /// Added like `origins`, without bumping [`MANIFEST_VERSION`]. `None` is a
+    /// manifest written before the field, which did not say what shape it
+    /// left; see [`PreviousContent::owns_directory`] for how that reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_dirs: Option<Vec<String>>,
 }
 
 /// Where one managed file came from (precheck-3, contentpack-4, contentpack-7).
@@ -74,6 +85,8 @@ pub struct PreviousContent {
     /// A manifest file is on disk, readable or not. Without one and without
     /// anything adopted, a sync with nothing to install writes nothing.
     pub manifest_exists: bool,
+    /// The manifest's `copied_dirs`: `None` when it predates the field.
+    pub copied_dirs: Option<Vec<String>>,
 }
 
 impl PreviousContent {
@@ -82,6 +95,32 @@ impl PreviousContent {
     pub fn owns(&self, name: &str) -> bool {
         self.files.iter().any(|listed| listed == name)
     }
+
+    /// Whether a **real directory** under `name` is the launcher's copy, the
+    /// only kind of folder it may delete (todo.md:1689).
+    ///
+    /// A manifest that records `copied_dirs` is the whole answer. One written
+    /// before it only lists names, and until then a listed name was ownership
+    /// whatever its shape — the rule this keeps for that one launch, so a
+    /// copied folder pack of an older launcher is still replaced and not
+    /// skipped forever — except for a Modrinth file: Modrinth ships files, so
+    /// a folder under one of their names was never the launcher's.
+    pub fn owns_directory(&self, name: &str) -> bool {
+        match &self.copied_dirs {
+            Some(copied) => copied.iter().any(|listed| listed == name),
+            None => self.owns(name) && !self.origins.contains_key(name),
+        }
+    }
+
+    /// [`Self::owns`] or [`Self::owns_directory`], by what is on disk at
+    /// `path` now: the ownership a link must have before it replaces it.
+    pub fn owns_target(&self, name: &str, path: &Path) -> bool {
+        if is_real_dir(path) {
+            self.owns_directory(name)
+        } else {
+            self.owns(name)
+        }
+    }
 }
 
 /// What this launch linked into one category directory.
@@ -89,6 +128,8 @@ impl PreviousContent {
 pub struct InstalledContent {
     pub files: Vec<String>,
     pub origins: BTreeMap<String, ManagedFileOrigin>,
+    /// The names this launch placed as a real directory (a copied folder).
+    pub copied_dirs: Vec<String>,
 }
 
 impl InstalledContent {
@@ -99,6 +140,14 @@ impl InstalledContent {
         }
         if let Some(origin) = origin {
             self.origins.insert(name.to_string(), origin);
+        }
+    }
+
+    /// Record one local pack this launch copied in as a real directory.
+    pub fn add_copied_directory(&mut self, name: &str) {
+        self.add(name, None);
+        if !self.copied_dirs.iter().any(|listed| listed == name) {
+            self.copied_dirs.push(name.to_string());
         }
     }
 }
@@ -112,6 +161,14 @@ pub struct ContentSyncOutcome {
     /// launch that stops (contentpack-10); the name stays in the manifest, so
     /// the next launch tries again.
     pub failed_removals: Vec<(String, String)>,
+    /// Managed names that are now a real folder the launcher did not create:
+    /// kept, never deleted, and out of the manifest from now on — the folder
+    /// is the user's (todo.md:1689). For a warning in the launch log.
+    pub kept_foreign_dirs: Vec<String>,
+    /// What this launch would have removed, had every lookup answered: the
+    /// packs a failed lookup keeps in the game although the list dropped them
+    /// (todo.md:1691). Empty on a complete launch.
+    pub frozen: Vec<String>,
     /// `(old name, new name)` for every entry whose file name changed since
     /// the last launch: what the game's own settings still call by the old
     /// name (D145).
@@ -149,7 +206,9 @@ pub fn manifest_path(instance_root: &Path, category: &str) -> PathBuf {
 /// it safe to remove a **real directory**: local packs can be unpacked folders,
 /// and on a platform where a directory cannot be linked the launcher copies one
 /// in, so "it is a directory, therefore not mine" stopped being true. A
-/// directory the manifest does not name is still never touched.
+/// directory the manifest does not name is still never touched, and one it
+/// names goes only if it is a copy the launcher made: the sync sets the
+/// others aside before removing anything (`copied_dirs`, todo.md:1689).
 pub fn plan_stale_removals(
     previous: &[String],
     installed: &[String],
@@ -201,12 +260,15 @@ pub fn read_manifest(manifest_path: &Path) -> Option<ManagedContentManifest> {
         files.iter().any(|listed| listed == name)
             && validate_path_component(&origin.version_id).is_ok()
     });
+    if let Some(copied) = manifest.copied_dirs.as_mut() {
+        copied.retain(|name| files.iter().any(|listed| listed == name));
+    }
     Some(manifest)
 }
 
 #[cfg(test)]
 fn write_manifest(manifest_path: &Path, category: &str, files: &[String]) -> Result<()> {
-    write_manifest_with_origins(manifest_path, category, files, &BTreeMap::new())
+    write_manifest_with_origins(manifest_path, category, files, &BTreeMap::new(), &[])
 }
 
 fn write_manifest_with_origins(
@@ -214,6 +276,7 @@ fn write_manifest_with_origins(
     category: &str,
     files: &[String],
     origins: &BTreeMap<String, ManagedFileOrigin>,
+    copied_dirs: &[String],
 ) -> Result<()> {
     let manifest = ManagedContentManifest {
         version: MANIFEST_VERSION,
@@ -224,6 +287,13 @@ fn write_manifest_with_origins(
             .filter(|(name, _)| files.contains(name))
             .map(|(name, origin)| (name.clone(), origin.clone()))
             .collect(),
+        copied_dirs: Some(
+            copied_dirs
+                .iter()
+                .filter(|name| files.contains(name))
+                .cloned()
+                .collect(),
+        ),
     };
     let body = serde_json::to_string_pretty(&manifest)
         .context("failed to serialize managed content manifest")?;
@@ -317,7 +387,7 @@ pub fn sync_managed_content_dir(
     let previous = previous_from_manifest(instance_root, category);
     let installed = InstalledContent {
         files: installed.to_vec(),
-        origins: BTreeMap::new(),
+        ..InstalledContent::default()
     };
     sync_managed_content(
         instance_root,
@@ -353,6 +423,10 @@ pub fn sync_managed_content(
     }
 
     if !installed_is_complete {
+        // Reading the directory only feeds the warning: a failure here costs
+        // the list of what stays, not the launch.
+        let present = present_entries(instance_dir).unwrap_or_default();
+        let frozen = plan_stale_removals(&previous.files, &installed.files, &present);
         let files = carry_forward(&previous.files, &installed.files);
         let mut origins = previous.origins.clone();
         origins.extend(
@@ -361,15 +435,18 @@ pub fn sync_managed_content(
                 .iter()
                 .map(|(name, origin)| (name.clone(), origin.clone())),
         );
-        write_manifest_with_origins(&manifest_path, category, &files, &origins)?;
+        let copied_dirs = carried_copied_dirs(previous, &installed.copied_dirs, &present);
+        write_manifest_with_origins(&manifest_path, category, &files, &origins, &copied_dirs)?;
         return Ok(ContentSyncOutcome {
             renamed,
+            frozen,
             ..ContentSyncOutcome::default()
         });
     }
 
     let present = present_entries(instance_dir)?;
     let removals = plan_stale_removals(&previous.files, &installed.files, &present);
+    let (removals, kept_foreign_dirs) = set_aside_foreign_dirs(previous, removals, &present);
 
     let mut removed = Vec::new();
     let mut failed_removals = Vec::new();
@@ -380,22 +457,65 @@ pub fn sync_managed_content(
         }
     }
 
-    // What would not go is still ours: it stays listed, with its origin.
+    // What would not go is still ours: it stays listed, with its origin and
+    // its shape.
     let mut files = installed.files.clone();
     let mut origins = installed.origins.clone();
+    let mut copied_dirs = installed.copied_dirs.clone();
     for (name, _) in &failed_removals {
         files.push(name.clone());
         if let Some(origin) = previous.origins.get(name) {
             origins.insert(name.clone(), origin.clone());
         }
+        if previous.owns_directory(name) {
+            copied_dirs.push(name.clone());
+        }
     }
-    write_manifest_with_origins(&manifest_path, category, &files, &origins)?;
+    write_manifest_with_origins(&manifest_path, category, &files, &origins, &copied_dirs)?;
 
     Ok(ContentSyncOutcome {
         removed,
         failed_removals,
+        kept_foreign_dirs,
         renamed,
+        frozen: Vec::new(),
     })
+}
+
+/// Split planned removals into what may go and the real folders the launcher
+/// did not create (todo.md:1689). The manifest names both — a folder the user
+/// put under the name of a pack we linked — but only our own copy is ours to
+/// delete; the other is kept, and reported.
+fn set_aside_foreign_dirs(
+    previous: &PreviousContent,
+    removals: Vec<String>,
+    present: &[PresentEntry],
+) -> (Vec<String>, Vec<String>) {
+    removals.into_iter().partition(|name| {
+        !present
+            .iter()
+            .any(|entry| entry.name == *name && entry.is_real_dir)
+            || previous.owns_directory(name)
+    })
+}
+
+/// The `copied_dirs` of a manifest that carries the previous names forward:
+/// this launch's copies, and the previous ones still on disk as a folder.
+fn carried_copied_dirs(
+    previous: &PreviousContent,
+    installed_copied: &[String],
+    present: &[PresentEntry],
+) -> Vec<String> {
+    let mut copied = installed_copied.to_vec();
+    for name in &previous.files {
+        let still_a_folder = present
+            .iter()
+            .any(|entry| entry.name == *name && entry.is_real_dir);
+        if still_a_folder && previous.owns_directory(name) && !copied.contains(name) {
+            copied.push(name.clone());
+        }
+    }
+    copied
 }
 
 /// The previous state as the manifest alone tells it.
@@ -407,6 +527,7 @@ pub fn previous_from_manifest(manifest_root: &Path, category: &str) -> PreviousC
             files: manifest.files,
             origins: manifest.origins,
             manifest_exists,
+            copied_dirs: manifest.copied_dirs,
         },
         None => PreviousContent {
             manifest_exists,
@@ -584,6 +705,8 @@ pub fn retire_legacy_content_dir(
 
     let present = present_entries(&instance_dir)?;
     let removals = plan_stale_removals(&previous.files, &[], &present);
+    // A folder the user made there is not ours, and it keeps its place.
+    let (removals, _kept) = set_aside_foreign_dirs(&previous, removals, &present);
     for name in &removals {
         let path = instance_dir.join(name);
         remove_managed_entry(&path)
@@ -925,6 +1048,10 @@ pub enum ContentLinkOutcome {
     /// Nothing was done: a real file sits under that name and the previous
     /// manifest does not claim it, so it is not ours to replace.
     SkippedForeignFile,
+    /// Nothing was done: a real folder sits under that name and it is not a
+    /// copy the launcher made (todo.md:1558). It used to stop the launch with
+    /// «failed to link content pack»; it is the user's, and it stays.
+    SkippedForeignDirectory,
 }
 
 /// Link a downloaded pack under `target`, applying the manifest rule on the way
@@ -973,6 +1100,14 @@ pub fn link_content_file_as(
         }
         fs::remove_file(target)
             .with_context(|| format!("failed to replace {}", target.display()))?;
+    } else if is_real_dir(target) {
+        // `target_is_ours` for a folder is the manifest's `copied_dirs`
+        // (`PreviousContent::owns_target`): our own copy gives way.
+        if !target_is_ours {
+            return Ok(ContentLinkOutcome::SkippedForeignDirectory);
+        }
+        fs::remove_dir_all(target)
+            .with_context(|| format!("failed to replace {}", target.display()))?;
     }
 
     match kind {
@@ -993,12 +1128,16 @@ pub fn place_file_without_symlink(source: &Path, target: &Path) -> Result<()> {
     }
 
     fs::hard_link(source, target).or_else(|hard_link_error| {
-        fs::copy(source, target).map(|_| ()).with_context(|| {
-            format!(
+        fs::copy(source, target).map(|_| ()).map_err(|copy_error| {
+            // A half-written copy would be a real file no manifest names:
+            // the next launch would take it for the user's and skip the pack
+            // for good (contentpack-6).
+            let _ = fs::remove_file(target);
+            anyhow::anyhow!(copy_error).context(format!(
                 "failed to copy {} to {} after the hard link failed: {hard_link_error}",
                 source.display(),
                 target.display()
-            )
+            ))
         })
     })
 }
@@ -1008,6 +1147,17 @@ pub fn place_file_without_symlink(source: &Path, target: &Path) -> Result<()> {
 pub fn is_real_file(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+/// A directory, and not a link pointing at one: the shape the launcher cannot
+/// tell from a user's folder without the manifest's `copied_dirs`.
+pub fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            let file_type = metadata.file_type();
+            file_type.is_dir() && !file_type.is_symlink()
+        })
         .unwrap_or(false)
 }
 
@@ -1186,6 +1336,7 @@ mod tests {
             category: "resourcepacks".to_string(),
             files: names(&["../escaped.zip", "managed.zip"]),
             origins: Default::default(),
+            copied_dirs: None,
         };
         fs::write(
             &path,
@@ -1703,6 +1854,7 @@ mod tests {
             .into_iter()
             .collect(),
             manifest_exists: true,
+            copied_dirs: None,
         };
         let mut installed = InstalledContent::default();
         installed.add("Same.zip", origin("same", "V2"));
@@ -1934,6 +2086,179 @@ mod tests {
             sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[], true)
                 .expect("the next sync should succeed");
         assert_eq!(removed, names(&["old.zip"]));
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    // ── todo.md:1689, :1558, :1691 ───────────────────────────────────────────
+
+    /// A folder the user put under the name of a pack we linked is theirs:
+    /// kept, reported, and out of the manifest from then on.
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn a_users_folder_under_a_managed_name_is_kept_and_leaves_the_manifest() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let cached = root_dir.join("Pack.zip");
+        fs::write(&cached, b"pack").expect("cached pack should exist");
+        std::os::unix::fs::symlink(&cached, instance_dir.join("Pack.zip"))
+            .expect("link should be created");
+        sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["Pack.zip"]),
+            true,
+        )
+        .expect("first sync should succeed");
+
+        // The user swaps our link for a folder of their own.
+        fs::remove_file(instance_dir.join("Pack.zip")).expect("link removed");
+        fs::create_dir_all(instance_dir.join("Pack.zip").join("assets")).expect("user folder");
+
+        let previous = super::previous_from_manifest(&root_dir, "resourcepacks");
+        let outcome = sync_managed_content(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &previous,
+            &InstalledContent::default(),
+            true,
+        )
+        .expect("sync should succeed");
+
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.kept_foreign_dirs, names(&["Pack.zip"]));
+        assert!(instance_dir.join("Pack.zip").join("assets").is_dir());
+        assert!(read_manifest_files(&manifest_path(&root_dir, "resourcepacks")).is_empty());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// The folder the launcher copied in itself is still its own to remove.
+    #[test]
+    fn our_own_copied_folder_is_removed_when_the_list_drops_it() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        fs::create_dir_all(instance_dir.join("Folder Pack").join("assets")).expect("copy");
+        let mut installed = InstalledContent::default();
+        installed.add_copied_directory("Folder Pack");
+        sync_managed_content(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &super::PreviousContent::default(),
+            &installed,
+            true,
+        )
+        .expect("first sync should succeed");
+        let manifest = read_manifest(&manifest_path(&root_dir, "resourcepacks")).expect("manifest");
+        assert_eq!(manifest.copied_dirs, Some(names(&["Folder Pack"])));
+
+        let removed =
+            sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[], true)
+                .expect("second sync should succeed");
+
+        assert_eq!(removed, names(&["Folder Pack"]));
+        assert!(!instance_dir.join("Folder Pack").exists());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// A manifest from before `copied_dirs` keeps its old word for a local
+    /// name — a copied folder pack is still replaced, not skipped forever —
+    /// but a folder under a Modrinth file's name was never the launcher's.
+    #[test]
+    fn a_manifest_before_copied_dirs_owns_a_local_folder_but_never_a_modrinth_one() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        fs::create_dir_all(instance_dir.join("Local Folder")).expect("old copy");
+        fs::create_dir_all(instance_dir.join("Modrinth.zip")).expect("user folder");
+        let path = manifest_path(&root_dir, "resourcepacks");
+        fs::create_dir_all(path.parent().expect("manifest dir")).expect("manifest dir");
+        fs::write(
+            &path,
+            r#"{"version":1,"category":"resourcepacks","files":["Local Folder","Modrinth.zip"],
+               "origins":{"Modrinth.zip":{"entryId":"m","versionId":"V1"}}}"#,
+        )
+        .expect("old manifest");
+
+        let previous = super::previous_from_manifest(&root_dir, "resourcepacks");
+        assert_eq!(previous.copied_dirs, None);
+        let outcome = sync_managed_content(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &previous,
+            &InstalledContent::default(),
+            true,
+        )
+        .expect("sync should succeed");
+
+        assert_eq!(outcome.removed, names(&["Local Folder"]));
+        assert_eq!(outcome.kept_foreign_dirs, names(&["Modrinth.zip"]));
+        assert!(instance_dir.join("Modrinth.zip").is_dir());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// todo.md:1558: a real folder under a Modrinth pack's name is skipped,
+    /// not a launch that fails; and it is left exactly as it was.
+    #[test]
+    fn a_real_folder_under_a_pack_name_is_skipped_not_an_error() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let source = root_dir.join("cache-Pack.zip");
+        fs::write(&source, b"pack").expect("cached pack should exist");
+        let target = instance_dir.join("Pack.zip");
+        fs::create_dir_all(target.join("theirs")).expect("user folder");
+
+        let outcome = link_content_file(&source, &target, false)
+            .expect("a folder under the name is not an error");
+
+        assert_eq!(outcome, ContentLinkOutcome::SkippedForeignDirectory);
+        assert!(target.join("theirs").is_dir());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// todo.md:1691: an incomplete pass says what it would have removed.
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn an_incomplete_sync_reports_what_it_holds_back() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        for name in ["a.zip", "b.zip"] {
+            let cached = root_dir.join(name);
+            fs::write(&cached, b"pack").expect("cached pack should exist");
+            std::os::unix::fs::symlink(&cached, instance_dir.join(name))
+                .expect("link should be created");
+        }
+        sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["a.zip", "b.zip"]),
+            true,
+        )
+        .expect("first sync should succeed");
+
+        let previous = super::previous_from_manifest(&root_dir, "resourcepacks");
+        let mut installed = InstalledContent::default();
+        installed.add("a.zip", None);
+        let outcome = sync_managed_content(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &previous,
+            &installed,
+            false,
+        )
+        .expect("sync should succeed");
+
+        assert_eq!(outcome.frozen, names(&["b.zip"]));
+        assert!(outcome.removed.is_empty());
+        assert!(fs::symlink_metadata(instance_dir.join("b.zip")).is_ok());
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

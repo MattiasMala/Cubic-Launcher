@@ -356,6 +356,10 @@ pub(super) struct PreparedCategory {
     /// `false` when at least one Modrinth entry is unknown: a failed lookup,
     /// or an account that plays offline (D157). Nothing may be removed then.
     pub(super) lookups_complete: bool,
+    /// The entries whose lookup failed — not an answer, a network or Modrinth
+    /// error. They are what holds the category's removals back, and the user
+    /// is told so (todo.md:1691).
+    pub(super) lookup_failures: Vec<String>,
 }
 
 /// The Modrinth loaders a category's versions are published under
@@ -420,6 +424,7 @@ async fn prepare_category_packs(
     let mut prepared = PreparedCategory {
         packs: Vec::new(),
         lookups_complete: true,
+        lookup_failures: Vec::new(),
     };
 
     // A missing file is an answer, not a failure: it is logged and does not
@@ -492,6 +497,7 @@ async fn prepare_category_packs(
             // Not an answer: we do not know which file this entry wants, so
             // nothing may be removed on this pass.
             prepared.lookups_complete = false;
+            prepared.lookup_failures.push(entry_id.clone());
             emit_log(
                 app_handle,
                 ProcessLogStream::Stdout,
@@ -543,14 +549,45 @@ async fn prepare_category_packs(
     Ok(prepared)
 }
 
+/// What [`link_prepared_packs`] did in one directory.
+#[derive(Debug, Default)]
+pub(super) struct LinkedPacks {
+    /// What reached the directory: the set the sync compares the previous
+    /// manifest against.
+    pub(super) installed: crate::instance_content::InstalledContent,
+    /// The packs left out because something the launcher did not create
+    /// holds their name (D1, D103). The user is told, not only the log.
+    pub(super) skipped: Vec<SkippedPack>,
+    /// The error that stopped the linking halfway (contentpack-6). Whatever
+    /// was linked before it is in `installed`, so the caller records it in
+    /// the manifest before it lets the launch fail: a link the manifest does
+    /// not name is, on the next launch, a file the launcher "did not create"
+    /// — skipped, never updated, never removed, and twice in game after an
+    /// update.
+    pub(super) interrupted: Option<anyhow::Error>,
+}
+
+/// One pack [`link_prepared_packs`] did not install, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SkippedPack {
+    /// The entry id of a Modrinth pack, the file name of a local one.
+    pub(super) pack: String,
+    pub(super) path: PathBuf,
+    /// `a file` or `a folder`: what sits under the pack's name.
+    pub(super) what: &'static str,
+}
+
 /// Link prepared packs into one directory, applying the manifest rule on the
 /// way in (D1), and return what reached it.
 ///
-/// What is returned is the point of this function: it is the set
+/// What is returned is the point of this function: `installed` is the set
 /// [`crate::instance_content::sync_managed_content`] compares the previous
-/// manifest against, with the origin of every Modrinth file. A pack that is
-/// linked but left out of that set is removed on the *next* launch — the wipe
-/// C1 closed, reappearing in a form that takes two launches to notice.
+/// manifest against, with the origin of every Modrinth file and the shape of
+/// every copied folder. A pack that is linked but left out of that set is
+/// removed on the *next* launch — the wipe C1 closed, reappearing in a form
+/// that takes two launches to notice. For the same reason an error does not
+/// return early: it stops the loop and travels in `interrupted`, next to what
+/// was already linked.
 ///
 /// `label` is how the log names the directory (`resourcepacks`,
 /// `saves/<world>/datapacks`).
@@ -561,111 +598,237 @@ pub(super) fn link_prepared_packs(
     previous: &crate::instance_content::PreviousContent,
     label: &str,
     kind: crate::instance_content::LinkKind,
-) -> Result<crate::instance_content::InstalledContent> {
-    let mut installed = crate::instance_content::InstalledContent::default();
+) -> LinkedPacks {
+    let mut linked = LinkedPacks::default();
 
     if !packs.is_empty() {
-        std::fs::create_dir_all(target_dir)
-            .with_context(|| format!("failed to create {}", target_dir.display()))?;
+        if let Err(error) = std::fs::create_dir_all(target_dir)
+            .with_context(|| format!("failed to create {}", target_dir.display()))
+        {
+            linked.interrupted = Some(error);
+            return linked;
+        }
     }
 
     for pack in packs {
-        let target_path = target_dir.join(&pack.file_name);
-        let target_is_ours = previous.owns(&pack.file_name);
+        if let Err(error) = link_one_pack(log, pack, target_dir, previous, label, kind, &mut linked)
+        {
+            linked.interrupted = Some(error);
+            break;
+        }
+    }
 
-        match &pack.source {
-            PreparedPackSource::Local { source_path } => {
-                let outcome = link_local_pack_as(source_path, &target_path, target_is_ours, kind)
-                    .with_context(|| {
+    linked
+}
+
+/// One step of [`link_prepared_packs`]: what it linked or skipped goes into
+/// `linked` before the next fallible call.
+fn link_one_pack(
+    log: &mut ContentLog<'_>,
+    pack: &PreparedPack,
+    target_dir: &Path,
+    previous: &crate::instance_content::PreviousContent,
+    label: &str,
+    kind: crate::instance_content::LinkKind,
+    linked: &mut LinkedPacks,
+) -> Result<()> {
+    let target_path = target_dir.join(&pack.file_name);
+    // A folder under the name is ours only if the manifest says we copied it
+    // there (todo.md:1689); anything else, if the manifest lists the name.
+    let target_is_ours = previous.owns_target(&pack.file_name, &target_path);
+
+    match &pack.source {
+        PreparedPackSource::Local { source_path } => {
+            let outcome = link_local_pack_as(source_path, &target_path, target_is_ours, kind)
+                .with_context(|| {
                     format!(
                         "failed to install local content pack '{}' into {label}",
                         pack.file_name
                     )
                 })?;
 
-                let how = match outcome {
-                    PackLinkOutcome::Linked => "",
-                    // Not silent: a copied folder is a second set of bytes on
-                    // disk, and whoever reads the log has to be able to tell why.
-                    PackLinkOutcome::Copied
-                        if kind == crate::instance_content::LinkKind::NoSymlink =>
-                    {
-                        " (copied: a world cannot hold a link to a folder)"
-                    }
-                    PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
-                    PackLinkOutcome::SkippedForeignDirectory
-                    | PackLinkOutcome::SkippedForeignFile => {
-                        // Left out of `installed` on purpose: the name is not in
-                        // the manifest, so the sync will not remove it either,
-                        // and what the user put there stays exactly as it is.
-                        let what = if outcome == PackLinkOutcome::SkippedForeignFile {
-                            "a file"
-                        } else {
-                            "a directory"
-                        };
-                        log(
-                            ProcessLogStream::Stdout,
-                            format!(
-                                "[Content] Skipped local pack '{}': {} is {what} the launcher did not create",
-                                pack.file_name,
-                                target_path.display()
-                            ),
-                        )?;
-                        continue;
-                    }
-                };
-
-                installed.add(&pack.file_name, None);
-                log(
-                    ProcessLogStream::Stdout,
-                    format!("[Content] {} -> {label}{how}", pack.file_name),
-                )?;
-            }
-            PreparedPackSource::Modrinth {
-                entry_id,
-                version_id,
-                cached_path,
-                was_cached,
-            } => {
-                let outcome = crate::instance_content::link_content_file_as(
-                    cached_path,
-                    &target_path,
-                    target_is_ours,
-                    kind,
-                )
-                .with_context(|| {
-                    format!("failed to link content pack '{entry_id}' into {label}")
-                })?;
-                if outcome == crate::instance_content::ContentLinkOutcome::SkippedForeignFile {
-                    // Left out of `installed`: the name is not in the manifest,
-                    // so the sync will not remove it either.
-                    log(
+            let how = match outcome {
+                PackLinkOutcome::Linked => "",
+                // Not silent: a copied folder is a second set of bytes on
+                // disk, and whoever reads the log has to be able to tell why.
+                PackLinkOutcome::Copied if kind == crate::instance_content::LinkKind::NoSymlink => {
+                    " (copied: a world cannot hold a link to a folder)"
+                }
+                PackLinkOutcome::Copied => " (copied: this platform refused a directory link)",
+                PackLinkOutcome::SkippedForeignDirectory | PackLinkOutcome::SkippedForeignFile => {
+                    // Left out of `installed` on purpose: the name is not in
+                    // the manifest, so the sync will not remove it either,
+                    // and what the user put there stays exactly as it is.
+                    let what = if outcome == PackLinkOutcome::SkippedForeignFile {
+                        "a file"
+                    } else {
+                        "a folder"
+                    };
+                    linked.skipped.push(SkippedPack {
+                        pack: pack.file_name.clone(),
+                        path: target_path.clone(),
+                        what,
+                    });
+                    return log(
                         ProcessLogStream::Stdout,
                         format!(
-                            "[Content] Skipped '{entry_id}': {} is a file the launcher did not create",
+                            "[Content] Skipped local pack '{}': {} is {what} the launcher did not create",
+                            pack.file_name,
                             target_path.display()
                         ),
-                    )?;
-                    continue;
+                    );
                 }
+            };
 
-                installed.add(
-                    &pack.file_name,
-                    Some(crate::instance_content::ManagedFileOrigin {
-                        entry_id: entry_id.clone(),
-                        version_id: version_id.clone(),
-                    }),
-                );
-                let cache_label = if *was_cached { " (cached)" } else { "" };
-                log(
-                    ProcessLogStream::Stdout,
-                    format!("[Content] {entry_id} -> {label}{cache_label}"),
-                )?;
+            if outcome == PackLinkOutcome::Copied {
+                linked.installed.add_copied_directory(&pack.file_name);
+            } else {
+                linked.installed.add(&pack.file_name, None);
             }
+            log(
+                ProcessLogStream::Stdout,
+                format!("[Content] {} -> {label}{how}", pack.file_name),
+            )
+        }
+        PreparedPackSource::Modrinth {
+            entry_id,
+            version_id,
+            cached_path,
+            was_cached,
+        } => {
+            let outcome = crate::instance_content::link_content_file_as(
+                cached_path,
+                &target_path,
+                target_is_ours,
+                kind,
+            )
+            .with_context(|| format!("failed to link content pack '{entry_id}' into {label}"))?;
+            let what = match outcome {
+                crate::instance_content::ContentLinkOutcome::Linked => None,
+                crate::instance_content::ContentLinkOutcome::SkippedForeignFile => Some("a file"),
+                // todo.md:1558: a real folder under the name used to fail the
+                // launch; it is skipped like a file, and kept.
+                crate::instance_content::ContentLinkOutcome::SkippedForeignDirectory => {
+                    Some("a folder")
+                }
+            };
+            if let Some(what) = what {
+                // Left out of `installed`: the name is not in the manifest,
+                // so the sync will not remove it either.
+                linked.skipped.push(SkippedPack {
+                    pack: entry_id.clone(),
+                    path: target_path.clone(),
+                    what,
+                });
+                return log(
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Content] Skipped '{entry_id}': {} is {what} the launcher did not create",
+                        target_path.display()
+                    ),
+                );
+            }
+
+            linked.installed.add(
+                &pack.file_name,
+                Some(crate::instance_content::ManagedFileOrigin {
+                    entry_id: entry_id.clone(),
+                    version_id: version_id.clone(),
+                }),
+            );
+            let cache_label = if *was_cached { " (cached)" } else { "" };
+            log(
+                ProcessLogStream::Stdout,
+                format!("[Content] {entry_id} -> {label}{cache_label}"),
+            )
         }
     }
+}
 
-    Ok(installed)
+/// D103: the packs a file or folder of the user's kept out of this launch, in
+/// one notice the user sees. The log line alone left the pack missing in game
+/// with no reason anywhere on screen (todo.md:1551).
+pub(super) fn describe_skipped_packs(
+    noun: &str,
+    skipped: &[SkippedPack],
+) -> Option<(String, String, String)> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let names = skipped
+        .iter()
+        .map(|skip| format!("'{}'", skip.pack))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let places = skipped
+        .iter()
+        .map(|skip| format!("{} is {}", skip.path.display(), skip.what))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some((
+        format!("Some {noun}s were not installed"),
+        format!(
+            "{names}: something the launcher did not create already sits under that name, so the pack was left out of this launch."
+        ),
+        format!(
+            "{places}. The launcher never replaces a file or folder it did not put there. Move or rename it, and the next launch installs the pack."
+        ),
+    ))
+}
+
+/// todo.md:1691: a failed lookup holds back every removal of the category, so
+/// a pack dropped from the list stays in the game. Said once per category,
+/// with what stays, while it lasts.
+pub(super) fn describe_frozen_removals(
+    noun: &str,
+    lookup_failures: &[String],
+    frozen: &[String],
+) -> Option<(String, String, String)> {
+    if lookup_failures.is_empty() {
+        return None;
+    }
+    let mut failures = lookup_failures.to_vec();
+    failures.sort();
+    failures.dedup();
+    let mut frozen = frozen.to_vec();
+    frozen.sort();
+    frozen.dedup();
+    let staying = if frozen.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " These stay in the game although they are no longer in the list: {}.",
+            frozen.join(", ")
+        )
+    };
+    let mut title = format!("{noun} removals are on hold");
+    // The nouns are ASCII; the title starts with a capital like the others.
+    if let Some(first) = title.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    Some((
+        title,
+        format!(
+            "Modrinth could not be asked about {}, so this launch removed no {noun} from the instance.{staying}",
+            failures.join(", ")
+        ),
+        format!(
+            "Until those entries can be looked up again the launcher cannot tell which file they want, and it keeps every {noun} it installed before rather than delete one still in use. A project deleted from Modrinth never answers: remove its entry from the list to lift the hold."
+        ),
+    ))
+}
+
+/// Send one of the two notices above, if there is one.
+fn emit_content_notice(
+    app_handle: &tauri::AppHandle,
+    notice: Option<(String, String, String)>,
+) -> Result<()> {
+    match notice {
+        Some((title, message, detail)) => {
+            emit_launcher_issue(app_handle, &title, &message, &detail, "warning", "launch")
+        }
+        None => Ok(()),
+    }
 }
 
 /// The active entries of one category list. A missing file is an empty
@@ -848,23 +1011,45 @@ pub(super) async fn resolve_and_install_content_packs(
             &instance_dir,
             Some(cache_dir),
         );
-        let installed = link_prepared_packs(
+        let linked = link_prepared_packs(
             &mut |stream, line| emit_log(app_handle, stream, line),
             &prepared.packs,
             &instance_dir,
             &previous,
             instance_subdir,
             crate::instance_content::LinkKind::Symlink,
-        )?;
+        );
 
-        let outcome = crate::instance_content::sync_managed_content(
+        // contentpack-6: what reached the directory goes into the manifest
+        // even when the linking stopped halfway — as an incomplete set, so
+        // nothing is removed on a pass that did not finish.
+        let synced = crate::instance_content::sync_managed_content(
             instance_root,
             instance_subdir,
             &instance_dir,
             &previous,
-            &installed,
-            prepared.lookups_complete,
+            &linked.installed,
+            prepared.lookups_complete && linked.interrupted.is_none(),
+        );
+        if let Some(error) = linked.interrupted {
+            return Err(error);
+        }
+        let outcome = synced?;
+        let noun = category_noun(content_type);
+        emit_content_notice(app_handle, describe_skipped_packs(noun, &linked.skipped))?;
+        emit_content_notice(
+            app_handle,
+            describe_frozen_removals(noun, &prepared.lookup_failures, &outcome.frozen),
         )?;
+        for name in &outcome.kept_foreign_dirs {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Content] Kept {name} in {instance_subdir}: it is a folder the launcher did not create, so it is never deleted"
+                ),
+            )?;
+        }
         for name in outcome.removed {
             emit_log(
                 app_handle,
@@ -1009,11 +1194,26 @@ async fn install_datapacks(
     )
     .await?;
 
-    link_datapacks_into_worlds(
+    let report = link_datapacks_into_worlds(
         &mut |stream, line| emit_log(app_handle, stream, line),
         instance_root,
         &prepared,
+    )?;
+    let noun = category_noun(DATAPACK_CATEGORY);
+    emit_content_notice(app_handle, describe_skipped_packs(noun, &report.skipped))?;
+    emit_content_notice(
+        app_handle,
+        describe_frozen_removals(noun, &prepared.lookup_failures, &report.frozen),
     )
+}
+
+/// What the data packs met in the worlds, for the notices of the launch.
+#[derive(Debug, Default)]
+pub(super) struct WorldDatapacksReport {
+    /// Every world's skipped packs, each with its own path.
+    pub(super) skipped: Vec<SkippedPack>,
+    /// What a failed lookup kept, world by world (`saves/<world>: name`).
+    pub(super) frozen: Vec<String>,
 }
 
 /// Link the prepared data packs into every world of the instance, each world
@@ -1022,7 +1222,8 @@ pub(super) fn link_datapacks_into_worlds(
     log: &mut ContentLog<'_>,
     instance_root: &Path,
     prepared: &PreparedCategory,
-) -> Result<()> {
+) -> Result<WorldDatapacksReport> {
+    let mut report = WorldDatapacksReport::default();
     let worlds = match crate::instance_content::instance_world_dirs(instance_root) {
         Ok(worlds) => worlds,
         Err(error) => {
@@ -1030,7 +1231,7 @@ pub(super) fn link_datapacks_into_worlds(
                 ProcessLogStream::Stderr,
                 format!("[Content] Could not list the worlds for the data packs: {error:#}"),
             )?;
-            return Ok(());
+            return Ok(report);
         }
     };
     if worlds.is_empty() && !prepared.packs.is_empty() {
@@ -1051,7 +1252,7 @@ pub(super) fn link_datapacks_into_worlds(
         let label = format!("saves/{world_name}/{WORLD_DATAPACKS_DIR}");
         // One world that cannot be updated — a file held open on Windows, a
         // read-only folder — must not stop the launch nor the other worlds.
-        if let Err(error) = sync_world_datapacks(log, &world_dir, prepared, &label) {
+        if let Err(error) = sync_world_datapacks(log, &world_dir, prepared, &label, &mut report) {
             log(
                 ProcessLogStream::Stderr,
                 format!("[Content] Could not update the data packs of {label}: {error:#}"),
@@ -1059,7 +1260,7 @@ pub(super) fn link_datapacks_into_worlds(
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 /// Where a world keeps its data packs, and the category name of its manifest.
@@ -1073,6 +1274,7 @@ fn sync_world_datapacks(
     world_dir: &Path,
     prepared: &PreparedCategory,
     label: &str,
+    report: &mut WorldDatapacksReport,
 ) -> Result<()> {
     let datapacks_dir = world_dir.join(WORLD_DATAPACKS_DIR);
     // No adoption here: no launcher before D144 wrote into a world, so a file
@@ -1083,22 +1285,39 @@ fn sync_world_datapacks(
         &datapacks_dir,
         None,
     );
-    let installed = link_prepared_packs(
+    let linked = link_prepared_packs(
         log,
         &prepared.packs,
         &datapacks_dir,
         &previous,
         label,
         crate::instance_content::LinkKind::NoSymlink,
-    )?;
-    let outcome = crate::instance_content::sync_managed_content(
+    );
+    // contentpack-6, as for the instance's own folders: recorded first.
+    let synced = crate::instance_content::sync_managed_content(
         world_dir,
         WORLD_DATAPACKS_DIR,
         &datapacks_dir,
         &previous,
-        &installed,
-        prepared.lookups_complete,
-    )?;
+        &linked.installed,
+        prepared.lookups_complete && linked.interrupted.is_none(),
+    );
+    if let Some(error) = linked.interrupted {
+        return Err(error);
+    }
+    let outcome = synced?;
+    report.skipped.extend(linked.skipped);
+    report
+        .frozen
+        .extend(outcome.frozen.iter().map(|name| format!("{label}/{name}")));
+    for name in &outcome.kept_foreign_dirs {
+        log(
+            ProcessLogStream::Stderr,
+            format!(
+                "[Content] Kept {name} in {label}: it is a folder the launcher did not create, so it is never deleted"
+            ),
+        )?;
+    }
     for name in outcome.removed {
         log(
             ProcessLogStream::Stdout,
@@ -1762,6 +1981,7 @@ mod tests {
             &PreparedCategory {
                 packs,
                 lookups_complete: complete,
+                lookup_failures: Vec::new(),
             },
         )
         .expect("linking into the worlds should succeed");
@@ -1962,5 +2182,190 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── contentpack-6, todo.md:1551, :1558, :1691 ───────────────────────────
+
+    fn link_into(
+        dir: &Path,
+        packs: &[PreparedPack],
+        previous: &crate::instance_content::PreviousContent,
+    ) -> LinkedPacks {
+        link_prepared_packs(
+            &mut |_, _| Ok(()),
+            packs,
+            dir,
+            previous,
+            "resourcepacks",
+            crate::instance_content::LinkKind::Symlink,
+        )
+    }
+
+    /// contentpack-6: a link that fails halfway leaves what was linked before
+    /// it in the manifest, so the next launch still knows those files are
+    /// its own — on Windows a hard link, which without the manifest reads as
+    /// "a file the launcher did not create" forever after.
+    #[test]
+    fn a_launch_stopped_halfway_records_what_it_already_linked() {
+        let root = unique_test_root("interrupted-link");
+        let cache = root.join("cache/content-packs");
+        let instance_root = root.join("instance");
+        let instance_dir = instance_root.join("resourcepacks");
+        let first = modrinth_pack(&cache, "fresh-animations", "VerA0001", "Fresh.zip");
+        let broken = PreparedPack {
+            file_name: "Gone.zip".to_string(),
+            source: PreparedPackSource::Local {
+                source_path: root.join("mod-list/resourcepacks/Gone.zip"),
+            },
+        };
+        let last = modrinth_pack(&cache, "never-reached", "VerB0001", "Last.zip");
+        let packs = vec![first.clone(), broken, last];
+
+        let previous = crate::instance_content::previous_content(
+            &instance_root,
+            "resourcepacks",
+            &instance_dir,
+            None,
+        );
+        let linked = link_into(&instance_dir, &packs, &previous);
+
+        assert!(linked.interrupted.is_some(), "the missing source stops it");
+        assert_eq!(linked.installed.files, vec!["Fresh.zip".to_string()]);
+        crate::instance_content::sync_managed_content(
+            &instance_root,
+            "resourcepacks",
+            &instance_dir,
+            &previous,
+            &linked.installed,
+            false,
+        )
+        .expect("the partial set is recorded");
+        assert_eq!(
+            crate::instance_content::read_manifest_files(&crate::instance_content::manifest_path(
+                &instance_root,
+                "resourcepacks"
+            )),
+            vec!["Fresh.zip".to_string()]
+        );
+
+        // What Windows without Developer Mode leaves: a hard link, a real file.
+        fs::remove_file(instance_dir.join("Fresh.zip")).expect("link removed");
+        fs::write(instance_dir.join("Fresh.zip"), b"VerA0001").expect("hard-link stand-in");
+        let previous = crate::instance_content::previous_content(
+            &instance_root,
+            "resourcepacks",
+            &instance_dir,
+            None,
+        );
+        let relinked = link_into(&instance_dir, &[first], &previous);
+
+        assert!(relinked.interrupted.is_none());
+        assert!(relinked.skipped.is_empty(), "ours, not the user's");
+        assert_eq!(relinked.installed.files, vec!["Fresh.zip".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// D103 and todo.md:1558: a file or a folder of the user's under a pack's
+    /// name skips that pack — never an error — and the skip is reported for
+    /// the notice, not only logged.
+    #[test]
+    fn a_users_file_or_folder_under_a_pack_name_is_skipped_and_reported() {
+        let root = unique_test_root("skipped-packs");
+        let cache = root.join("cache/content-packs");
+        let instance_dir = root.join("instance/resourcepacks");
+        fs::create_dir_all(instance_dir.join("Folder.zip/assets")).expect("user folder");
+        fs::write(instance_dir.join("File.zip"), b"user").expect("user file");
+        let packs = vec![
+            modrinth_pack(&cache, "by-file", "VerC0001", "File.zip"),
+            modrinth_pack(&cache, "by-folder", "VerD0001", "Folder.zip"),
+            modrinth_pack(&cache, "free", "VerE0001", "Free.zip"),
+        ];
+
+        let linked = link_into(
+            &instance_dir,
+            &packs,
+            &crate::instance_content::PreviousContent::default(),
+        );
+
+        assert!(linked.interrupted.is_none(), "{:?}", linked.interrupted);
+        assert_eq!(linked.installed.files, vec!["Free.zip".to_string()]);
+        assert_eq!(
+            linked
+                .skipped
+                .iter()
+                .map(|skip| (skip.pack.as_str(), skip.what))
+                .collect::<Vec<_>>(),
+            vec![("by-file", "a file"), ("by-folder", "a folder")]
+        );
+        assert_eq!(
+            fs::read(instance_dir.join("File.zip")).expect("user file"),
+            b"user"
+        );
+        assert!(instance_dir.join("Folder.zip/assets").is_dir());
+
+        let (title, message, detail) =
+            describe_skipped_packs("resource pack", &linked.skipped).expect("a notice");
+        assert_eq!(title, "Some resource packs were not installed");
+        assert!(message.contains("'by-file'") && message.contains("'by-folder'"));
+        assert!(detail.contains("Folder.zip is a folder"));
+        assert!(describe_skipped_packs("resource pack", &[]).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same skip inside a world reaches the report the notice is built on.
+    #[test]
+    fn a_users_data_pack_in_a_world_is_reported_as_skipped() {
+        let root = unique_test_root("skipped-world-pack");
+        let cache = root.join("cache/content-packs");
+        let instance_root = root.join("mod-lists/Pack/instances/1.20.1-fabric");
+        let world = instance_root.join("saves/Survival");
+        make_world(&world);
+        fs::create_dir_all(world.join("datapacks")).expect("datapacks dir");
+        fs::write(world.join("datapacks/Terralith.zip"), b"user").expect("user pack");
+
+        let report = link_datapacks_into_worlds(
+            &mut |_, _| Ok(()),
+            &instance_root,
+            &PreparedCategory {
+                packs: vec![modrinth_pack(
+                    &cache,
+                    "terralith",
+                    "VerA0001",
+                    "Terralith.zip",
+                )],
+                lookups_complete: true,
+                lookup_failures: Vec::new(),
+            },
+        )
+        .expect("linking into the worlds should succeed");
+
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].pack, "terralith");
+        assert_eq!(
+            fs::read(world.join("datapacks/Terralith.zip")).expect("user pack"),
+            b"user"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// todo.md:1691: the notice exists only when a lookup failed, and names
+    /// what the hold keeps in the game.
+    #[test]
+    fn frozen_removals_are_announced_only_after_a_failed_lookup() {
+        assert!(describe_frozen_removals("shader", &[], &["Old.zip".to_string()]).is_none());
+
+        let (title, message, detail) = describe_frozen_removals(
+            "shader",
+            &["deleted-project".to_string()],
+            &["Old.zip".to_string()],
+        )
+        .expect("a notice");
+        assert_eq!(title, "Shader removals are on hold");
+        assert!(message.contains("deleted-project"));
+        assert!(message.contains("Old.zip"));
+        assert!(detail.contains("remove its entry from the list"));
     }
 }

@@ -136,7 +136,9 @@ export function UpdatePopup(props: {
           <p class="text-sm text-warning">
             Modrinth could not be asked about{" "}
             {props.contentLookupFailures!.map(entry => entry.entryId).join(", ")}. Whether they have
-            an update is unknown; the launch keeps what you have.
+            an update is unknown; the launch keeps what you have. If the launch cannot ask either, it
+            removes no pack of that kind, so one you took out of the list stays in the game until
+            Modrinth answers.
           </p>
         </div>
       </Show>

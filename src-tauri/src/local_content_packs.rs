@@ -461,7 +461,7 @@ pub fn link_local_pack_as(
         .is_dir();
 
     if !target_is_ours {
-        if target_is_real_dir(target) {
+        if crate::instance_content::is_real_dir(target) {
             return Ok(PackLinkOutcome::SkippedForeignDirectory);
         }
         if crate::instance_content::is_real_file(target) {
@@ -473,7 +473,7 @@ pub fn link_local_pack_as(
 
     if kind == crate::instance_content::LinkKind::NoSymlink {
         if source_is_dir {
-            copy_directory_recursive(source, target)?;
+            copy_folder_pack(source, target)?;
             return Ok(PackLinkOutcome::Copied);
         }
         crate::instance_content::place_file_without_symlink(source, target)?;
@@ -488,21 +488,19 @@ pub fn link_local_pack_as(
     match create_directory_symlink(source, target) {
         Ok(()) => Ok(PackLinkOutcome::Linked),
         Err(_) => {
-            copy_directory_recursive(source, target)?;
+            copy_folder_pack(source, target)?;
             Ok(PackLinkOutcome::Copied)
         }
     }
 }
 
-/// A directory, and not a symlink pointing at one: with a real file, the shape
-/// whose removal can destroy something the launcher did not create.
-fn target_is_real_dir(target: &Path) -> bool {
-    fs::symlink_metadata(target)
-        .map(|metadata| {
-            let file_type = metadata.file_type();
-            file_type.is_dir() && !file_type.is_symlink()
-        })
-        .unwrap_or(false)
+/// Copy a folder pack into the instance, or leave nothing: a half-copied
+/// folder no manifest names would be taken for the user's on the next launch,
+/// and the pack skipped for good (contentpack-6).
+fn copy_folder_pack(source: &Path, target: &Path) -> Result<()> {
+    copy_directory_recursive(source, target).inspect_err(|_| {
+        let _ = fs::remove_dir_all(target);
+    })
 }
 
 /// Clear the instance-side name before installing over it, once the manifest
