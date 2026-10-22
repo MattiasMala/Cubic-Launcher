@@ -10,7 +10,7 @@ import {
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
   accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, activeAccount,
-  accountAvatarUrl,
+  activePlaysOffline, accountAvatarUrl,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
   createModlistModalOpen, setCreateModlistModalOpen,
@@ -69,6 +69,9 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
   );
 }
 
+const OFFLINE_UPDATE_CHECK_TEXT =
+  "The active account plays offline, so the launcher doesn't check GitHub for updates. Turn off Play offline in Manage Accounts to check.";
+
 export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => Promise<void> }) {
   const [globalDraft, setGlobalDraft] = createSignal<GlobalSettingsState>({ ...globalSettings() });
   const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
@@ -109,6 +112,12 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
         return;
       }
 
+      // The backend asked nobody: the active account plays offline (D140).
+      if (result.status === "offline") {
+        setUpdateCheckState("offline");
+        return;
+      }
+
       setUpdateCheckState("error");
     } catch {
       setLastUpdateCheck(null);
@@ -123,6 +132,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
     if (state === "available" && result?.version) return `Version ${result.version} available`;
     if (state === "upToDate" && result) return `You're up to date (v${result.currentVersion})`;
     if (state === "error") return "Could not check for updates";
+    if (state === "offline") return OFFLINE_UPDATE_CHECK_TEXT;
     return null;
   };
 
@@ -214,7 +224,8 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <button
                       type="button"
                       onClick={() => void handleCheckForUpdates()}
-                      disabled={!isTauriEnv() || updateCheckState() === "checking"}
+                      disabled={!isTauriEnv() || updateCheckState() === "checking" || activePlaysOffline()}
+                      title={activePlaysOffline() ? OFFLINE_UPDATE_CHECK_TEXT : undefined}
                       class="rounded-md bg-secondary px-3 py-1.5 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {updateCheckState() === "checking" ? "Checking..." : "Check for updates"}
@@ -240,7 +251,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <input type="checkbox" checked={globalDraft().updateNotificationsEnabled} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Notify me when updates are available</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. It checks Modrinth before every launch either way; when this is on and something can be updated, it stops and lets you choose what to update.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. With an account that plays online it checks Modrinth before every launch either way; when this is on and something can be updated, it stops and lets you choose what to update. An account set to Play offline checks nothing and launches from what is already downloaded.</p>
                   <div class="mt-2">
                     <div class="flex items-center gap-2">
                       <span class="flex-1 text-sm text-muted-foreground ml-7">Advanced</span>

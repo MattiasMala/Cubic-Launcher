@@ -4,7 +4,7 @@ import { MODRINTH_HEADERS } from "../lib/modrinth-user-agent";
 import { normalizeModLoader, type AccountSummary, type ShellAccount, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
-  setModRowsState, setAccounts, setActiveAccountId, setAccountsRevision,
+  setModRowsState, setAccounts, setActiveAccountId, setAccountsRevision, activePlaysOffline,
   setGlobalSettings, setModlistOverrides,
   pushUiError,
   setAestheticGroups, setFunctionalGroups,
@@ -493,6 +493,9 @@ export async function fetchModMetadata(rows: ModRow[]) {
  * mod list — and whoever needs the rows patched does it itself.
  */
 export async function fetchMetadataForIds(ids: string[]) {
+  // D140: with the active account playing offline nothing is asked; the rows
+  // keep the names already known this session, else their ids.
+  if (activePlaysOffline()) return;
   const missing = ids.filter(id => !modIcons().has(id));
   if (missing.length === 0) return;
 

@@ -28,9 +28,10 @@ export type UpdateInfo = {
   notes: string | null;
   currentVersion: string;
 };
-export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error";
+export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error" | "offline";
 export type UpdateCheckResponse = {
-  status: "upToDate" | "available" | "error";
+  /** `offline`: the active account plays offline and GitHub was not asked (D140). */
+  status: "upToDate" | "available" | "error" | "offline";
   currentVersion: string;
   version: string | null;
   notes: string | null;

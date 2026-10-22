@@ -9,6 +9,7 @@ import { Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  activePlaysOffline,
   mcWithSnapshots,
   minecraftVersions,
   parentIdByChildId,
@@ -79,7 +80,11 @@ export function PinVersionDialog() {
             pinnedLabel={context.pinnedModId}
             canPin={context.dynamic !== null}
             loadReleases={mcVersion =>
-              slug ? fetchPinReleases(slug, mcVersion, loader) : Promise.resolve([])
+              // D140: the release list is Modrinth's, and an account that
+              // plays offline asks nobody.
+              activePlaysOffline()
+                ? Promise.reject("this account plays offline, and the release list comes from Modrinth. Turn off Play offline in Manage Accounts to pin a version.")
+                : slug ? fetchPinReleases(slug, mcVersion, loader) : Promise.resolve([])
             }
             onSave={async choice => {
               await invoke("pin_mod_version_command", {

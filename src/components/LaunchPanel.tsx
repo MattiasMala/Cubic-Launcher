@@ -8,7 +8,7 @@ import {
   minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
   launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath,
-  activeAccount, accounts, setAccountsModalOpen, pushUiError,
+  activeAccount, accounts, setAccountsModalOpen, pushUiError, accountAvatarUrl,
   minecraftVersionsNotice,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
@@ -205,12 +205,12 @@ export function LaunchPanel(props: LaunchPanelProps) {
               onClick={() => setAccountMenuOpen(v => !v)}
               class="flex items-center gap-3 cursor-pointer hover:bg-bgHover p-2 rounded-lg transition-colors duration-75 border border-transparent hover:border-borderColor"
             >
-              <Show when={activeAccount()?.avatarUrl} fallback={
+              <Show when={accountAvatarUrl(activeAccount())} fallback={
                 <div class="w-10 h-10 rounded-full border border-borderColor bg-primary/20 flex items-center justify-center text-primary font-bold">
                   {(activeAccount()?.gamertag ?? "?").slice(0, 2).toUpperCase()}
                 </div>
               }>
-                <img src={activeAccount()!.avatarUrl} alt="" class="w-10 h-10 rounded-md border border-borderColor" loading="lazy" />
+                {url => <img src={url()} alt="" class="w-10 h-10 rounded-md border border-borderColor" loading="lazy" />}
               </Show>
               <div class="flex flex-col">
                 <span class="text-sm font-semibold text-white">
@@ -237,12 +237,12 @@ export function LaunchPanel(props: LaunchPanelProps) {
                         account.id === activeAccount()?.id ? "text-primary" : "text-textMain"
                       }`}
                     >
-                      <Show when={account.avatarUrl} fallback={
+                      <Show when={accountAvatarUrl(account)} fallback={
                         <div class="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-xs">
                           {account.gamertag.slice(0, 2).toUpperCase()}
                         </div>
                       }>
-                        <img src={account.avatarUrl} alt="" class="w-8 h-8 rounded-md" loading="lazy" />
+                        {url => <img src={url()} alt="" class="w-8 h-8 rounded-md" loading="lazy" />}
                       </Show>
                       <span class="flex-1 text-left truncate">{account.gamertag}</span>
                       <Show when={account.id === activeAccount()?.id}>

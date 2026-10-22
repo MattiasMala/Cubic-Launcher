@@ -132,6 +132,8 @@ export default function App() {
 
     void (async () => {
       try {
+        // With the active account playing offline the backend asks nobody
+        // and answers `offline` (D140), which needs nothing here.
         const result = await invoke<UpdateCheckResponse>("check_for_updates");
         if (result.status === "available" && result.version) {
           setUpdateInfo({
@@ -948,8 +950,11 @@ export default function App() {
     resetLaunchUiState();
 
     if (isTauri()) {
-      // The pre-check runs before every launch: making it conditional on a
-      // setting is A3. Two commands instead of one widen the double-click
+      // The pre-check command runs before every launch. With an account that
+      // plays online it asks Modrinth whatever the notification setting says
+      // (the setting only decides whether the popup may stop the launch);
+      // with one that plays offline it asks nothing and reads the cache
+      // (D115, D116). Two commands instead of one widen the double-click
       // window, hence the guard above and the disabled Play button.
       setUpdateCheckRunning(true);
       let precheck: UpdatePrecheckResult;
