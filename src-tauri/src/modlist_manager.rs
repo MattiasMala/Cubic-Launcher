@@ -328,13 +328,19 @@ pub fn modlist_delete_preview_command(
 /// permanent deletion may a trash that does not work become one. Otherwise
 /// the refusal starts with [`crate::screenshots::TRASH_UNAVAILABLE`], as for
 /// a screenshot, and the dialog asks again with the permanent wording.
+///
+/// Off the main thread (review-contenuti-15): the trash can be a recursive copy
+/// of every world when it sits on another disk, and the hand-over of the
+/// shared files and a permanent delete are file work too. A sync command ran
+/// all of it on the window's thread, which froze for the whole time.
 #[tauri::command]
-pub fn delete_modlist_command(
+pub async fn delete_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
     allow_permanent: Option<bool>,
 ) -> Result<ModlistDisposal, String> {
-    (|| {
+    let launcher_paths = launcher_paths.inner().clone();
+    let work = move || -> Result<ModlistDisposal> {
         let connection = open_database(&launcher_paths)?;
         delete_modlist_from_root(
             launcher_paths.root_dir(),
@@ -342,8 +348,11 @@ pub fn delete_modlist_command(
             &modlist_name,
             allow_permanent.unwrap_or(false),
         )
-    })()
-    .map_err(|e| format!("{e:#}"))
+    };
+    match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(result) => result.map_err(|e| format!("{e:#}")),
+        Err(joined) => Err(format!("the deletion stopped unexpectedly: {joined}")),
+    }
 }
 
 pub fn delete_modlist_from_root(
