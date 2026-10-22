@@ -355,6 +355,39 @@ pub(super) fn maven_artifact_relative_path(coordinates: &str) -> Result<PathBuf>
         .join(file_name))
 }
 
+/// I `.part` lasciati da download interrotti (un kill, il launcher chiuso a
+/// metà), più vecchi di un'ora, si tolgono a ogni lancio
+/// (r2-primo-avvio-ambiente-degradato-5): nessuno li riprende se quel file
+/// non viene più chiesto. Le cache per intero; `java-runtimes/` solo al primo
+/// livello, dove arrivano gli archivi di Adoptium, senza entrare nei runtime.
+pub(super) fn remove_stale_partial_downloads(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+) {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let removed = [
+        launcher_paths.mods_cache_dir().to_path_buf(),
+        launcher_paths.configs_cache_dir().to_path_buf(),
+        launcher_paths.content_packs_cache_dir().to_path_buf(),
+        launcher_paths.mc_cache_dir(),
+    ]
+    .iter()
+    .map(|cache| crate::atomic_write::remove_stale_partials(cache, STALE_AFTER, true))
+    .sum::<usize>()
+        + crate::atomic_write::remove_stale_partials(
+            launcher_paths.java_runtimes_dir(),
+            STALE_AFTER,
+            false,
+        );
+    if removed > 0 {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!("[Cache] Removed {removed} leftover partial download(s) (*.part)"),
+        );
+    }
+}
+
 /// D142: l'account offline non scarica Minecraft, lo trova in cache.
 pub(super) fn minecraft_cache_policy(plays_offline: bool) -> MinecraftCachePolicy {
     if plays_offline {

@@ -276,6 +276,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
 
+    remove_stale_partial_downloads(&app_handle, &launcher_paths);
+
     let http_client = crate::modrinth::build_download_client();
     if target.mod_loader == ModLoader::Vanilla {
         return run_vanilla_launch_pipeline(

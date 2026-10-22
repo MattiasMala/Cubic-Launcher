@@ -12,6 +12,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Replace `path` with `bytes`, or leave the file that was there untouched.
 ///
@@ -61,6 +62,53 @@ fn write_then_rename(
     file.sync_all()?;
     drop(file);
     fs::rename(partial, path)
+}
+
+/// Remove the `*.part` files under `root` that nobody has written to for
+/// `older_than`, and say how many went.
+///
+/// A partial is left behind only when its writer was killed (a crash, the
+/// launcher closed mid-download, a power cut): the error paths remove their
+/// own. A download that is never asked again — another version won, the mod
+/// left the list — kept its partial in the cache forever
+/// (r2-primo-avvio-ambiente-degradato-5). The age keeps clear of a download
+/// still running elsewhere, which keeps touching its partial. Symlinks are
+/// neither followed nor removed; every error is skipped, because a sweep that
+/// cannot finish must not stop what called it.
+pub fn remove_stale_partials(root: &Path, older_than: Duration, recursive: bool) -> usize {
+    let now = SystemTime::now();
+    let mut removed = 0;
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if recursive {
+                    folders.push(path);
+                }
+                continue;
+            }
+            let is_partial = metadata.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "part");
+            let is_stale = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= older_than);
+            if is_partial && is_stale && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -148,6 +196,56 @@ mod tests {
             fs::read_dir(&root).expect("root").count(),
             1,
             "nothing but the target is left in the folder"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// r2-primo-avvio-ambiente-degradato-5: i `.part` di un download ucciso
+    /// se ne vanno; quelli ancora scritti da poco, i file veri e quelli che
+    /// solo finiscono per «part» restano.
+    #[test]
+    fn stale_partials_are_swept_and_everything_else_stays() {
+        let root = scratch_root("stale-partials");
+        let nested = root.join("libraries").join("org").join("lwjgl");
+        fs::create_dir_all(&nested).expect("nested folder");
+        let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        let stale = |path: &Path| {
+            fs::write(path, b"half").expect("partial");
+            File::options()
+                .write(true)
+                .open(path)
+                .expect("open")
+                .set_modified(old)
+                .expect("age the partial");
+        };
+        stale(&root.join("sodium.jar.part"));
+        stale(&nested.join("lwjgl.jar.part"));
+        let old_real_file = root.join("counterpart");
+        stale(&old_real_file);
+        fs::write(root.join("running.jar.part"), b"being written").expect("fresh partial");
+        fs::write(root.join("sodium.jar"), b"whole").expect("real file");
+
+        // Not recursive: only the top folder.
+        assert_eq!(
+            remove_stale_partials(&root, Duration::from_secs(60 * 60), false),
+            1
+        );
+        assert!(nested.join("lwjgl.jar.part").exists());
+
+        assert_eq!(
+            remove_stale_partials(&root, Duration::from_secs(60 * 60), true),
+            1
+        );
+        assert!(!root.join("sodium.jar.part").exists());
+        assert!(!nested.join("lwjgl.jar.part").exists());
+        assert!(root.join("running.jar.part").exists());
+        assert!(root.join("sodium.jar").exists());
+        assert!(old_real_file.exists());
+        // A folder that is not there is nothing to sweep.
+        assert_eq!(
+            remove_stale_partials(&root.join("missing"), Duration::ZERO, true),
+            0
         );
 
         let _ = fs::remove_dir_all(&root);
