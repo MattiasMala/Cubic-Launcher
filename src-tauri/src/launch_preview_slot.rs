@@ -17,6 +17,20 @@ use crate::process_streaming::ProcessExitSignal;
 pub(crate) struct LaunchSlot {
     preparing: AtomicBool,
     running: Mutex<Option<RunningGame>>,
+    /// An update is being downloaded and installed, and the launcher will
+    /// restart: no launch may start meanwhile (review-frontend-shell-23).
+    updating: AtomicBool,
+}
+
+/// Holds launches off while an update installs; dropped if the install fails.
+pub(crate) struct UpdateGuard<'slot> {
+    slot: &'slot LaunchSlot,
+}
+
+impl Drop for UpdateGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.updating.store(false, Ordering::Release);
+    }
 }
 
 /// The running game: its PID, and the signal its monitor raises when the
@@ -52,6 +66,7 @@ impl LaunchSlot {
         Self {
             preparing: AtomicBool::new(false),
             running: Mutex::new(None),
+            updating: AtomicBool::new(false),
         }
     }
 
@@ -70,6 +85,9 @@ impl LaunchSlot {
                 "Minecraft is already running (PID {pid}). Stop it or close the game before launching again."
             ));
         }
+        if self.updating.load(Ordering::Acquire) {
+            return Err("Cubic Launcher is installing an update and will restart. Launch again after it restarts.".to_string());
+        }
         if self
             .preparing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -79,6 +97,22 @@ impl LaunchSlot {
         }
         drop(running);
         Ok(PreparingGuard { slot: self })
+    }
+
+    /// Stops new launches for an update install, and says what is going on
+    /// right now: a game running or a launch preparing. Under the PID lock, as
+    /// `claim`, so no launch slips in between the two (review-frontend-shell-23).
+    pub(crate) fn hold_for_update(&self) -> Result<(UpdateGuard<'_>, LaunchStatus), String> {
+        let running = self.pid_guard();
+        if self.updating.swap(true, Ordering::AcqRel) {
+            return Err("An update is already being installed.".to_string());
+        }
+        let status = LaunchStatus {
+            preparing: self.preparing.load(Ordering::Acquire),
+            running_pid: running.as_ref().map(|game| game.pid),
+        };
+        drop(running);
+        Ok((UpdateGuard { slot: self }, status))
     }
 
     pub(crate) fn set_running(&self, pid: u32, exit_signal: ProcessExitSignal) {
@@ -123,6 +157,30 @@ impl LaunchSlot {
 mod tests {
     use super::{LaunchSlot, LaunchStatus};
     use crate::process_streaming::ProcessExitSignal;
+
+    /// review-frontend-shell-23: while an update installs no launch starts,
+    /// and the install sees a launch that is preparing.
+    #[test]
+    fn an_update_install_holds_launches_off_and_sees_a_preparing_launch() {
+        let slot = LaunchSlot::new();
+        let (guard, status) = slot.hold_for_update().expect("nothing in the way");
+        assert_eq!(
+            status,
+            LaunchStatus {
+                preparing: false,
+                running_pid: None
+            }
+        );
+        let refusal = slot.claim().err().expect("no launch during the install");
+        assert!(refusal.contains("installing an update"), "{refusal}");
+        assert!(slot.hold_for_update().is_err());
+        drop(guard);
+
+        let preparing = slot.claim().expect("a failed install frees the slot");
+        let (_guard, status) = slot.hold_for_update().unwrap();
+        assert!(status.preparing);
+        drop(preparing);
+    }
 
     #[test]
     fn a_second_launch_is_refused_while_the_first_is_preparing() {

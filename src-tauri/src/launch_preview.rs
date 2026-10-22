@@ -206,6 +206,12 @@ pub(super) fn current_minecraft_pid() -> Option<u32> {
     ACTIVE_LAUNCH.running_pid()
 }
 
+/// See [`slot::LaunchSlot::hold_for_update`].
+pub(crate) fn hold_launches_for_update(
+) -> Result<(slot::UpdateGuard<'static>, LaunchStatus), String> {
+    ACTIVE_LAUNCH.hold_for_update()
+}
+
 pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
     emit_log(
         app_handle,

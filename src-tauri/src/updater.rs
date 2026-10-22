@@ -121,8 +121,13 @@ pub async fn install_update(
                 .to_string(),
         );
     }
+    // review-frontend-shell-23: from here to the restart no launch starts, so
+    // the game the check below does not see cannot start during the download.
+    // A launch still preparing counts like a running game: the restart would
+    // cut it off.
+    let (_no_launch, status) = crate::launch_preview::hold_launches_for_update()?;
     if let Some(refusal) = install_refusal(
-        crate::launch_preview::current_minecraft_pid().is_some(),
+        status.running_pid.is_some() || status.preparing,
         confirmed_while_running.unwrap_or(false),
     ) {
         return Err(refusal);

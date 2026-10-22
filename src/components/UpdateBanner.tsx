@@ -32,7 +32,7 @@ const MINECRAFT_RUNNING = "minecraft-running:";
  */
 const confirmInstallWhileRunning = async () => {
   return ask(
-    "Minecraft is still running. Installing the update restarts Cubic Launcher, and the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.",
+    "Minecraft is running or starting. Installing the update restarts Cubic Launcher: a launch still being prepared stops, and the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.",
     {
       title: "Install the update now?",
       kind: "warning",
@@ -47,7 +47,9 @@ export function UpdateBanner() {
     if (!isTauri() || updateBusy()) return;
 
     let confirmedWhileRunning = false;
-    if (launchState() === "running") {
+    // A launch still preparing counts too: the restart would cut it off
+    // (review-frontend-shell-23), and the backend refuses it the same way.
+    if (launchState() === "running" || launchState() === "resolving") {
       if (!(await confirmInstallWhileRunning())) return;
       confirmedWhileRunning = true;
     }
