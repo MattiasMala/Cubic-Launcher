@@ -1,12 +1,52 @@
-import { createSignal } from "solid-js";
+import { createSignal, onCleanup, onMount } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
 import logoUrl from "../../assets/icon.png";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
+/**
+ * Closing the window while Minecraft runs skips the copy back of the shared
+ * files (servers.dat, hotbar.nbt, command_history.txt): it happens when the
+ * game exits, and a closed launcher is not there to see it. The backend stops
+ * every close request while the game runs — the button below, Alt+F4, the
+ * taskbar — and asks here (D152).
+ */
+const CLOSE_WHILE_RUNNING_MESSAGE =
+  "Minecraft is still running. If you close Cubic Launcher now, the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.";
+
 export function Header() {
   const [maximized, setMaximized] = createSignal(false);
+
+  onMount(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const stop = await listen("close-requested-while-running", async () => {
+        try {
+          const { ask } = await import("@tauri-apps/plugin-dialog");
+          const close = await ask(CLOSE_WHILE_RUNNING_MESSAGE, {
+            title: "Close Cubic Launcher?",
+            kind: "warning",
+            okLabel: "Close anyway",
+            cancelLabel: "Keep open",
+          });
+          if (close) await invoke("close_launcher_anyway_command");
+        } catch (err) {
+          pushUiError({ title: "Window control failed", message: "The launcher could not be closed.", detail: String(err), severity: "error", scope: "launch" });
+        }
+      });
+      if (disposed) stop();
+      else unlisten = stop;
+    })();
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
+  });
 
   const handleWindowAction = async (action: "minimize" | "toggle-maximize" | "close") => {
     if (!isTauri()) return;

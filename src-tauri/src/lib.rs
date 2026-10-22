@@ -44,6 +44,34 @@ pub mod token_storage;
 mod updater;
 pub mod worlds;
 
+/// L'evento con cui il backend chiede al frontend di confermare la chiusura
+/// col gioco aperto (D152).
+const CLOSE_WHILE_RUNNING_EVENT: &str = "close-requested-while-running";
+
+/// Chiudere il launcher col gioco aperto salta la copia indietro dei file
+/// condivisi, che vive dopo `process.wait()` (`concorrenza-1`). La copia dentro
+/// del lancio dopo li recupera (D152), ma la chiusura chiede comunque conferma:
+/// qui si ferma, e il frontend decide se richiamare
+/// [`close_launcher_anyway_command`]. Vale per ogni strada — il bottone della
+/// testata, Alt+F4, il menu della barra delle applicazioni — perché passano
+/// tutte da `CloseRequested`.
+fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    use tauri::Emitter;
+
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        if window.label() == "main" && launch_preview::current_minecraft_pid().is_some() {
+            api.prevent_close();
+            let _ = window.emit(CLOSE_WHILE_RUNNING_EVENT, ());
+        }
+    }
+}
+
+/// La chiusura confermata: `destroy` non ripassa da `CloseRequested`.
+#[tauri::command]
+fn close_launcher_anyway_command(window: tauri::Window) -> Result<(), String> {
+    window.destroy().map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -85,6 +113,7 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(on_window_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -167,7 +196,8 @@ pub fn run() {
             shared_worlds::share_world_with_instance_command,
             shared_worlds::unshare_world_from_instance_command,
             updater::check_for_updates,
-            updater::install_update
+            updater::install_update,
+            close_launcher_anyway_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
