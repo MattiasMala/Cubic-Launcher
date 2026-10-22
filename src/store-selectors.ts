@@ -64,7 +64,26 @@ export type TopLevelItem =
   | { kind: "group"; id: string; name: string; collapsed: boolean; blocks: ModRow[] }
   | { kind: "row"; row: ModRow };
 
-export const topLevelItems = createMemo<TopLevelItem[]>(() => {
+function sameRows(a: ModRow[], b: ModRow[]): boolean {
+  return a.length === b.length && a.every((row, index) => row === b[index]);
+}
+
+/**
+ * The editor's top level. `For` keys its children by object identity, so an
+ * item is reused from the previous run whenever what it shows is the same
+ * object: a row keeps its item while the row object is unchanged, a group
+ * while its name, collapse state and block rows are. A new wrapper every run
+ * made one change rebuild every row of the editor (audit 101,
+ * r2-scala-mod-list-grandi-3).
+ */
+export const topLevelItems = createMemo<TopLevelItem[]>(previous => {
+  const previousRowItems = new Map<ModRow, TopLevelItem>();
+  const previousGroupItems = new Map<string, Extract<TopLevelItem, { kind: "group" }>>();
+  for (const item of previous) {
+    if (item.kind === "row") previousRowItems.set(item.row, item);
+    else previousGroupItems.set(item.id, item);
+  }
+
   const topGroups = aestheticGroups().filter(group => !group.scopeRowId);
   const groupByRow = new Map<string, string>();
   for (const group of topGroups) {
@@ -74,11 +93,13 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
   const query = search().trim().toLowerCase();
   const tags = tagFilter();
   const fGroups = functionalGroups();
+  const rows = modRowsState();
+  const rowById = new Map(rows.map(row => [row.id, row]));
 
   const addedGroups = new Set<string>();
   const items: TopLevelItem[] = [];
 
-  for (const row of modRowsState()) {
+  for (const row of rows) {
     const groupId = groupByRow.get(row.id);
     if (groupId) {
       if (addedGroups.has(groupId)) continue;
@@ -86,23 +107,29 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
       const group = topGroups.find(candidate => candidate.id === groupId);
       if (!group) continue;
       const blocks = group.blockIds
-        .map(id => modRowsState().find(candidate => candidate.id === id))
+        .map(id => rowById.get(id))
         .filter((candidate): candidate is ModRow => Boolean(candidate))
         .filter(candidate => !query || rowMatchesQuery(candidate, query))
         .filter(candidate => tags.size === 0 || rowOrDescendantMatchesTag(candidate, fGroups, tags));
       if (blocks.length > 0 || (!query && tags.size === 0)) {
-        items.push({ kind: "group", id: groupId, name: group.name, collapsed: group.collapsed, blocks });
+        const reusable = previousGroupItems.get(groupId);
+        items.push(
+          reusable && reusable.name === group.name && reusable.collapsed === group.collapsed && sameRows(reusable.blocks, blocks)
+            ? reusable
+            : { kind: "group", id: groupId, name: group.name, collapsed: group.collapsed, blocks },
+        );
       }
       continue;
     }
 
     if (query && !rowMatchesQuery(row, query)) continue;
     if (tags.size > 0 && !rowOrDescendantMatchesTag(row, fGroups, tags)) continue;
-    items.push({ kind: "row", row });
+    items.push(previousRowItems.get(row) ?? { kind: "row", row });
   }
 
-  return items;
-});
+  // Nothing changed: the same array, so nothing downstream reruns.
+  return items.length === previous.length && items.every((item, index) => item === previous[index]) ? previous : items;
+}, []);
 
 export const filteredRows = createMemo(() => {
   const query = search().trim().toLowerCase();
