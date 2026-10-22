@@ -379,23 +379,42 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
         if !path.is_dir() {
             continue;
         }
-        // An import in progress, or one cut short, is not a mod list.
-        if crate::modlist_manager::is_import_staging_dir(&entry.file_name().to_string_lossy()) {
+        // An import in progress, or one cut short, is not a mod list; nor is
+        // what a permanent deletion could not remove yet.
+        if crate::modlist_manager::is_launcher_work_dir(&entry.file_name().to_string_lossy()) {
             continue;
         }
+        // `dati-6`: the folder name is the mod list. Every command — editor,
+        // launch, export, delete — finds it by that name, so the sidebar
+        // shows that name too; `modlist_name` inside rules.json is only a
+        // label. A folder copied by hand («Pack copy») then stays itself, and
+        // deleting it can never reach the original «Pack».
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            eprintln!(
+                "[shell] skipping {}: its name is not valid UTF-8",
+                path.display()
+            );
+            continue;
+        };
 
         let rules_path = path.join(RULES_FILENAME);
         if rules_path.exists() {
             let modlist = ModList::read_from_file(&rules_path)?;
+            if modlist.modlist_name != name {
+                eprintln!(
+                    "[shell] the mod list in folder '{name}' calls itself '{}' in its {RULES_FILENAME}: the folder name is used",
+                    modlist.modlist_name
+                );
+            }
             summaries.push(ShellModListSummary {
-                name: modlist.modlist_name,
+                name: name.to_string(),
                 description: modlist.description,
                 author: Some(modlist.author),
                 rule_count: modlist.rules.len(),
                 minecraft_version: None,
                 mod_loader: None,
             });
-        } else if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        } else {
             summaries.push(ShellModListSummary {
                 name: name.to_string(),
                 description: String::new(),
@@ -912,6 +931,44 @@ mod tests {
         assert!(snapshot.global_settings.update_notifications_data_packs);
         assert!(snapshot.global_settings.update_notifications_shaders);
         assert_eq!(snapshot.selected_modlist_overrides.modlist_name, None);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn a_folder_copied_by_hand_is_listed_under_its_own_name() {
+        // `dati-6`: «Pack copy» has the rules.json of «Pack», which still says
+        // «Pack». The sidebar must show two different names, the folders'.
+        let root_dir = unique_test_root();
+        initialize_database(&root_dir.join("launcher_data.db"))
+            .expect("database should initialize");
+        for folder in [
+            "Pack",
+            "Pack copy",
+            ".cubic-delete-1-2",
+            ".cubic-import-1-2",
+        ] {
+            let dir = root_dir.join("mod-lists").join(folder);
+            fs::create_dir_all(&dir).expect("modlist directory should exist");
+            ModList {
+                modlist_name: "Pack".into(),
+                author: "Author".into(),
+                description: String::new(),
+                rules: vec![],
+            }
+            .write_to_file(&dir.join("rules.json"))
+            .expect("rules should write");
+        }
+
+        let snapshot = load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+            .expect("snapshot should load");
+
+        let names: Vec<&str> = snapshot
+            .modlists
+            .iter()
+            .map(|modlist| modlist.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Pack", "Pack copy"]);
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
