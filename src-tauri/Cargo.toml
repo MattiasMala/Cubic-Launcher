@@ -64,6 +64,11 @@ rfd = { version = "0.16", default-features = false, features = ["gtk3", "common-
 # `multipart` for the skin upload (E7): Mojang takes the PNG as a form field.
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Already in the lock through walkdir; direct for the adoption of an instance
+# without manifest (review-contenuti-11): a pack is the launcher's only when it
+# is the cache's own file (a hard link: same device and inode on unix, same
+# volume and file index on Windows), never because its bytes match.
+same-file = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"

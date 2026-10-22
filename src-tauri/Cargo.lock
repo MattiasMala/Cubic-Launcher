@@ -732,6 +732,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rfd",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha1",

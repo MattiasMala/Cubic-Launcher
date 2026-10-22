@@ -21,7 +21,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -542,8 +541,8 @@ pub fn previous_from_manifest(manifest_root: &Path, category: &str) -> PreviousC
 /// A manifest on disk — readable or not — is the whole answer, as before. With
 /// none, and `adopt_from_cache` given, the names adopted are the ones only the
 /// launcher can have put there: a symlink into the content-pack cache, or a
-/// real file whose bytes equal a cache file of the same name (the hard-link
-/// fallback on Windows, or a copy). Up to v0.1.2 the launcher wiped and
+/// hard link to a cache file of the same name (the fallback on Windows). A
+/// file that only has the same bytes is not adopted (review-contenuti-11). Up to v0.1.2 the launcher wiped and
 /// relinked these directories without writing a manifest, so without this
 /// step their packs were never updated nor removed again. Anything else — a
 /// zip the user dropped in, a folder, a link elsewhere — stays foreign.
@@ -567,8 +566,8 @@ pub fn previous_content(
     }
 }
 
-/// The names in `instance_dir` that are, byte for byte or by link, a file of
-/// the content-pack cache. Sorted, for a reproducible manifest.
+/// The names in `instance_dir` that are, by link, a file of the
+/// content-pack cache. Sorted, for a reproducible manifest.
 fn adoptable_cache_files(instance_dir: &Path, cache_dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(instance_dir) else {
         return Vec::new();
@@ -606,7 +605,7 @@ fn adoptable_cache_files(instance_dir: &Path, cache_dir: &Path) -> Vec<String> {
                     })
             })
         } else if file_type.is_file() {
-            matches_a_cache_file(&path, &name, metadata.len(), cache_dir)
+            matches_a_cache_file(&path, &name, cache_dir)
         } else {
             false
         };
@@ -620,11 +619,17 @@ fn adoptable_cache_files(instance_dir: &Path, cache_dir: &Path) -> Vec<String> {
     adopted
 }
 
-/// Whether a cache file with the same name has the same bytes: in the flat
+/// Whether the file *is* a cache file with the same name — a hard link to
+/// it, the shape the launcher's fallback leaves on Windows — in the flat
 /// layout of v0.1.x (`<cache>/<file>`) or in the per-version one of C5
-/// (`<cache>/<version id>/<file>`). Same name first, then same size, then the
-/// bytes: the comparison is rare and short.
-fn matches_a_cache_file(path: &Path, name: &str, len: u64, cache_dir: &Path) -> bool {
+/// (`<cache>/<version id>/<file>`).
+///
+/// Equal bytes are not enough (review-contenuti-11): the cache is shared by
+/// every mod list, and the same zip downloaded by hand from Modrinth into an
+/// instance that never listed it would be adopted, then removed as stale. A
+/// copy the launcher made is left alone too; keeping a pack of ours costs a
+/// file, removing one of the user's costs the user's file (D4).
+fn matches_a_cache_file(path: &Path, name: &str, cache_dir: &Path) -> bool {
     let mut candidates = vec![cache_dir.join(name)];
     if let Ok(entries) = fs::read_dir(cache_dir) {
         candidates.extend(
@@ -637,28 +642,8 @@ fn matches_a_cache_file(path: &Path, name: &str, len: u64, cache_dir: &Path) -> 
     }
 
     candidates.iter().any(|candidate| {
-        fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && metadata.len() == len)
-            && same_bytes(path, candidate).unwrap_or(false)
+        candidate.is_file() && same_file::is_same_file(path, candidate).unwrap_or(false)
     })
-}
-
-fn same_bytes(left: &Path, right: &Path) -> std::io::Result<bool> {
-    let mut left = fs::File::open(left)?;
-    let mut right = fs::File::open(right)?;
-    let mut left_buffer = vec![0u8; 64 * 1024];
-    let mut right_buffer = vec![0u8; 64 * 1024];
-
-    loop {
-        let read = left.read(&mut left_buffer)?;
-        if read == 0 {
-            // The sizes were equal, so the right side is at its end too.
-            return Ok(true);
-        }
-        right.read_exact(&mut right_buffer[..read])?;
-        if left_buffer[..read] != right_buffer[..read] {
-            return Ok(false);
-        }
-    }
 }
 
 /// `(old name, new name)` for every entry whose file changed name between the
@@ -1867,8 +1852,8 @@ mod tests {
 
     /// v0.1.2 wiped and relinked `resourcepacks/` without a manifest: a
     /// symlink into the cache, or — on Windows without Developer Mode — a hard
-    /// link, i.e. a file with the cache's bytes. Both are adopted; a zip the
-    /// user dropped in, even under a cached name with other bytes, is not.
+    /// link to the cache's own file. Both are adopted; a zip the user dropped
+    /// in, even under a cached name with other bytes, is not.
     #[cfg(unix)]
     #[test]
     fn the_first_sync_without_manifest_adopts_what_only_the_launcher_made() {
@@ -1927,6 +1912,43 @@ mod tests {
             .expect("a link made by hand later");
         let later = previous_content(&root_dir, "resourcepacks", &instance_dir, Some(&cache));
         assert!(later.files.is_empty());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// review-contenuti-11: another mod list cached a pack; the user downloads
+    /// the same zip by hand into an instance that never listed it. Same name,
+    /// same bytes, not ours: it is not adopted, and the sync leaves it.
+    #[test]
+    fn a_copy_with_the_cache_bytes_is_not_adopted() {
+        let root_dir = unique_test_root();
+        let cache = root_dir.join("cache");
+        let instance_dir = fixture_instance(&root_dir, "shaderpacks");
+        cached_pack(
+            &root_dir,
+            "Ver00001",
+            "ComplementaryReimagined_r5.zip",
+            b"shader bytes",
+        );
+        fs::write(
+            instance_dir.join("ComplementaryReimagined_r5.zip"),
+            b"shader bytes",
+        )
+        .expect("the user's download");
+
+        let previous = previous_content(&root_dir, "shaderpacks", &instance_dir, Some(&cache));
+        assert!(previous.files.is_empty());
+        let outcome = sync_managed_content(
+            &root_dir,
+            "shaderpacks",
+            &instance_dir,
+            &previous,
+            &InstalledContent::default(),
+            true,
+        )
+        .expect("sync");
+        assert!(outcome.removed.is_empty());
+        assert!(instance_dir.join("ComplementaryReimagined_r5.zip").exists());
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
