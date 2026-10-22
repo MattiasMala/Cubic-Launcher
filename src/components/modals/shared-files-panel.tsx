@@ -30,6 +30,8 @@ export type SharedFilesView = {
   canonical: string;
   linkable: string[];
   files: SharedFileToggle[];
+  /** The game of a mod list in this group is running: linking waits for it to exit. */
+  gameRunning?: boolean;
 };
 
 /**
@@ -92,6 +94,13 @@ export function SharedFilesPanel(props: Props) {
   });
 
   const linked = () => (view()?.group.length ?? 0) > 1;
+  /**
+   * Col gioco aperto il collegamento non si tocca (condivisi-3): la copia
+   * indietro all'uscita va a chi teneva i file al lancio, e un gesto
+   * confermato adesso sembrerebbe valere da subito. Il backend rifiuta
+   * comunque; qui si dice prima.
+   */
+  const gameRunning = () => view()?.gameRunning ?? false;
   /** Le altre del gruppo, cioè tutte tranne questa. */
   const partners = () => (view()?.group ?? []).filter(name => name !== props.modlist);
 
@@ -172,11 +181,17 @@ export function SharedFilesPanel(props: Props) {
           </p>
         </Show>
 
+        <Show when={gameRunning()}>
+          <p class="mt-2 text-xs text-warning" data-testid="shared-files-game-running">
+            The game is running. Linking and unlinking come back when it exits.
+          </p>
+        </Show>
+
         <div class="mt-3 flex flex-wrap gap-2">
           <Show when={!picking()}>
             <button
               class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-              disabled={busy() || (view()?.linkable.length ?? 0) === 0}
+              disabled={busy() || gameRunning() || (view()?.linkable.length ?? 0) === 0}
               data-testid="shared-files-link-open"
               onClick={() => setPicking(true)}
             >
@@ -186,7 +201,7 @@ export function SharedFilesPanel(props: Props) {
           <Show when={linked()}>
             <button
               class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-              disabled={busy()}
+              disabled={busy() || gameRunning()}
               data-testid="shared-files-unlink-open"
               onClick={() => setConfirmUnlink(true)}
             >
@@ -253,7 +268,7 @@ export function SharedFilesPanel(props: Props) {
             <div class="mt-3 flex gap-2">
               <button
                 class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
-                disabled={busy()}
+                disabled={busy() || gameRunning()}
                 data-testid="shared-files-link-confirm-yes"
                 onClick={() => {
                   const target = other();
@@ -292,7 +307,7 @@ export function SharedFilesPanel(props: Props) {
           <div class="mt-3 flex gap-2">
             <button
               class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
-              disabled={busy()}
+              disabled={busy() || gameRunning()}
               data-testid="shared-files-unlink-confirm-yes"
               onClick={() => {
                 setConfirmUnlink(false);
