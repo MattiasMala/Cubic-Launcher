@@ -299,15 +299,27 @@ pub fn filter_for_seed(
 // Seminare
 // ---------------------------------------------------------------------------
 
+/// Cosa fare del bersaglio che esiste già. La semina automatica non lo tocca
+/// mai; i gesti espliciti della GUI lo riscrivono, intero o solo nelle righe
+/// spuntate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingTarget {
+    Keep,
+    Overwrite,
+    /// Solo le righe che passano il filtro e la spunta (D155): il resto del
+    /// file — righe non spuntate, keybind dei mod, stato interno — resta.
+    Merge,
+}
+
 fn seed_into(
     launcher_paths: &LauncherPaths,
     source_path: &Path,
     target_path: &Path,
-    overwrite: bool,
+    existing_target: ExistingTarget,
     include_resource_packs: bool,
     unchecked: &BTreeSet<String>,
 ) -> SeedStatus {
-    if !overwrite && target_path.exists() {
+    if existing_target == ExistingTarget::Keep && target_path.exists() {
         return SeedStatus::SkippedTargetExists {
             target: target_path.display().to_string(),
         };
@@ -365,7 +377,21 @@ fn seed_into(
 
     let (seeded, blocked) =
         filter_for_seed(&source, &source_keys, include_resource_packs, unchecked);
-    if let Err(error) = seeded.write(target_path) {
+    let written = if existing_target == ExistingTarget::Merge && target_path.exists() {
+        match OptionsFile::read(target_path) {
+            Ok(target) => merge_into(target, &seeded),
+            // Un bersaglio che non si legge non si sostituisce intero al posto
+            // di fonderlo: sarebbe il danno che la fusione esiste per evitare.
+            Err(error) => {
+                return SeedStatus::Refused {
+                    reason: format!("{error:#}"),
+                }
+            }
+        }
+    } else {
+        seeded.clone()
+    };
+    if let Err(error) = written.write(target_path) {
         return SeedStatus::Refused {
             reason: error.to_string(),
         };
@@ -384,6 +410,31 @@ fn seed_into(
     }
 }
 
+/// Le righe seminate scritte sopra quelle del bersaglio, che per il resto
+/// resta com'è e nel suo ordine (D155).
+///
+/// La riga `version:` è la più alta delle due. Il file che ne esce mescola
+/// righe scritte da due versioni del gioco, e un numero solo non le descrive
+/// tutte: dichiarare quello più basso farebbe ripassare al gioco i datafixer
+/// sopra valori già migrati — la stessa classe di danno di D70 —, mentre
+/// quello più alto al massimo lascia una riga del lato più vecchio senza la
+/// sua migrazione, che il gioco legge come valore predefinito.
+fn merge_into(mut target: OptionsFile, seeded: &OptionsFile) -> OptionsFile {
+    let version = match (seeded.data_version(), target.data_version()) {
+        (Some(seeded), Some(target)) => Some(seeded.max(target)),
+        (seeded, target) => seeded.or(target),
+    };
+    for (key, value) in seeded.iter() {
+        if key != VERSION_KEY {
+            target.set(key, value);
+        }
+    }
+    if let Some(version) = version {
+        target.set_first(VERSION_KEY, &version.to_string());
+    }
+    target
+}
+
 /// Alla creazione di una modlist: il globale è il modello per una modlist nuova.
 pub fn seed_modlist_from_global(launcher_paths: &LauncherPaths, modlist_name: &str) -> SeedStatus {
     let target = match modlist_options_path(launcher_paths, modlist_name) {
@@ -398,7 +449,7 @@ pub fn seed_modlist_from_global(launcher_paths: &LauncherPaths, modlist_name: &s
         launcher_paths,
         &global_options_path(launcher_paths),
         &target,
-        false,
+        ExistingTarget::Keep,
         // globale → modlist: i pack elencati altrove quasi certamente non
         // stanno in questa modlist (D67).
         false,
@@ -427,7 +478,7 @@ pub fn seed_instance_from_modlist(
         launcher_paths,
         &source,
         &instance_options_path(instance_root),
-        false,
+        ExistingTarget::Keep,
         // modlist → istanza: le istanze della stessa modlist hanno gli stessi
         // pack (D67).
         true,
@@ -680,9 +731,15 @@ fn write_with_version_guard(file: &OptionsFile, path: &Path) -> anyhow::Result<(
 /// Copre i tre gesti della GUI: ri-applicare verso il basso (modlist → istanza:
 /// è l'unico modo di sovrascrivere un'istanza, e infatti la GUI chiede
 /// conferma dicendo cosa sta per coprire), promuovere all'insù (istanza →
-/// modlist, modlist → globale), copiare da un'altra modlist. Sovrascrive
-/// sempre, perché qui è l'utente a chiederlo: la regola del "una volta sola"
-/// vale per la semina automatica, non per un gesto esplicito.
+/// modlist, modlist → globale), copiare da un'altra modlist. Scrive sempre,
+/// anche sopra un file che c'è, perché qui è l'utente a chiederlo: la regola
+/// del "una volta sola" vale per la semina automatica, non per un gesto
+/// esplicito.
+///
+/// `merge` decide **come** (D155): «Re-apply to instance» e «Promote» lo
+/// passano, e toccano solo le righe spuntate — le altre righe del file di
+/// arrivo, i keybind dei mod e lo stato interno restano com'erano. Senza,
+/// il file di arrivo è sostituito intero, come fa «Bring these settings».
 #[tauri::command]
 pub async fn apply_options_command(
     launcher_paths: State<'_, LauncherPaths>,
@@ -690,6 +747,7 @@ pub async fn apply_options_command(
     to: OptionsScope,
     unchecked: Vec<String>,
     include_resource_packs: bool,
+    merge: Option<bool>,
 ) -> Result<SeedStatus, String> {
     let launcher_paths = launcher_paths.inner().clone();
     off_main_thread(move || {
@@ -699,6 +757,7 @@ pub async fn apply_options_command(
             &to,
             &unchecked.into_iter().collect(),
             include_resource_packs,
+            merge.unwrap_or(false),
         )
     })
     .await
@@ -710,6 +769,7 @@ pub fn apply_options(
     to: &OptionsScope,
     unchecked: &BTreeSet<String>,
     include_resource_packs: bool,
+    merge: bool,
 ) -> anyhow::Result<SeedStatus> {
     let source = from.path(launcher_paths)?;
     let target = to.path(launcher_paths)?;
@@ -734,7 +794,11 @@ pub fn apply_options(
         launcher_paths,
         &source,
         &target,
-        true,
+        if merge {
+            ExistingTarget::Merge
+        } else {
+            ExistingTarget::Overwrite
+        },
         include_resource_packs,
         unchecked,
     ))
@@ -852,7 +916,7 @@ mod tests {
             &launcher_paths,
             &source,
             &root.join("target.txt"),
-            false,
+            ExistingTarget::Keep,
             true,
             &BTreeSet::new(),
         );
@@ -878,7 +942,7 @@ mod tests {
             &launcher_paths,
             &source,
             &root.join("target.txt"),
-            false,
+            ExistingTarget::Keep,
             true,
             &BTreeSet::new(),
         );
@@ -905,7 +969,7 @@ mod tests {
             &launcher_paths,
             &source,
             &target,
-            false,
+            ExistingTarget::Keep,
             true,
             &BTreeSet::new(),
         );
@@ -1224,8 +1288,15 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, original).unwrap();
 
-        let status =
-            apply_options(&launcher_paths, &scope, &scope, &BTreeSet::new(), true).unwrap();
+        let status = apply_options(
+            &launcher_paths,
+            &scope,
+            &scope,
+            &BTreeSet::new(),
+            true,
+            false,
+        )
+        .unwrap();
 
         match status {
             SeedStatus::Refused { reason } => {
@@ -1237,6 +1308,94 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merging_writes_only_the_seeded_lines_and_keeps_the_rest() {
+        let target = OptionsFile::parse(concat!(
+            "version:3465\n",
+            "fov:0.5\n",
+            "lastServer:mc.example.invalid\n",
+            "key_key.epicfight.dodge:key.keyboard.left.alt\n",
+            "guiScale:3\n",
+        ));
+        let seeded = OptionsFile::parse("version:3700\nfov:0.9\nrenderDistance:12\n");
+
+        let merged = merge_into(target, &seeded);
+
+        assert_eq!(
+            merged.render(),
+            concat!(
+                "version:3700\n",
+                "fov:0.9\n",
+                "lastServer:mc.example.invalid\n",
+                "key_key.epicfight.dodge:key.keyboard.left.alt\n",
+                "guiScale:3\n",
+                "renderDistance:12\n",
+            )
+        );
+    }
+
+    #[test]
+    fn merging_never_lowers_the_version_line() {
+        let target = OptionsFile::parse("version:3700\nfov:0.5\n");
+        let seeded = OptionsFile::parse("version:3465\nfov:0.9\n");
+
+        assert_eq!(merge_into(target, &seeded).data_version(), Some(3700));
+    }
+
+    #[test]
+    fn reapplying_to_an_instance_touches_only_the_checked_lines() {
+        // D155: prima «Re-apply to instance» sostituiva l'intero file, e i
+        // keybind dei mod, le righe non spuntate e lo stato interno dell'istanza
+        // tornavano ai default.
+        let root = temp_root("reapply-merge");
+        if !copy_real_jar(&root, "1.20.1") {
+            eprintln!("skipping: 1.20.1/client.jar not in the local cache");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let launcher_paths = LauncherPaths::new(root.clone());
+        let modlist = OptionsScope::Modlist {
+            modlist: "Drehmal".into(),
+        };
+        let instance = OptionsScope::Instance {
+            modlist: "Drehmal".into(),
+            instance: "1.20.1-forge".into(),
+        };
+        OptionsFile::parse("version:3465\nfov:0.75\nrenderDistance:16\nguiScale:2\n")
+            .write(&modlist.path(&launcher_paths).unwrap())
+            .unwrap();
+        let instance_path = instance.path(&launcher_paths).unwrap();
+        OptionsFile::parse(concat!(
+            "version:3465\n",
+            "fov:0.5\n",
+            "renderDistance:8\n",
+            "guiScale:4\n",
+            "lastServer:mc.example.invalid\n",
+            "key_key.epicfight.dodge:key.keyboard.left.alt\n",
+        ))
+        .write(&instance_path)
+        .unwrap();
+
+        let unchecked: BTreeSet<String> = ["renderDistance".to_string()].into_iter().collect();
+        let status =
+            apply_options(&launcher_paths, &modlist, &instance, &unchecked, true, true).unwrap();
+        assert!(matches!(status, SeedStatus::Seeded { .. }), "{status:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(&instance_path).unwrap(),
+            concat!(
+                "version:3465\n",
+                "fov:0.75\n",
+                "renderDistance:8\n",
+                "guiScale:2\n",
+                "lastServer:mc.example.invalid\n",
+                "key_key.epicfight.dodge:key.keyboard.left.alt\n",
+            )
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

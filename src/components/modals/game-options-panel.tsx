@@ -131,6 +131,8 @@ export function GameOptionsPanel(props: Props) {
   const [confirm, setConfirm] = createSignal<null | {
     title: string;
     detail: string;
+    /** The button: "Overwrite" when the whole file is replaced, "Apply" when only the checked lines are. */
+    action: string;
     run: () => Promise<void>;
   }>(null);
 
@@ -308,7 +310,12 @@ export function GameOptionsPanel(props: Props) {
     return `Nothing to do: ${status.target} already exists.`;
   };
 
-  const apply = async (from: OptionsScope, to: OptionsScope, toInstance: boolean) => {
+  /**
+   * `merge` (D155): «Re-apply to instance» e «Promote» scrivono solo le righe
+   * spuntate e lasciano il resto del file di arrivo com'è; «Bring these
+   * settings» sostituisce il file della modlist intero, come prima.
+   */
+  const apply = async (from: OptionsScope, to: OptionsScope, toInstance: boolean, merge: boolean) => {
     setNotice(null);
     setError(null);
     try {
@@ -320,6 +327,7 @@ export function GameOptionsPanel(props: Props) {
         // resta fuori è già in `unchecked`. Così il default di D67 resta un
         // default e non una regola cablata nella direzione.
         includeResourcePacks: true,
+        merge,
       })) as SeedStatus;
       setNotice(describe(status));
       await load();
@@ -370,8 +378,9 @@ export function GameOptionsPanel(props: Props) {
     setConfirm({
       title: `Bring the settings from ${sourceLabel()} here?`,
       detail: `Overwrites mod-lists/${modlistName()}/options.txt, the default that new instances are born from. Instances that already exist do not change.`,
+      action: "Overwrite",
       run: async () => {
-        await apply(sourceScope(), props.scope, false);
+        await apply(sourceScope(), props.scope, false, false);
         setSource("default");
         setCheckedOverride({});
         await load();
@@ -385,16 +394,18 @@ export function GameOptionsPanel(props: Props) {
     if (!target || modlist === null) return;
     setConfirm({
       title: `Re-apply to “${target}”?`,
-      detail: `Overwrites mod-lists/${modlist}/instances/${target}/options.txt, which has belonged to the game since it was created: whatever you changed in-game in that instance is lost.`,
-      run: () => apply(props.scope, { level: "instance", modlist, instance: target }, true),
+      detail: `Writes the checked settings into mod-lists/${modlist}/instances/${target}/options.txt, over the values you set in-game for those settings. Everything else in that file stays as it is: unchecked lines, mod keybinds and the game's own state.`,
+      action: "Apply",
+      run: () => apply(props.scope, { level: "instance", modlist, instance: target }, true, true),
     });
   };
 
   const promoteToGlobal = () => {
     setConfirm({
       title: "Promote to the global default?",
-      detail: "Overwrites the global options.txt, the template for new mod-lists. Mod-lists that already exist do not change.",
-      run: () => apply(props.scope, { level: "global" }, false),
+      detail: "Writes the checked settings into the global options.txt, the template for new mod-lists. The other lines of the global file stay as they are, and mod-lists that already exist do not change.",
+      action: "Apply",
+      run: () => apply(props.scope, { level: "global" }, false, true),
     });
   };
 
@@ -710,7 +721,7 @@ export function GameOptionsPanel(props: Props) {
                 }}
                 class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
-                Overwrite
+                {confirm()!.action}
               </button>
             </div>
           </div>
