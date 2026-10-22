@@ -1726,6 +1726,12 @@ mod tests {
                     key          TEXT NOT NULL,
                     value        TEXT NOT NULL,
                     PRIMARY KEY (modlist_name, key)
+                );
+                -- save_modlist_overrides checks the effective RAM pair
+                -- against the global settings (shell-5).
+                CREATE TABLE global_settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 );",
             )
             .expect("modlist settings schema should initialize");
