@@ -15,7 +15,7 @@ use super::{
     maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
     merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
     minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
-    substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
+    split_installations_by_host_architecture, substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
     EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest,
     LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
 };
@@ -1176,4 +1176,34 @@ fn offline_with_no_runtime_of_the_required_major_is_a_clear_error() {
         installed_java_for_launch(&installed, 21, true, runtimes_dir).expect("offline, installed"),
         Some(PathBuf::from("/launcher/java-runtimes/java-21/bin/java"))
     );
+}
+
+/// download-4 (audit 101): una Java di un'altra architettura non entra nella
+/// scelta, nemmeno quando è la sola della major giusta o viene dal PATH.
+#[test]
+fn java_of_another_architecture_is_left_out_of_the_choice() {
+    let host = crate::java_runtime::host_java_architecture();
+    let foreign = if host == "x86" { "x64" } else { "x86" };
+    let installation = |path: &str, architecture: &str, source| JavaInstallation {
+        path: PathBuf::from(path),
+        version: 8,
+        auto_detected: true,
+        architecture: architecture.into(),
+        source,
+    };
+    let (usable, skipped) = split_installations_by_host_architecture(vec![
+        installation("/usr/bin/java", foreign, JavaInstallationSource::SystemPath),
+        installation(
+            "/launcher/java-runtimes/java-8/bin/java",
+            &host,
+            JavaInstallationSource::LauncherManaged,
+        ),
+    ]);
+
+    assert_eq!(
+        usable.iter().map(|java| java.path.clone()).collect::<Vec<_>>(),
+        vec![PathBuf::from("/launcher/java-runtimes/java-8/bin/java")]
+    );
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].architecture, foreign);
 }

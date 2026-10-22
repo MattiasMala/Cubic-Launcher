@@ -12,8 +12,9 @@ use crate::adoptium::{
     host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download, AdoptiumClient,
 };
 use crate::java_runtime::{
-    discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
-    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
+    discover_java_installations, host_java_architecture, java_architecture_matches_host,
+    persist_java_installations, select_exact_java_for_requirement, select_java_for_requirement,
+    CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
 };
 use crate::launch_command::PreparedLaunchCommand;
 use crate::launcher_paths::LauncherPaths;
@@ -1002,6 +1003,7 @@ pub(super) async fn select_or_download_java(
         )
     })?;
     persist_java_installations(&connection, &installations)?;
+    let installations = installations_for_this_computer(app_handle, installations)?;
 
     if let Some(path) = installed_java_for_launch(
         &installations,
@@ -1014,7 +1016,12 @@ pub(super) async fn select_or_download_java(
 
     let adoptium = AdoptiumClient::new();
     let os = host_adoptium_os();
-    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
+    let arch = normalize_adoptium_architecture(std::env::consts::ARCH).with_context(|| {
+        format!(
+            "No Java {required_version} runtime is installed, and Adoptium has no runtime for this computer's architecture ({}). Install Java {required_version} yourself and set its path in the settings.",
+            std::env::consts::ARCH
+        )
+    })?;
 
     // Resolve the nearest major Adoptium actually ships. EOL majors (e.g. Java
     // 16) return an empty asset list, so this walks upward to the next
@@ -1077,6 +1084,7 @@ pub(super) async fn select_or_download_java(
     // original requirement.
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
     persist_java_installations(&connection, &installations)?;
+    let installations = installations_for_this_computer(app_handle, installations)?;
 
     select_java_for_requirement(&installations, required_version)
         .map(|installation| installation.path)
@@ -1087,6 +1095,40 @@ pub(super) async fn select_or_download_java(
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// Le Java che possono far partire il gioco su questo computer: quelle di
+/// un'altra architettura si scartano, con una riga nel log (download-4). Una
+/// Java 8 a 32 bit nel PATH vinceva su quella a 64 bit del launcher a parità
+/// di major, e la JVM non partiva con la memoria chiesta.
+fn installations_for_this_computer(
+    app_handle: &tauri::AppHandle,
+    installations: Vec<JavaInstallation>,
+) -> Result<Vec<JavaInstallation>> {
+    let (usable, foreign) = split_installations_by_host_architecture(installations);
+    for installation in &foreign {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Java] Skipping {} (Java {}, {}): this computer needs a {} runtime",
+                installation.path.display(),
+                installation.version,
+                installation.architecture,
+                host_java_architecture()
+            ),
+        )?;
+    }
+    Ok(usable)
+}
+
+/// `(adatte, scartate)` secondo l'architettura di questo computer.
+pub(super) fn split_installations_by_host_architecture(
+    installations: Vec<JavaInstallation>,
+) -> (Vec<JavaInstallation>, Vec<JavaInstallation>) {
+    installations
+        .into_iter()
+        .partition(|installation| java_architecture_matches_host(&installation.architecture))
 }
 
 /// La Java già installata per questo lancio, oppure `None` quando va scaricata.

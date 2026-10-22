@@ -46,40 +46,45 @@ impl JavaBinaryInspector for CommandJavaBinaryInspector {
             return Ok(None);
         }
 
-        let mut cmd = Command::new(path);
-        cmd.arg("-version");
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+        // `-XshowSettings:properties` aggiunge `os.arch = …`, l'unico dato
+        // esatto sull'architettura: `-version` da solo dice «64-Bit» anche su
+        // aarch64 e niente su una JVM a 32 bit (download-4). Una JVM che non
+        // conosce l'opzione non stampa la versione, e allora si riprova con
+        // `-version` soltanto.
+        for args in [&["-XshowSettings:properties", "-version"][..], &["-version"][..]] {
+            let Some(combined_output) = run_java_for_output(path, args) else {
+                return Ok(None); // binary not executable or missing
+            };
+            if let Some(version) = parse_java_major_version(&combined_output) {
+                return Ok(Some(JavaProbe {
+                    version,
+                    architecture: parse_java_architecture(&combined_output),
+                }));
+            }
         }
 
-        let output = match cmd.output() {
-            Ok(output) => output,
-            Err(_) => return Ok(None), // binary not executable or missing
-        };
-
-        let combined_output = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        if !output.status.success() && combined_output.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let Some(version) = parse_java_major_version(&combined_output) else {
-            return Ok(None);
-        };
-
-        Ok(Some(JavaProbe {
-            version,
-            architecture: parse_java_architecture(&combined_output),
-        }))
+        Ok(None)
     }
+}
+
+/// stdout e stderr di `java <args>`, insieme; `None` se il binario non parte.
+fn run_java_for_output(path: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(path);
+    cmd.args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().ok()?;
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 pub fn discover_java_installations(
@@ -257,29 +262,89 @@ pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u3
 }
 
 pub fn parse_java_major_version(output: &str) -> Option<u32> {
+    // La riga di `-version` (`openjdk version "17.0.12"`) prima di tutto: con
+    // `-XshowSettings` l'output contiene anche le proprietà, e un loro valore
+    // tra virgolette non deve passare per la versione.
     let version_token = output
-        .split(|character: char| character.is_whitespace())
-        .find(|token| token.starts_with('"') && token.ends_with('"'))?
+        .lines()
+        .filter(|line| line.contains(" version \""))
+        .chain(output.lines())
+        .flat_map(|line| line.split(|character: char| character.is_whitespace()))
+        .find(|token| token.len() > 2 && token.starts_with('"') && token.ends_with('"'))?
         .trim_matches('"');
 
     let mut segments = version_token.split('.');
-    let first = segments.next()?.parse::<u32>().ok()?;
+    let first = leading_number(segments.next()?)?;
 
     if first == 1 {
-        segments.next()?.parse::<u32>().ok()
+        leading_number(segments.next()?)
     } else {
         Some(first)
     }
 }
 
+/// Le cifre iniziali di un segmento di versione: le build «early access» e
+/// interne scrivono `25-ea` o `17-internal` senza minor, e il suffisso non
+/// deve rendere la Java invisibile (r2-percorsi-non-ascii-e-limiti-windows-6).
+fn leading_number(segment: &str) -> Option<u32> {
+    let end = segment
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(segment.len());
+    segment[..end].parse().ok()
+}
+
+/// L'architettura di una JVM: `x64`, `arm64`, `x86`, oppure il nome di
+/// `os.arch` per le altre.
+///
+/// Prima `os.arch` di `-XshowSettings:properties`, che è esatto; senza, i
+/// segni di `-version`: aarch64/arm64, poi «64-Bit», e altrimenti una JVM a
+/// 32 bit, che è proprio quella che non lo scrive (download-4). Prima tutto
+/// quello che non era arm diventava `x64`, e una Java 8 a 32 bit nel PATH
+/// vinceva su quella a 64 bit del launcher, per poi non partire con `-Xmx4096M`.
 pub fn parse_java_architecture(output: &str) -> String {
+    let os_arch = output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("os.arch")?
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if let Some(os_arch) = os_arch {
+        return normalize_java_architecture(os_arch);
+    }
+
     let normalized = output.to_ascii_lowercase();
 
     if normalized.contains("aarch64") || normalized.contains("arm64") {
         "arm64".to_string()
-    } else {
+    } else if normalized.contains("64-bit") {
         "x64".to_string()
+    } else {
+        "x86".to_string()
     }
+}
+
+/// `os.arch` di Java e `std::env::consts::ARCH` di Rust con gli stessi nomi.
+fn normalize_java_architecture(architecture: &str) -> String {
+    match architecture.to_ascii_lowercase().as_str() {
+        "amd64" | "x86_64" | "x64" => "x64".to_string(),
+        "aarch64" | "arm64" => "arm64".to_string(),
+        "x86" | "i386" | "i486" | "i586" | "i686" => "x86".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// L'architettura di questo computer, nei nomi di [`parse_java_architecture`].
+pub fn host_java_architecture() -> String {
+    normalize_java_architecture(std::env::consts::ARCH)
+}
+
+/// Se una Java di questa architettura è adatta al lancio su questo computer.
+/// Una JVM a 32 bit su un sistema a 64 bit parte, ma non con la memoria che
+/// il lancio le chiede: si scarta, come ogni architettura diversa.
+pub fn java_architecture_matches_host(architecture: &str) -> bool {
+    architecture == host_java_architecture()
 }
 
 pub fn candidates_from_path_entries(path_entries: &[PathBuf]) -> Vec<JavaBinaryCandidate> {
@@ -420,8 +485,9 @@ mod tests {
     use crate::database::initialize_database;
 
     use super::{
-        candidates_from_java_home_root, candidates_from_path_entries,
-        inspect_java_binary_candidates, parse_java_architecture, parse_java_major_version,
+        candidates_from_java_home_root, candidates_from_path_entries, host_java_architecture,
+        inspect_java_binary_candidates, java_architecture_matches_host, parse_java_architecture,
+        parse_java_major_version,
         persist_java_installations, required_java_version_for_minecraft,
         select_exact_java_for_requirement, select_java_for_minecraft, select_java_for_requirement,
         JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation, JavaInstallationSource,
@@ -483,6 +549,68 @@ mod tests {
             parse_java_architecture("Java HotSpot(TM) 64-Bit Server VM"),
             "x64"
         );
+        // download-4: la Java 8 Oracle a 32 bit non scrive «64-Bit», e non è x64.
+        assert_eq!(
+            parse_java_architecture(
+                "java version \"1.8.0_381\"\nJava(TM) SE Runtime Environment (build 1.8.0_381-b09)\nJava HotSpot(TM) Client VM (build 25.381-b09, mixed mode, sharing)"
+            ),
+            "x86"
+        );
+    }
+
+    /// `os.arch` di `-XshowSettings:properties` vince sui segni di `-version`:
+    /// una JVM aarch64 scrive «64-Bit» come una x64.
+    #[test]
+    fn os_arch_property_decides_the_architecture() {
+        let output = |os_arch: &str| {
+            format!(
+                "Property settings:\n    file.encoding = UTF-8\n    os.arch = {os_arch}\n    os.name = Linux\n\nopenjdk version \"17.0.12\" 2024-07-16\nOpenJDK 64-Bit Server VM (build 17.0.12+7, mixed mode)\n"
+            )
+        };
+        assert_eq!(parse_java_architecture(&output("amd64")), "x64");
+        assert_eq!(parse_java_architecture(&output("x86_64")), "x64");
+        assert_eq!(parse_java_architecture(&output("aarch64")), "arm64");
+        assert_eq!(parse_java_architecture(&output("x86")), "x86");
+        assert_eq!(parse_java_architecture(&output("riscv64")), "riscv64");
+        assert_eq!(parse_java_major_version(&output("amd64")), Some(17));
+    }
+
+    #[test]
+    fn host_architecture_accepts_only_its_own_runtimes() {
+        let host = host_java_architecture();
+        assert!(java_architecture_matches_host(&host));
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(host, "x64");
+            assert!(!java_architecture_matches_host("x86"));
+            assert!(!java_architecture_matches_host("arm64"));
+        }
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(host, "arm64");
+            assert!(!java_architecture_matches_host("x64"));
+        }
+    }
+
+    /// r2-percorsi-non-ascii-e-limiti-windows-6: le build «early access» e
+    /// interne non hanno il minor, e prima non venivano mai rilevate.
+    #[test]
+    fn parses_early_access_and_internal_java_versions() {
+        assert_eq!(
+            parse_java_major_version("openjdk version \"25-ea\" 2025-09-16"),
+            Some(25)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"17-internal\" 2021-09-14"),
+            Some(17)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"1.8.0-internal\""),
+            Some(8)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"21.0.2-ea\" 2024-01-16"),
+            Some(21)
+        );
+        assert_eq!(parse_java_major_version("openjdk version \"ea\""), None);
     }
 
     #[test]
