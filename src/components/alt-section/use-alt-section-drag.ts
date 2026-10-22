@@ -123,6 +123,7 @@ export function useAltSectionDrag(props: AltSectionProps) {
         commitAltDrop(fromId, dropId);
       }
     },
+    detect: cursorY => detectAltDropTarget(cursorY),
   });
 
   const isGroupDrag = () => engine.draggingKind() === "group";
@@ -141,15 +142,23 @@ export function useAltSectionDrag(props: AltSectionProps) {
     const draggingItemId = engine.draggingId()!;
     const membership = altGroupMembership();
     const initMidYs = engine.cachedMidYs();
+    // Measurements are from dragStart: if the list scrolled since, rows and
+    // their centres moved up by scrollDelta.
+    const scrollDelta = engine.scrollDelta();
+    const midOf = (rowId: string) => {
+      const mid = initMidYs.get(rowId);
+      return mid === undefined ? undefined : mid - scrollDelta;
+    };
 
+    const dragTlId = groupDrag ? `alt-group:${draggingItemId}` : draggingItemId;
     for (const item of items) {
       const id = altTlId(item);
-      const dragTlId = groupDrag ? `alt-group:${draggingItemId}` : draggingItemId;
       if (id === dragTlId) continue;
 
-      const y = tops.get(id);
+      const rawY = tops.get(id);
       const h = heights.get(id) ?? 40;
-      if (y === undefined) continue;
+      if (rawY === undefined) continue;
+      const y = rawY - scrollDelta;
 
       if (cursorY < y + h) {
         if (item.kind === "alt-group") {
@@ -169,9 +178,9 @@ export function useAltSectionDrag(props: AltSectionProps) {
           if (candidates.length === 0) return `alt-group-drop:${gId}`;
 
           let nearest = candidates[0];
-          let nearestMid = initMidYs.get(nearest.id) ?? (y + h / 2);
+          let nearestMid = midOf(nearest.id) ?? (y + h / 2);
           for (const c of candidates.slice(1)) {
-            const mid = initMidYs.get(c.id) ?? nearestMid;
+            const mid = midOf(c.id) ?? nearestMid;
             if (Math.abs(cursorY - mid) < Math.abs(cursorY - nearestMid)) {
               nearest = c;
               nearestMid = mid;
@@ -184,29 +193,22 @@ export function useAltSectionDrag(props: AltSectionProps) {
         if (groupDrag) {
           return cursorY >= y + h / 2 ? `alt-row-after:${altId}` : `alt-row:${altId}`;
         }
-        const midY = initMidYs.get(altId) ?? (y + h / 2);
+        const midY = midOf(altId) ?? (y + h / 2);
         return cursorY >= midY ? `alt-after:${altId}` : altId;
       }
     }
-    return null;
+
+    // Below every item: after the last one, in this detector's own ids.
+    const last = [...items].reverse().find(item => altTlId(item) !== dragTlId);
+    if (!last) return null;
+    if (last.kind === "alt-group") {
+      return groupDrag ? `alt-group-after:${last.id}` : `alt-tl-group-after:${last.id}`;
+    }
+    return groupDrag ? `alt-row-after:${last.row.id}` : `alt-after:${last.row.id}`;
   };
 
   const handleAltDragStart = (id: string, kind: "row" | "group", event: PointerEvent | MouseEvent) => {
     engine.startDrag(id, kind, event);
-
-    const onMoveOverride = (ev: PointerEvent) => {
-      if (!engine.draggingId()) return;
-      const target = detectAltDropTarget(ev.clientY);
-      if (target !== null) {
-        engine.setHoveredDropId(target);
-      }
-    };
-    const onUpCleanup = () => {
-      window.removeEventListener("pointermove", onMoveOverride);
-      window.removeEventListener("pointerup", onUpCleanup);
-    };
-    window.addEventListener("pointermove", onMoveOverride);
-    window.addEventListener("pointerup", onUpCleanup);
   };
 
   const previewAltTLItems = createMemo((): AltTLItem[] => {

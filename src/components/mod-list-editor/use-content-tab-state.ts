@@ -243,6 +243,7 @@ export function useContentTabState(props: ContentTabViewProps) {
         : { kind: "group", id: item.id }
     ),
     onCommit: (fromId, dropId, fromKind) => commitContentDrop(fromId, dropId, fromKind),
+    detect: cursorY => detectContentDropTarget(cursorY),
   });
 
   const isDraggingGroup = () => engine.draggingKind() === "group";
@@ -294,22 +295,14 @@ export function useContentTabState(props: ContentTabViewProps) {
         return cursorY >= y + height / 2 ? `row-after:${entryId}` : entryId;
       }
     }
-    return null;
+    // Below every item: after the last one, in this detector's own ids.
+    const last = [...items].reverse().find(item => ctlId(item) !== dragTlId);
+    if (!last) return null;
+    return last.kind === "group" ? `tl-group-after:${last.id}` : `row-after:${last.entry.id}`;
   };
 
   const handleStartDrag = (id: string, kind: "row" | "group", event: PointerEvent | MouseEvent) => {
     engine.startDrag(id, kind, event);
-    const onMoveOverride = (pointerEvent: PointerEvent) => {
-      if (!engine.draggingId()) return;
-      const target = detectContentDropTarget(pointerEvent.clientY);
-      if (target !== null) engine.setHoveredDropId(target);
-    };
-    const onUpCleanup = () => {
-      window.removeEventListener("pointermove", onMoveOverride);
-      window.removeEventListener("pointerup", onUpCleanup);
-    };
-    window.addEventListener("pointermove", onMoveOverride);
-    window.addEventListener("pointerup", onUpCleanup);
   };
 
   const previewTLItems = createMemo(() => {
