@@ -14,21 +14,34 @@ finto `java` è anche la rete di sicurezza: risponde a `-version` per superare
 l'ispezione, e per ogni altra chiamata scrive gli argomenti ed esce con 1, quindi
 Minecraft non parte mai.
 
-Scenari (account offline, cache reale in hard link):
+Scenari (cache reale in hard link):
 
-- `vanilla`            — cache completa; atteso: 0 richieste, `java` raggiunto,
-                         nessun file nella cache dei metadati del loader.
+- `vanilla`            — account offline, cache completa; atteso: 0 richieste,
+                         `java` raggiunto, nessun file nella cache dei metadati
+                         del loader.
 - `fabric-jar-missing` — un jar registrato tolto dalla cache del workspace.
 - `fabric-complete`    — cache completa.
 
-I due scenari Fabric hanno due fasi sullo **stesso** workspace (D137):
+I due scenari Fabric hanno due fasi sullo **stesso** workspace (D137, D160):
 
-- `priming` — il proxy inoltra alla rete vera **solo** `meta.fabricmc.net` e
-              rifiuta il resto; atteso: 1 sola richiesta, `meta.fabricmc.net`,
-              `java` raggiunto, e la voce di cache scritta dal lancio in
+- `priming` — l'account sintetico gioca **online** (un `UPDATE` esplicito di
+              `plays_offline`) e lancia una mod list Fabric sintetica **vuota**
+              della stessa combinazione: senza mod non c'è niente da chiedere
+              a Modrinth. Il proxy inoltra alla rete vera **solo**
+              `meta.fabricmc.net` e rifiuta il resto. Atteso: 1
+              `meta.fabricmc.net`, più **una** richiesta rifiutata al primo
+              artefatto che l'istanza vuota non ha, `java` **non** raggiunto, e
+              la voce di cache scritta dal lancio in
               `cache/loader-metadata/<mc>/fabric.json`. La voce la scrive il
-              codice di produzione con la risposta della rete vera.
-- `measure` — il proxy rifiuta tutto; atteso: 0 richieste, `java` raggiunto.
+              codice di produzione con la risposta della rete vera, appena la
+              fetch rende il valore: prima della richiesta rifiutata.
+- `measure` — l'account torna offline, la mod list è quella vera, il proxy
+              rifiuta tutto; atteso: 0 richieste, `java` raggiunto.
+
+La voce ha chiave `(minecraft, loader)`, non la mod list: per D137 conta che la
+combinazione sia stata lanciata online, e l'innesco sulla mod list vuota è
+proprio quel lancio. Con l'account offline l'innesco non si può fare: offline
+la cache si rilegge soltanto (report 100, «Serve da te»).
 
 Controlli negativi, eseguiti a ogni giro perché senza di loro il conteggio non
 prova niente:
@@ -40,20 +53,24 @@ prova niente:
                           mentre il proxy ascolta sulla sua: il log deve restare
                           **vuoto** e il lancio fallire. Le righe arrivano solo dal
                           traffico che passa dal proxy.
-- `control-no-cache-entry` — Fabric, `priming`, poi la sola voce di cache tolta
-                          dal workspace e la misura: 0 richieste, `java` non
-                          raggiunto, e il motivo dice che la combinazione non è mai
-                          stata lanciata online. Se resta verde, il verde non
-                          veniva dalla cache.
+- `control-no-cache-entry` — Fabric, `priming` (online), poi la sola voce di
+                          cache tolta dal workspace e la misura (offline): 0
+                          richieste, `java` non raggiunto, e il motivo dice che
+                          la combinazione non è mai stata lanciata online. Se
+                          resta verde, il verde non veniva dalla cache.
 - `control-online-still-fetches` — Fabric, `priming` due volte: anche con la voce
                           presente la seconda chiede ancora `meta.fabricmc.net`
                           (la cache non vince mai sulla rete, D137 vincolo 2).
 
 Esce con 0 se ogni scenario e ogni controllo combacia con l'atteso, 1 altrimenti.
 
-Dati veri: il proxy rifiuta tutto tranne il meta di Fabric nella fase di
-innesco, quindi nessun download riesce e nessun file in hard link viene
-riscritto da un download (trappola 10). La cache dei metadati del loader non è
+Dati veri: il proxy inoltra **solo host di metadati, mai host di artefatti**
+(`FORWARDED_METADATA_HOSTS`): nella fase di innesco il solo meta di Fabric,
+altrimenti niente. Quindi nessun download riesce e nessun file in hard link
+viene riscritto da un download (trappola 10); l'innesco scrive soltanto nella
+propria istanza vuota, che nasce nel workspace. L'account sintetico ha i token
+NULL anche quando gioca online, e il lancio muore sul primo artefatto rifiutato
+prima di arrivare all'identità del giocatore. La cache dei metadati del loader non è
 mai collegata ai dati veri: nasce nel workspace, e prima e dopo ogni fase
 `assert_private` la verifica (nlink 1). Si copiano il DB (con
 le righe account cancellate), i JSON della mod list, i `custom_configs`, le
@@ -109,6 +126,9 @@ SOURCE_FILES = ("src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri
 DEFAULT_MC = "1.20.1"
 DEFAULT_MISSING_JAR = "fabric/unerR5MN/ferritecore-6.0.1-fabric.jar"
 VANILLA_MODLIST = "offline-guard-vanilla"
+# La mod list Fabric sintetica e vuota dell'innesco online (D160).
+PRIMING_MODLIST = "offline-guard-priming"
+GUARD_ACCOUNT = "offline-guard"
 # Il `devUrl` del binario debug (`tauri.conf.json`): se qui risponde qualcuno,
 # la webview carica il frontend e le sue richieste finiscono nel log.
 DEV_SERVER_PORT = 1420
@@ -126,6 +146,15 @@ FAKE_JAVA_ARGS = "fake-java-args.txt"
 # cerca, la toglie (controllo) e la verifica privata.
 LOADER_CACHE_DIR = "cache/loader-metadata"
 FABRIC_META_HOST = "meta.fabricmc.net"
+# Gli unici host che il proxy può inoltrare: metadati, mai artefatti.
+FORWARDED_METADATA_HOSTS = frozenset({FABRIC_META_HOST})
+# Dove muore l'innesco online, dopo il meta: al primo artefatto che manca, che il
+# proxy rifiuta. Nell'ordine della pipeline viene prima la configurazione di log4j
+# di Minecraft (download-1, `piston-data.mojang.com`), che nella cache reale c'è
+# solo dopo un lancio online fatto con quel codice; se c'è, la prima libreria del
+# loader che l'istanza vuota non ha (`maven.fabricmc.net`). Una richiesta sola,
+# rifiutata, a uno dei due: nient'altro.
+PRIMING_FATAL_ARTIFACT_HOSTS = ("piston-data.mojang.com", "maven.fabricmc.net")
 # Il pezzo fisso del messaggio di D137, vincolo 3: offline, combinazione mai lanciata online.
 NEVER_LAUNCHED_ONLINE = "has never been launched online"
 
@@ -192,6 +221,9 @@ class LoggingProxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, log_path: Path, forward_hosts: tuple[str, ...] = ()):
+        unexpected = set(forward_hosts) - FORWARDED_METADATA_HOSTS
+        if unexpected:
+            raise RuntimeError(f"REFUSING to forward {sorted(unexpected)}: not a metadata host")
         super().__init__(("127.0.0.1", 0), _LoggingHandler)
         self.log_path = log_path
         self.forward_hosts = frozenset(forward_hosts)
@@ -260,7 +292,7 @@ def build_workspace(args: argparse.Namespace, scenario: "Scenario") -> HarnessWo
     ws = HarnessWorkspace(keep=args.keep, base_dir=args.work_dir)
     ws.adopt_database(real / "launcher_data.db")
     ws.seed_offline_account(
-        username="OfflineGuard", microsoft_id="offline-guard", plays_offline=True
+        username="OfflineGuard", microsoft_id=GUARD_ACCOUNT, plays_offline=True
     )
     ws.set_global_setting("java_path_override", str(write_fake_java(ws)))
 
@@ -279,6 +311,8 @@ def build_workspace(args: argparse.Namespace, scenario: "Scenario") -> HarnessWo
     if scenario.loader == "vanilla":
         ws.create_modlist(vanilla_modlist(VANILLA_MODLIST))
     else:
+        # Vuota: l'innesco online non ha niente da chiedere a Modrinth (D160).
+        ws.create_modlist(vanilla_modlist(PRIMING_MODLIST))
         source = real / "mod-lists" / args.modlist
         target = f"mod-lists/{args.modlist}"
         for name in (*MODLIST_JSON_FILES, "options.txt"):
@@ -324,6 +358,13 @@ class Phase:
     expected_hosts: dict[str, int] | None
     expect_java: bool
     must_see: str | None = None
+    # Altri conteggi accettati oltre a `expected_hosts`, ciascuno esatto.
+    alternative_hosts: tuple[dict[str, int], ...] = ()
+    # L'account sintetico gioca offline (D115). False: `UPDATE` esplicito a
+    # online prima del lancio (`seed_offline_account` salta una riga esistente).
+    plays_offline: bool = True
+    # La mod list del lancio; None = quella dello scenario.
+    modlist: str | None = None
     # Host che il proxy inoltra alla rete vera; tutto il resto è rifiutato.
     forward_hosts: tuple[str, ...] = ()
     proxy_on_closed_port: bool = False
@@ -347,21 +388,27 @@ class Scenario:
 
 
 def priming(label: str = "priming", loader_cache_before: bool | None = None) -> Phase:
-    """Fase 1: account offline, il proxy inoltra solo il meta di Fabric.
+    """Fase 1 (D160): account online, mod list Fabric vuota, il proxy inoltra solo il meta.
 
     La voce di cache che la fase 2 rilegge la scrive il codice di produzione,
     con la risposta della rete vera: nessuna fixture, nessun formato del harness.
+    Il lancio poi muore sul primo artefatto rifiutato, e `java` non si raggiunge.
     """
+    expected = [{FABRIC_META_HOST: 1, host: 1} for host in PRIMING_FATAL_ARTIFACT_HOSTS]
     return Phase(
         label,
-        expected_hosts={FABRIC_META_HOST: 1},
-        expect_java=True,
+        expected_hosts=expected[0],
+        alternative_hosts=tuple(expected[1:]),
+        expect_java=False,
         forward_hosts=(FABRIC_META_HOST,),
+        plays_offline=False,
+        modlist=PRIMING_MODLIST,
         loader_cache_before=loader_cache_before,
         loader_cache_after=True,
     )
 
 
+# Fase 2: account offline, la mod list vera, il proxy rifiuta tutto.
 MEASURE = Phase("measure", expected_hosts={}, expect_java=True)
 
 SCENARIOS = [
@@ -489,12 +536,15 @@ def run_phase(
             reasons.append(f"no loader metadata cache entry {entry} to remove")
     reasons += loader_cache_reasons(ws, entry, phase.loader_cache_before, "before the launch")
 
+    ws.set_plays_offline(GUARD_ACCOUNT, phase.plays_offline)
     args_file = ws.launcher_root / FAKE_JAVA_ARGS
     args_file.unlink(missing_ok=True)  # quello di una fase precedente non conta
     log_path = ws.xdg_data_home / f"proxy-{name.replace('/', '-')}.log"
     with LoggingProxy(log_path, phase.forward_hosts) as proxy:
         port = closed_port() if phase.proxy_on_closed_port else proxy.port
-        modlist = VANILLA_MODLIST if scenario.loader == "vanilla" else args.modlist
+        modlist = phase.modlist or (
+            VANILLA_MODLIST if scenario.loader == "vanilla" else args.modlist
+        )
         spec = ComboSpec(
             loader=scenario.loader,
             mc_version=args.mc,
@@ -522,8 +572,10 @@ def run_phase(
     if result.harness_error:
         reasons.append(f"harness: {result.harness_error}")
     if phase.expected_hosts is not None:
-        if dict(hosts) != phase.expected_hosts:
-            reasons.append(f"requests {dict(hosts)} != expected {phase.expected_hosts}")
+        accepted = [phase.expected_hosts, *phase.alternative_hosts]
+        if dict(hosts) not in accepted:
+            wanted = " or ".join(str(expected) for expected in accepted)
+            reasons.append(f"requests {dict(hosts)} != expected {wanted}")
     elif hosts.get(phase.must_see, 0) < 1:
         reasons.append(f"no request to {phase.must_see}: the proxy is not in the loop")
     if java_reached != phase.expect_java:
