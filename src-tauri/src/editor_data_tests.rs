@@ -246,6 +246,49 @@ fn delete_rules_removes_from_tree() {
     fs::remove_dir_all(&root).unwrap();
 }
 
+/// Audit 101, editor-logica-5: con «X requires Y» si cancella Y, e il link
+/// verso un mod che non c'è più restava nel file — X rossa per sempre, senza
+/// nessun link visibile. Vale anche per `exclude_if`, per le alternative che
+/// spariscono insieme al mod cancellato, e in tutto l'albero.
+#[test]
+fn delete_rules_removes_requires_and_exclusions_towards_the_deleted_mods() {
+    let root = unique_test_root();
+    let mut x = simple_rule("x");
+    x.requires = vec!["y".into(), "keep".into()];
+    x.exclude_if = vec!["y-alt".into(), "keep".into()];
+    let mut nested = simple_rule("nested");
+    nested.requires = vec!["y-alt".into()];
+    x.alternatives = vec![nested];
+    let mut y = simple_rule("y");
+    y.alternatives = vec![simple_rule("y-alt")];
+    let mut z = simple_rule("z");
+    z.requires = vec!["keep".into()];
+    setup_modlist(&root, "Pack", vec![x, y, simple_rule("keep"), z]);
+
+    delete_rules_from_root(
+        &root,
+        &DeleteRulesInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["y".into()],
+        },
+    )
+    .unwrap();
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    let x = modlist.find_rule("x").unwrap();
+    assert_eq!(x.requires, vec!["keep".to_string()]);
+    assert_eq!(x.exclude_if, vec!["keep".to_string()]);
+    assert!(modlist.find_rule("nested").unwrap().requires.is_empty());
+    assert!(modlist.find_rule("y-alt").is_none());
+    // Un link verso un mod che resta non si tocca.
+    assert_eq!(
+        modlist.find_rule("z").unwrap().requires,
+        vec!["keep".to_string()]
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn reorder_rules_changes_order() {
     let root = unique_test_root();
