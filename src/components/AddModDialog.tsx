@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect } from "solid-js";
+import { Show, createSignal, createEffect, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import {
   addModModalOpen, setAddModModalOpen,
@@ -6,29 +6,36 @@ import {
   addModMode, setAddModMode,
   modRowsState,
   activeContentTab, selectedModListName,
+  selectedMcVersion, selectedModLoader,
 } from "../store";
+import { isTauri } from "../app/backend-loaders";
 import { SearchIcon, XIcon, UploadIcon, MaterialIcon } from "./icons";
 import { LocalJarTab } from "./add-mod-dialog/LocalJarTab";
 import { SearchSidebar } from "./add-mod-dialog/SearchSidebar";
 import { SearchResults } from "./add-mod-dialog/SearchResults";
-import type { AddModDialogProps, SearchFilters } from "./add-mod-dialog/shared";
-import { searchModrinth } from "./add-mod-dialog/shared";
+import type { AddModDialogProps, SearchContentType, SearchFilters } from "./add-mod-dialog/shared";
+import { compatibleSearchLoaders, searchModrinth } from "./add-mod-dialog/shared";
 
 export function AddModDialog(props: AddModDialogProps) {
   const [searchResults, setSearchResults] = createSignal<any[]>([]);
   const [totalHits, setTotalHits] = createSignal(0);
   const [page, setPage] = createSignal(0);
   const [searching, setSearching] = createSignal(false);
+  const [searchError, setSearchError] = createSignal<string | null>(null);
   const [addingIds, setAddingIds] = createSignal<Set<string>>(new Set());
   const [addedIds, setAddedIds] = createSignal<Set<string>>(new Set());
+  const [failedIds, setFailedIds] = createSignal<Map<string, string>>(new Map());
   const [selCategories, setSelCategories] = createSignal<Set<string>>(new Set());
   const [selLoaders, setSelLoaders] = createSignal<Set<string>>(new Set());
-  const [selVersions, setSelVersions] = createSignal<Set<string>>(new Set());
   const [selEnvs, setSelEnvs] = createSignal<Set<string>>(new Set());
+  // D149: by default the search shows only what fits the mod list's
+  // Minecraft version (and loader, for mods); the sidebar can turn it off.
+  const [compatFilter, setCompatFilter] = createSignal(true);
   const [sortBy, setSortBy] = createSignal("relevance");
-  const [contentType, setContentType] = createSignal<"mod" | "resourcepack" | "datapack" | "shader">("mod");
+  const [contentType, setContentType] = createSignal<SearchContentType>("mod");
   const [showMoreCats, setShowMoreCats] = createSignal(false);
   const [existingContentIds, setExistingContentIds] = createSignal<Set<string>>(new Set());
+  const [existingError, setExistingError] = createSignal<string | null>(null);
 
   createEffect(() => {
     if (addModModalOpen()) {
@@ -37,22 +44,42 @@ export function AddModDialog(props: AddModDialogProps) {
     }
   });
 
+  // Loader, categorie e ambiente sono di un tipo di contenuto: passando a
+  // un'altra tab si azzerano, o un «Fabric» spuntato nei Mods svuoterebbe la
+  // ricerca degli shader (audit 101, rete-6).
+  createEffect(on(contentType, () => {
+    setSelCategories(new Set<string>());
+    setSelLoaders(new Set<string>());
+    setSelEnvs(new Set<string>());
+    setShowMoreCats(false);
+    setFailedIds(new Map<string, string>());
+  }, { defer: true }));
+
+  // Le voci già nella mod list, per il badge «Added». Una lettura fallita si
+  // dice invece di sembrare una lista vuota, e una lettura per una tab già
+  // lasciata non scrive sopra quella nuova.
+  let existingSeq = 0;
   createEffect(() => {
     const ct = contentType();
     const open = addModModalOpen();
+    const seq = ++existingSeq;
+    setExistingError(null);
     if (!open || ct === "mod") {
       setExistingContentIds(new Set<string>());
       return;
     }
     const modlist = selectedModListName();
-    if (!modlist) return;
+    if (!modlist || !isTauri()) return;
     void (async () => {
       try {
         const snap: any = await invoke("load_content_list_command", { input: { modlistName: modlist, contentType: ct } });
+        if (seq !== existingSeq) return;
         const ids = new Set<string>((snap.entries ?? []).map((entry: any) => entry.id));
         setExistingContentIds(ids);
-      } catch {
+      } catch (error) {
+        if (seq !== existingSeq) return;
         setExistingContentIds(new Set<string>());
+        setExistingError(String(error));
       }
     })();
   });
@@ -69,28 +96,52 @@ export function AddModDialog(props: AddModDialogProps) {
     });
   };
 
+  const compatLoaders = () => contentType() === "mod" ? compatibleSearchLoaders(selectedModLoader(), selectedMcVersion()) : [];
+  const loaderFromModList = () => compatFilter() && compatLoaders().length > 0;
+  const compatLabel = () => {
+    const version = selectedMcVersion() || "any version";
+    return compatLoaders().length > 0 ? `${version} · ${selectedModLoader()}` : `Minecraft ${version}`;
+  };
+
   const filters = (): SearchFilters => ({
     categories: [...selCategories()],
-    loaders: [...selLoaders()],
-    versions: [...selVersions()],
+    loaders: loaderFromModList() ? compatLoaders() : [...selLoaders()],
+    versions: compatFilter() && selectedMcVersion() ? [selectedMcVersion()] : [],
     environments: [...selEnvs()],
     sortBy: sortBy(),
   });
 
-  const projectType = () => contentType() === "datapack" ? "datapack" : contentType() === "resourcepack" ? "resourcepack" : contentType() === "shader" ? "shader" : "mod";
-  const hasFilters = () => selCategories().size > 0 || selLoaders().size > 0 || selVersions().size > 0 || selEnvs().size > 0;
+  const hasFilters = () => selCategories().size > 0 || selLoaders().size > 0 || selEnvs().size > 0;
+
+  // Solo l'ultima ricerca scrive i risultati: quella prima viene interrotta,
+  // e se risponde lo stesso la sua risposta si butta (audit 101, rete-7).
+  let searchSeq = 0;
+  let searchAbort: AbortController | undefined;
 
   const runSearch = async (pg?: number) => {
     const nextPage = pg ?? page();
+    const seq = ++searchSeq;
+    searchAbort?.abort();
+    const controller = new AbortController();
+    searchAbort = controller;
     setSearching(true);
     try {
-      const { results, totalHits: total } = await searchModrinth(addModSearch(), filters(), nextPage * pageSize, projectType());
+      const { results, totalHits: total } = await searchModrinth(addModSearch(), filters(), nextPage * pageSize, contentType(), controller.signal);
+      if (seq !== searchSeq) return;
       setSearchResults(results);
       setTotalHits(total);
-    } catch {
-      // ignore
+      setSearchError(null);
+    } catch (error) {
+      if (seq !== searchSeq) return;
+      // Nessun risultato inventato: la lista resta vuota e si dice perché
+      // (audit 101, todo.md:1486).
+      setSearchResults([]);
+      setTotalHits(0);
+      const reason = error instanceof Error ? error.message : String(error);
+      setSearchError(`Modrinth could not be reached or refused the search. ${reason}`);
+    } finally {
+      if (seq === searchSeq) setSearching(false);
     }
-    setSearching(false);
   };
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -105,13 +156,28 @@ export function AddModDialog(props: AddModDialogProps) {
     debounceTimer = setTimeout(() => void runSearch(0), 350);
   });
 
-  createEffect(() => {
-    if (addModModalOpen()) {
+  // Only the opening resets the dialog: `runSearch` reads the query and the
+  // filters, and without `on` this effect would track them and wipe the
+  // «Added» badges on every keystroke.
+  createEffect(on(addModModalOpen, open => {
+    if (open) {
       setAddedIds(new Set<string>());
       setAddingIds(new Set<string>());
+      setFailedIds(new Map<string, string>());
+      setCompatFilter(true);
       setPage(0);
       void runSearch(0);
+    } else {
+      clearTimeout(debounceTimer);
+      searchSeq += 1;
+      searchAbort?.abort();
+      setSearching(false);
     }
+  }));
+
+  onCleanup(() => {
+    clearTimeout(debounceTimer);
+    searchAbort?.abort();
   });
 
   const existingModIds = () => {
@@ -127,20 +193,35 @@ export function AddModDialog(props: AddModDialogProps) {
     return ids;
   };
 
+  // «Added» solo quando l'aggiunta è sul disco: un rifiuto lascia la riga
+  // cliccabile con il motivo (audit 101, todo.md:1711).
   const handleAdd = async (id: string, name: string) => {
+    const type = contentType();
     setAddingIds(current => new Set([...current, id]));
-    if (contentType() === "mod") {
-      await props.onAddModrinth(id, name);
-    } else if (props.onAddContent) {
-      await props.onAddContent(contentType(), id, name);
+    setFailedIds(current => {
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    let failure: string | null;
+    try {
+      if (type === "mod") failure = await props.onAddModrinth(id, name);
+      else if (props.onAddContent) failure = await props.onAddContent(type, id, name);
+      else failure = "Packs cannot be added from here.";
+    } catch (error) {
+      failure = String(error);
     }
     setAddingIds(current => {
       const next = new Set(current);
       next.delete(id);
       return next;
     });
+    if (failure !== null) {
+      setFailedIds(current => new Map(current).set(id, failure));
+      return;
+    }
     setAddedIds(current => new Set([...current, id]));
-    if (contentType() !== "mod") {
+    if (type !== "mod" && contentType() === type) {
       setExistingContentIds(current => new Set([...current, id]));
     }
   };
@@ -228,8 +309,13 @@ export function AddModDialog(props: AddModDialogProps) {
             >
               <div class="flex flex-1 min-h-0">
                 <SearchSidebar
+                  contentType={contentType()}
                   sortBy={sortBy()}
                   setSortBy={setSortBy}
+                  compatFilter={compatFilter()}
+                  setCompatFilter={setCompatFilter}
+                  compatLabel={compatLabel()}
+                  loaderFromModList={loaderFromModList()}
                   selLoaders={selLoaders()}
                   selEnvs={selEnvs()}
                   selCategories={selCategories()}
@@ -239,12 +325,15 @@ export function AddModDialog(props: AddModDialogProps) {
                   showMoreCats={showMoreCats()}
                   setShowMoreCats={setShowMoreCats}
                   hasFilters={hasFilters()}
-                  clearFilters={() => { setSelCategories(new Set<string>()); setSelLoaders(new Set<string>()); setSelVersions(new Set<string>()); setSelEnvs(new Set<string>()); }}
+                  clearFilters={() => { setSelCategories(new Set<string>()); setSelLoaders(new Set<string>()); setSelEnvs(new Set<string>()); }}
                 />
 
                 <SearchResults
                   contentType={contentType()}
                   searching={searching()}
+                  searchError={searchError()}
+                  retrySearch={() => void runSearch()}
+                  existingError={existingError()}
                   searchResults={searchResults()}
                   totalPages={totalPages()}
                   page={page()}
@@ -254,6 +343,7 @@ export function AddModDialog(props: AddModDialogProps) {
                   handleAdd={handleAdd}
                   addingIds={addingIds()}
                   addedIds={addedIds()}
+                  failedIds={failedIds()}
                   existingIds={new Set([...existingModIds(), ...existingContentIds()])}
                 />
               </div>

@@ -472,11 +472,16 @@ export default function App() {
     }
   };
 
-  const handleAddModrinth = async (modId: string, displayName: string) => {
+  /**
+   * Add a Modrinth mod as a new rule. Resolves to `null` when the rule is on
+   * disk, or to the reason it is not: the Add dialog marks a result «Added»
+   * only on `null` (audit 101, todo.md:1711).
+   */
+  const handleAddModrinth = async (modId: string, displayName: string): Promise<string | null> => {
     // Must have a mod list selected before we can add anything
     if (!selectedModListName()) {
       pushUiError({ title: "No mod list selected", message: "Create or select a mod list in the sidebar before adding mods.", detail: "", severity: "warning", scope: "launch" });
-      return;
+      return "No mod list is selected.";
     }
     logger.info("App", "handleAddModrinth started", { modId, displayName });
     // Optimistic insert: append a placeholder row immediately so the list
@@ -501,20 +506,37 @@ export default function App() {
     seedModName(modId, displayName);
     void fetchModMetadata([tempRow]);
 
-    if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
+    if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return null; }
     try {
       await invoke("add_mod_rule_command", {
         input: { modlistName: selectedModListName(), modId, source: "modrinth", fileName: null },
       });
-      // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
-      await loadEditorSnapshot(selectedModListName());
-      logger.debug("App", "handleAddModrinth completed", { modId, displayName });
     } catch (err) {
       logger.error("App", "handleAddModrinth failed", err);
       // Remove the optimistic row on failure.
       setModRowsState(c => c.filter(r => r.id !== tempId));
       pushUiError({ title: "Failed to add mod", message: `'${displayName}' could not be added.`, detail: String(err), severity: "error", scope: "launch" });
+      return String(err);
     }
+    // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
+    await loadEditorSnapshot(selectedModListName());
+    logger.debug("App", "handleAddModrinth completed", { modId, displayName });
+    return null;
+  };
+
+  /** The pack half of the Add dialog: same contract as `handleAddModrinth`. */
+  const handleAddContent = async (contentType: string, id: string, name: string): Promise<string | null> => {
+    if (!selectedModListName()) return "No mod list is selected.";
+    try {
+      await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
+    } catch (err) {
+      logger.error("App", "handleAddContent failed", err);
+      pushUiError({ title: "Failed to add content", message: `Could not add '${name}'.`, detail: String(err), severity: "error", scope: "launch" });
+      return String(err);
+    }
+    seedContentName(id, name);
+    bumpContentVersion();
+    return null;
   };
 
   /**
@@ -1189,16 +1211,7 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={async (contentType, id, name) => {
-        if (!selectedModListName()) return;
-        try {
-          await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
-          seedContentName(id, name);
-          bumpContentVersion();
-        } catch (err) {
-          pushUiError({ title: "Failed to add content", message: `Could not add '${id}'.`, detail: String(err), severity: "error", scope: "launch" });
-        }
-      }} onUploadLocal={handleUploadLocal} onDropLocal={handleDropLocal} />
+      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={handleAddContent} onUploadLocal={handleUploadLocal} onDropLocal={handleDropLocal} />
       <CreateModlistModal onCreate={handleCreateModlist} />
       <SettingsModal onSave={handleSaveSettings} />
       <AccountsModal onSwitchAccount={handleSwitchAccount} />
