@@ -173,6 +173,13 @@ pub fn sort_versions_by_target_preference(
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REQUEST_ATTEMPTS: u32 = 4;
+/// How long the download client waits for a TCP/TLS connection to open.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the download client waits between two reads of the same response.
+/// It bounds silence, not size: a jar that keeps arriving is never cut, a
+/// server or proxy that accepts the connection and then says nothing is
+/// (audit 101, rete-4).
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Channel cascade for `version_files/update`, in the same order as
 /// `ModrinthVersion::channel_rank` (release > beta > alpha). The endpoint
@@ -218,9 +225,14 @@ pub(crate) fn build_http_client() -> reqwest::Client {
 /// The launch pipeline's client, which downloads the jars from Modrinth's CDN
 /// as well as the game, loader and content files. No `REQUEST_TIMEOUT`: that
 /// bounds a whole request, body included, and 20 s is an API call, not a jar.
+/// What it has instead are a connect timeout and an inactivity timeout, so a
+/// stalled connection fails the launch instead of keeping PLAY on «resolving»
+/// until the app is closed (audit 101, rete-4).
 pub(crate) fn build_download_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .build()
         .unwrap_or_default()
 }
@@ -228,8 +240,9 @@ pub(crate) fn build_download_client() -> reqwest::Client {
 // Retry on HTTP 429 to be polite to Modrinth's rate limiter, and on transient
 // server/transport failures. `build_request` is invoked fresh on every attempt
 // because `RequestBuilder` is not `Clone` once a body is attached, which is the
-// case for the POST endpoints.
-async fn send_with_retry<F>(build_request: F) -> reqwest::Result<reqwest::Response>
+// case for the POST endpoints. Also used by `loader_metadata`, whose servers
+// (Fabric, Quilt, Prism meta) fail the same transient ways (audit 101, rete-4).
+pub(crate) async fn send_with_retry<F>(build_request: F) -> reqwest::Result<reqwest::Response>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
