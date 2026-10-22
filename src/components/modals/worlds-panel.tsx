@@ -69,12 +69,18 @@ export function WorldsPanel(props: Props) {
    * I mondi che questa modlist vede: i suoi, e quelli condivisi che almeno una
    * sua istanza apre. Anche quelli nascosti dalla home — nascondere è una cosa
    * della home, non della condivisione.
+   *
+   * E i mondi condivisi che **nessuna** istanza apre più, in ogni modlist: non
+   * sono di nessuno, e se la home li ha nascosti questo è l'unico posto da cui
+   * ridargli un'istanza. Senza, un mondo nascosto e senza istanze non si
+   * raggiungeva più da nessuna schermata, contro D65 (condivisi-10).
    */
   const ours = createMemo(() =>
     worlds().filter(world =>
       world.scope === "instance"
         ? world.modlistName === props.modlist
-        : world.instances.some(way => way.modlistName === props.modlist),
+        : world.instances.length === 0 ||
+          world.instances.some(way => way.modlistName === props.modlist),
     ),
   );
 
@@ -160,7 +166,9 @@ export function WorldsPanel(props: Props) {
                 <span class="block text-sm font-medium">{world.levelName}</span>
                 <span class="block text-[11px] text-muted-foreground">
                   {world.scope === "shared"
-                    ? `shared · ${world.folderName}`
+                    ? world.instances.length === 0
+                      ? `shared · ${world.folderName} · no instance opens it`
+                      : `shared · ${world.folderName}`
                     : `${world.instanceName} · ${world.folderName}`}
                 </span>
               </button>
