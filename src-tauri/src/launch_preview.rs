@@ -291,6 +291,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     }
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
+    let pins = load_modlist_pins(&launcher_paths, &modlist_name, &modlist);
     let modrinth_client = ModrinthClient::new();
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
@@ -305,11 +306,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         LaunchResolutionPath::for_active_account(plays_offline, request.resolved_versions.as_ref());
     let selection = match resolution_path {
         LaunchResolutionPath::Preresolved(preresolved) => {
-            resolve_offline_selection(&launcher_paths, &modlist, &target, Some(preresolved))?
+            resolve_offline_selection(&launcher_paths, &modlist, &pins, &target, Some(preresolved))?
         }
         // No map, and none wanted: the cache alone answers (D115).
         LaunchResolutionPath::Offline => {
-            resolve_offline_selection(&launcher_paths, &modlist, &target, None)?
+            resolve_offline_selection(&launcher_paths, &modlist, &pins, &target, None)?
         }
         LaunchResolutionPath::Resolve => {
             resolve_online_selection(
@@ -317,6 +318,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                 &launcher_paths,
                 &http_client,
                 &modlist,
+                &pins,
                 &modrinth_client,
                 &target,
             )

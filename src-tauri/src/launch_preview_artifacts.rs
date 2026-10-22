@@ -13,7 +13,7 @@ use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{
     resolve_modlist_without, version_rules_conflict, AvailabilityFixpoint, FailureReason,
-    ModLoader, ResolutionResult, ResolutionTarget, RuleOutcome,
+    ModLoader, PinAliases, ResolutionResult, ResolutionTarget, RuleOutcome,
 };
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
@@ -134,6 +134,17 @@ pub(super) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
         "quilt" => bail!("Quilt is no longer supported by Cubic Launcher"),
         other => bail!("unsupported mod loader '{other}'"),
     }
+}
+
+/// The pins of a mod list, for the resolver (audit 101, modlist-1): read from
+/// the markers next to the jars, which live in the mod list's directory and
+/// not in `rules.json` (D14).
+pub(super) fn load_modlist_pins(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    modlist: &ModList,
+) -> PinAliases {
+    crate::mod_version_pin::pin_aliases(&launcher_paths.modlists_dir().join(modlist_name), modlist)
 }
 
 pub(super) fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<ModList> {
@@ -1655,10 +1666,11 @@ pub(super) async fn resolve_online_selection(
     launcher_paths: &LauncherPaths,
     http_client: &reqwest::Client,
     modlist: &ModList,
+    pins: &PinAliases,
     client: &ModrinthClient,
     target: &ResolutionTarget,
 ) -> Result<TargetSelection> {
-    let mut pass = AvailabilityFixpoint::new(modlist, target)?;
+    let mut pass = AvailabilityFixpoint::pinned(modlist, pins.clone(), target)?;
 
     loop {
         let pending_ids = pass.pending();
@@ -1724,6 +1736,7 @@ pub(super) async fn resolve_online_selection(
 pub(super) fn resolve_offline_selection(
     launcher_paths: &LauncherPaths,
     modlist: &ModList,
+    pins: &PinAliases,
     target: &ResolutionTarget,
     preresolved: Option<&HashMap<String, String>>,
 ) -> Result<TargetSelection> {
@@ -1732,7 +1745,7 @@ pub(super) fn resolve_offline_selection(
     } else {
         CacheBacking::JarOnDisk
     };
-    let mut pass = AvailabilityFixpoint::new(modlist, target)?;
+    let mut pass = AvailabilityFixpoint::pinned(modlist, pins.clone(), target)?;
     let mut jar_gone = HashSet::new();
 
     loop {

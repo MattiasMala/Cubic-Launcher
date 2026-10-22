@@ -126,7 +126,48 @@ pub enum FailureReason {
     NoOptionAvailable,
 }
 
+/// Voce pinnata → voce dinamica che ha preso il posto (audit 101, modlist-1).
+///
+/// Il pin è una voce locale con un altro mod_id (lo stem del jar), quindi un
+/// `requires` o un `exclude_if` che nomina la voce dinamica non la vede mai
+/// attiva sul target del pin: «iris requires sodium» lasciava fuori iris su
+/// 1.20.1/fabric appena si pinnava sodium. Con questa mappa, quando la voce
+/// pinnata è attiva conta come attiva anche la dinamica, per i soli controlli
+/// dei vincoli: `active_mods` resta l'insieme dei mod caricati davvero. La
+/// mappa la legge chi ha la cartella della mod list
+/// (`mod_version_pin::pin_aliases`); vuota, la risoluzione è quella di sempre.
+pub type PinAliases = HashMap<String, String>;
+
+/// L'insieme con cui si controllano `requires` ed `exclude_if`: i mod attivi
+/// più la voce dinamica di ogni pin attivo.
+fn constraint_view<'a>(
+    active_mods: &'a HashSet<String>,
+    pins: &PinAliases,
+) -> std::borrow::Cow<'a, HashSet<String>> {
+    let aliases = active_mods
+        .iter()
+        .filter_map(|mod_id| pins.get(mod_id))
+        .filter(|dynamic| !active_mods.contains(dynamic.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if aliases.is_empty() {
+        return std::borrow::Cow::Borrowed(active_mods);
+    }
+    let mut view = active_mods.clone();
+    view.extend(aliases);
+    std::borrow::Cow::Owned(view)
+}
+
 pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<ResolutionResult> {
+    resolve_modlist_pinned(modlist, &PinAliases::new(), target)
+}
+
+/// `resolve_modlist` con i pin della mod list (`PinAliases`).
+pub fn resolve_modlist_pinned(
+    modlist: &ModList,
+    pins: &PinAliases,
+    target: &ResolutionTarget,
+) -> Result<ResolutionResult> {
     // ── Pre-process: strip mutual requires ──────────────────────────────────
     // Mutual links (A requires B AND B requires A) create a deadlock — neither
     // can activate first.  We detect these pairs across the entire rule tree
@@ -139,7 +180,7 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     let mut resolved_rules: Vec<ResolvedRule> = Vec::with_capacity(rules.len());
 
     for rule in &rules {
-        let outcome = try_resolve(rule, &active_mods, target);
+        let outcome = try_resolve(rule, &constraint_view(&active_mods, pins), target);
         if let RuleOutcome::Resolved { ref resolved_id } = outcome {
             active_mods.insert(resolved_id.clone());
         }
@@ -163,8 +204,9 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     for _ in 0..MAX_RESOLUTION_PASSES {
         let mut next_active = HashSet::new();
         let mut next_rules = Vec::with_capacity(rules.len());
+        let previous = constraint_view(&active_mods, pins);
         for rule in &rules {
-            let outcome = try_resolve(rule, &active_mods, target);
+            let outcome = try_resolve(rule, &previous, target);
             if let RuleOutcome::Resolved { ref resolved_id } = outcome {
                 next_active.insert(resolved_id.clone());
             }
@@ -174,6 +216,7 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
             });
         }
 
+        drop(previous);
         let fixed_point = next_rules == resolved_rules;
         let cycle = !fixed_point && history.contains(&next_rules);
         resolved_rules = next_rules;
@@ -189,7 +232,7 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     }
 
     if !consistent {
-        active_mods = repair_inconsistent(&rules, &mut resolved_rules);
+        active_mods = repair_inconsistent(&rules, pins, &mut resolved_rules);
     }
 
     Ok(ResolutionResult {
@@ -208,7 +251,11 @@ const MAX_RESOLUTION_PASSES: usize = 32;
 /// che sull'insieme corrente viola il proprio `exclude_if` o `requires`.
 /// L'insieme può solo restringersi, quindi termina, e alla fine ogni mod
 /// rimasto ha i suoi vincoli soddisfatti dall'insieme finale.
-fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> HashSet<String> {
+fn repair_inconsistent(
+    rules: &[Rule],
+    pins: &PinAliases,
+    resolved_rules: &mut [ResolvedRule],
+) -> HashSet<String> {
     let active_of = |resolved_rules: &[ResolvedRule]| {
         resolved_rules
             .iter()
@@ -221,6 +268,7 @@ fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> H
 
     let mut active = active_of(resolved_rules);
     loop {
+        let view = constraint_view(&active, pins);
         let violation = resolved_rules
             .iter()
             .enumerate()
@@ -229,14 +277,15 @@ fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> H
                     return None;
                 };
                 let rule = find_rule_by_id(&rules[index], resolved_id)?;
-                if rule.exclude_if.iter().any(|id| active.contains(id)) {
+                if rule.exclude_if.iter().any(|id| view.contains(id)) {
                     Some((index, FailureReason::ExcludedByActiveMod))
-                } else if rule.requires.iter().any(|id| !active.contains(id)) {
+                } else if rule.requires.iter().any(|id| !view.contains(id)) {
                     Some((index, FailureReason::RequiredModMissing))
                 } else {
                     None
                 }
             });
+        drop(view);
         let Some((index, reason)) = violation else {
             return active;
         };
@@ -250,6 +299,16 @@ fn repair_inconsistent(rules: &[Rule], resolved_rules: &mut [ResolvedRule]) -> H
 /// turns out to have nothing installable for the target.
 pub fn resolve_modlist_without(
     modlist: &ModList,
+    unavailable: &[String],
+    target: &ResolutionTarget,
+) -> Result<ResolutionResult> {
+    resolve_modlist_without_pinned(modlist, &PinAliases::new(), unavailable, target)
+}
+
+/// `resolve_modlist_without` con i pin della mod list.
+pub fn resolve_modlist_without_pinned(
+    modlist: &ModList,
+    pins: &PinAliases,
     unavailable: &[String],
     target: &ResolutionTarget,
 ) -> Result<ResolutionResult> {
@@ -268,7 +327,7 @@ pub fn resolve_modlist_without(
         .collect::<HashSet<_>>();
     let mut patched = modlist.clone();
     disable(&mut patched.rules, &unavailable);
-    resolve_modlist(&patched, target)
+    resolve_modlist_pinned(&patched, pins, target)
 }
 
 /// La disponibilità e la ri-risoluzione iterate fino al punto fisso (audit
@@ -293,6 +352,7 @@ pub fn resolve_modlist_without(
 #[derive(Debug, Clone)]
 pub struct AvailabilityFixpoint<'a> {
     modlist: &'a ModList,
+    pins: PinAliases,
     target: &'a ResolutionTarget,
     first: ResolutionResult,
     current: ResolutionResult,
@@ -302,9 +362,19 @@ pub struct AvailabilityFixpoint<'a> {
 
 impl<'a> AvailabilityFixpoint<'a> {
     pub fn new(modlist: &'a ModList, target: &'a ResolutionTarget) -> Result<Self> {
-        let first = resolve_modlist(modlist, target)?;
+        Self::pinned(modlist, PinAliases::new(), target)
+    }
+
+    /// `new` con i pin della mod list (`PinAliases`), per ogni giro.
+    pub fn pinned(
+        modlist: &'a ModList,
+        pins: PinAliases,
+        target: &'a ResolutionTarget,
+    ) -> Result<Self> {
+        let first = resolve_modlist_pinned(modlist, &pins, target)?;
         Ok(Self {
             modlist,
+            pins,
             target,
             current: first.clone(),
             first,
@@ -347,7 +417,12 @@ impl<'a> AvailabilityFixpoint<'a> {
             }
         }
         if changed {
-            self.current = resolve_modlist_without(self.modlist, &self.unavailable, self.target)?;
+            self.current = resolve_modlist_without_pinned(
+                self.modlist,
+                &self.pins,
+                &self.unavailable,
+                self.target,
+            )?;
         }
         Ok(())
     }
@@ -578,8 +653,15 @@ pub async fn resolve_modlist_command(
         return Ok(Vec::new());
     }
 
+    // I pin contano come la voce dinamica che sostituiscono, come al lancio
+    // (audit 101, modlist-1).
+    let pins = crate::mod_version_pin::pin_aliases(
+        &launcher_paths.modlists_dir().join(&modlist_name),
+        &modlist,
+    );
     let client = ModrinthClient::new();
-    let mut pass = AvailabilityFixpoint::new(&modlist, &target).map_err(|e| e.to_string())?;
+    let mut pass =
+        AvailabilityFixpoint::pinned(&modlist, pins, &target).map_err(|e| e.to_string())?;
     loop {
         let pending = pass.pending();
         if pending.is_empty() {

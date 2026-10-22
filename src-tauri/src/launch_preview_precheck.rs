@@ -22,7 +22,7 @@ use crate::rules::ModSource;
 
 use super::{
     active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
-    load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
+    load_cached_version_ids_for_selected, load_modlist, load_modlist_pins, parse_mod_loader,
     resolve_compatible_versions_hybrid, resolve_offline_selection, resolve_online_selection,
     run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
     DroppedMod, ResolvedContentVersions, SelectedMod,
@@ -315,7 +315,8 @@ pub(super) fn offline_precheck_for_active_account(
     }
 
     let modlist = load_modlist(launcher_paths, modlist_name)?;
-    let selection = resolve_offline_selection(launcher_paths, &modlist, target, None)?;
+    let pins = load_modlist_pins(launcher_paths, modlist_name, &modlist);
+    let selection = resolve_offline_selection(launcher_paths, &modlist, &pins, target, None)?;
 
     Ok(Some(UpdatePrecheckResult {
         dropped_mods: dropped_mod_groups(&selection.dropped, target),
@@ -364,6 +365,7 @@ pub(super) async fn run_update_precheck(
     }
 
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
+    let pins = load_modlist_pins(launcher_paths, &modlist_name, &modlist);
     let modrinth_client = ModrinthClient::new();
     let http_client = crate::modrinth::build_download_client();
 
@@ -372,6 +374,7 @@ pub(super) async fn run_update_precheck(
         launcher_paths,
         &http_client,
         &modlist,
+        &pins,
         &modrinth_client,
         &target,
     )
@@ -438,6 +441,7 @@ pub(super) async fn run_update_precheck(
 
 #[cfg(test)]
 mod tests {
+    use crate::resolver::PinAliases;
     use crate::rules::{ModList, Rule, VersionRule, VersionRuleKind};
 
     use super::super::collect_selected_mods;
@@ -1001,8 +1005,14 @@ mod tests {
         let launcher_paths = offline_root("jar-gone", true);
         let modlist = load_modlist(&launcher_paths, "Offline Pack").expect("mod-list");
 
-        let offline = resolve_offline_selection(&launcher_paths, &modlist, &target(), None)
-            .expect("the offline selection should run");
+        let offline = resolve_offline_selection(
+            &launcher_paths,
+            &modlist,
+            &PinAliases::new(),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
         assert_eq!(
             offline
                 .dropped
@@ -1020,9 +1030,14 @@ mod tests {
             .any(|selected| selected.mod_id == "sodium"));
 
         let map = HashMap::from([("sodium".to_string(), "sodium-v2".to_string())]);
-        let preresolved =
-            resolve_offline_selection(&launcher_paths, &modlist, &target(), Some(&map))
-                .expect("the pre-resolved selection should run");
+        let preresolved = resolve_offline_selection(
+            &launcher_paths,
+            &modlist,
+            &PinAliases::new(),
+            &target(),
+            Some(&map),
+        )
+        .expect("the pre-resolved selection should run");
         assert!(preresolved
             .selected_mods
             .iter()
@@ -1113,6 +1128,7 @@ mod tests {
         let reaches_rubidium = resolve_offline_selection(
             &launcher_paths,
             &chain(vec![alternative("embeddium"), alternative("rubidium")]),
+            &PinAliases::new(),
             &target(),
             None,
         )
@@ -1129,6 +1145,7 @@ mod tests {
         let nothing_on_disk = resolve_offline_selection(
             &launcher_paths,
             &chain(vec![alternative("embeddium")]),
+            &PinAliases::new(),
             &target(),
             None,
         )

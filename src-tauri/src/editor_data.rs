@@ -764,6 +764,9 @@ fn build_editor_row(rule: &Rule, modlist_dir: &Path) -> EditorRow {
             }
             ModSource::Modrinth => None,
         },
+        pin: crate::mod_version_pin::pin_kind(rule, modlist_dir).map(|kind| EditorPin {
+            owns_jar: kind == crate::mod_version_pin::PinKind::Marked,
+        }),
         enabled: rule.enabled,
         exclude_if: rule.exclude_if.clone(),
         requires: rule.requires.clone(),

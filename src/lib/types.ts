@@ -20,6 +20,12 @@ export type ModRow = {
   links?: string[];
   /** Visual groups inside this row's alternatives panel. */
   altGroups?: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
+  /**
+   * Set when the row is a pinned version, as the backend decides it from the
+   * marker next to the jar (audit 101, modlist-2). `ownsJar` says whether
+   * removing the pin deletes the jar: a pin from before the marker keeps it.
+   */
+  pin?: { ownsJar: boolean };
 };
 
 export type ModListCard = {

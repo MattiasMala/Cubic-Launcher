@@ -11,12 +11,26 @@
 //! loader: outside that target the pin is excluded and the dynamic entry —
 //! kept as its alternative — takes over.
 //!
+//! What makes an entry a pin is written down, not inferred (audit 101,
+//! modlist-2): a marker file next to the jar, `local-jars/<pinned id>.pin.json`,
+//! still outside `rules.json` as D14 wants. Before it, "local + an `only`
+//! rule" was the definition, and a jar the user uploaded himself with an "Only
+//! when" became a pin that "Remove pin" deleted, only copy included.
+//!
+//! The pinned entry stands for the dynamic one (audit 101, modlist-1): it
+//! inherits its `requires` and `exclude_if`, and the resolver counts the
+//! dynamic id as active whenever the pin is (`resolver::PinAliases`), so a
+//! link or an incompatibility that names the mod keeps working on the pinned
+//! target. With the dynamic entry removed, its custom configs move to the pin
+//! and every reference to it is rewritten to the pinned id.
+//!
 //! The writes live in one command because they are not independent: a local
 //! jar registered without its version rule is a mod pinned *everywhere*. They
 //! run in a fixed order behind a snapshot of `rules.json`, and any failure
 //! restores it byte for byte — the discipline of
 //! `local_content_packs::remove_partial_import`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +42,8 @@ use tauri::State;
 use crate::editor_data::{
     add_alternative_from_root, delete_rules_from_root, remove_alternative_from_root,
     reorder_rules_from_root, save_rule_advanced_from_root, AddAlternativeInput, DeleteRulesInput,
-    RemoveAlternativeInput, ReorderRulesInput, SaveRuleAdvancedInput, SaveVersionRuleInput,
+    RemoveAlternativeInput, ReorderRulesInput, SaveCustomConfigInput, SaveRuleAdvancedInput,
+    SaveVersionRuleInput,
 };
 use crate::launcher_paths::LauncherPaths;
 use crate::minecraft_downloader::download_file_verified;
@@ -40,8 +55,106 @@ use crate::modrinth::{
     build_download_client, is_version_compatible, ModrinthClient, ModrinthVersion,
 };
 use crate::path_safety::validate_path_component;
-use crate::resolver::{parse_mod_loader, ResolutionTarget};
-use crate::rules::{ModList, ModSource, Rule, VersionRuleKind, RULES_FILENAME};
+use crate::resolver::{parse_mod_loader, PinAliases, ResolutionTarget};
+use crate::rules::{
+    custom_config_files_dir, CustomConfig, ModList, ModSource, Rule, VersionRuleKind,
+    RULES_FILENAME,
+};
+
+/// The marker of a pin sits next to its jar: `local-jars/<pinned id>.pin.json`.
+const PIN_MARKER_SUFFIX: &str = ".pin.json";
+
+/// What the marker file says. The dynamic id is the one thing a pin needs to
+/// remember that `rules.json` cannot always tell: with the dynamic entry
+/// removed (D5) it is nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinMarker {
+    pub dynamic_mod_id: String,
+    pub minecraft_version: String,
+    pub loader: String,
+}
+
+/// How an entry is known to be a pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinKind {
+    /// It has its marker: the pin owns its jar, and removing the pin deletes it.
+    Marked,
+    /// A pin made before the marker existed, recognised by the shape the pin
+    /// has always written when the dynamic entry is kept: a local entry with
+    /// an `only` rule whose single alternative is a Modrinth entry. Nothing
+    /// proves the jar is ours, so removing such a pin keeps the jar.
+    Legacy,
+}
+
+pub fn pin_marker_path(modlist_dir: &Path, pinned_mod_id: &str) -> Result<PathBuf> {
+    validate_path_component(pinned_mod_id)?;
+    Ok(modlist_dir
+        .join("local-jars")
+        .join(format!("{pinned_mod_id}{PIN_MARKER_SUFFIX}")))
+}
+
+fn read_pin_marker(modlist_dir: &Path, pinned_mod_id: &str) -> Result<Option<PinMarker>> {
+    let path = pin_marker_path(modlist_dir, pinned_mod_id)?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()))
+        }
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .with_context(|| format!("failed to parse the pin marker {}", path.display()))
+}
+
+/// Whether `rule` is a pin, and how that is known. `None` for every Modrinth
+/// entry and for a local jar the user added himself, "Only when" or not.
+pub fn pin_kind(rule: &Rule, modlist_dir: &Path) -> Option<PinKind> {
+    if rule.source != ModSource::Local {
+        return None;
+    }
+    if pin_marker_path(modlist_dir, &rule.mod_id).is_ok_and(|path| path.is_file()) {
+        return Some(PinKind::Marked);
+    }
+
+    let has_only_rule = rule
+        .version_rules
+        .iter()
+        .any(|version_rule| version_rule.kind == VersionRuleKind::Only);
+    let parks_a_dynamic_entry =
+        rule.alternatives.len() == 1 && rule.alternatives[0].source == ModSource::Modrinth;
+    (has_only_rule && parks_a_dynamic_entry).then_some(PinKind::Legacy)
+}
+
+/// Pinned id → dynamic id for every pin of the mod list, for the resolver
+/// (`resolver::PinAliases`). The dynamic entry parked under the pin answers
+/// first; the marker answers for a pin whose dynamic entry was removed. A
+/// marker that cannot be read costs that alias only, never the resolution.
+pub fn pin_aliases(modlist_dir: &Path, modlist: &ModList) -> PinAliases {
+    let mut aliases = HashMap::new();
+    for rule in &modlist.rules {
+        let Some(kind) = pin_kind(rule, modlist_dir) else {
+            continue;
+        };
+        let parked = rule
+            .alternatives
+            .iter()
+            .find(|alt| alt.source == ModSource::Modrinth)
+            .map(|alt| alt.mod_id.clone());
+        let dynamic = match (parked, kind) {
+            (Some(dynamic), _) => Some(dynamic),
+            (None, PinKind::Marked) => read_pin_marker(modlist_dir, &rule.mod_id)
+                .ok()
+                .flatten()
+                .map(|marker| marker.dynamic_mod_id),
+            (None, PinKind::Legacy) => None,
+        };
+        if let Some(dynamic) = dynamic.filter(|dynamic| dynamic != &rule.mod_id) {
+            aliases.insert(rule.mod_id.clone(), dynamic);
+        }
+    }
+    aliases
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +195,8 @@ pub struct RemovePinInput {
 pub struct RemovedPin {
     /// The dynamic entry put back at the top level, when the pin had one.
     pub restored_mod_id: Option<String>,
+    /// Whether the pin's jar was deleted: only a marked pin owns its jar.
+    pub jar_deleted: bool,
 }
 
 #[tauri::command]
@@ -113,14 +228,17 @@ pub fn remove_pin_from_root(root_dir: &Path, input: &RemovePinInput) -> Result<R
             )
         })?;
 
-    // The `only` rule is what tells a pin from a jar the user uploaded
-    // himself, and removing a pin deletes the jar.
-    if !is_pinned_entry(pin) {
+    // The marker is what tells a pin from a jar the user uploaded himself
+    // (audit 101, modlist-2); a pin from before the marker is recognised by
+    // its shape and keeps its jar, because nothing proves the jar is ours.
+    let modlist_dir = modlist_dir(root_dir, &input.modlist_name);
+    let Some(kind) = pin_kind(pin, &modlist_dir) else {
         bail!(
-            "'{}' is not a pinned version: a local entry without an 'only' version rule is a jar you added by hand, and its jar is the only copy",
+            "'{}' is not a pinned version: it is a jar you added by hand, and its jar is the only copy",
             input.pinned_mod_id
         );
-    }
+    };
+    let jar_deleted = kind == PinKind::Marked;
 
     if pin.alternatives.len() > 1 {
         bail!(
@@ -135,9 +253,12 @@ pub fn remove_pin_from_root(root_dir: &Path, input: &RemovePinInput) -> Result<R
         &rules_path,
         &local_jars_dir(root_dir, &input.modlist_name).join(format!("{}.jar", pin.mod_id)),
     )?;
-    snapshot.stash_jar(
-        &local_jars_dir(root_dir, &input.modlist_name).join(format!("{}.jar", pin.mod_id)),
-    )?;
+    if jar_deleted {
+        snapshot.stash(
+            &local_jars_dir(root_dir, &input.modlist_name).join(format!("{}.jar", pin.mod_id)),
+        )?;
+        snapshot.stash(&pin_marker_path(&modlist_dir, &pin.mod_id)?)?;
+    }
 
     let applied = (|| -> Result<()> {
         // `remove_alternative_from_root` re-inserts the extracted rule right
@@ -167,7 +288,10 @@ pub fn remove_pin_from_root(root_dir: &Path, input: &RemovePinInput) -> Result<R
     match applied {
         Ok(()) => {
             snapshot.commit();
-            Ok(RemovedPin { restored_mod_id })
+            Ok(RemovedPin {
+                restored_mod_id,
+                jar_deleted,
+            })
         }
         Err(error) => {
             snapshot.restore();
@@ -383,31 +507,23 @@ struct PinPlan {
     /// D48: the pin this one replaces, when the dynamic entry is already
     /// parked under an older pin.
     replaced_pin: Option<String>,
-}
-
-/// A pinned entry, told apart from a hand-uploaded local jar by the `only`
-/// rule the pin always writes.
-///
-/// It matters because "remove pin" deletes the jar: doing that to a jar the
-/// user uploaded himself would destroy the only copy.
-fn is_pinned_entry(rule: &Rule) -> bool {
-    rule.source == ModSource::Local
-        && rule
-            .version_rules
-            .iter()
-            .any(|version_rule| version_rule.kind == VersionRuleKind::Only)
+    /// Whether the replaced pin owns its jar (`PinKind::Marked`): only then is
+    /// the jar deleted with it.
+    replaced_pin_owns_jar: bool,
+    /// The dynamic entry as it was, for what the pin inherits from it.
+    dynamic_rule: Rule,
 }
 
 pub fn apply_pin_from_root(root_dir: &Path, input: &ApplyPinInput) -> Result<PinnedVersion> {
     validate_path_component(&input.modlist_name)?;
     let rules_path = rules_path(root_dir, &input.modlist_name);
     let modlist = ModList::read_from_file(&rules_path)?;
-    let plan = plan_pin(&modlist, input)?;
+    let plan = plan_pin(&modlist, &modlist_dir(root_dir, &input.modlist_name), input)?;
 
     apply_pin_plan(root_dir, &input.modlist_name, &input.source_jar_path, &plan)
 }
 
-fn plan_pin(modlist: &ModList, input: &ApplyPinInput) -> Result<PinPlan> {
+fn plan_pin(modlist: &ModList, modlist_dir: &Path, input: &ApplyPinInput) -> Result<PinPlan> {
     if input.minecraft_version.trim().is_empty() {
         // An `only` rule with no Minecraft version matches *every* version
         // (`resolver::version_rules_conflict`), which is the opposite of a pin.
@@ -452,7 +568,7 @@ fn plan_pin(modlist: &ModList, input: &ApplyPinInput) -> Result<PinPlan> {
                 .rules
                 .iter()
                 .position(|rule| {
-                    is_pinned_entry(rule)
+                    pin_kind(rule, modlist_dir).is_some()
                         && rule
                             .alternatives
                             .iter()
@@ -514,6 +630,9 @@ fn plan_pin(modlist: &ModList, input: &ApplyPinInput) -> Result<PinPlan> {
         );
     }
 
+    let replaced_pin_owns_jar = replaced_pin.is_some()
+        && pin_kind(&modlist.rules[position], modlist_dir) == Some(PinKind::Marked);
+
     let mut top_level_order: Vec<String> = modlist
         .rules
         .iter()
@@ -535,6 +654,8 @@ fn plan_pin(modlist: &ModList, input: &ApplyPinInput) -> Result<PinPlan> {
         }],
         top_level_order,
         replaced_pin,
+        replaced_pin_owns_jar,
+        dynamic_rule: dynamic_rule.clone(),
     })
 }
 
@@ -556,15 +677,20 @@ fn apply_pin_plan(
     plan: &PinPlan,
 ) -> Result<PinnedVersion> {
     let rules_path = rules_path(root_dir, modlist_name);
+    let modlist_dir = modlist_dir(root_dir, modlist_name);
     let jar_destination =
         local_jars_dir(root_dir, modlist_name).join(format!("{}.jar", plan.pinned_mod_id));
     let mut snapshot = PinSnapshot::capture(&rules_path, &jar_destination)?;
 
     // The jar of the pin being replaced moves aside before anything else: a
-    // rename is undoable, a delete is not.
+    // rename is undoable, a delete is not. A pin without its marker keeps its
+    // jar: nothing proves it is ours (audit 101, modlist-2).
     if let Some(replaced) = &plan.replaced_pin {
-        snapshot
-            .stash_jar(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
+        if plan.replaced_pin_owns_jar {
+            snapshot
+                .stash(&local_jars_dir(root_dir, modlist_name).join(format!("{replaced}.jar")))?;
+            snapshot.stash(&pin_marker_path(&modlist_dir, replaced)?)?;
+        }
     }
 
     let applied = (|| -> Result<()> {
@@ -576,19 +702,48 @@ fn apply_pin_plan(
             },
         )?;
 
+        // The pin stands for the dynamic entry (audit 101, modlist-1): it
+        // inherits its links and incompatibilities. Its custom configs stay
+        // where they are while the dynamic entry does — they apply by target,
+        // not by which entry resolved — and move here when it goes.
+        let dynamic = &plan.dynamic_rule;
+        let custom_configs = if plan.remove_dynamic {
+            snapshot.copy_custom_config_files(
+                &modlist_dir,
+                &dynamic.mod_id,
+                &plan.pinned_mod_id,
+                &dynamic.custom_configs,
+            )?;
+            dynamic
+                .custom_configs
+                .iter()
+                .map(save_custom_config_input)
+                .collect()
+        } else {
+            vec![]
+        };
         save_rule_advanced_from_root(
             root_dir,
             &SaveRuleAdvancedInput {
                 modlist_name: modlist_name.to_string(),
                 mod_id: plan.pinned_mod_id.clone(),
-                exclude_if: vec![],
-                requires: vec![],
+                exclude_if: dynamic.exclude_if.clone(),
+                requires: dynamic.requires.clone(),
                 version_rules: plan.version_rules.clone(),
-                custom_configs: vec![],
+                custom_configs,
             },
         )?;
 
         if plan.remove_dynamic {
+            // Deleting a rule strips every reference to it (editor-logica-5),
+            // and with the dynamic entry gone for good the pin is the mod on
+            // every target where it exists: the references follow it.
+            retarget_references(
+                root_dir,
+                modlist_name,
+                &plan.dynamic_mod_id,
+                &plan.pinned_mod_id,
+            )?;
             delete_rules_from_root(
                 root_dir,
                 &DeleteRulesInput {
@@ -627,6 +782,24 @@ fn apply_pin_plan(
                 modlist_name: modlist_name.to_string(),
                 ordered_mod_ids: plan.top_level_order.clone(),
             },
+        )?;
+
+        snapshot.write_marker(
+            &pin_marker_path(&modlist_dir, &plan.pinned_mod_id)?,
+            &PinMarker {
+                dynamic_mod_id: plan.dynamic_mod_id.clone(),
+                minecraft_version: plan
+                    .version_rules
+                    .first()
+                    .and_then(|rule| rule.mc_versions.first())
+                    .cloned()
+                    .unwrap_or_default(),
+                loader: plan
+                    .version_rules
+                    .first()
+                    .map(|rule| rule.loader.clone())
+                    .unwrap_or_default(),
+            },
         )
     })();
 
@@ -658,20 +831,65 @@ fn rules_path(root_dir: &Path, modlist_name: &str) -> PathBuf {
 }
 
 fn local_jars_dir(root_dir: &Path, modlist_name: &str) -> PathBuf {
+    modlist_dir(root_dir, modlist_name).join("local-jars")
+}
+
+fn modlist_dir(root_dir: &Path, modlist_name: &str) -> PathBuf {
     LauncherPaths::new(root_dir.to_path_buf())
         .modlists_dir()
         .join(modlist_name)
-        .join("local-jars")
 }
 
-/// `rules.json` as it was, whether the pinned jar was already there, and the
-/// jar of a replaced pin moved aside instead of deleted.
+fn save_custom_config_input(config: &CustomConfig) -> SaveCustomConfigInput {
+    SaveCustomConfigInput {
+        id: config.id.clone(),
+        mc_versions: config.mc_versions.clone(),
+        loader: config.loader.clone(),
+        target_path: config.target_path.clone(),
+        files: config.files.clone(),
+    }
+}
+
+/// Every `requires` and `exclude_if` of the tree that names `from` names `to`
+/// instead, once.
+fn retarget_references(root_dir: &Path, modlist_name: &str, from: &str, to: &str) -> Result<()> {
+    fn retarget(ids: &mut Vec<String>, from: &str, to: &str) {
+        if !ids.iter().any(|id| id == from) {
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        ids.retain_mut(|id| {
+            if id == from {
+                *id = to.to_string();
+            }
+            seen.insert(id.clone())
+        });
+    }
+    fn walk(rules: &mut [Rule], from: &str, to: &str) {
+        for rule in rules {
+            if rule.mod_id != to {
+                retarget(&mut rule.requires, from, to);
+                retarget(&mut rule.exclude_if, from, to);
+            }
+            walk(&mut rule.alternatives, from, to);
+        }
+    }
+
+    let rules_path = rules_path(root_dir, modlist_name);
+    let mut modlist = ModList::read_from_file(&rules_path)?;
+    walk(&mut modlist.rules, from, to);
+    modlist.write_to_file(&rules_path)
+}
+
+/// `rules.json` as it was, whether the pinned jar was already there, the files
+/// moved aside instead of deleted, and the files the pin created.
 struct PinSnapshot {
     rules_path: PathBuf,
     rules_contents: Vec<u8>,
     jar_destination: PathBuf,
     jar_existed: bool,
-    stashed_jar: Option<(PathBuf, PathBuf)>,
+    stashed: Vec<(PathBuf, PathBuf)>,
+    created: Vec<PathBuf>,
 }
 
 impl PinSnapshot {
@@ -682,38 +900,91 @@ impl PinSnapshot {
                 .with_context(|| format!("failed to read {}", rules_path.display()))?,
             jar_destination: jar_destination.to_path_buf(),
             jar_existed: jar_destination.exists(),
-            stashed_jar: None,
+            stashed: Vec::new(),
+            created: Vec::new(),
         })
     }
 
-    /// Move a jar out of the way, keeping it restorable. A rename inside the
+    /// Move a file out of the way, keeping it restorable. A rename inside the
     /// same directory cannot half-succeed and cannot cross a filesystem.
-    fn stash_jar(&mut self, jar: &Path) -> Result<()> {
-        if !jar.exists() {
+    fn stash(&mut self, file: &Path) -> Result<()> {
+        if !file.exists() {
             return Ok(());
         }
 
-        let stash = jar.with_extension("jar.replaced");
-        std::fs::rename(jar, &stash).with_context(|| {
+        let mut stash_name = file.file_name().unwrap_or_default().to_os_string();
+        stash_name.push(".replaced");
+        let stash = file.with_file_name(stash_name);
+        std::fs::rename(file, &stash).with_context(|| {
             format!(
                 "failed to move {} aside before replacing the pin",
-                jar.display()
+                file.display()
             )
         })?;
-        self.stashed_jar = Some((jar.to_path_buf(), stash));
+        self.stashed.push((file.to_path_buf(), stash));
 
         Ok(())
     }
 
-    /// Nothing left to undo: drop the stashed jar for good.
+    /// Write the pin marker; a rollback removes it.
+    fn write_marker(&mut self, path: &Path, marker: &PinMarker) -> Result<()> {
+        let json = serde_json::to_string_pretty(marker).context("failed to serialize the pin")?;
+        if !path.exists() {
+            self.created.push(path.to_path_buf());
+        }
+        crate::atomic_write::write_atomically(path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    /// Copy the files of the dynamic entry's custom configs under the pinned
+    /// id (D128 keys them by mod id). A copy, not a move: the rollback only
+    /// has to remove what was created.
+    fn copy_custom_config_files(
+        &mut self,
+        modlist_dir: &Path,
+        from_mod_id: &str,
+        to_mod_id: &str,
+        configs: &[CustomConfig],
+    ) -> Result<()> {
+        for config in configs {
+            let Ok(source) = custom_config_files_dir(modlist_dir, from_mod_id, &config.id) else {
+                continue;
+            };
+            if !source.is_dir() {
+                continue;
+            }
+            let destination = custom_config_files_dir(modlist_dir, to_mod_id, &config.id)?;
+            if !destination.exists() {
+                self.created.push(destination.clone());
+            }
+            std::fs::create_dir_all(&destination)
+                .with_context(|| format!("failed to create {}", destination.display()))?;
+            for name in &config.files {
+                validate_path_component(name)?;
+                let file = source.join(name);
+                if file.is_file() {
+                    std::fs::copy(&file, destination.join(name)).with_context(|| {
+                        format!(
+                            "failed to copy {} to {}",
+                            file.display(),
+                            destination.display()
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Nothing left to undo: drop the stashed files for good.
     fn commit(&mut self) {
-        if let Some((_, stash)) = self.stashed_jar.take() {
+        for (_, stash) in self.stashed.drain(..) {
             std::fs::remove_file(stash).ok();
         }
     }
 
-    /// Put `rules.json` back byte for byte, remove the jar the pin copied, and
-    /// bring a stashed jar back.
+    /// Put `rules.json` back byte for byte, remove the jar and the files the
+    /// pin created, and bring the stashed files back.
     ///
     /// A jar that was already there keeps its bytes: same filename means the
     /// same Modrinth file, and the copy was sha1-verified before it got here.
@@ -726,7 +997,14 @@ impl PinSnapshot {
         if !self.jar_existed {
             std::fs::remove_file(&self.jar_destination).ok();
         }
-        if let Some((original, stash)) = &self.stashed_jar {
+        for created in &self.created {
+            if created.is_dir() {
+                std::fs::remove_dir_all(created).ok();
+            } else {
+                std::fs::remove_file(created).ok();
+            }
+        }
+        for (original, stash) in &self.stashed {
             std::fs::rename(stash, original).ok();
         }
     }
@@ -976,6 +1254,8 @@ mod tests {
             }],
             top_level_order: vec!["deleted-meanwhile".into(), PINNED_ID.into()],
             replaced_pin: None,
+            replaced_pin_owns_jar: false,
+            dynamic_rule: modrinth_rule("modernfix"),
         };
 
         let error = apply_pin_plan(&root, "Test Pack", &source_jar(&root), &plan)
@@ -993,6 +1273,12 @@ mod tests {
         assert!(
             !modlist_dir.join("local-jars").join(PINNED_JAR).exists(),
             "the copied jar must be gone"
+        );
+        assert!(
+            !super::pin_marker_path(&modlist_dir, PINNED_ID)
+                .unwrap()
+                .exists(),
+            "no marker survives a rolled-back pin"
         );
 
         fs::remove_dir_all(&root).unwrap();
@@ -1157,6 +1443,214 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(jar.exists(), "the user's jar must still be there");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn local_rule(mod_id: &str) -> Rule {
+        Rule {
+            source: ModSource::Local,
+            ..modrinth_rule(mod_id)
+        }
+    }
+
+    fn only(mc_version: &str, loader: &str) -> crate::rules::VersionRule {
+        crate::rules::VersionRule {
+            kind: VersionRuleKind::Only,
+            mc_versions: vec![mc_version.into()],
+            loader: loader.into(),
+        }
+    }
+
+    /// Audit 101, modlist-2: the case of the report. A jar added by hand, with
+    /// an "Only when", used to read as "Pinned", and "Remove pin" deleted it.
+    #[test]
+    fn a_hand_uploaded_jar_with_an_only_rule_is_not_a_pin_and_keeps_its_jar() {
+        let root = unique_test_root();
+        let mut manual = local_rule("mythicmetals-0.19.11+1.20.1-fabric");
+        manual.version_rules = vec![only("1.20.1", "fabric")];
+        let modlist_dir = seed_modlist(&root, vec![manual.clone()]);
+        let jar = modlist_dir
+            .join("local-jars")
+            .join("mythicmetals-0.19.11+1.20.1-fabric.jar");
+        fs::write(&jar, b"the user's only copy").unwrap();
+
+        assert_eq!(super::pin_kind(&manual, &modlist_dir), None);
+        let error = remove_pin_from_root(
+            &root,
+            &RemovePinInput {
+                modlist_name: "Test Pack".into(),
+                pinned_mod_id: "mythicmetals-0.19.11+1.20.1-fabric".into(),
+            },
+        )
+        .expect_err("a hand-uploaded jar is not a pin, 'Only when' or not");
+        assert!(error.to_string().contains("not a pinned version"));
+        assert!(jar.exists(), "the user's jar must still be there");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_pin_writes_its_marker_and_removing_it_deletes_jar_and_marker() {
+        let root = unique_test_root();
+        let modlist_dir = seed_modlist(&root, vec![modrinth_rule("modernfix")]);
+
+        apply_pin_from_root(&root, &pin_input(&root, false)).unwrap();
+        let marker = super::pin_marker_path(&modlist_dir, PINNED_ID).unwrap();
+        let written: super::PinMarker =
+            serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(written.dynamic_mod_id, "modernfix");
+        assert_eq!(written.minecraft_version, "1.20.1");
+        assert_eq!(written.loader, "forge");
+
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        assert_eq!(
+            super::pin_kind(&modlist.rules[0], &modlist_dir),
+            Some(super::PinKind::Marked)
+        );
+
+        let removed = remove_pin_from_root(
+            &root,
+            &RemovePinInput {
+                modlist_name: "Test Pack".into(),
+                pinned_mod_id: PINNED_ID.into(),
+            },
+        )
+        .unwrap();
+        assert!(removed.jar_deleted);
+        assert!(!marker.exists());
+        assert!(!modlist_dir.join("local-jars").join(PINNED_JAR).exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A pin made before the marker: still recognised by the shape the pin
+    /// always wrote, removable, but its jar is kept — nothing proves it is ours.
+    #[test]
+    fn a_pin_from_before_the_marker_is_recognised_and_keeps_its_jar() {
+        let root = unique_test_root();
+        let mut legacy = local_rule(PINNED_ID);
+        legacy.version_rules = vec![only("1.20.1", "forge")];
+        legacy.alternatives = vec![modrinth_rule("modernfix")];
+        let modlist_dir = seed_modlist(&root, vec![legacy.clone()]);
+        let jar = modlist_dir.join("local-jars").join(PINNED_JAR);
+        fs::write(&jar, b"pinned jar bytes").unwrap();
+
+        assert_eq!(
+            super::pin_kind(&legacy, &modlist_dir),
+            Some(super::PinKind::Legacy)
+        );
+        let removed = remove_pin_from_root(
+            &root,
+            &RemovePinInput {
+                modlist_name: "Test Pack".into(),
+                pinned_mod_id: PINNED_ID.into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(removed.restored_mod_id.as_deref(), Some("modernfix"));
+        assert!(!removed.jar_deleted);
+        assert!(jar.exists(), "a pin without its marker keeps its jar");
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        let ids: Vec<&str> = modlist.rules.iter().map(|r| r.mod_id.as_str()).collect();
+        assert_eq!(ids, vec!["modernfix"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Audit 101, modlist-1: iris requires sodium, rubidium excludes it. On
+    /// the pinned target the pin is the mod, so both rules keep holding.
+    #[test]
+    fn links_and_incompatibilities_that_name_the_mod_survive_the_pin() {
+        let root = unique_test_root();
+        let mut iris = modrinth_rule("iris");
+        iris.requires = vec!["modernfix".into()];
+        let mut rubidium = modrinth_rule("rubidium");
+        rubidium.exclude_if = vec!["modernfix".into()];
+        let mut dynamic = modrinth_rule("modernfix");
+        dynamic.requires = vec!["cloth-config".into()];
+        dynamic.exclude_if = vec!["optifine".into()];
+        let modlist_dir = seed_modlist(
+            &root,
+            vec![dynamic, modrinth_rule("cloth-config"), iris, rubidium],
+        );
+
+        apply_pin_from_root(&root, &pin_input(&root, false)).unwrap();
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        let pinned = modlist.find_rule(PINNED_ID).unwrap();
+        assert_eq!(pinned.requires, vec!["cloth-config".to_string()]);
+        assert_eq!(pinned.exclude_if, vec!["optifine".to_string()]);
+
+        let pins = super::pin_aliases(&modlist_dir, &modlist);
+        assert_eq!(pins.get(PINNED_ID).map(String::as_str), Some("modernfix"));
+        for target in [
+            target("1.20.1", ModLoader::Forge),
+            target("1.21.1", ModLoader::Forge),
+        ] {
+            let resolution =
+                crate::resolver::resolve_modlist_pinned(&modlist, &pins, &target).unwrap();
+            assert!(
+                resolution.active_mods.contains("iris"),
+                "iris requires the mod: it stays on {target:?}"
+            );
+            assert!(
+                resolution.active_mods.contains(PINNED_ID)
+                    != resolution.active_mods.contains("modernfix"),
+                "exactly one of pin and dynamic entry loads on {target:?}"
+            );
+            assert!(
+                !resolution.active_mods.contains("rubidium"),
+                "rubidium excludes the mod: it stays out on {target:?}"
+            );
+        }
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// With the dynamic entry removed the references follow the pin, and its
+    /// custom configs move to it with their files.
+    #[test]
+    fn removing_the_dynamic_entry_moves_its_references_and_custom_configs_to_the_pin() {
+        let root = unique_test_root();
+        let mut iris = modrinth_rule("iris");
+        iris.requires = vec!["modernfix".into()];
+        let mut dynamic = modrinth_rule("modernfix");
+        dynamic.custom_configs = vec![crate::rules::CustomConfig {
+            id: "cc-1".into(),
+            mc_versions: vec![],
+            loader: "any".into(),
+            target_path: String::new(),
+            files: vec!["modernfix.toml".into()],
+        }];
+        let modlist_dir = seed_modlist(&root, vec![dynamic, iris]);
+        let files =
+            crate::rules::custom_config_files_dir(&modlist_dir, "modernfix", "cc-1").unwrap();
+        fs::create_dir_all(&files).unwrap();
+        fs::write(files.join("modernfix.toml"), b"setting = true").unwrap();
+
+        apply_pin_from_root(&root, &pin_input(&root, true)).unwrap();
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        assert!(!modlist.contains_mod_id("modernfix"));
+        assert_eq!(
+            modlist.find_rule("iris").unwrap().requires,
+            vec![PINNED_ID.to_string()]
+        );
+        let pinned = modlist.find_rule(PINNED_ID).unwrap();
+        assert_eq!(pinned.custom_configs.len(), 1);
+        assert_eq!(pinned.custom_configs[0].id, "cc-1");
+        let moved = crate::rules::custom_config_files_dir(&modlist_dir, PINNED_ID, "cc-1")
+            .unwrap()
+            .join("modernfix.toml");
+        assert_eq!(fs::read(moved).unwrap(), b"setting = true");
+
+        let resolution = crate::resolver::resolve_modlist_pinned(
+            &modlist,
+            &super::pin_aliases(&modlist_dir, &modlist),
+            &target("1.20.1", ModLoader::Forge),
+        )
+        .unwrap();
+        assert!(resolution.active_mods.contains("iris"));
 
         fs::remove_dir_all(&root).unwrap();
     }
