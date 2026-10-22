@@ -39,6 +39,7 @@ pub mod screenshots;
 pub mod shared_files;
 pub mod shared_worlds;
 pub mod skins;
+mod startup;
 #[cfg(test)]
 mod test_client_jars;
 pub mod token_storage;
@@ -47,32 +48,23 @@ pub mod worlds;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+
+    // The data folder, its lock and the database are checked before Tauri
+    // starts, so that a failure is a dialog that says where and why instead
+    // of a panic with no window (r2-primo-avvio-ambiente-degradato-4), and a
+    // second launcher on the same folder stops here (concorrenza-5).
+    let launcher_data = startup::launcher_root(&context.config().identifier)
+        .and_then(startup::prepare_launcher_data)
+        .unwrap_or_else(|failure| startup::report_and_exit(&failure));
+    let startup::LauncherData {
+        paths: launcher_paths,
+        instance_lock,
+    } = launcher_data;
+
     tauri::Builder::default()
-        .setup(|app| {
-            let launcher_root = app
-                .path()
-                .app_local_data_dir()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let launcher_paths = launcher_paths::LauncherPaths::new(launcher_root);
-
-            launcher_paths
-                .create_required_directories()
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            debug_trace::reset_debug_trace_at_startup(launcher_paths.root_dir());
-
-            database::initialize_database(launcher_paths.database_path())
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-
-            {
-                let connection = rusqlite::Connection::open(launcher_paths.database_path())
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                database::migrate_account_tokens_from_profile_data(
-                    &connection,
-                    token_storage::KeyringSecretStore::new(),
-                )
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            }
-
+        .setup(move |app| {
+            app.manage(instance_lock);
             app.manage(launcher_paths.clone());
             app.manage(skins::SkinsState::default());
             app.manage(app_shell::MicrosoftLoginState::default());
@@ -172,6 +164,6 @@ pub fn run() {
             updater::check_for_updates,
             updater::install_update
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
