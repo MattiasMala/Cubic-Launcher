@@ -14,6 +14,24 @@ const MICROSOFT_AUTHORIZE_URL: &str =
 const MICROSOFT_TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const BUNDLED_MICROSOFT_CLIENT_ID: &str = "7dce88aa-79b0-4b77-9666-0fdb8addd50c";
 
+/// How long a sign-in or refresh request waits for a connection to open.
+const AUTH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one request of the sign-in and refresh chain may take, body
+/// included: every answer is a small JSON document.
+const AUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client of the Microsoft, Xbox and Minecraft services. Before audit 101
+/// (account-7) it was `reqwest::Client::new()`, with no timeout at all: a
+/// service that accepted the connection and said nothing kept the launch on
+/// «Authenticating» for as long as the operating system allowed.
+fn auth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(AUTH_CONNECT_TIMEOUT)
+        .timeout(AUTH_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftOAuthConfig {
     pub client_id: String,
@@ -45,7 +63,7 @@ pub struct MicrosoftOAuthClient {
 impl MicrosoftOAuthClient {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: MICROSOFT_AUTHORIZE_URL.to_string(),
             token_url: MICROSOFT_TOKEN_URL.to_string(),
         }
@@ -53,7 +71,7 @@ impl MicrosoftOAuthClient {
 
     pub fn with_endpoints(authorize_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: authorize_url.into(),
             token_url: token_url.into(),
         }
@@ -642,7 +660,7 @@ impl Default for MinecraftAuthChain {
 impl MinecraftAuthChain {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
         }
     }
 
