@@ -34,9 +34,75 @@ export function markMinecraftVersionsKnown() {
   minecraftVersionsKnown = true;
 }
 
+/** Whether `defaultMinecraftVersion()` is a real latest release, not the placeholder. */
+export function minecraftVersionsAreKnown(): boolean {
+  return minecraftVersionsKnown;
+}
+
 /** The version proposed to a mod list that has none saved yet. */
 export function defaultMinecraftVersion(): string {
   return minecraftVersions()[0] ?? "1.21.1";
+}
+
+/**
+ * The mod list shown with a version it has not saved, taken from the
+ * placeholder list because Mojang had not answered yet
+ * (review-frontend-shell-21). When the real list arrives the default is
+ * applied to it, and Play waits for that instead of launching the
+ * placeholder's instance.
+ */
+let provisionalTargetFor: string | null = null;
+let minecraftVersionsLoading: Promise<void> | null = null;
+
+/** Play on a list whose version is still provisional waits for the version list. */
+export async function settleProvisionalTarget(modlistName: string) {
+  if (provisionalTargetFor === modlistName && minecraftVersionsLoading) await minecraftVersionsLoading;
+}
+
+function applyProvisionalDefault() {
+  const name = provisionalTargetFor;
+  if (!name || minecraftVersions().length === 0) return;
+  const version = defaultMinecraftVersion();
+  if (selectedModListName() === name) {
+    setSelectedMcVersion(version);
+    const cached = modlistVersionLoaderCache.get(name);
+    modlistVersionLoaderCache.set(name, { version, loader: cached?.loader ?? normalizeModLoader(selectedModLoader()) });
+  } else {
+    // Shown again later: the snapshot then applies (and saves) the default.
+    modlistVersionLoaderCache.delete(name);
+  }
+  if (!minecraftVersionsKnown || !isTauri()) return;
+  provisionalTargetFor = null;
+  if (selectedModListName() !== name) return;
+  const loader = normalizeModLoader(selectedModLoader());
+  void saveModlistTarget(name, version, loader)
+    .then(() => setModListCards(current => current.map(card => card.name === name ? { ...card, mcVersion: version, modLoader: loader } : card)))
+    .catch(error => logger.warn("App", "could not save the default target of a mod list", { modlist: name, error: String(error) }));
+}
+
+/**
+ * Which selection of a mod list is the current one (review-frontend-stato-16).
+ * Opening a list takes a number; every loader handed that number drops its
+ * answer once another selection began, so a slow answer for the list clicked
+ * before never lands on the one clicked after, and never primes it.
+ */
+let selectionGeneration = 0;
+export function beginModlistSelection(): number {
+  return ++selectionGeneration;
+}
+export function isCurrentSelection(generation: number): boolean {
+  return generation === selectionGeneration;
+}
+const stale = (generation?: number) => generation !== undefined && generation !== selectionGeneration;
+
+/**
+ * How a mod list is opened, with everything that goes with it: App's
+ * `selectModList`. `loadShellSnapshot` goes through it when the list on screen
+ * is gone from the snapshot (review-frontend-stato-17).
+ */
+let reselectModlist: ((name: string) => Promise<void>) | null = null;
+export function setModlistReselector(select: (name: string) => Promise<void>) {
+  reselectModlist = select;
 }
 
 /**
@@ -48,6 +114,8 @@ export async function saveModlistTarget(modlistName: string, version: string, lo
   await invoke("save_modlist_target_command", {
     input: { modlistName, minecraftVersion: version, modLoader: normalizeModLoader(loader) },
   });
+  // Saved: the list's own version from now on, chosen or defaulted.
+  if (provisionalTargetFor === modlistName) provisionalTargetFor = null;
 }
 
 export async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
@@ -107,6 +175,12 @@ function minecraftVersionsNoticeFor(payload: MinecraftVersionsPayload): string |
  */
 export async function loadMinecraftVersions() {
   if (!isTauri()) return;
+  const loading = loadMinecraftVersionsOnce();
+  minecraftVersionsLoading = loading;
+  await loading;
+}
+
+async function loadMinecraftVersionsOnce() {
   try {
     const payload = await invoke<MinecraftVersionsPayload>("fetch_minecraft_versions_command");
     logger.debug("App", "fetched minecraft versions", {
@@ -120,6 +194,7 @@ export async function loadMinecraftVersions() {
       // may become a mod list's saved version. A list of the installed
       // versions alone is not "the latest release", so it never is.
       if (payload.source !== "installed") markMinecraftVersionsKnown();
+      applyProvisionalDefault();
     }
     if (payload.withSnapshots.length > 0) setMcWithSnapshots(payload.withSnapshots);
     setMinecraftVersionsNotice(minecraftVersionsNoticeFor(payload));
@@ -184,7 +259,13 @@ function reportUnreadableModlists(unreadable: Array<{ folder: string; error: str
   }
 }
 
-export async function loadShellSnapshot(preferredName?: string | null) {
+/**
+ * `generation`: the selection this load belongs to (`beginModlistSelection`).
+ * Once another selection began, the answer still refreshes the cards, the
+ * accounts and the settings, but no longer moves the selection nor applies
+ * the overrides and target of the list it was asked for.
+ */
+export async function loadShellSnapshot(preferredName?: string | null, generation?: number) {
   // The accounts are a call of their own (todo.md:1414): a snapshot that
   // fails must not leave the launcher without its account list.
   const accountsLoaded = loadAccounts();
@@ -192,6 +273,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
     const snap = await invoke<ShellSnapshot>("load_shell_snapshot_command", {
       selectedModlistName: preferredName ?? null,
     });
+    const superseded = stale(generation);
     reportUnreadableModlists(snap.unreadable_modlists ?? []);
 
     const existing = modListCards();
@@ -216,7 +298,21 @@ export async function loadShellSnapshot(preferredName?: string | null) {
     const needLoad = cards.filter((card: any) => !card.iconLabel).map((card: any) => card.name);
     if (needLoad.length > 0) void loadAllCardIcons(needLoad);
 
-    if (cards.length > 0) {
+    // The open list is gone (its folder removed, its rules.json unreadable):
+    // opening another goes through the whole selection — persistence reset,
+    // editor, groups — instead of renaming the selection over the old list's
+    // rows, whose next save would land in the new one (review-frontend-stato-17).
+    const openListGone = !superseded
+      && !!preferredName
+      && preferredName === selectedModListName()
+      && !cards.some((card: any) => card.name === preferredName);
+    let reselecting = false;
+    if (superseded) {
+      // Another selection is under way: it owns the selection.
+    } else if (openListGone && cards.length > 0 && reselectModlist) {
+      reselecting = true;
+      void reselectModlist(cards[0].name);
+    } else if (cards.length > 0) {
       const selected = preferredName && cards.some((card: any) => card.name === preferredName)
         ? preferredName
         : cards[0].name;
@@ -246,7 +342,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
       });
     }
 
-    const overrides = snap.selected_modlist_overrides;
+    const overrides = superseded || reselecting ? null : snap.selected_modlist_overrides;
     if (overrides) {
       // An override that is off shows what the launch would use without it,
       // never the value of the mod list shown before: ticking the box would
@@ -276,6 +372,9 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         // The default is written the first time it is shown, and from then on
         // it is the list's own. Not with the placeholder list: offline that
         // would pin "1.21.1" on a list that never asked for it.
+        // review-frontend-shell-21: shown with the placeholder for now; the
+        // real default comes with the version list.
+        if (overrides.minecraft_version == null && !minecraftVersionsKnown) provisionalTargetFor = overridesName;
         if ((overrides.minecraft_version == null || overrides.mod_loader == null) && minecraftVersionsKnown && isTauri()) {
           void saveModlistTarget(overridesName, resolvedVersion, resolvedLoader)
             .then(() => {
@@ -324,10 +423,12 @@ function mapEditorRowsToModRows(rows: any[]): ModRow[] {
   return rows.map((row: any, index: number) => mapEditorRow(row, index, ""));
 }
 
-export async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
+export async function loadEditorSnapshot(modlistName: string, resetGroups = false, generation?: number) {
   if (!modlistName) return null;
   try {
     const snap: any = await invoke("load_modlist_editor_command", { selectedModlistName: modlistName });
+    // Another list was opened meanwhile: these rows are not its rows.
+    if (stale(generation) || selectedModListName() !== modlistName) return null;
     const mappedRows = mapEditorRowsToModRows(snap.rows ?? []);
 
     const primaryModToRowId = new Map<string, string>();
@@ -401,7 +502,7 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
   } catch (error) {
     logger.error("App", "loadEditorSnapshot failed", error);
     pushUiError({ title: "Could not load mod list", message: `Failed to read rules for '${modlistName}'.`, detail: String(error), severity: "error", scope: "launch" });
-    setModRowsState([]);
+    if (!stale(generation) && selectedModListName() === modlistName) setModRowsState([]);
     return null;
   }
 }
@@ -425,7 +526,7 @@ export async function loadAllCardIcons(names: string[]) {
   }));
 }
 
-export async function loadModlistPresentation(modlistName: string) {
+export async function loadModlistPresentation(modlistName: string, generation?: number) {
   if (!modlistName) {
     setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
     return null;
@@ -439,6 +540,7 @@ export async function loadModlistPresentation(modlistName: string) {
 
   try {
     const presentation: any = await invoke("load_modlist_presentation_command", { modlistName });
+    if (stale(generation)) return null;
     const iconImage = presentation.iconImage ?? "";
     const iconLabel = presentation.iconLabel ?? buildDefaultIconLabel(modlistName);
     const iconAccent = presentation.iconAccent ?? "";
@@ -453,13 +555,14 @@ export async function loadModlistPresentation(modlistName: string) {
     setModListCards(cards => cards.map(card => card.name === modlistName ? { ...card, iconImage, iconLabel, iconAccent, displayName } : card));
     return presentation;
   } catch (error) {
+    if (stale(generation)) return null;
     setInstancePresentation({ displayName: modlistName, iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     pushUiError({ title: "Could not load notes", message: `Saved notes for '${modlistName}' could not be loaded.`, detail: String(error), severity: "error", scope: "launch" });
     return null;
   }
 }
 
-export async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
+export async function loadModlistGroups(modlistName: string, rows: ModRow[], generation?: number) {
   if (!modlistName) {
     setFunctionalGroups([]);
     return null;
@@ -473,6 +576,7 @@ export async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
 
   try {
     const layout: any = await invoke("load_modlist_groups_command", { modlistName });
+    if (stale(generation)) return null;
     const availableIds = new Set<string>();
     const modIdToRowId = new Map<string, string>();
     const collect = (items: ModRow[]) => {
@@ -516,6 +620,7 @@ export async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
 
     return layout;
   } catch (error) {
+    if (stale(generation)) return null;
     setFunctionalGroups([]);
     pushUiError({ title: "Could not load groups", message: `Saved groups for '${modlistName}' could not be loaded.`, detail: String(error), severity: "error", scope: "launch" });
     return null;

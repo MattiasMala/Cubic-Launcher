@@ -28,6 +28,8 @@ import {
   loadModlistPresentation,
   loadShellSnapshot,
   runResolution,
+  beginModlistSelection,
+  isCurrentSelection,
 } from "./backend-loaders";
 
 interface AppBootstrapOptions {
@@ -143,18 +145,31 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
         // and the accounts. It has its own timeout and falls back to disk.
         void loadMinecraftVersions();
 
-        const snap = await loadShellSnapshot(null);
+        // The first list is a selection like a click in the sidebar: a click
+        // while it loads takes over, and boot stops before priming
+        // (review-frontend-stato-16).
+        const generation = beginModlistSelection();
+        const snap = await loadShellSnapshot(null, generation);
         logger.debug("App", "shell snapshot loaded", {
           modlists: (snap?.modlists ?? []).map((modlist: any) => modlist.name),
         });
 
         const firstList = snap?.modlists?.[0]?.name ?? "";
-        if (firstList) {
-          const [editorSnapshot] = await Promise.all([
-            loadEditorSnapshot(firstList),
-            loadModlistPresentation(firstList),
+        let editorSnapshot: any = null;
+        if (firstList && isCurrentSelection(generation)) {
+          [editorSnapshot] = await Promise.all([
+            loadEditorSnapshot(firstList, false, generation),
+            loadModlistPresentation(firstList, generation),
           ]);
-          await loadModlistGroups(firstList, modRowsState());
+        }
+        if (firstList && isCurrentSelection(generation)) {
+          await loadModlistGroups(firstList, modRowsState(), generation);
+        }
+        if (!firstList) {
+          logger.debug("App", "boot completed - no mod lists found");
+        } else if (!isCurrentSelection(generation)) {
+          logger.debug("App", "boot left the first mod list to the one opened meanwhile", { firstList });
+        } else {
           options.primePersistenceState();
 
           logger.debug("App", "boot completed", {
@@ -163,8 +178,6 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
           });
           void fetchModMetadata(modRowsState());
           void runResolution(firstList, selectedMcVersion(), selectedModLoader());
-        } else {
-          logger.debug("App", "boot completed - no mod lists found");
         }
       } catch (error) {
         logger.error("App", "boot failed", error);

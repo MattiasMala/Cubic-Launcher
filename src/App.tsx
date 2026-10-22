@@ -78,6 +78,11 @@ import {
   modlistVersionLoaderCache,
   runResolution,
   saveModlistTarget,
+  beginModlistSelection,
+  isCurrentSelection,
+  setModlistReselector,
+  minecraftVersionsAreKnown,
+  settleProvisionalTarget,
 } from "./app/backend-loaders";
 import { useAppBootstrap } from "./app/use-app-bootstrap";
 import { useAppPersistence } from "./app/persistence-effects";
@@ -213,6 +218,10 @@ export default function App() {
   const selectModList = async (name: string) => {
     logger.info("App", "handleSelectModList started", { name });
     appendDebugTrace("modlist.select", { name });
+    // This selection's number: a click on another list while this one loads
+    // makes every answer below stale, and this one stops before applying or
+    // priming anything (review-frontend-stato-16).
+    const generation = beginModlistSelection();
     // First: the persistence effects must not see the new name with the old
     // list's state, or they save it there.
     resetPersistenceState();
@@ -234,15 +243,22 @@ export default function App() {
     const cachedVL = modlistVersionLoaderCache.get(name);
     if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(normalizeModLoader(cachedVL.loader)); }
     if (!isTauri()) { logger.warn("App", "handleSelectModList skipped — no backend"); return; }
-    await loadShellSnapshot(name);
-    await loadEditorSnapshot(name, true);
-    await loadModlistPresentation(name);
-    await loadModlistGroups(name, modRowsState());
+    await loadShellSnapshot(name, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadEditorSnapshot(name, true, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadModlistPresentation(name, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadModlistGroups(name, modRowsState(), generation);
+    if (!isCurrentSelection(generation)) return;
     primePersistenceState();
 
     void fetchModMetadata(modRowsState());
     void runResolution(name, selectedMcVersion(), selectedModLoader());
   };
+
+  // The open list vanished from a snapshot: the next one opens the same way.
+  setModlistReselector(selectModList);
 
   const handleReorderRules = async (orderedIds: string[]) => {
     logger.info("App", "handleReorderRules started", { count: orderedIds.length });
@@ -465,7 +481,10 @@ export default function App() {
 
     // The target a new list starts on is written with it, so it never follows
     // the next Mojang release (audit 101, r2-primo-avvio-ambiente-degradato-1).
-    const minecraftVersion = defaultMinecraftVersion();
+    // Only a real latest release: the placeholder list (Mojang not answered
+    // yet, or not at all) would pin "1.21.1" for good; without one the list is
+    // given the default when the version list arrives (review-frontend-shell-29).
+    const minecraftVersion = minecraftVersionsAreKnown() ? defaultMinecraftVersion() : null;
     const modLoader = normalizeModLoader(null);
     try {
       await invoke("create_modlist_command", {
@@ -1064,6 +1083,10 @@ export default function App() {
       return;
     }
     resetLaunchUiState();
+    // A list shown with the placeholder version waits for the real default,
+    // or Play would launch the placeholder's (empty) instance
+    // (review-frontend-shell-21).
+    await settleProvisionalTarget(selectedModListName());
     const target: LaunchTarget = {
       modlistName: selectedModListName(),
       minecraftVersion: selectedMcVersion(),
