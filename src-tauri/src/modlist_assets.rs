@@ -240,12 +240,19 @@ fn list_instance_files_from_root(
     Ok(nodes)
 }
 
+/// Async and off the main thread (condivisi-7): a synchronous command runs on
+/// the GUI thread, and reading and encoding up to 16 MB froze the window for
+/// as long as it took.
 #[tauri::command]
-pub fn read_image_as_data_url_command(
+pub async fn read_image_as_data_url_command(
     launcher_paths: State<'_, LauncherPaths>,
     path: String,
 ) -> Result<String, String> {
-    read_image_as_data_url(launcher_paths.root_dir(), &path).map_err(|e| e.to_string())
+    let root_dir = launcher_paths.root_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || read_image_as_data_url(&root_dir, &path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 fn read_image_as_data_url(root_dir: &Path, path: &str) -> Result<String> {

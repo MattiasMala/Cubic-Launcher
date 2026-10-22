@@ -177,6 +177,7 @@ pub fn run() {
             screenshots::list_screenshots_command,
             screenshots::delete_screenshot_command,
             screenshots::open_screenshot_folder_command,
+            screenshots::screenshot_thumbnail_command,
             shared_files::shared_files_view_command,
             shared_files::set_shared_file_enabled_command,
             shared_files::link_shared_files_command,
