@@ -9,9 +9,7 @@ use tauri::State;
 // orchestrator makes launch behavior easier to audit without returning to one
 // very large mixed-responsibility file.
 use crate::app_shell::load_shell_snapshot_from_root;
-use crate::instance_configs::{
-    materialize_custom_configs, prepare_instance_config_directory, CachedConfigPlacement,
-};
+use crate::instance_configs::materialize_custom_configs;
 use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_for_minecraft_version;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
@@ -264,11 +262,11 @@ fn seed_instance_options(
 /// for the modded and the Vanilla pipeline (contentpack-3); with Vanilla the
 /// shaders are skipped inside, since no loader would read them.
 ///
-/// D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
-/// Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
-/// i file del lancio precedente. Il lookup fallito lasciava già lo stesso
-/// risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
-/// funzionante un account offline si vedeva aggiornare i pack.
+/// D-c (onda 8a), D157: con l'account offline i pack Modrinth non si cercano
+/// né si installano, e restano nell'istanza quelli del lancio precedente; i
+/// pack locali sì. La condizione vive dentro
+/// `resolve_and_install_content_packs`, l'unico punto che la decide, per
+/// entrambi i percorsi.
 // Nove input distinti di un passo del lancio, gli stessi di
 // `resolve_and_install_content_packs` più la scelta dell'account: il lint è
 // sospeso solo qui, come là (D120).
@@ -284,14 +282,6 @@ async fn install_launch_content_packs(
     resolved_content: Option<&ResolvedContentVersions>,
     plays_offline: bool,
 ) -> Result<()> {
-    if plays_offline {
-        emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
-        )?;
-        return Ok(());
-    }
     resolve_and_install_content_packs(
         app_handle,
         launcher_paths,
@@ -301,6 +291,7 @@ async fn install_launch_content_packs(
         target,
         instance_root,
         resolved_content,
+        plays_offline,
     )
     .await
 }
@@ -316,6 +307,9 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     };
     let modlist_name = request.modlist_name.trim().to_string();
     anyhow::ensure!(!modlist_name.is_empty(), "modlist_name cannot be empty");
+    // D153: la mod list non si cancella mentre il lancio la prepara; dallo
+    // spawn in poi la tiene il processo del gioco (`spawn_minecraft_process`).
+    let _in_use = crate::modlist_manager::mark_modlist_in_use(&modlist_name);
     let launch_log_session = LaunchLogSession::create(&launcher_paths, &modlist_name, &target)?;
     set_active_launch_log_session(Some(launch_log_session.clone()));
 
@@ -781,11 +775,12 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             format!("[Cache] could not record which versions this launch used: {error:#}"),
         )?;
     }
-    prepare_instance_config_directory(
-        launcher_paths.configs_cache_dir(),
-        &instance_config_dir,
-        &Vec::<CachedConfigPlacement>::new(),
-    )?;
+    std::fs::create_dir_all(&instance_config_dir).with_context(|| {
+        format!(
+            "failed to create instance config directory at {}",
+            instance_config_dir.display()
+        )
+    })?;
     // D105: the custom configs of the mod list that apply to this target,
     // copied into the instance at every launch (D118). A file that does not
     // resolve does not stop the launch, but it is never silent.
@@ -796,6 +791,30 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &target.minecraft_version,
         target.mod_loader.as_modrinth_loader(),
     )?;
+    for skipped in &custom_configs.skipped_configs {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Config] Custom config '{}' of '{}' has Path '{}', which cannot be used ({}): not placed",
+                skipped.config_id, skipped.mod_id, skipped.target_path, skipped.reason
+            ),
+        )?;
+    }
+    for collision in &custom_configs.collisions {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Config] {} is written by custom config '{}' of '{}' and again by '{}' of '{}': the later one in the mod list is kept",
+                collision.target.display(),
+                collision.overridden_config_id,
+                collision.overridden_mod_id,
+                collision.winner_config_id,
+                collision.winner_mod_id
+            ),
+        )?;
+    }
     for missing in &custom_configs.missing_files {
         emit_log(
             &app_handle,

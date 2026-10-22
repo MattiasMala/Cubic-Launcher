@@ -40,7 +40,19 @@ impl Fixture {
         }
     }
 
+    /// A mod list exists when its folder has a `rules.json`: the shared copy
+    /// is only written into one that does (`dati-5`).
+    fn ensure_modlist(&self, modlist: &str) {
+        let dir = self.paths.modlists_dir().join(modlist);
+        fs::create_dir_all(&dir).expect("the mod list directory should be creatable");
+        let rules = dir.join("rules.json");
+        if !rules.exists() {
+            fs::write(rules, b"{}").expect("rules.json should be writable");
+        }
+    }
+
     fn instance_root(&self, modlist: &str, instance: &str) -> PathBuf {
+        self.ensure_modlist(modlist);
         let dir = self
             .paths
             .modlists_dir()
@@ -61,6 +73,7 @@ impl Fixture {
     }
 
     fn write_canonical(&self, modlist: &str, file: SharedFile, body: &[u8]) {
+        self.ensure_modlist(modlist);
         let path = self.canonical(modlist, file);
         fs::create_dir_all(path.parent().expect("a canonical path has a parent"))
             .expect("the mod list directory should be creatable");
@@ -1299,4 +1312,92 @@ fn copies_leave_no_partial_file_behind() {
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
         .collect();
     assert!(leftovers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// La cancellazione di una modlist (`dati-5`, `r2-ciclo-vita-nome-1`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deleting_the_holder_hands_the_bytes_over_and_leaves_no_trace_in_the_groups() {
+    let fixture = Fixture::new("delete-holder");
+    fixture.write_canonical("A", SharedFile::Servers, b"lista-di-a");
+    fixture.ensure_modlist("B");
+    fixture.ensure_modlist("C");
+    // B e C entrano nel gruppo di A: A tiene i byte.
+    link_modlists(&fixture.connection, "B", "A").expect("linking should persist");
+    link_modlists(&fixture.connection, "C", "A").expect("linking should persist");
+    set_shared_file_enabled(&fixture.connection, "A", SharedFile::CommandHistory, false)
+        .expect("the toggle should persist");
+
+    hand_over_before_delete(&fixture.paths, &fixture.connection, "A")
+        .expect("the hand-over should work");
+    fs::remove_dir_all(fixture.paths.modlists_dir().join("A")).expect("A goes away");
+    forget_modlist(&fixture.connection, "A").expect("forgetting should persist");
+
+    assert_eq!(
+        fs::read(fixture.canonical("B", SharedFile::Servers)).unwrap(),
+        b"lista-di-a",
+        "il nuovo portatore riceve la lista prima che A sparisca"
+    );
+    let groups = load_groups(&fixture.connection).unwrap();
+    assert_eq!(
+        groups,
+        vec![SharedGroup {
+            members: vec!["B".to_string(), "C".to_string()]
+        }]
+    );
+    assert!(
+        !load_file_options(&fixture.connection).contains_key("A"),
+        "gli interruttori di A non passano a una A nuova"
+    );
+}
+
+#[test]
+fn deleting_a_member_of_a_pair_dissolves_the_group_and_copies_nothing_into_it() {
+    let fixture = Fixture::new("delete-member");
+    fixture.write_canonical("A", SharedFile::Servers, b"lista-di-a");
+    fixture.ensure_modlist("B");
+    link_modlists(&fixture.connection, "B", "A").expect("linking should persist");
+
+    hand_over_before_delete(&fixture.paths, &fixture.connection, "B")
+        .expect("the hand-over should work");
+    assert!(
+        !fixture.canonical("B", SharedFile::Servers).exists(),
+        "chi viene cancellato non riceve una copia"
+    );
+    forget_modlist(&fixture.connection, "B").expect("forgetting should persist");
+
+    assert!(load_groups(&fixture.connection).unwrap().is_empty());
+    assert_eq!(canonical_modlist(&fixture.connection, "A").unwrap(), "A");
+}
+
+#[test]
+fn a_group_whose_holder_is_gone_does_not_bring_its_folder_back() {
+    // Il caso di `dati-5` con un gruppo lasciato da una build vecchia: A è
+    // stata cancellata, il gruppo la nomina ancora come portatrice. Il lancio
+    // di B non deve ricreare `mod-lists/A/`.
+    let fixture = Fixture::new("ghost");
+    let b_instance = fixture.instance_root("B", "1.20.1-forge");
+    fs::write(
+        instance_path(&b_instance, SharedFile::Servers),
+        b"lista-di-b",
+    )
+    .unwrap();
+    link_modlists(&fixture.connection, "B", "A").expect("linking should persist");
+    assert_eq!(canonical_modlist(&fixture.connection, "B").unwrap(), "A");
+
+    let into = copy_into_instance(&fixture.paths, &fixture.connection, "B", &b_instance, None);
+    let back = copy_back_from_instance(&fixture.paths, &fixture.connection, "B", &b_instance);
+
+    for statuses in [&into, &back] {
+        assert!(matches!(
+            action_for(statuses, SharedFile::Servers),
+            SharedFileAction::Failed { reason } if reason.contains("no longer exists")
+        ));
+    }
+    assert!(
+        !fixture.paths.modlists_dir().join("A").exists(),
+        "nessuna cartella fantasma"
+    );
 }

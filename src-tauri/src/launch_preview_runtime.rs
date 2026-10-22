@@ -472,6 +472,9 @@ pub(super) fn spawn_minecraft_process(
         app_handle.clone(),
         launch_log_session.clone(),
     ));
+    // D153: finché il gioco gira (e finché i file condivisi non sono tornati
+    // nella modlist) la mod list non si cancella.
+    let in_use = crate::modlist_manager::mark_modlist_in_use(&shared_files.modlist_name);
     let process = spawn_and_stream_process(prepared_command, sink)?;
 
     let pid = process.pid;
@@ -511,6 +514,7 @@ pub(super) fn spawn_minecraft_process(
             ProcessLogStream::Stdout,
             format!("[shared] {}", copy_shared_files_back(&shared_files)),
         );
+        drop(in_use);
         let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
     });
 

@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -10,10 +10,12 @@ use tauri::State;
 use zip::write::FileOptions;
 
 use crate::atomic_write::write_atomically;
+use crate::content_packs::filename_for_type;
 use crate::launcher_paths::LauncherPaths;
+use crate::local_content_packs::{icon_relative_path, modlist_category_dir};
 use crate::mod_icons::LOCAL_JARS_DIR;
 use crate::path_safety::{contained_join, validate_path_component};
-use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
+use crate::rules::{ModlistPresentation, CUSTOM_CONFIG_FILES_DIRNAME, RULES_FILENAME};
 
 const MODLIST_PRESENTATION_FILENAME: &str = "modlist-presentation.json";
 const MODLIST_GROUP_LAYOUT_FILENAME: &str = "modlist-editor-groups.json";
@@ -77,14 +79,21 @@ pub struct ExportModlistInput {
     pub modlist_name: String,
     pub destination_path: String,
     pub rules_json: bool,
+    /// The files of the mod list's custom configs, `config-files/` as it is.
     pub config_files: bool,
     pub resource_packs: bool,
     #[serde(default)]
     pub data_packs: bool,
     #[serde(default)]
     pub shaders: bool,
+    /// D150: packs picked one by one, as `<category folder>/<pack>` relative
+    /// to the mod list (`resourcepacks/Fresh.zip`). A checked category with
+    /// at least one pick exports only those; one with none, its whole folder.
+    #[serde(default)]
+    pub selected_content_paths: Vec<String>,
     pub other_files: bool,
-    /// If non-empty, only these relative paths from instance dirs are included for "other_files".
+    /// Paths relative to the mod list's `instances/` for "other_files". D150:
+    /// none picked means nothing from the instances.
     #[serde(default)]
     pub selected_other_paths: Vec<String>,
 }
@@ -185,6 +194,9 @@ fn list_instance_files_from_root(
         .modlists_dir()
         .join(modlist_name)
         .join("instances");
+    // A mod list never launched has no instances: that is an empty tree, not
+    // an error. Anything that fails past this point is said, not turned into
+    // an empty list the modal would read as "launch the game first".
     if !instances_dir.exists() {
         return Ok(vec![]);
     }
@@ -193,9 +205,6 @@ fn list_instance_files_from_root(
         Some(rel) if !rel.is_empty() => contained_join(&instances_dir, rel)?,
         _ => instances_dir.clone(),
     };
-    if !target.exists() {
-        return Ok(vec![]);
-    }
 
     // Determine depth for filtering (0 = listing instance roots, 1 = inside an instance)
     let depth = match relative_path {
@@ -203,11 +212,14 @@ fn list_instance_files_from_root(
         _ => 0,
     };
 
-    let entries = match fs::read_dir(&target) {
-        Ok(rd) => rd,
-        Err(_) => return Ok(vec![]),
-    };
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    let mut sorted = Vec::new();
+    for entry in
+        fs::read_dir(&target).with_context(|| format!("failed to list {}", target.display()))?
+    {
+        sorted.push(
+            entry.with_context(|| format!("failed to read an entry of {}", target.display()))?,
+        );
+    }
     sorted.sort_by_key(|e| e.file_name());
 
     let mut nodes = Vec::new();
@@ -228,7 +240,9 @@ fn list_instance_files_from_root(
         let path = entry.path();
         let relative = path.strip_prefix(&instances_dir).unwrap_or(&path);
         let rel_str = relative.to_string_lossy().replace('\\', "/");
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        // Through links: a shared world is a link to a folder (D151), and it
+        // must open like the folder it is.
+        let is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
         // Children are NOT loaded here — frontend requests them on expand
         nodes.push(InstanceFileNode {
             name,
@@ -356,11 +370,14 @@ pub fn save_modlist_presentation_from_root(
 ) -> Result<()> {
     validate_path_component(&input.modlist_name)?;
     let presentation = ModlistPresentation {
+        // A display name equal to the folder name says nothing the folder does
+        // not, and it would go stale when an import renames the folder
+        // (`r2-ciclo-vita-nome-2`): it is not stored.
         display_name: input
             .display_name
             .clone()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+            .filter(|s| !s.is_empty() && *s != input.modlist_name),
         icon_label: normalize_icon_label(&input.icon_label, &input.modlist_name),
         icon_accent: input.icon_accent.trim().to_string(),
         notes: input.notes.trim().to_string(),
@@ -381,6 +398,29 @@ pub fn save_modlist_presentation_from_root(
             presentation_path.display()
         )
     })
+}
+
+/// Drop the display name of the mod list in `modlist_dir`, so the folder name
+/// shows (`r2-ciclo-vita-nome-2`). For an import that had to rename the folder
+/// to «Pack (1)»: the display name it carried is the one of the list it was
+/// exported from, and keeping it shows two identical «Pack» in the sidebar.
+/// No presentation file, or one without a display name, is left as it is.
+pub(crate) fn forget_display_name(modlist_dir: &Path) -> Result<()> {
+    let path = modlist_dir.join(MODLIST_PRESENTATION_FILENAME);
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut presentation: ModlistPresentation = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if presentation.display_name.take().is_none() {
+        return Ok(());
+    }
+    let json = serde_json::to_string_pretty(&presentation)
+        .context("failed to serialize modlist presentation")?;
+    write_atomically(&path, format!("{json}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub fn load_modlist_groups_from_root(
@@ -452,15 +492,47 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         !destination_path.as_os_str().is_empty(),
         "destination_path cannot be empty"
     );
+    let destination_name = destination_path
+        .file_name()
+        .with_context(|| format!("{} does not name a file", destination_path.display()))?;
     if let Some(parent) = destination_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let file = fs::File::create(&destination_path).with_context(|| {
+    // `concorrenza-7`: lo zip si scrive accanto alla destinazione e prende il
+    // suo nome solo dopo un `finish()` riuscito. Un export che fallisce a metà
+    // non lascia un archivio rotto dove l'utente l'aspetta, e un file che era
+    // già lì resta com'era. Accanto e non in `env::temp_dir()`, perché una
+    // rename fra due filesystem fallisce (`atomic_write.rs`).
+    let mut partial_name = destination_name.to_os_string();
+    partial_name.push(".part");
+    let partial_path = destination_path.with_file_name(partial_name);
+    let result =
+        write_export_archive(root_dir, &modlist_dir, input, &partial_path).and_then(|()| {
+            fs::rename(&partial_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to move the finished archive to {}",
+                    destination_path.display()
+                )
+            })
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&partial_path);
+    }
+    result
+}
+
+fn write_export_archive(
+    root_dir: &Path,
+    modlist_dir: &Path,
+    input: &ExportModlistInput,
+    partial_path: &Path,
+) -> Result<()> {
+    let file = fs::File::create(partial_path).with_context(|| {
         format!(
             "failed to create export archive at {}",
-            destination_path.display()
+            partial_path.display()
         )
     })?;
     let mut archive = zip::ZipWriter::new(file);
@@ -489,12 +561,24 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         &format!("{archive_root}/{MODLIST_GROUP_LAYOUT_FILENAME}"),
     )?;
 
+    // `modlist-4`: le liste dei content pack sono la definizione della mod
+    // list quanto rules.json, quindi viaggiano sempre. Senza, chi importa
+    // trova le schede Content vuote e nessun pack viene scaricato.
+    for content_type in CONTENT_TYPES {
+        let file_name = filename_for_type(content_type);
+        add_file_if_exists(
+            &mut archive,
+            &mut added_paths,
+            &modlist_dir.join(file_name),
+            &format!("{archive_root}/{file_name}"),
+        )?;
+    }
+
     // D107: i jar di `local-jars/` sono gli unici che chi importa non può
     // riscaricare (un mod pinnato è un mod locale, D14), quindi viaggiano
     // sempre, come presentation e group layout. La cache globale dei mod no:
     // è la metà riscaricabile, e l'import scarta comunque tutto `cache/`.
-    // Una cartella vuota o assente non aggiunge voci: `add_directory_contents`
-    // scrive solo file e salta una radice che non esiste.
+    // Una cartella vuota o assente non aggiunge voci.
     add_directory_contents(
         &mut archive,
         &mut added_paths,
@@ -502,195 +586,159 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         &format!("{archive_root}/{LOCAL_JARS_DIR}"),
     )?;
 
+    // 085 scheda 5: i file dei custom config viaggiano come stanno nella mod
+    // list, `config-files/<mod_id>/<id>/<nome>`, cioè dove l'import li rimette
+    // e il lancio li cerca. Nessuna scelta fra due file con lo stesso nome qui:
+    // la fa il lancio, la stessa da chi esporta e da chi importa
+    // (todo.md:1295). La vecchia `cache/configs` globale non c'è più: era
+    // sempre vuota, e l'import la scartava.
     if input.config_files {
         add_directory_contents(
             &mut archive,
             &mut added_paths,
-            launcher_paths.configs_cache_dir(),
-            &format!("{archive_root}/cache/configs"),
+            &modlist_dir.join(CUSTOM_CONFIG_FILES_DIRNAME),
+            &format!("{archive_root}/{CUSTOM_CONFIG_FILES_DIRNAME}"),
         )?;
-        // Collect config files referenced in rules.json custom_configs. Since
-        // D112 `files` holds names, resolved in the mod list's own
-        // `config-files/<mod_id>/<id>/`; a name that does not resolve there (a
-        // pre-D112 absolute path, an empty id) is never read as a path.
-        let rules_path = modlist_dir.join(RULES_FILENAME);
-        if rules_path.exists() {
-            if let Ok(modlist) = ModList::read_from_file(&rules_path) {
-                fn collect_config_files(
-                    modlist_dir: &Path,
-                    rule: &Rule,
-                    out: &mut Vec<(PathBuf, String)>,
-                ) {
-                    for cc in &rule.custom_configs {
-                        let Ok(files_dir) = crate::rules::custom_config_files_dir(
-                            modlist_dir,
-                            &rule.mod_id,
-                            &cc.id,
-                        ) else {
-                            continue;
-                        };
-                        for file_name in &cc.files {
-                            if validate_path_component(file_name).is_err() {
-                                continue;
-                            }
-                            // Use target_path + filename as archive path
-                            let archive_rel = if cc.target_path.is_empty() {
-                                format!("config/{file_name}")
-                            } else {
-                                let base = cc.target_path.trim_end_matches('/');
-                                format!("{base}/{file_name}")
-                            };
-                            out.push((files_dir.join(file_name), archive_rel));
-                        }
-                    }
-                    for alt in &rule.alternatives {
-                        collect_config_files(modlist_dir, alt, out);
-                    }
-                }
-                let mut config_entries: Vec<(PathBuf, String)> = Vec::new();
-                for rule in &modlist.rules {
-                    collect_config_files(&modlist_dir, rule, &mut config_entries);
-                }
-                for (source, rel_path) in &config_entries {
-                    add_file_if_exists(
-                        &mut archive,
-                        &mut added_paths,
-                        source,
-                        &format!("{archive_root}/{rel_path}"),
-                    )?;
-                }
-            }
-        }
     }
 
-    // Content packs from instance directories
-    for (flag, dir_name) in [
-        (input.resource_packs, "resourcepacks"),
-        (input.data_packs, "datapacks"),
-        (input.shaders, "shaderpacks"),
+    // `modlist-4`, D150: i pack locali escono dalle cartelle di categoria della
+    // mod list, mai dalle copie viste attraverso i link delle istanze. Una
+    // categoria spuntata con dei pack scelti uno per uno porta solo quelli;
+    // senza scelte, tutta la cartella.
+    let picked_packs = picked_content_packs(&input.selected_content_paths)?;
+    for (enabled, content_type) in [
+        (input.resource_packs, "resourcepack"),
+        (input.data_packs, "datapack"),
+        (input.shaders, "shader"),
     ] {
-        if !flag {
+        let Some(category_dir) = modlist_category_dir(content_type) else {
+            continue;
+        };
+        if !enabled {
             continue;
         }
-        for path in collect_files_recursive(&modlist_dir)? {
-            if !path_contains_component(&path, dir_name) {
-                continue;
-            }
-            let relative = path
-                .strip_prefix(&modlist_dir)
-                .with_context(|| format!("failed to make {} relative", path.display()))?;
-            add_file_to_zip(
+        let source_dir = modlist_dir.join(category_dir);
+        let names = match picked_packs.get(category_dir) {
+            Some(names) => names.clone(),
+            None => child_names(&source_dir)?,
+        };
+        for name in names {
+            let source = source_dir.join(&name);
+            anyhow::ensure!(
+                fs::symlink_metadata(&source).is_ok(),
+                "the pack '{name}' is not in the mod list's {category_dir} folder"
+            );
+            add_path_contents(
                 &mut archive,
                 &mut added_paths,
-                &path,
-                &format!("{archive_root}/{}", path_to_archive_string(relative)),
+                &source,
+                &format!("{archive_root}/{category_dir}/{name}"),
+                |_| true,
+            )?;
+            let icon = icon_relative_path(category_dir, &name);
+            add_file_if_exists(
+                &mut archive,
+                &mut added_paths,
+                &contained_join(modlist_dir, &icon)?,
+                &format!("{archive_root}/{icon}"),
             )?;
         }
     }
 
+    // D150: «Other files» porta solo i percorsi scelti nell'albero delle
+    // istanze; senza scelte, niente. Prima, senza scelte usciva tutta la
+    // cartella della mod list, filtrata guardando il percorso assoluto
+    // (`windows-7`: una mod list chiamata «Minecraft» non esportava niente).
     if input.other_files {
         let instances_dir = modlist_dir.join("instances");
-        if instances_dir.exists() {
-            if input.selected_other_paths.is_empty() {
-                // Legacy: export everything except well-known dirs
-                for path in collect_files_recursive(&modlist_dir)? {
-                    let relative = path
-                        .strip_prefix(&modlist_dir)
-                        .with_context(|| format!("failed to make {} relative", path.display()))?;
-                    let relative_string = path_to_archive_string(relative);
-                    if relative_string == RULES_FILENAME
-                        || relative_string == MODLIST_PRESENTATION_FILENAME
-                    {
-                        continue;
-                    }
-                    // D77: la cronologia comandi non esce da qui, e non c'è
-                    // un'opzione per rimetterla. Il gioco scrive in
-                    // `command_history.txt` ogni riga di chat che comincia per
-                    // `/`, testo esatto e senza redazione, quindi il
-                    // `/login <password>` con cui si entra nei server AuthMe
-                    // finisce lì in chiaro — e un archivio di modlist è una
-                    // cosa che si manda a qualcun altro. Togliere questo filtro
-                    // è una perdita di credenziali, non una semplificazione.
-                    if crate::shared_files::is_excluded_from_export(
+        for selected in &input.selected_other_paths {
+            let full_path = contained_join(&instances_dir, selected)?;
+            let relative = full_path
+                .strip_prefix(&instances_dir)
+                .map(path_to_archive_string)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                !relative.is_empty(),
+                "pick a file or a folder inside an instance, not '{selected}'"
+            );
+            // D77: la cronologia comandi non esce da qui, e non c'è
+            // un'opzione per rimetterla. Il gioco scrive in
+            // `command_history.txt` ogni riga di chat che comincia per `/`,
+            // testo esatto e senza redazione, quindi il `/login <password>`
+            // con cui si entra nei server AuthMe finisce lì in chiaro — e un
+            // archivio di modlist è una cosa che si manda a qualcun altro.
+            // Vale anche per il file nominato esplicitamente e per la cartella
+            // che lo contiene: è proprio il ramo che qualcuno userebbe per
+            // aggirarlo. Togliere questo filtro è una perdita di credenziali,
+            // non una semplificazione.
+            add_path_contents(
+                &mut archive,
+                &mut added_paths,
+                &full_path,
+                &format!("{archive_root}/instances/{relative}"),
+                |path| {
+                    !crate::shared_files::is_excluded_from_export(
                         &path.file_name().unwrap_or_default().to_string_lossy(),
-                    ) {
-                        continue;
-                    }
-                    if path_contains_any_component(
-                        &path,
-                        &[
-                            "mods",
-                            "config",
-                            "resourcepacks",
-                            "datapacks",
-                            "shaderpacks",
-                            "libraries",
-                            "assets",
-                            "natives",
-                            "minecraft",
-                        ],
-                    ) {
-                        continue;
-                    }
-                    add_file_to_zip(
-                        &mut archive,
-                        &mut added_paths,
-                        &path,
-                        &format!("{archive_root}/{relative_string}"),
-                    )?;
-                }
-            } else {
-                // User selected specific paths from the instance tree
-                for sel_path in &input.selected_other_paths {
-                    let full_path = contained_join(&instances_dir, sel_path)?;
-                    if full_path.is_file() {
-                        // Stesso filtro di D77 anche qui: nominare il file
-                        // esplicitamente non lo rende meno pericoloso, ed è
-                        // proprio questo il ramo che qualcuno userebbe per
-                        // aggirarlo.
-                        if crate::shared_files::is_excluded_from_export(
-                            &full_path.file_name().unwrap_or_default().to_string_lossy(),
-                        ) {
-                            continue;
-                        }
-                        add_file_if_exists(
-                            &mut archive,
-                            &mut added_paths,
-                            &full_path,
-                            &format!("{archive_root}/instances/{}", sel_path.replace('\\', "/")),
-                        )?;
-                    } else if full_path.is_dir() {
-                        for path in collect_files_recursive(&full_path)? {
-                            if crate::shared_files::is_excluded_from_export(
-                                &path.file_name().unwrap_or_default().to_string_lossy(),
-                            ) {
-                                continue;
-                            }
-                            let relative =
-                                path.strip_prefix(&instances_dir).with_context(|| {
-                                    format!("failed to make {} relative", path.display())
-                                })?;
-                            add_file_to_zip(
-                                &mut archive,
-                                &mut added_paths,
-                                &path,
-                                &format!(
-                                    "{archive_root}/instances/{}",
-                                    path_to_archive_string(relative)
-                                ),
-                            )?;
-                        }
-                    }
-                }
-            }
+                    )
+                },
+            )?;
         }
     }
 
-    archive
+    let file = archive
         .finish()
-        .with_context(|| format!("failed to finalize {}", destination_path.display()))?;
-
+        .with_context(|| format!("failed to finalize {}", partial_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", partial_path.display()))?;
     Ok(())
+}
+
+/// The content types whose list (`resourcepacks.json`, …) is part of a mod
+/// list's definition.
+const CONTENT_TYPES: [&str; 3] = ["resourcepack", "datapack", "shader"];
+
+/// D150: the packs picked one by one, grouped by category folder. Each path
+/// is `<category folder>/<pack>`, relative to the mod list; anything else is
+/// refused, so a picked path never reads outside the category folders.
+fn picked_content_packs(selected: &[String]) -> Result<HashMap<&'static str, Vec<String>>> {
+    let mut picked: HashMap<&'static str, Vec<String>> = HashMap::new();
+    for path in selected {
+        let unified = path.replace('\\', "/");
+        let category = CONTENT_TYPES
+            .iter()
+            .filter_map(|content_type| modlist_category_dir(content_type))
+            .find(|dir| unified.starts_with(&format!("{dir}/")));
+        let Some(category) = category else {
+            bail!("'{path}' is not a pack of the mod list");
+        };
+        let name = &unified[category.len() + 1..];
+        validate_path_component(name)
+            .with_context(|| format!("'{path}' is not a pack of the mod list"))?;
+        let names = picked.entry(category).or_default();
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(picked)
+}
+
+/// The names in a directory, sorted; a directory that is not there has none.
+fn child_names(dir: &Path) -> Result<Vec<String>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", dir.display()))
+        }
+    };
+    let mut names = Vec::new();
+    for entry in read_dir {
+        let entry =
+            entry.with_context(|| format!("failed to read an entry of {}", dir.display()))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn modlist_presentation_path(root_dir: &Path, modlist_name: &str) -> PathBuf {
@@ -765,30 +813,109 @@ fn normalize_archive_root(modlist_name: &str) -> String {
     }
 }
 
-fn collect_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
+/// Every regular file under `source` (or `source` itself, when it is a file),
+/// with its path relative to `source` written with `/`; empty for `source`
+/// itself.
+///
+/// Links are followed. D151: a shared world is a link to a folder in
+/// `saves/` (a symlink on Linux, a junction on Windows), and it goes into the
+/// archive as the world it is — before, it was read as a file and the export
+/// failed with "Is a directory" (todo.md:1574). A folder that is its own
+/// ancestor through a link is walked once, and a link that points at nothing
+/// is skipped with a line in the log: neither has anything to export.
+fn collect_files_following_links(source: &Path) -> Result<Vec<(PathBuf, String)>> {
+    fn walk(
+        path: &Path,
+        relative: String,
+        ancestors: &mut Vec<PathBuf>,
+        files: &mut Vec<(PathBuf, String)>,
+    ) -> Result<()> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(path).is_ok() =>
+            {
+                eprintln!(
+                    "[export] skipped {}: it is a link to something that is not there",
+                    path.display()
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()))
+            }
+        };
+
+        if metadata.is_file() {
+            files.push((path.to_path_buf(), relative));
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+
+        let canonical = fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        if ancestors.contains(&canonical) {
+            eprintln!(
+                "[export] skipped {}: it links back to a folder that contains it",
+                path.display()
+            );
+            return Ok(());
+        }
+        ancestors.push(canonical);
+        let mut entries = Vec::new();
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            entries.push(
+                entry.with_context(|| format!("failed to read an entry of {}", path.display()))?,
+            );
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_relative = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            walk(&entry.path(), child_relative, ancestors, files)?;
+        }
+        ancestors.pop();
+        Ok(())
     }
 
     let mut files = Vec::new();
-    collect_files_recursive_inner(root, &mut files)?;
+    walk(source, String::new(), &mut Vec::new(), &mut files)?;
     Ok(files)
 }
 
-fn collect_files_recursive_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
-        let entry = entry.with_context(|| format!("failed to inspect {}", root.display()))?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            collect_files_recursive_inner(&path, files)?;
-        } else if metadata.is_file() || metadata.file_type().is_symlink() {
-            files.push(path);
-        }
+/// Add `source` — a file, or a folder and everything in it — under
+/// `archive_path`, keeping only the files `keep` accepts. A `source` that is
+/// not there adds nothing.
+fn add_path_contents<W: Write + Seek>(
+    archive: &mut zip::ZipWriter<W>,
+    added_paths: &mut HashSet<String>,
+    source: &Path,
+    archive_path: &str,
+    keep: impl Fn(&Path) -> bool,
+) -> Result<()> {
+    if fs::symlink_metadata(source).is_err() {
+        return Ok(());
     }
-
+    for (path, relative) in collect_files_following_links(source)? {
+        if !keep(&path) {
+            continue;
+        }
+        let entry = if relative.is_empty() {
+            archive_path.to_string()
+        } else {
+            format!("{archive_path}/{relative}")
+        };
+        add_file_to_zip(archive, added_paths, &path, &entry)?;
+    }
     Ok(())
 }
 
@@ -798,23 +925,7 @@ fn add_directory_contents<W: Write + Seek>(
     source_root: &Path,
     archive_root: &str,
 ) -> Result<()> {
-    for path in collect_files_recursive(source_root)? {
-        let relative = path.strip_prefix(source_root).with_context(|| {
-            format!(
-                "failed to make {} relative to {}",
-                path.display(),
-                source_root.display()
-            )
-        })?;
-        add_file_to_zip(
-            archive,
-            added_paths,
-            &path,
-            &format!("{archive_root}/{}", path_to_archive_string(relative)),
-        )?;
-    }
-
-    Ok(())
+    add_path_contents(archive, added_paths, source_root, archive_root, |_| true)
 }
 
 fn add_file_if_exists<W: Write + Seek>(
@@ -842,10 +953,6 @@ fn add_file_to_zip<W: Write + Seek>(
 
     let mut source_file = fs::File::open(source_path)
         .with_context(|| format!("failed to open {}", source_path.display()))?;
-    let mut bytes = Vec::new();
-    source_file
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {}", source_path.display()))?;
 
     archive
         .start_file(
@@ -853,9 +960,13 @@ fn add_file_to_zip<W: Write + Seek>(
             FileOptions::default().compression_method(zip::CompressionMethod::Deflated),
         )
         .with_context(|| format!("failed to create archive entry {archive_path}"))?;
-    archive
-        .write_all(&bytes)
-        .with_context(|| format!("failed to write archive entry {archive_path}"))?;
+    // A file at a time, not read whole into memory: a world can be gigabytes.
+    io::copy(&mut source_file, archive).with_context(|| {
+        format!(
+            "failed to write archive entry {archive_path} from {}",
+            source_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -868,19 +979,6 @@ fn path_to_archive_string(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn path_contains_component(path: &Path, component_name: &str) -> bool {
-    path.components().any(|component| match component {
-        Component::Normal(value) => value.to_string_lossy().eq_ignore_ascii_case(component_name),
-        _ => false,
-    })
-}
-
-fn path_contains_any_component(path: &Path, component_names: &[&str]) -> bool {
-    component_names
-        .iter()
-        .any(|component_name| path_contains_component(path, component_name))
 }
 
 #[cfg(test)]
@@ -1053,6 +1151,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: true,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: vec!["../../etc/passwd".into()],
             },
         );
@@ -1073,6 +1172,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: true,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: vec!["profile/options.txt".into()],
             },
         )
@@ -1111,12 +1211,13 @@ mod tests {
         )
         .expect("the command history should exist");
 
-        // I tre punti in cui il filtro deve mordere: il ramo che rastrella
-        // tutto, quello che nomina il file, e quello che nomina la cartella
-        // che lo contiene. Il terzo è quello che si può togliere restando
-        // verdi, se non lo si prova.
+        // I punti in cui il filtro deve mordere: il ramo che nomina il file,
+        // e quello che nomina la cartella che lo contiene. Il secondo è quello
+        // che si può togliere restando verdi, se non lo si prova. Il ramo che
+        // rastrellava tutto senza una scelta non c'è più (D150), ma il caso
+        // resta: senza scelte non deve uscire niente.
         for (tag, selected) in [
-            ("all", Vec::new()),
+            ("none", Vec::new()),
             ("file", vec!["profile/command_history.txt".to_string()]),
             ("dir", vec!["profile".to_string()]),
         ] {
@@ -1132,6 +1233,7 @@ mod tests {
                     data_packs: false,
                     shaders: false,
                     other_files: true,
+                    selected_content_paths: Vec::new(),
                     selected_other_paths: selected.clone(),
                 },
             )
@@ -1150,8 +1252,15 @@ mod tests {
             );
             // Controprova: il filtro deve essere su un file, non un modo per
             // spegnere il ramo. Nel caso "file" l'utente ha nominato solo la
-            // cronologia, quindi lì non c'è niente da controllare.
-            if tag != "file" {
+            // cronologia, e nel caso "none" niente, quindi lì non c'è niente
+            // da controllare.
+            if tag == "none" {
+                assert!(
+                    !names.iter().any(|name| name.contains("/instances/")),
+                    "D150: «Other files» with nothing picked exports nothing; the archive held {names:?}"
+                );
+            }
+            if tag == "dir" {
                 assert!(
                     names
                         .iter()
@@ -1179,6 +1288,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: false,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: Vec::new(),
             },
         );
@@ -1280,72 +1390,118 @@ mod tests {
         fs::remove_dir_all(&outside).expect("temporary outside dir should be removable");
     }
 
+    fn export_input(modlist_name: &str, destination: &std::path::Path) -> ExportModlistInput {
+        ExportModlistInput {
+            modlist_name: modlist_name.into(),
+            destination_path: destination.display().to_string(),
+            rules_json: true,
+            config_files: false,
+            resource_packs: false,
+            data_packs: false,
+            shaders: false,
+            selected_content_paths: Vec::new(),
+            other_files: false,
+            selected_other_paths: Vec::new(),
+        }
+    }
+
+    fn write_file(path: &std::path::Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().expect("file should have a parent"))
+            .expect("parent should be created");
+        fs::write(path, bytes).expect("file should be written");
+    }
+
+    /// `modlist-4`: the three pack lists travel always, like rules.json, and
+    /// a checked category carries the mod list's own folder — never the
+    /// copies seen through an instance's links, and never the old global
+    /// `cache/configs` (085 scheda 3, punto 7).
     #[test]
     fn export_archive_includes_rules_presentation_and_selected_assets() {
         let root_dir = unique_test_root();
         let modlist_dir = root_dir.join("mod-lists").join("Sky Pack");
-        let cache_configs_dir = root_dir.join("cache").join("configs");
-        let resourcepacks_dir = modlist_dir
-            .join("instances")
-            .join("1.21.1-fabric")
-            .join("resourcepacks");
-        let notes_path = modlist_dir.join(MODLIST_PRESENTATION_FILENAME);
-        let groups_path = modlist_dir.join(MODLIST_GROUP_LAYOUT_FILENAME);
         let export_path = root_dir.join("sky-pack.zip");
 
-        fs::create_dir_all(cache_configs_dir.join("sodium"))
-            .expect("configs cache dir should exist");
-        fs::create_dir_all(&resourcepacks_dir).expect("resourcepacks dir should exist");
-
-        fs::write(modlist_dir.join(RULES_FILENAME), b"{}\n").expect("rules file should exist");
-        fs::write(&notes_path, b"{\n  \"iconLabel\": \"SP\",\n  \"iconAccent\": \"Sky\",\n  \"notes\": \"Bring elytra\"\n}\n")
-            .expect("presentation file should exist");
-        fs::write(&groups_path, b"{\n  \"aestheticGroups\": [{\"id\": \"ag-1\", \"name\": \"Visuals\", \"collapsed\": false}],\n  \"tags\": []\n}\n")
-            .expect("group layout file should exist");
-        fs::write(
-            cache_configs_dir.join("sodium").join("options.json"),
+        write_file(&modlist_dir.join(RULES_FILENAME), b"{}\n");
+        write_file(
+            &modlist_dir.join(MODLIST_PRESENTATION_FILENAME),
+            b"{\n  \"iconLabel\": \"SP\",\n  \"iconAccent\": \"Sky\",\n  \"notes\": \"Bring elytra\"\n}\n",
+        );
+        write_file(
+            &modlist_dir.join(MODLIST_GROUP_LAYOUT_FILENAME),
+            b"{\n  \"aestheticGroups\": [{\"id\": \"ag-1\", \"name\": \"Visuals\", \"collapsed\": false}],\n  \"tags\": []\n}\n",
+        );
+        for list in ["resourcepacks.json", "datapacks.json", "shaders.json"] {
+            write_file(&modlist_dir.join(list), list.as_bytes());
+        }
+        write_file(&modlist_dir.join("resourcepacks").join("sky.zip"), b"pack");
+        write_file(
+            &modlist_dir
+                .join("resourcepacks")
+                .join("Unpacked Pack")
+                .join("pack.mcmeta"),
+            b"{}",
+        );
+        write_file(
+            &modlist_dir
+                .join(".cubic")
+                .join("icons")
+                .join("resourcepacks")
+                .join("sky.zip.png"),
+            b"\x89PNG\r\n\x1a\nicon",
+        );
+        write_file(&modlist_dir.join("shaders").join("bsl.zip"), b"shader");
+        write_file(
+            &modlist_dir
+                .join("instances")
+                .join("1.21.1-fabric")
+                .join("resourcepacks")
+                .join("sky.zip"),
+            b"instance copy",
+        );
+        write_file(
+            &root_dir
+                .join("cache")
+                .join("configs")
+                .join("sodium")
+                .join("options.json"),
             b"config",
-        )
-        .expect("config should exist");
-        fs::write(resourcepacks_dir.join("sky.zip"), b"pack").expect("pack should exist");
+        );
 
-        export_modlist_from_root(
-            &root_dir,
-            &ExportModlistInput {
-                modlist_name: "Sky Pack".into(),
-                destination_path: export_path.display().to_string(),
-                rules_json: true,
-                config_files: true,
-                resource_packs: true,
-                other_files: false,
-                data_packs: false,
-                shaders: false,
-                selected_other_paths: Vec::new(),
-            },
-        )
-        .expect("export should succeed");
+        let mut input = export_input("Sky Pack", &export_path);
+        input.config_files = true;
+        input.resource_packs = true;
+        export_modlist_from_root(&root_dir, &input).expect("export should succeed");
+
+        let names = archive_names(&export_path);
+        for expected in [
+            "Sky Pack/rules.json",
+            "Sky Pack/modlist-presentation.json",
+            "Sky Pack/modlist-editor-groups.json",
+            "Sky Pack/resourcepacks.json",
+            "Sky Pack/datapacks.json",
+            "Sky Pack/shaders.json",
+            "Sky Pack/resourcepacks/sky.zip",
+            "Sky Pack/resourcepacks/Unpacked Pack/pack.mcmeta",
+            "Sky Pack/.cubic/icons/resourcepacks/sky.zip.png",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} must travel; the archive held {names:?}"
+            );
+        }
+        for absent in [
+            "Sky Pack/shaders/bsl.zip",
+            "Sky Pack/instances/1.21.1-fabric/resourcepacks/sky.zip",
+            "Sky Pack/cache/configs/sodium/options.json",
+        ] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} must not travel; the archive held {names:?}"
+            );
+        }
 
         let archive_file = fs::File::open(&export_path).expect("archive should open");
         let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
-        let mut names = (0..archive.len())
-            .map(|index| {
-                archive
-                    .by_index(index)
-                    .expect("entry should exist")
-                    .name()
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        names.sort();
-
-        assert!(names.contains(&"Sky Pack/rules.json".to_string()));
-        assert!(names.contains(&format!("Sky Pack/{MODLIST_PRESENTATION_FILENAME}")));
-        assert!(names.contains(&format!("Sky Pack/{MODLIST_GROUP_LAYOUT_FILENAME}")));
-        assert!(names.contains(&"Sky Pack/cache/configs/sodium/options.json".to_string()));
-        assert!(
-            names.contains(&"Sky Pack/instances/1.21.1-fabric/resourcepacks/sky.zip".to_string())
-        );
-
         let mut presentation = String::new();
         archive
             .by_name(&format!("Sky Pack/{MODLIST_PRESENTATION_FILENAME}"))
@@ -1353,14 +1509,207 @@ mod tests {
             .read_to_string(&mut presentation)
             .expect("presentation should read");
         assert!(presentation.contains("Bring elytra"));
-
-        let mut config = String::new();
+        let mut pack = Vec::new();
         archive
-            .by_name("Sky Pack/cache/configs/sodium/options.json")
-            .expect("config entry should exist")
-            .read_to_string(&mut config)
-            .expect("config should read");
-        assert_eq!(config, "config");
+            .by_name("Sky Pack/resourcepacks/sky.zip")
+            .expect("pack entry should exist")
+            .read_to_end(&mut pack)
+            .expect("pack should read");
+        assert_eq!(pack, b"pack", "the mod list's own copy, not the instance's");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D150: the packs picked one by one filter their category; a category
+    /// left unchecked exports nothing even with picks; a pick outside the
+    /// category folders is refused.
+    #[test]
+    fn picked_packs_filter_their_category() {
+        let root_dir = unique_test_root();
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        write_file(&modlist_dir.join(RULES_FILENAME), b"{}\n");
+        write_file(&modlist_dir.join("resourcepacks").join("a.zip"), b"a");
+        write_file(&modlist_dir.join("resourcepacks").join("b.zip"), b"b");
+        write_file(&modlist_dir.join("shaders").join("s.zip"), b"s");
+
+        let export_path = root_dir.join("pack.zip");
+        let mut input = export_input("Pack", &export_path);
+        input.resource_packs = true;
+        input.selected_content_paths = vec!["resourcepacks/b.zip".into(), "shaders/s.zip".into()];
+        export_modlist_from_root(&root_dir, &input).expect("export should succeed");
+
+        let names = archive_names(&export_path);
+        assert!(
+            names.contains(&"Pack/resourcepacks/b.zip".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"Pack/resourcepacks/a.zip".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"Pack/shaders/s.zip".to_string()),
+            "an unchecked category exports nothing, picks or not: {names:?}"
+        );
+
+        for outside in [
+            "rules.json",
+            "resourcepacks/../rules.json",
+            "instances/x/options.txt",
+        ] {
+            let mut input = export_input("Pack", &root_dir.join("bad.zip"));
+            input.resource_packs = true;
+            input.selected_content_paths = vec![outside.into()];
+            assert!(
+                export_modlist_from_root(&root_dir, &input).is_err(),
+                "{outside} is not a pack and must be refused"
+            );
+        }
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// `windows-7`: what is exported is decided on paths relative to the mod
+    /// list, so a mod list whose name is also a folder name the export
+    /// handles specially exports the same as any other.
+    #[test]
+    fn a_mod_list_named_like_a_managed_folder_exports_normally() {
+        for name in ["Minecraft", "resourcepacks", "config"] {
+            let root_dir = unique_test_root();
+            let modlist_dir = root_dir.join("mod-lists").join(name);
+            write_file(&modlist_dir.join(RULES_FILENAME), b"{}\n");
+            write_file(&modlist_dir.join("resourcepacks").join("a.zip"), b"a");
+            write_file(
+                &modlist_dir
+                    .join("instances")
+                    .join("1.21.1-fabric")
+                    .join("options.txt"),
+                b"fov:70",
+            );
+
+            let export_path = root_dir.join("export.zip");
+            let mut input = export_input(name, &export_path);
+            input.other_files = true;
+            input.selected_other_paths = vec!["1.21.1-fabric/options.txt".into()];
+            export_modlist_from_root(&root_dir, &input).expect("export should succeed");
+
+            let names = archive_names(&export_path);
+            assert!(
+                names.contains(&format!("{name}/instances/1.21.1-fabric/options.txt")),
+                "{name}: {names:?}"
+            );
+            assert!(
+                !names.contains(&format!("{name}/resourcepacks/a.zip")),
+                "{name}: the category was not checked: {names:?}"
+            );
+            fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        }
+    }
+
+    /// D151, `concorrenza-7`, todo.md:1574: a shared world is a link to a
+    /// folder in `saves/`, and the export follows it — before, it failed with
+    /// "Is a directory". A link back to an ancestor and a link to nothing do
+    /// not stop the export.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_world_link_is_followed_into_the_archive() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = unique_test_root();
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        write_file(&modlist_dir.join(RULES_FILENAME), b"{}\n");
+        let world = root_dir.join("worlds").join("New World");
+        write_file(&world.join("level.dat"), b"level");
+        write_file(&world.join("region").join("r.0.0.mca"), b"region");
+        let saves = modlist_dir
+            .join("instances")
+            .join("1.21.1-fabric")
+            .join("saves");
+        fs::create_dir_all(&saves).unwrap();
+        symlink(&world, saves.join("New World shared")).unwrap();
+        symlink(&saves, saves.join("loop")).unwrap();
+        symlink(root_dir.join("nowhere"), saves.join("dangling")).unwrap();
+
+        let export_path = root_dir.join("pack.zip");
+        let mut input = export_input("Pack", &export_path);
+        input.other_files = true;
+        input.selected_other_paths = vec!["1.21.1-fabric/saves".into()];
+        export_modlist_from_root(&root_dir, &input).expect("export should succeed");
+
+        let names = archive_names(&export_path);
+        for expected in [
+            "Pack/instances/1.21.1-fabric/saves/New World shared/level.dat",
+            "Pack/instances/1.21.1-fabric/saves/New World shared/region/r.0.0.mca",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected}: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name.contains("/loop/")),
+            "a link back to an ancestor is walked once: {names:?}"
+        );
+
+        let nodes = list_instance_files_from_root(&root_dir, "Pack", Some("1.21.1-fabric/saves"))
+            .expect("the saves folder should list");
+        let shared = nodes
+            .iter()
+            .find(|node| node.name == "New World shared")
+            .expect("the shared world should be listed");
+        assert!(shared.is_dir, "a shared world opens like a folder");
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// `concorrenza-7`: the archive is written beside the destination and
+    /// renamed at the end, so a failed export leaves no broken zip and does
+    /// not touch a file already there.
+    #[test]
+    fn a_failed_export_leaves_the_destination_as_it_was() {
+        let root_dir = unique_test_root();
+        let modlist_dir = root_dir.join("mod-lists").join("Pack");
+        write_file(&modlist_dir.join(RULES_FILENAME), b"{}\n");
+        let export_path = root_dir.join("out").join("pack.zip");
+        write_file(&export_path, b"the previous export");
+
+        let mut input = export_input("Pack", &export_path);
+        input.resource_packs = true;
+        input.selected_content_paths = vec!["resourcepacks/missing.zip".into()];
+        let error = export_modlist_from_root(&root_dir, &input)
+            .expect_err("a picked pack that is not there must fail the export");
+        assert!(format!("{error:#}").contains("missing.zip"), "{error:#}");
+
+        assert_eq!(fs::read(&export_path).unwrap(), b"the previous export");
+        let leftovers: Vec<_> = fs::read_dir(root_dir.join("out"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("pack.zip")]);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Listing the instance tree says why it failed instead of answering
+    /// with an empty list the modal would show as "launch the game first".
+    #[test]
+    fn listing_a_folder_that_is_not_there_is_an_error() {
+        let root_dir = unique_test_root();
+        let instance = root_dir
+            .join("mod-lists")
+            .join("Pack")
+            .join("instances")
+            .join("1.21.1-fabric");
+        fs::create_dir_all(&instance).unwrap();
+
+        assert!(
+            list_instance_files_from_root(&root_dir, "Pack", Some("1.21.1-fabric/saves")).is_err()
+        );
+        assert!(
+            list_instance_files_from_root(&root_dir, "Never Launched", None)
+                .expect("a mod list without instances has an empty tree")
+                .is_empty()
+        );
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
@@ -1422,6 +1771,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: false,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: Vec::new(),
             },
         )
@@ -1443,9 +1793,10 @@ mod tests {
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 
-    /// Onda 4, tappa C: dopo D112 `files` contiene nomi, e i byte stanno in
-    /// `config-files/<mod_id>/<id>/`. L'export li cerca lì e li mette nello
-    /// zip allo stesso percorso di prima: `<target_path o config>/<nome>`.
+    /// 085 scheda 5: dopo D112 `files` contiene nomi, e i byte stanno in
+    /// `config-files/<mod_id>/<id>/`. L'export porta quella cartella così
+    /// com'è, che è dove l'import la rimette e il lancio la cerca: due config
+    /// con lo stesso nome non si scavalcano nello zip (todo.md:1295).
     #[test]
     fn export_archive_carries_the_custom_config_files_from_the_modlist() {
         use crate::rules::{CustomConfig, ModList, ModSource, Rule};
@@ -1499,6 +1850,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: false,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: Vec::new(),
             },
         )
@@ -1508,8 +1860,11 @@ mod tests {
         let archive_file = fs::File::open(&export_path).expect("archive should open");
         let mut archive = zip::ZipArchive::new(archive_file).expect("archive should parse");
         for (entry, bytes) in [
-            ("Pack/config/sodium-options.json", &b"{\"fancy\":true}"[..]),
-            ("Pack/shaderpacks/shader.txt", &b"shader"[..]),
+            (
+                "Pack/config-files/sodium/cc-1/sodium-options.json",
+                &b"{\"fancy\":true}"[..],
+            ),
+            ("Pack/config-files/sodium/cc-2/shader.txt", &b"shader"[..]),
         ] {
             let mut exported = Vec::new();
             archive
@@ -1550,6 +1905,7 @@ mod tests {
                 data_packs: false,
                 shaders: false,
                 other_files: false,
+                selected_content_paths: Vec::new(),
                 selected_other_paths: Vec::new(),
             },
         )
@@ -1591,6 +1947,7 @@ mod tests {
                     data_packs: false,
                     shaders: false,
                     other_files: false,
+                    selected_content_paths: Vec::new(),
                     selected_other_paths: Vec::new(),
                 },
             )

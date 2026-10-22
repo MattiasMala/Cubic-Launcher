@@ -1,166 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::path_safety::{contained_join, validate_path_component};
-use crate::rules::{custom_config_files_dir, CustomConfig, Rule};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedConfigPlacement {
-    pub cache_subdir: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedInstanceConfigs {
-    pub materialized_files: Vec<PathBuf>,
-}
-
-pub fn prepare_instance_config_directory(
-    configs_cache_dir: &Path,
-    instance_config_dir: &Path,
-    placements: &[CachedConfigPlacement],
-) -> Result<PreparedInstanceConfigs> {
-    fs::create_dir_all(instance_config_dir).with_context(|| {
-        format!(
-            "failed to create instance config directory at {}",
-            instance_config_dir.display()
-        )
-    })?;
-
-    let mut materialized_files = Vec::new();
-
-    for placement in placements {
-        let source_dir = configs_cache_dir.join(&placement.cache_subdir);
-
-        if !source_dir.exists() {
-            bail!(
-                "required config cache directory '{}' is missing from {}",
-                placement.cache_subdir,
-                configs_cache_dir.display()
-            );
-        }
-
-        if !source_dir.is_dir() {
-            bail!(
-                "config cache entry '{}' is not a directory in {}",
-                placement.cache_subdir,
-                configs_cache_dir.display()
-            );
-        }
-
-        collect_and_materialize_config_files(
-            &source_dir,
-            &source_dir,
-            instance_config_dir,
-            &mut materialized_files,
-        )?;
-    }
-
-    Ok(PreparedInstanceConfigs { materialized_files })
-}
-
-fn collect_and_materialize_config_files(
-    source_root: &Path,
-    current_dir: &Path,
-    instance_config_dir: &Path,
-    materialized_files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    for entry in fs::read_dir(current_dir).with_context(|| {
-        format!(
-            "failed to read config cache directory {}",
-            current_dir.display()
-        )
-    })? {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to inspect config cache entry in {}",
-                current_dir.display()
-            )
-        })?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            collect_and_materialize_config_files(
-                source_root,
-                &path,
-                instance_config_dir,
-                materialized_files,
-            )?;
-            continue;
-        }
-
-        let relative_path = path.strip_prefix(source_root).with_context(|| {
-            format!(
-                "failed to determine relative config path for {} from {}",
-                path.display(),
-                source_root.display()
-            )
-        })?;
-        let target_path = instance_config_dir.join(relative_path);
-
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create config target directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        link_or_copy_file(&path, &target_path)?;
-        materialized_files.push(target_path);
-    }
-
-    Ok(())
-}
-
-fn link_or_copy_file(source_path: &Path, target_path: &Path) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(target_path) {
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(target_path).with_context(|| {
-                format!(
-                    "failed to remove directory target {}",
-                    target_path.display()
-                )
-            })?;
-        } else {
-            fs::remove_file(target_path).with_context(|| {
-                format!("failed to remove file target {}", target_path.display())
-            })?;
-        }
-    }
-
-    if create_symlink_file(source_path, target_path).is_ok() {
-        return Ok(());
-    }
-
-    if fs::hard_link(source_path, target_path).is_ok() {
-        return Ok(());
-    }
-
-    fs::copy(source_path, target_path)
-        .map(|_| ())
-        .with_context(|| {
-            format!(
-                "failed to materialize config file from {} to {}",
-                source_path.display(),
-                target_path.display()
-            )
-        })
-}
-
-#[cfg(target_family = "unix")]
-fn create_symlink_file(source_path: &Path, target_path: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(source_path, target_path).map_err(Into::into)
-}
-
-#[cfg(target_family = "windows")]
-fn create_symlink_file(source_path: &Path, target_path: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_file(source_path, target_path).map_err(Into::into)
-}
+use crate::path_safety::{contained_join, normalize_relative_dir, validate_path_component};
+use crate::rules::{custom_config_files_dir, CustomConfig, Rule, CUSTOM_CONFIG_FILES_DIRNAME};
 
 /// One name in a custom config's `files` that has no file in the mod list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,32 +15,63 @@ pub struct MissingCustomConfigFile {
     pub file_name: String,
 }
 
+/// A custom config whose «Path» cannot be used: absolute, with `..`, or
+/// otherwise not a folder inside the instance. Nothing of it is placed; the
+/// rest of the launch goes on (`modlist-10`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedCustomConfig {
+    pub mod_id: String,
+    pub config_id: String,
+    pub target_path: String,
+    pub reason: String,
+}
+
+/// Two custom configs that put a file with the same name in the same folder of
+/// the instance. The later one in the tree order wins — the same order every
+/// launch and every machine that imported the mod list uses — and the earlier
+/// one is named here so the log says so (todo.md:1295, :1309).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomConfigCollision {
+    pub target: PathBuf,
+    pub overridden_mod_id: String,
+    pub overridden_config_id: String,
+    pub winner_mod_id: String,
+    pub winner_config_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MaterializedCustomConfigs {
     pub materialized_files: Vec<PathBuf>,
     pub missing_files: Vec<MissingCustomConfigFile>,
+    pub skipped_configs: Vec<SkippedCustomConfig>,
+    pub collisions: Vec<CustomConfigCollision>,
 }
 
 /// Put the custom configs of a mod list that apply to this Minecraft version
 /// and loader into the instance, at every launch (D105).
 ///
 /// Rooted on the instance, not on `config/`: `target_path` is a directory
-/// relative to the instance root and empty means `config` (D129), and one that
-/// leaves the instance — absolute, or `..` past the root — refuses the whole
-/// call before anything is written. Applies-to follows the repo's convention
+/// relative to the instance root and empty means `config` (D129). Backslashes
+/// in it are separators ([`normalize_relative_dir`]); one that leaves the
+/// instance — absolute, or with `..` — is not placed and goes into
+/// `skipped_configs`, and the other configs still are: a bad «Path», even on a
+/// mod the launch does not use, never stops the launch (`modlist-10`).
+/// Applies-to follows the repo's convention
 /// (`launch_preview_content::is_content_entry_active`): no versions means any
 /// version, `any` or a case-insensitive match for the loader.
 ///
 /// Each file is the launcher's copy in
 /// [`custom_config_files_dir`]; the instance file is removed and the copy
 /// written with `fs::copy`, so an edit made in game is lost at the next launch
-/// (D118). Never a symlink or a hard link, as [`link_or_copy_file`] would try:
-/// with those the instance file *is* the launcher's file, a game edit would
-/// rewrite it, and the next launch would "restore" the game's edit.
+/// (D118). Never a symlink or a hard link: with those the instance file *is*
+/// the launcher's file, a game edit would rewrite it, and the next launch
+/// would "restore" the game's edit.
 ///
 /// A name that does not resolve to a file there — gone, or a pre-D112
 /// absolute path, which is never read as a path — goes into
-/// `missing_files` and the rest is still placed: the caller logs it.
+/// `missing_files` and the rest is still placed: the caller logs it. Two
+/// configs that write the same file: the later one in the tree wins, and the
+/// pair goes into `collisions`.
 pub fn materialize_custom_configs(
     modlist_dir: &Path,
     instance_root: &Path,
@@ -225,23 +101,30 @@ pub fn materialize_custom_configs(
     let mut active = Vec::new();
     collect(rules, mc_version, loader, &mut active);
 
+    let mut result = MaterializedCustomConfigs::default();
     let mut placements = Vec::with_capacity(active.len());
     for (mod_id, config) in active {
-        let relative = if config.target_path.trim().is_empty() {
-            "config"
-        } else {
-            config.target_path.as_str()
-        };
-        let target_dir = contained_join(instance_root, relative).with_context(|| {
-            format!(
-                "custom config '{}' of '{mod_id}' has target path '{}', which is outside the instance",
-                config.id, config.target_path
-            )
-        })?;
-        placements.push((mod_id, config, target_dir));
+        let target_dir = normalize_relative_dir(&config.target_path).and_then(|relative| {
+            let relative = if relative.is_empty() {
+                "config".to_string()
+            } else {
+                relative
+            };
+            contained_join(instance_root, &relative)
+        });
+        match target_dir {
+            Ok(target_dir) => placements.push((mod_id, config, target_dir)),
+            Err(error) => result.skipped_configs.push(SkippedCustomConfig {
+                mod_id: mod_id.to_string(),
+                config_id: config.id.clone(),
+                target_path: config.target_path.clone(),
+                reason: format!("{error:#}"),
+            }),
+        }
     }
 
-    let mut result = MaterializedCustomConfigs::default();
+    // Who wrote each target last, to name the one it overrides.
+    let mut written_by: HashMap<PathBuf, (String, String)> = HashMap::new();
     for (mod_id, config, target_dir) in placements {
         let source_dir = custom_config_files_dir(modlist_dir, mod_id, &config.id).ok();
         for name in &config.files {
@@ -262,15 +145,128 @@ pub fn materialize_custom_configs(
                 .with_context(|| format!("failed to create {}", target_dir.display()))?;
             let target = target_dir.join(name);
             copy_replacing(&source, &target)?;
+            if let Some((overridden_mod_id, overridden_config_id)) =
+                written_by.insert(target.clone(), (mod_id.to_string(), config.id.clone()))
+            {
+                result.collisions.push(CustomConfigCollision {
+                    target: target.clone(),
+                    overridden_mod_id,
+                    overridden_config_id,
+                    winner_mod_id: mod_id.to_string(),
+                    winner_config_id: config.id.clone(),
+                });
+                result.materialized_files.retain(|placed| placed != &target);
+            }
             result.materialized_files.push(target);
         }
     }
     Ok(result)
 }
 
-/// Remove whatever file is at `target` and write a fresh copy of `source`.
-/// Removing first matters: `fs::copy` onto a symlink or a hard link would write
-/// through it, into the file it shares bytes with.
+/// Remove from the mod list's `config-files/` what no custom config lists any
+/// more (todo.md:1291): a file taken off a config's list, the folder of a
+/// config that was deleted. Returns what was removed, for the log.
+///
+/// A config folder is kept as long as a custom config with that id exists
+/// anywhere in the tree, even under another mod: ids are unique, and a folder
+/// that a config of another mod still names is a move to finish, not
+/// garbage. Inside a folder whose config is under the same mod, only the
+/// names the config does not list are removed. Folders that are not a custom
+/// config's (`config-files/<mod_id>/` with nothing left) go when empty.
+pub fn prune_orphan_custom_config_files(
+    modlist_dir: &Path,
+    rules: &[Rule],
+) -> Result<Vec<PathBuf>> {
+    fn index<'a>(rules: &'a [Rule], out: &mut HashMap<&'a str, Vec<(&'a str, &'a CustomConfig)>>) {
+        for rule in rules {
+            for config in &rule.custom_configs {
+                if !config.id.is_empty() {
+                    out.entry(config.id.as_str())
+                        .or_default()
+                        .push((rule.mod_id.as_str(), config));
+                }
+            }
+            index(&rule.alternatives, out);
+        }
+    }
+    let mut configs_by_id = HashMap::new();
+    index(rules, &mut configs_by_id);
+
+    let root = modlist_dir.join(CUSTOM_CONFIG_FILES_DIRNAME);
+    let mut removed = Vec::new();
+    for mod_dir in child_entries(&root)? {
+        if !fs::symlink_metadata(&mod_dir)
+            .with_context(|| format!("failed to inspect {}", mod_dir.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let mod_id = mod_dir.file_name().unwrap_or_default().to_string_lossy();
+        for config_dir in child_entries(&mod_dir)? {
+            let config_id = config_dir.file_name().unwrap_or_default().to_string_lossy();
+            let Some(configs) = configs_by_id.get(config_id.as_ref()) else {
+                remove_any(&config_dir)?;
+                removed.push(config_dir);
+                continue;
+            };
+            let Some((_, config)) = configs.iter().find(|(owner, _)| *owner == mod_id) else {
+                continue;
+            };
+            if !fs::symlink_metadata(&config_dir)
+                .with_context(|| format!("failed to inspect {}", config_dir.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+            for file in child_entries(&config_dir)? {
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                if !config.files.iter().any(|listed| *listed == name) {
+                    remove_any(&file)?;
+                    removed.push(file);
+                }
+            }
+        }
+        if child_entries(&mod_dir)?.is_empty() {
+            fs::remove_dir(&mod_dir)
+                .with_context(|| format!("failed to remove {}", mod_dir.display()))?;
+        }
+    }
+    Ok(removed)
+}
+
+/// The entries of `dir`; a directory that is not there has none.
+fn child_entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", dir.display()))
+        }
+    };
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        entries.push(
+            entry
+                .with_context(|| format!("failed to read an entry of {}", dir.display()))?
+                .path(),
+        );
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Remove a file, a link (never what it points to) or a whole directory.
+fn remove_any(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("failed to remove {}", path.display()))
+}
+
 fn copy_replacing(source: &Path, target: &Path) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(target) {
         if metadata.is_dir() {
@@ -290,136 +286,6 @@ fn copy_replacing(source: &Path, target: &Path) -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::env;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::{prepare_instance_config_directory, CachedConfigPlacement};
-
-    fn unique_test_root() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-
-        env::temp_dir().join(format!("cubic-launcher-instance-configs-test-{timestamp}"))
-    }
-
-    #[test]
-    fn prepares_nested_config_files_without_removing_unrelated_entries() {
-        let root_dir = unique_test_root();
-        let configs_cache_dir = root_dir.join("cache").join("configs");
-        let cache_subdir = configs_cache_dir.join("hash_sodium_fabric_084");
-        let instance_config_dir = root_dir.join("instance").join("config");
-
-        fs::create_dir_all(cache_subdir.join("cloth-config"))
-            .expect("cache subdirectories should be created");
-        fs::create_dir_all(&instance_config_dir).expect("instance config dir should be created");
-
-        fs::write(cache_subdir.join("sodium-options.json"), b"new sodium")
-            .expect("sodium config should be written");
-        fs::write(
-            cache_subdir.join("cloth-config").join("client.toml"),
-            b"cloth settings",
-        )
-        .expect("cloth config should be written");
-        fs::write(instance_config_dir.join("generated.cfg"), b"keep me")
-            .expect("unrelated config should be written");
-
-        let prepared = prepare_instance_config_directory(
-            &configs_cache_dir,
-            &instance_config_dir,
-            &[CachedConfigPlacement {
-                cache_subdir: "hash_sodium_fabric_084".into(),
-            }],
-        )
-        .expect("config preparation should succeed");
-
-        assert_eq!(prepared.materialized_files.len(), 2);
-        assert_eq!(
-            fs::read(instance_config_dir.join("sodium-options.json"))
-                .expect("sodium config should read"),
-            b"new sodium"
-        );
-        assert_eq!(
-            fs::read(instance_config_dir.join("cloth-config").join("client.toml"))
-                .expect("nested config should read"),
-            b"cloth settings"
-        );
-        assert_eq!(
-            fs::read(instance_config_dir.join("generated.cfg"))
-                .expect("unrelated config should remain"),
-            b"keep me"
-        );
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
-    }
-
-    #[test]
-    fn later_config_placements_override_earlier_files() {
-        let root_dir = unique_test_root();
-        let configs_cache_dir = root_dir.join("cache").join("configs");
-        let first_cache_subdir = configs_cache_dir.join("hash_first");
-        let second_cache_subdir = configs_cache_dir.join("hash_second");
-        let instance_config_dir = root_dir.join("instance").join("config");
-
-        fs::create_dir_all(&first_cache_subdir).expect("first cache dir should be created");
-        fs::create_dir_all(&second_cache_subdir).expect("second cache dir should be created");
-        fs::write(first_cache_subdir.join("shared.toml"), b"first")
-            .expect("first config should be written");
-        fs::write(second_cache_subdir.join("shared.toml"), b"second")
-            .expect("second config should be written");
-
-        prepare_instance_config_directory(
-            &configs_cache_dir,
-            &instance_config_dir,
-            &[
-                CachedConfigPlacement {
-                    cache_subdir: "hash_first".into(),
-                },
-                CachedConfigPlacement {
-                    cache_subdir: "hash_second".into(),
-                },
-            ],
-        )
-        .expect("config preparation should succeed");
-
-        assert_eq!(
-            fs::read(instance_config_dir.join("shared.toml")).expect("shared config should read"),
-            b"second"
-        );
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
-    }
-
-    #[test]
-    fn errors_when_required_config_cache_directory_is_missing() {
-        let root_dir = unique_test_root();
-        let configs_cache_dir = root_dir.join("cache").join("configs");
-        let instance_config_dir = root_dir.join("instance").join("config");
-
-        fs::create_dir_all(&configs_cache_dir).expect("configs cache dir should be created");
-
-        let error = prepare_instance_config_directory(
-            &configs_cache_dir,
-            &instance_config_dir,
-            &[CachedConfigPlacement {
-                cache_subdir: "missing_config_set".into(),
-            }],
-        )
-        .expect_err("config preparation should fail");
-
-        assert!(error
-            .to_string()
-            .contains("required config cache directory 'missing_config_set' is missing"));
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
-    }
 }
 
 #[cfg(test)]
@@ -552,30 +418,174 @@ mod custom_config_tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// `modlist-10`: a «Path» that leaves the instance is not placed, and it
+    /// does not take the other configs — or the launch — down with it.
     #[test]
-    fn a_target_path_outside_the_instance_is_refused() {
+    fn a_target_path_outside_the_instance_is_skipped_and_the_rest_is_placed() {
         for escaping in ["../outside", "/tmp/cubic-custom-config-absolute-target"] {
             let root = unique_test_root();
             let modlist_dir = root.join("Pack");
             let instance = root.join("instance");
             store(&modlist_dir, "cc-1", "evil.txt", b"evil");
-            let rules = [rule_with(vec![config(
-                "cc-1",
-                &[],
-                "any",
-                escaping,
-                &["evil.txt"],
-            )])];
+            store(&modlist_dir, "cc-2", "good.json", b"good");
+            let rules = [rule_with(vec![
+                config("cc-1", &[], "any", escaping, &["evil.txt"]),
+                config("cc-2", &[], "any", "", &["good.json"]),
+            ])];
 
-            let error =
+            let placed =
                 materialize_custom_configs(&modlist_dir, &instance, &rules, "1.21.1", "fabric")
-                    .expect_err("an escaping target path must be refused");
+                    .expect("a bad path must not fail the launch");
 
-            assert!(format!("{error:#}").contains(escaping), "{error:#}");
+            assert_eq!(placed.skipped_configs.len(), 1, "{placed:?}");
+            let skipped = &placed.skipped_configs[0];
+            assert_eq!(
+                (
+                    skipped.mod_id.as_str(),
+                    skipped.config_id.as_str(),
+                    skipped.target_path.as_str()
+                ),
+                ("sodium", "cc-1", escaping)
+            );
+            assert!(skipped.reason.contains(escaping), "{}", skipped.reason);
             assert!(!root.join("outside").join("evil.txt").exists());
             assert!(!Path::new(escaping).join("evil.txt").exists());
+            assert_eq!(
+                fs::read(instance.join("config").join("good.json")).unwrap(),
+                b"good"
+            );
             fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    /// `r2-percorsi-non-ascii-e-limiti-windows-4`: a «Path» typed with
+    /// backslashes is a nested folder on every platform, not one folder with a
+    /// backslash in its name.
+    #[test]
+    fn a_target_path_with_backslashes_is_a_nested_folder() {
+        let root = unique_test_root();
+        let modlist_dir = root.join("Pack");
+        let instance = root.join("instance");
+        store(&modlist_dir, "cc-1", "create.toml", b"create");
+        let rules = [rule_with(vec![config(
+            "cc-1",
+            &[],
+            "any",
+            "config\\create",
+            &["create.toml"],
+        )])];
+
+        materialize_custom_configs(&modlist_dir, &instance, &rules, "1.21.1", "fabric")
+            .expect("materialization should succeed");
+
+        assert_eq!(
+            fs::read(instance.join("config").join("create").join("create.toml")).unwrap(),
+            b"create"
+        );
+        assert!(!instance.join("config\\create").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// todo.md:1309: two configs that write the same file. The later one in
+    /// the tree wins — an alternative after its primary — and the pair is
+    /// reported, so the launch can log it instead of choosing in silence.
+    #[test]
+    fn two_configs_writing_the_same_file_are_reported_and_the_later_wins() {
+        let root = unique_test_root();
+        let modlist_dir = root.join("Pack");
+        let instance = root.join("instance");
+        store(&modlist_dir, "cc-primary", "shared.json", b"primary");
+        let alt_dir = modlist_dir
+            .join("config-files")
+            .join("embeddium")
+            .join("cc-alt");
+        fs::create_dir_all(&alt_dir).unwrap();
+        fs::write(alt_dir.join("shared.json"), b"alternative").unwrap();
+        let mut primary = rule_with(vec![config(
+            "cc-primary",
+            &[],
+            "any",
+            "config",
+            &["shared.json"],
+        )]);
+        let mut alternative = rule_with(vec![config("cc-alt", &[], "any", "", &["shared.json"])]);
+        alternative.mod_id = "embeddium".into();
+        primary.alternatives = vec![alternative];
+
+        let placed =
+            materialize_custom_configs(&modlist_dir, &instance, &[primary], "1.21.1", "fabric")
+                .expect("materialization should succeed");
+
+        let target = instance.join("config").join("shared.json");
+        assert_eq!(fs::read(&target).unwrap(), b"alternative");
+        assert_eq!(placed.materialized_files, vec![target.clone()]);
+        assert_eq!(placed.collisions.len(), 1, "{placed:?}");
+        let collision = &placed.collisions[0];
+        assert_eq!(collision.target, target);
+        assert_eq!(
+            (
+                collision.overridden_mod_id.as_str(),
+                collision.overridden_config_id.as_str(),
+                collision.winner_mod_id.as_str(),
+                collision.winner_config_id.as_str()
+            ),
+            ("sodium", "cc-primary", "embeddium", "cc-alt")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// todo.md:1291: what no custom config lists any more leaves
+    /// `config-files/`; what one lists stays, and so does a folder whose id a
+    /// config of another mod still names.
+    #[test]
+    fn pruning_removes_only_what_no_custom_config_lists() {
+        use super::prune_orphan_custom_config_files;
+
+        let root = unique_test_root();
+        let modlist_dir = root.join("Pack");
+        let kept = store(&modlist_dir, "cc-1", "kept.json", b"kept");
+        let dropped = store(&modlist_dir, "cc-1", "dropped.json", b"dropped");
+        let deleted_config = store(&modlist_dir, "cc-gone", "x.json", b"x");
+        let moved_dir = modlist_dir
+            .join("config-files")
+            .join("old-mod")
+            .join("cc-moved");
+        fs::create_dir_all(&moved_dir).unwrap();
+        fs::write(moved_dir.join("moved.json"), b"moved").unwrap();
+        let removed_mod_dir = modlist_dir.join("config-files").join("removed-mod");
+        fs::create_dir_all(removed_mod_dir.join("cc-old")).unwrap();
+        fs::write(removed_mod_dir.join("cc-old").join("a.json"), b"a").unwrap();
+        let mut other = rule_with(vec![config("cc-moved", &[], "any", "", &["moved.json"])]);
+        other.mod_id = "new-mod".into();
+        let rules = [
+            rule_with(vec![config("cc-1", &[], "any", "", &["kept.json"])]),
+            other,
+        ];
+
+        let removed =
+            prune_orphan_custom_config_files(&modlist_dir, &rules).expect("pruning should succeed");
+
+        assert!(kept.is_file());
+        assert!(!dropped.exists());
+        assert!(!deleted_config.exists());
+        assert!(moved_dir.join("moved.json").is_file());
+        assert!(!removed_mod_dir.exists());
+        assert!(removed.contains(&dropped), "{removed:?}");
+        assert!(
+            removed.contains(&deleted_config.parent().unwrap().to_path_buf()),
+            "{removed:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pruning_a_mod_list_without_config_files_does_nothing() {
+        use super::prune_orphan_custom_config_files;
+
+        let root = unique_test_root();
+        let removed = prune_orphan_custom_config_files(&root.join("Pack"), &[])
+            .expect("a missing config-files/ is not an error");
+        assert!(removed.is_empty());
     }
 
     /// D118: the launcher's file is the truth, at every launch. And the vincolo

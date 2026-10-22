@@ -15,6 +15,7 @@ export type ContentImportErrorCode =
   | "invalidContentType"
   | "invalidSourcePath"
   | "unsupportedSourceType"
+  | "notAPack"
   | "nameCollision"
   | "readFailed"
   | "writeFailed";
@@ -40,6 +41,7 @@ const CODES: Record<ContentImportErrorCode, true> = {
   invalidContentType: true,
   invalidSourcePath: true,
   unsupportedSourceType: true,
+  notAPack: true,
   nameCollision: true,
   readFailed: true,
   writeFailed: true,
@@ -134,6 +136,18 @@ export function describeContentImportError(error: unknown, context: ImportContex
         message: `A ${noun} is either a .zip archive or the folder a .zip was unpacked into. Pick one of those.`,
         detail,
       };
+    case "notAPack": {
+      // contentpack-12: the game looks at the root only, so a pack wrapped
+      // in one more folder is the usual way to get here.
+      const marker = context.contentType === "shader" ? "a shaders folder" : "a pack.mcmeta file";
+      return {
+        title: `'${name}' is not a ${noun}`,
+        message:
+          `A ${noun} has ${marker} at its root, and this one does not, so the game would not load it. ` +
+          `If the pack is wrapped in an extra folder, pick that inner folder instead. Nothing was added to the mod list.`,
+        detail,
+      };
+    }
     case "invalidSourcePath":
       return {
         title: `'${name}' could not be used`,

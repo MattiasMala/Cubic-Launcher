@@ -233,22 +233,28 @@ pub fn description_from_mcmeta(bytes: &[u8]) -> Option<String> {
 /// Display name for a pack stored under `file_name`: the stem for a zip, the
 /// directory name as-is for an unpacked pack.
 pub fn display_name_for(file_name: &str) -> String {
-    let stem = file_name
-        .strip_suffix(".zip")
-        .or_else(|| {
-            file_name
-                .len()
-                .checked_sub(4)
-                .filter(|cut| file_name[*cut..].eq_ignore_ascii_case(".zip"))
-                .map(|cut| &file_name[..cut])
-        })
-        .unwrap_or(file_name);
+    let stem = strip_zip_extension(file_name).unwrap_or(file_name);
 
     if stem.is_empty() {
         file_name.to_string()
     } else {
         stem.to_string()
     }
+}
+
+/// `file_name` without a trailing `.zip`, in any case; `None` when it has none.
+///
+/// `get` and not an index (`r2-percorsi-non-ascii-e-limiti-windows-3`): four
+/// bytes from the end can fall inside a multibyte character — `Mañana` has
+/// one at bytes 2-3 — and slicing there panicked the whole import. A cut that
+/// is not a character boundary cannot precede `.zip` anyway, so it is simply
+/// no extension.
+fn strip_zip_extension(file_name: &str) -> Option<&str> {
+    let cut = file_name.len().checked_sub(4)?;
+    file_name
+        .get(cut..)
+        .filter(|extension| extension.eq_ignore_ascii_case(".zip"))
+        .and_then(|_| file_name.get(..cut))
 }
 
 /// Build the entry for a pack that now lives at `<category>/<file_name>`.
@@ -432,12 +438,30 @@ pub fn link_local_pack(
     target: &Path,
     target_is_ours: bool,
 ) -> Result<PackLinkOutcome> {
+    link_local_pack_as(
+        source,
+        target,
+        target_is_ours,
+        crate::instance_content::LinkKind::Symlink,
+    )
+}
+
+/// [`link_local_pack`] with the shape chosen by the caller. With
+/// [`crate::instance_content::LinkKind::NoSymlink`] — a world's `datapacks/`
+/// (D144) — a file is hard-linked or copied and a folder is always copied:
+/// Minecraft refuses to open a world with a symlink inside.
+pub fn link_local_pack_as(
+    source: &Path,
+    target: &Path,
+    target_is_ours: bool,
+    kind: crate::instance_content::LinkKind,
+) -> Result<PackLinkOutcome> {
     let source_is_dir = fs::metadata(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .is_dir();
 
     if !target_is_ours {
-        if target_is_real_dir(target) {
+        if crate::instance_content::is_real_dir(target) {
             return Ok(PackLinkOutcome::SkippedForeignDirectory);
         }
         if crate::instance_content::is_real_file(target) {
@@ -447,6 +471,15 @@ pub fn link_local_pack(
 
     remove_existing_target(target)?;
 
+    if kind == crate::instance_content::LinkKind::NoSymlink {
+        if source_is_dir {
+            copy_folder_pack(source, target)?;
+            return Ok(PackLinkOutcome::Copied);
+        }
+        crate::instance_content::place_file_without_symlink(source, target)?;
+        return Ok(PackLinkOutcome::Linked);
+    }
+
     if !source_is_dir {
         crate::instance_mods::create_file_link(source, target)?;
         return Ok(PackLinkOutcome::Linked);
@@ -455,21 +488,19 @@ pub fn link_local_pack(
     match create_directory_symlink(source, target) {
         Ok(()) => Ok(PackLinkOutcome::Linked),
         Err(_) => {
-            copy_directory_recursive(source, target)?;
+            copy_folder_pack(source, target)?;
             Ok(PackLinkOutcome::Copied)
         }
     }
 }
 
-/// A directory, and not a symlink pointing at one: with a real file, the shape
-/// whose removal can destroy something the launcher did not create.
-fn target_is_real_dir(target: &Path) -> bool {
-    fs::symlink_metadata(target)
-        .map(|metadata| {
-            let file_type = metadata.file_type();
-            file_type.is_dir() && !file_type.is_symlink()
-        })
-        .unwrap_or(false)
+/// Copy a folder pack into the instance, or leave nothing: a half-copied
+/// folder no manifest names would be taken for the user's on the next launch,
+/// and the pack skipped for good (contentpack-6).
+fn copy_folder_pack(source: &Path, target: &Path) -> Result<()> {
+    copy_directory_recursive(source, target).inspect_err(|_| {
+        let _ = fs::remove_dir_all(target);
+    })
 }
 
 /// Clear the instance-side name before installing over it, once the manifest
@@ -482,7 +513,7 @@ fn remove_existing_target(target: &Path) -> Result<()> {
     let file_type = metadata.file_type();
 
     let removed = if file_type.is_symlink() {
-        remove_symlink(target)
+        crate::instance_content::remove_symlink(target)
     } else if file_type.is_dir() {
         fs::remove_dir_all(target)
     } else {
@@ -490,20 +521,6 @@ fn remove_existing_target(target: &Path) -> Result<()> {
     };
 
     removed.with_context(|| format!("failed to replace {}", target.display()))
-}
-
-#[cfg(target_family = "windows")]
-fn remove_symlink(target: &Path) -> std::io::Result<()> {
-    if target.is_dir() {
-        fs::remove_dir(target)
-    } else {
-        fs::remove_file(target)
-    }
-}
-
-#[cfg(target_family = "unix")]
-fn remove_symlink(target: &Path) -> std::io::Result<()> {
-    fs::remove_file(target)
 }
 
 #[cfg(target_family = "unix")]
@@ -550,6 +567,9 @@ pub enum ContentImportErrorCode {
     InvalidSourcePath,
     /// It exists but is neither a directory nor a `.zip`.
     UnsupportedSourceType,
+    /// A folder or a `.zip`, but without what makes it a pack of the category
+    /// at its root: `pack.mcmeta`, or `shaders/` for a shader (contentpack-12).
+    NotAPack,
     /// The category already holds a pack under that name.
     NameCollision,
     /// The source could not be read (unreadable file, corrupt archive).
@@ -585,14 +605,29 @@ pub struct ImportLocalContentPackInput {
     pub source_path: String,
 }
 
+/// `async`, with the work inside [`tauri::async_runtime::spawn_blocking`]
+/// (contentpack-12): a synchronous command runs on the main thread, and an
+/// unpacked pack of a few thousand textures kept the window frozen for the
+/// whole copy. A panic in the work arrives here as a join error, after the
+/// import has undone itself (see [`PartialImport`]).
 #[tauri::command]
-pub fn import_local_content_pack_command(
+pub async fn import_local_content_pack_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: ImportLocalContentPackInput,
 ) -> Result<ContentEntrySnapshot, ContentImportError> {
-    let entry = import_local_content_pack_from_root(launcher_paths.root_dir(), &input)?;
-    let modlist_dir = launcher_paths.modlists_dir().join(&input.modlist_name);
-    Ok(entry_snapshot(&entry, &modlist_dir))
+    let launcher_paths = launcher_paths.inner().clone();
+    let work = move || -> Result<ContentEntrySnapshot, ContentImportError> {
+        let entry = import_local_content_pack_from_root(launcher_paths.root_dir(), &input)?;
+        let modlist_dir = launcher_paths.modlists_dir().join(&input.modlist_name);
+        Ok(entry_snapshot(&entry, &modlist_dir))
+    };
+    match tauri::async_runtime::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(joined) => Err(ContentImportError::new(
+            ContentImportErrorCode::WriteFailed,
+            format!("the import stopped unexpectedly and was undone: {joined}"),
+        )),
+    }
 }
 
 /// Copy a local pack into the mod list and append its entry, returning the
@@ -685,6 +720,17 @@ pub fn import_local_content_pack_from_root(
         ));
     }
 
+    let missing_marker =
+        missing_pack_marker(source, shape, &input.content_type).map_err(|error| {
+            ContentImportError::new(ReadFailed, format!("cannot read '{file_name}': {error:#}"))
+        })?;
+    if let Some(problem) = missing_marker {
+        return Err(ContentImportError::new(
+            NotAPack,
+            format!("'{file_name}' {problem}"),
+        ));
+    }
+
     let metadata = read_pack_metadata(source, shape).map_err(|error| {
         ContentImportError::new(ReadFailed, format!("cannot read '{file_name}': {error}"))
     })?;
@@ -701,11 +747,22 @@ pub fn import_local_content_pack_from_root(
     // every retry of the same pack fail as a name collision, an error that
     // lies about what happened and that the user cannot clear from the UI.
     //
-    // It undoes the copy and the icon, not the category JSON: `save_content_list`
-    // (`content_packs.rs:100`) truncates before writing, so a failure inside it
-    // has already lost the previous contents and there is nothing left to
-    // restore. That non-atomic write predates this module and is shared by all
-    // six content commands, so it is not fixed here.
+    // It undoes the copy and the icon, not the category JSON: that is the
+    // last step, and `save_content_list` writes it atomically (temporary file,
+    // then rename), so when it fails the previous list is still on disk as it
+    // was and there is nothing to restore (contentpack-14).
+    //
+    // The undo is a guard and not a call on the `Err` branch: a panic in here
+    // used to skip it and leave the copy behind with no entry
+    // (`r2-percorsi-non-ascii-e-limiti-windows-3`).
+    let mut partial = PartialImport {
+        dest: &dest,
+        shape,
+        modlist_dir: &modlist_dir,
+        category_dir,
+        file_name: &file_name,
+        armed: true,
+    };
     let written = (|| -> Result<ContentEntry> {
         copy_pack(source, &dest, shape)?;
         let icon_path = match metadata.icon_png.as_deref() {
@@ -718,32 +775,86 @@ pub fn import_local_content_pack_from_root(
         Ok(entry)
     })();
 
-    written.map_err(|error| {
-        remove_partial_import(&dest, shape, &modlist_dir, category_dir, &file_name);
-        ContentImportError::new(WriteFailed, error.to_string())
-    })
+    match written {
+        Ok(entry) => {
+            partial.armed = false;
+            Ok(entry)
+        }
+        // `partial` is still armed and undoes the import as it goes.
+        Err(error) => Err(ContentImportError::new(WriteFailed, error.to_string())),
+    }
 }
 
-/// Undo a failed import: the copied pack and the extracted icon, if they got
-/// as far as existing. Failures here are ignored — we are already returning an
-/// error, and the caller gets a worse message if this one replaces it.
-fn remove_partial_import(
-    dest: &Path,
+/// What makes a pack of the category loadable, checked at its root where the
+/// game looks (contentpack-12): `pack.mcmeta` for a resource or data pack, a
+/// `shaders/` folder for a shader pack. `Some(why)` when it is missing — the
+/// import used to take any folder at all, and the pack then did nothing in
+/// game without a word. A zip that wraps everything in one more folder fails
+/// here too, as it fails in the game.
+fn missing_pack_marker(
+    source: &Path,
     shape: PackShape,
-    modlist_dir: &Path,
-    category_dir: &str,
-    file_name: &str,
-) {
-    match shape {
+    content_type: &str,
+) -> Result<Option<&'static str>> {
+    let is_shader = content_type == "shader";
+    let present = match shape {
+        PackShape::Directory if is_shader => source.join("shaders").is_dir(),
+        PackShape::Directory => source.join("pack.mcmeta").is_file(),
         PackShape::Archive => {
-            fs::remove_file(dest).ok();
+            let file = fs::File::open(source)
+                .with_context(|| format!("failed to open {}", source.display()))?;
+            let archive = zip::ZipArchive::new(file)
+                .with_context(|| format!("failed to read zip archive {}", source.display()))?;
+            let mut names = archive.file_names();
+            if is_shader {
+                // A zip made on Windows by hand can carry `\` separators.
+                names.any(|name| name.starts_with("shaders/") || name.starts_with("shaders\\"))
+            } else {
+                names.any(|name| name == "pack.mcmeta")
+            }
         }
-        PackShape::Directory => {
-            fs::remove_dir_all(dest).ok();
+    };
+
+    Ok((!present).then_some(if is_shader {
+        "has no shaders folder at its root, so no shader mod would load it"
+    } else {
+        "has no pack.mcmeta at its root, so Minecraft would not load it"
+    }))
+}
+
+/// Undoes an import that did not finish, when dropped while still armed: on
+/// the `Err` path and while a panic unwinds alike. It removes the copied pack
+/// and the extracted icon, if they got as far as existing. Failures here are
+/// ignored — we are already returning an error (or unwinding), and the caller
+/// gets a worse message if this one replaces it.
+struct PartialImport<'a> {
+    dest: &'a Path,
+    shape: PackShape,
+    modlist_dir: &'a Path,
+    category_dir: &'a str,
+    file_name: &'a str,
+    armed: bool,
+}
+
+impl Drop for PartialImport<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
         }
-    }
-    if let Ok(icon) = contained_join(modlist_dir, &icon_relative_path(category_dir, file_name)) {
-        fs::remove_file(icon).ok();
+        match self.shape {
+            PackShape::Archive => {
+                fs::remove_file(self.dest).ok();
+            }
+            PackShape::Directory => {
+                fs::remove_dir_all(self.dest).ok();
+            }
+        }
+        if let Ok(icon) = contained_join(
+            self.modlist_dir,
+            &icon_relative_path(self.category_dir, self.file_name),
+        ) {
+            fs::remove_file(icon).ok();
+        }
     }
 }
 
@@ -784,7 +895,26 @@ mod tests {
         dir
     }
 
+    /// The `pack.mcmeta` every fixture gets unless it writes its own: since
+    /// contentpack-12 the import refuses a pack without one, and these tests
+    /// are about something else. No description, so the ones that check there
+    /// is none still see none.
+    const FIXTURE_MCMETA: (&str, &[u8]) = ("pack.mcmeta", br#"{"pack":{"pack_format":15}}"#);
+
+    fn with_mcmeta<'a>(members: &[(&'a str, &'a [u8])]) -> Vec<(&'a str, &'a [u8])> {
+        let mut members = members.to_vec();
+        if !members.iter().any(|(name, _)| *name == "pack.mcmeta") {
+            members.push(FIXTURE_MCMETA);
+        }
+        members
+    }
+
     fn write_zip_pack(path: &Path, members: &[(&str, &[u8])]) {
+        write_zip_exactly(path, &with_mcmeta(members));
+    }
+
+    /// A zip with these members and nothing else.
+    fn write_zip_exactly(path: &Path, members: &[(&str, &[u8])]) {
         let file = fs::File::create(path).expect("zip fixture should be creatable");
         let mut writer = zip::ZipWriter::new(file);
         for (name, bytes) in members {
@@ -799,6 +929,11 @@ mod tests {
     }
 
     fn write_dir_pack(path: &Path, members: &[(&str, &[u8])]) {
+        write_dir_exactly(path, &with_mcmeta(members));
+    }
+
+    /// A folder with these files and nothing else.
+    fn write_dir_exactly(path: &Path, members: &[(&str, &[u8])]) {
         fs::create_dir_all(path).expect("dir fixture should be creatable");
         for (name, bytes) in members {
             let member = path.join(name);
@@ -889,7 +1024,10 @@ mod tests {
         let source = root.join("No Icon.zip");
         write_zip_pack(
             &source,
-            &[("pack.mcmeta", br#"{"pack":{"pack_format":15}}"#)],
+            &[
+                ("pack.mcmeta", br#"{"pack":{"pack_format":15}}"#),
+                ("shaders/final.fsh", b"void main() {}"),
+            ],
         );
 
         let entry = import(&root, "Sky Pack", "shader", &source).expect("import should work");
@@ -1275,6 +1413,128 @@ mod tests {
             "only the trailing extension goes"
         );
         assert_eq!(display_name_for(".zip"), ".zip", "an empty stem is no name");
+    }
+
+    /// r2-percorsi-non-ascii-e-limiti-windows-3: four bytes from the end of
+    /// `Mañana` are inside the `ñ`, and slicing there panicked.
+    #[test]
+    fn display_name_survives_a_multibyte_character_near_the_end() {
+        assert_eq!(display_name_for("Mañana"), "Mañana");
+        assert_eq!(display_name_for("ñañ"), "ñañ");
+        assert_eq!(display_name_for("Señal.ZIP"), "Señal");
+        assert_eq!(display_name_for("日本語.zip"), "日本語");
+    }
+
+    #[test]
+    fn a_folder_with_a_non_ascii_name_is_imported_and_named_after_itself() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let source = root.join("Mañana");
+        write_dir_pack(&source, &[("data/x/functions/a.mcfunction", b"say hi")]);
+
+        let entry = import(&root, "Sky Pack", "datapack", &source).expect("import should work");
+
+        assert_eq!(entry.name.as_deref(), Some("Mañana"));
+        assert!(modlist.join("datapacks").join("Mañana").is_dir());
+        assert_eq!(
+            load_content_list(&modlist, "datapack")
+                .expect("list should load")
+                .entries
+                .len(),
+            1,
+            "the copy and its entry go together"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The undo runs while a panic unwinds, not only on the `Err` branch: the
+    /// panic of r2-percorsi-non-ascii-e-limiti-windows-3 left the copy in the
+    /// mod list with no entry, and every retry then failed as a collision.
+    #[test]
+    fn an_import_that_panics_halfway_leaves_no_copy_behind() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+        let dest = modlist.join("datapacks").join("Mañana");
+        write_dir_exactly(&dest, &[("half.txt", b"copied so far")]);
+        let icon = modlist
+            .join(".cubic")
+            .join("icons")
+            .join("datapacks")
+            .join("Mañana.png");
+        fs::create_dir_all(icon.parent().expect("icon dir")).expect("icon dir");
+        fs::write(&icon, PNG_BYTES).expect("icon written");
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _partial = super::PartialImport {
+                dest: &dest,
+                shape: super::PackShape::Directory,
+                modlist_dir: &modlist,
+                category_dir: "datapacks",
+                file_name: "Mañana",
+                armed: true,
+            };
+            panic!("halfway through the import");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(!dest.exists(), "the half copy is removed while unwinding");
+        assert!(!icon.exists(), "and so is its icon");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// contentpack-12: what the game would not load is refused before a byte
+    /// is copied, with its own code.
+    #[test]
+    fn a_pack_without_its_marker_at_the_root_is_refused_and_nothing_is_copied() {
+        let root = unique_test_root();
+        let modlist = modlist_dir(&root, "Sky Pack");
+
+        let bare_zip = root.join("Wrapped.zip");
+        write_zip_exactly(
+            &bare_zip,
+            &[(
+                "Wrapped/pack.mcmeta",
+                br#"{"pack":{"pack_format":15}}"# as &[u8],
+            )],
+        );
+        let bare_folder = root.join("Just Textures");
+        write_dir_exactly(&bare_folder, &[("assets/minecraft/x.txt", b"texture")]);
+        let shader_folder = root.join("Not A Shader");
+        write_dir_pack(&shader_folder, &[("readme.txt", b"hello")]);
+
+        for (content_type, source) in [
+            ("resourcepack", &bare_zip),
+            ("datapack", &bare_folder),
+            ("shader", &shader_folder),
+        ] {
+            let error = import(&root, "Sky Pack", content_type, source)
+                .expect_err("a pack the game would not load is refused");
+            assert_eq!(
+                error.code,
+                ContentImportErrorCode::NotAPack,
+                "{content_type}"
+            );
+            let category = super::modlist_category_dir(content_type).expect("known type");
+            assert!(
+                !modlist
+                    .join(category)
+                    .join(source.file_name().expect("name"))
+                    .exists(),
+                "{content_type}: nothing was copied"
+            );
+        }
+
+        // The markers that do make a pack: a shader folder, a shader zip.
+        let shader_dir = root.join("Real Shader");
+        write_dir_exactly(&shader_dir, &[("shaders/final.fsh", b"void main() {}")]);
+        import(&root, "Sky Pack", "shader", &shader_dir).expect("a shaders folder is a shader");
+        let shader_zip = root.join("Zipped Shader.zip");
+        write_zip_exactly(&shader_zip, &[("shaders/gbuffers.vsh", b"void main() {}")]);
+        import(&root, "Sky Pack", "shader", &shader_zip).expect("a shaders/ entry is a shader");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

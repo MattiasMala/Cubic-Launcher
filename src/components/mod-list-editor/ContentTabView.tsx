@@ -4,6 +4,7 @@ import { ContentEntryRow } from "./ContentEntryRow";
 import type { ContentTabViewProps } from "./content-types";
 import { useContentTabState } from "./use-content-tab-state";
 import {
+  AlertTriangleIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   FolderOpenIcon,
@@ -72,8 +73,36 @@ export function ContentTabView(props: ContentTabViewProps) {
         </header>
       </Show>
 
+      {/* D144: data packs are linked into every world at launch, so a world
+          made in game only has them from the launch after. */}
+      <Show when={props.type === "datapack"}>
+        <div class="px-6 py-2 border-b border-borderColor shrink-0 flex items-center gap-2 text-xs text-muted-foreground">
+          <MaterialIcon name="info" size="sm" />
+          <span>
+            Data packs are added to every world of the instance each time you press Play. A world you
+            create in game receives them from the next launch.
+          </span>
+        </div>
+      </Show>
+
       <div class="flex-1 p-4" style={{ overflow: "auto" }}>
         <Show when={state.entries().length > 0} fallback={
+          <Show when={state.loadError() === null} fallback={
+            // contentpack-11: an unreadable list is not an empty one. The
+            // launch leaves these packs as they are until the file is fixed.
+            <div class="flex flex-col items-center justify-center py-16 text-center">
+              <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-destructive/10">
+                <AlertTriangleIcon class="h-8 w-8 text-destructive" />
+              </div>
+              <h3 class="mb-2 text-lg font-semibold text-foreground">The {state.label().toLowerCase()} list could not be read</h3>
+              <p class="mb-2 max-w-md text-sm text-muted-foreground">
+                The file that holds this tab is damaged or unreadable, so nothing is shown and nothing can be changed
+                here. Until it is fixed or restored, Play leaves the instance's {state.label().toLowerCase()} exactly
+                as they are.
+              </p>
+              <p class="max-w-md break-all font-mono text-xs text-muted-foreground">{state.loadError()}</p>
+            </div>
+          }>
           <div class="flex flex-col items-center justify-center py-16 text-center">
             <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
               <PackageIcon class="h-8 w-8 text-muted-foreground" />
@@ -89,6 +118,7 @@ export function ContentTabView(props: ContentTabViewProps) {
               Add Your First {state.label().replace(/s$/, "")}
             </button>
           </div>
+          </Show>
         }>
           <>
             <Show when={state.engine.draggingId() && state.engine.dragPointer()}>

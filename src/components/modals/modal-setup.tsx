@@ -21,9 +21,11 @@ import { GameOptionsPanel } from "./game-options-panel";
 import { SharedFilesPanel } from "./shared-files-panel";
 import { WorldsPanel } from "./worlds-panel";
 import { ChevronDownIcon, ChevronRightIcon } from "../icons";
+import { modlistNameProblem } from "../../lib/modlist-name";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
 export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
+  const nameProblem = () => modlistNameProblem(createModlistName().trim());
   return (
     <Show when={createModlistModalOpen()}>
       <Modal onClose={() => setCreateModlistModalOpen(false)}>
@@ -39,6 +41,9 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
               class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               autofocus
             />
+            <Show when={nameProblem()}>
+              <p class="mt-1.5 text-xs text-red-400">{nameProblem()}</p>
+            </Show>
           </div>
           <div>
             <label class="mb-1.5 block text-sm font-medium text-foreground">Description</label>
@@ -55,7 +60,7 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
           <button onClick={() => setCreateModlistModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
           <button
             onClick={() => void props.onCreate()}
-            disabled={!createModlistName().trim() || createModlistBusy()}
+            disabled={!createModlistName().trim() || nameProblem() !== null || createModlistBusy()}
             class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             Create
@@ -562,17 +567,30 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
 }
 
 
-export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: () => Promise<void> }) {
+type ModlistDeletePreview = { worlds: number; screenshots: number; running: boolean; trashSupported: boolean };
+
+const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+
+/**
+ * `onDelete(allowPermanent)` resolves to the reason the trash refused, when it
+ * did (nothing was deleted then), or null. `allowPermanent` is exactly what the
+ * confirmation promised, as for a screenshot (D153).
+ */
+export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: (allowPermanent: boolean) => Promise<string | null> }) {
   const [draft, setDraft] = createSignal({ ...instancePresentation() });
   const [saving, setSaving] = createSignal(false);
   const [confirmDelete, setConfirmDelete] = createSignal(false);
   const [deleting, setDeleting] = createSignal(false);
+  const [deletePreview, setDeletePreview] = createSignal<ModlistDeletePreview | null>(null);
+  const [deletePreviewError, setDeletePreviewError] = createSignal<string | null>(null);
+  const [trashRefusal, setTrashRefusal] = createSignal<string | null>(null);
   const [tab, setTab] = createSignal<"identity" | "game" | "shared" | "worlds">("identity");
 
   createEffect(() => {
     if (instancePresentationOpen()) {
       setDraft({ ...instancePresentation() });
       setConfirmDelete(false);
+      setTrashRefusal(null);
       setTab("identity");
     }
   });
@@ -580,6 +598,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
   const close = () => {
     setInstancePresentationOpen(false);
     setConfirmDelete(false);
+    setTrashRefusal(null);
   };
 
   const handleSave = async () => {
@@ -593,14 +612,51 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
     }
   };
 
+  // D153: before asking, count what goes with the mod list and whether its
+  // game is running (then the backend refuses, and the button is off).
+  const askDelete = async () => {
+    setDeletePreview(null);
+    setDeletePreviewError(null);
+    setTrashRefusal(null);
+    setConfirmDelete(true);
+    if (!isTauriEnv()) return;
+    try {
+      const { invoke: invokeCore } = await import("@tauri-apps/api/core");
+      setDeletePreview(await invokeCore<ModlistDeletePreview>("modlist_delete_preview_command", { modlistName: selectedModListName() }));
+    } catch (err) {
+      setDeletePreviewError(String(err));
+    }
+  };
+
+  const cancelDelete = () => {
+    setConfirmDelete(false);
+    setTrashRefusal(null);
+  };
+
+  const permanentPromised = () => trashRefusal() !== null || deletePreview()?.trashSupported === false;
+
+  const deleteQuestion = () => {
+    const preview = deletePreview();
+    if (deletePreviewError()) return "Delete this mod list? Its worlds and screenshots could not be counted.";
+    if (!preview) return "Counting worlds and screenshots...";
+    if (preview.running) return "This mod list is being launched or played. Close the game first, then delete it.";
+    const contents = `${plural(preview.worlds, "world", "worlds")} and ${plural(preview.screenshots, "screenshot", "screenshots")}`;
+    const refusal = trashRefusal();
+    if (refusal !== null) return `The trash could not be used (${refusal}). Delete permanently, with ${contents}? This cannot be undone.`;
+    if (!preview.trashSupported) return `Delete permanently, with ${contents}? This cannot be undone.`;
+    return `Move this mod list to the trash, with ${contents}? You can restore it from the trash.`;
+  };
+
   const handleDelete = async () => {
     if (deleting()) return;
     setDeleting(true);
+    let refusal: string | null = null;
     try {
-      await props.onDelete();
+      refusal = await props.onDelete(permanentPromised());
     } finally {
       setDeleting(false);
-      setConfirmDelete(false);
+      setTrashRefusal(refusal);
+      if (refusal === null) setConfirmDelete(false);
     }
   };
 
@@ -736,23 +792,23 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
         <div class="flex items-center justify-between gap-2 border-t border-border px-6 py-4">
           <Show when={confirmDelete()} fallback={
             <button
-              onClick={() => setConfirmDelete(true)}
+              onClick={() => void askDelete()}
               class="rounded-md bg-red-900/40 px-4 py-2 text-sm text-red-300 hover:bg-red-900/70 border border-red-700/40 transition-colors"
             >
               Delete Mod-list
             </button>
           }>
             <div class="flex items-center gap-2">
-              <span class="text-sm text-red-400">Are you sure? This cannot be undone.</span>
+              <span class="max-w-md text-sm text-red-400">{deleteQuestion()}</span>
               <button
                 onClick={() => void handleDelete()}
-                disabled={deleting()}
-                class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                disabled={deleting() || (!deletePreview() && !deletePreviewError()) || deletePreview()?.running === true}
+                class="shrink-0 rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
               >
-                {deleting() ? "Deleting..." : "Yes, delete"}
+                {deleting() ? "Deleting..." : permanentPromised() ? "Yes, delete permanently" : "Yes, move to trash"}
               </button>
               <button
-                onClick={() => setConfirmDelete(false)}
+                onClick={cancelDelete}
                 class="rounded-md bg-secondary px-3 py-1.5 text-sm text-secondary-foreground hover:bg-secondary/80"
               >
                 Cancel

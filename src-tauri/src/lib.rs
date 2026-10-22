@@ -144,6 +144,7 @@ pub fn run() {
             editor_data::import_custom_config_files_command,
             modlist_manager::create_modlist_command,
             modlist_manager::delete_modlist_command,
+            modlist_manager::modlist_delete_preview_command,
             modlist_manager::copy_local_jar_command,
             modlist_manager::import_modlist_command,
             mod_version_pin::pin_mod_version_command,

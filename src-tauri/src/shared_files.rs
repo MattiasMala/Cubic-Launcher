@@ -335,6 +335,84 @@ pub fn unlink_modlist(
     Ok(updated)
 }
 
+/// Prima di cancellare `modlist_name`: se è lei a tenere i byte del suo gruppo,
+/// li passa a chi diventa il nuovo portatore. È la metà di [`unlink_modlist`]
+/// che deve girare **prima** che la cartella sparisca; l'altra metà, togliere
+/// il nome dai gruppi, è [`forget_modlist`], **dopo**. Il verso opposto di
+/// `unlink_modlist` (dal portatore verso chi esce) qui non serve: chi esce va
+/// nel cestino, e copiarci dentro ricreerebbe la cartella appena tolta
+/// (`dati-5`).
+pub fn hand_over_before_delete(
+    launcher_paths: &LauncherPaths,
+    connection: &Connection,
+    modlist_name: &str,
+) -> Result<()> {
+    validate_path_component(modlist_name)?;
+
+    let groups = load_groups(connection)?;
+    let Some(group) = groups.iter().find(|group| group.contains(modlist_name)) else {
+        return Ok(());
+    };
+    if group.canonical() != Some(modlist_name) {
+        return Ok(());
+    }
+    if let Some(new_canonical) = group.members.iter().find(|name| *name != modlist_name) {
+        copy_canonical_files(launcher_paths, modlist_name, new_canonical)?;
+    }
+
+    Ok(())
+}
+
+/// Dopo la cancellazione di `modlist_name`, o prima di far nascere una mod
+/// list con lo stesso nome: il nome esce da ogni gruppo e perde i suoi
+/// interruttori, senza copiare niente (`r2-ciclo-vita-nome-1`). Un gruppo che
+/// resta con un solo membro sparisce, come in [`unlink_modlist`].
+pub fn forget_modlist(connection: &Connection, modlist_name: &str) -> Result<()> {
+    let groups = load_groups(connection)?;
+    if groups.iter().any(|group| group.contains(modlist_name)) {
+        let updated: Vec<SharedGroup> = groups
+            .into_iter()
+            .filter_map(|mut group| {
+                group.members.retain(|name| name != modlist_name);
+                (group.members.len() > 1).then_some(group)
+            })
+            .collect();
+        write_groups(connection, &updated)?;
+    }
+
+    let mut options = load_file_options(connection);
+    if options.remove(modlist_name).is_some() {
+        let value =
+            serde_json::to_string(&options).context("failed to serialize the file options")?;
+        connection
+            .execute(
+                "INSERT INTO global_settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [SHARED_FILE_OPTIONS_KEY, value.as_str()],
+            )
+            .context("failed to write the file options")?;
+    }
+
+    Ok(())
+}
+
+/// `dati-5`: la copia canonica si scrive solo nella cartella di una mod list
+/// che esiste davvero. Senza `rules.json` — la cartella tolta a mano, o un
+/// gruppo rimasto da una build che non puliva alla cancellazione — scriverci
+/// dentro farebbe rinascere la mod list come un fantasma nella sidebar.
+fn missing_canonical_owner(launcher_paths: &LauncherPaths, owner: &str) -> Option<String> {
+    let rules = launcher_paths
+        .modlists_dir()
+        .join(owner)
+        .join(crate::rules::RULES_FILENAME);
+    (!rules.is_file()).then(|| {
+        format!(
+            "the mod list '{owner}' that holds the shared copy no longer exists ({} is missing)",
+            rules.display()
+        )
+    })
+}
+
 fn copy_canonical_files(launcher_paths: &LauncherPaths, from: &str, to: &str) -> Result<()> {
     for file in SharedFile::ALL {
         let source = canonical_path(launcher_paths, from, file)?;
@@ -792,10 +870,10 @@ fn fingerprint(bytes: &[u8]) -> String {
 fn recorded_owner(launcher_paths: &LauncherPaths, record: Option<&SyncRecord>) -> Option<String> {
     let owner = record?.owner.clone()?;
     validate_path_component(&owner).ok()?;
-    launcher_paths
-        .modlists_dir()
-        .join(&owner)
-        .is_dir()
+    // Una mod list esiste quando ha il suo rules.json (dati-5), non quando ne
+    // resta solo la cartella.
+    missing_canonical_owner(launcher_paths, &owner)
+        .is_none()
         .then_some(owner)
 }
 
@@ -974,6 +1052,9 @@ pub fn copy_into_instance(
             return failed_for_all(&error.to_string());
         }
     };
+    if let Some(reason) = missing_canonical_owner(launcher_paths, &canonical_owner) {
+        return failed_for_all(&reason);
+    }
     let options = match load_file_options(connection) {
         Ok(options) => options,
         Err(error) => return failed_for_all(&format!("{error:#}")),
@@ -1147,6 +1228,10 @@ pub fn copy_back_from_instance(
             }
         },
     };
+    // dati-5: una portatrice sparita non si ricrea scrivendoci la copia.
+    if let Some(reason) = missing_canonical_owner(launcher_paths, &canonical_owner) {
+        return failed_for_all(&reason);
+    }
     let options = match load_file_options(connection) {
         Ok(options) => options,
         Err(error) => return failed_for_all(&format!("{error:#}")),
