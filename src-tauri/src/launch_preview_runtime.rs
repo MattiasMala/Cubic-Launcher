@@ -1308,6 +1308,16 @@ pub(super) fn substitute_known_placeholders(
             "${resolution_height}",
             placeholders.resolution_height.as_str(),
         ),
+        // Segnaposto che il launcher non ha da riempire, ma che non possono
+        // restare letterali. 1.7.10–1.8.9 passano `--userProperties
+        // ${user_properties}` a Gson come `PropertyMap`: alla lettera il Main
+        // esce con un'eccezione, `{}` è la mappa vuota. `${clientid}` e
+        // `${auth_xuid}` (1.19+) sono argomenti facoltativi del Main, e la
+        // stringa vuota è proprio il suo «assente».
+        ("${user_properties}", "{}"),
+        ("${user_property_map}", "{}"),
+        ("${clientid}", ""),
+        ("${auth_xuid}", ""),
     ]
     .into_iter()
     .fold(argument.to_string(), |current, (needle, replacement)| {

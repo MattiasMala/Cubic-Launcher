@@ -691,6 +691,55 @@ fn legacy_virtual_assets_redirect_game_assets_and_session() {
     );
 }
 
+/// download-2 (audit 101): 1.7.10–1.8.9 portano `--userProperties
+/// ${user_properties}`, e il Main lo passa a Gson; alla lettera il gioco esce
+/// in pochi secondi. Nessun segnaposto deve sopravvivere, nemmeno quelli
+/// facoltativi delle versioni nuove (`${clientid}`, `${auth_xuid}`).
+#[test]
+fn legacy_and_optional_placeholders_never_reach_the_game_literally() {
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "Pack",
+        &ResolutionTarget {
+            minecraft_version: "1.8.9".into(),
+            mod_loader: ModLoader::Vanilla,
+        },
+        PathBuf::from("game-dir").as_path(),
+        PathBuf::from("assets-root").as_path(),
+        "1.8",
+        PathBuf::from("libraries-root").as_path(),
+        PathBuf::from("natives-root").as_path(),
+        false,
+    );
+    // `minecraftArguments` di 1.8.9 com'è nel version.json di Mojang.
+    let minecraft_arguments = "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userProperties ${user_properties} --userType ${user_type}";
+
+    let substituted = minecraft_arguments
+        .split_whitespace()
+        .map(|argument| substitute_known_placeholders(argument, &placeholders))
+        .collect::<Vec<_>>();
+
+    assert!(
+        substituted.iter().all(|argument| !argument.contains("${")),
+        "{substituted:?}"
+    );
+    let user_properties = substituted
+        .iter()
+        .position(|argument| argument == "--userProperties")
+        .expect("the option stays");
+    assert_eq!(substituted[user_properties + 1], "{}");
+
+    // 1.19+: `--clientId ${clientid} --xuid ${auth_xuid}`.
+    assert_eq!(substitute_known_placeholders("${clientid}", &placeholders), "");
+    assert_eq!(substitute_known_placeholders("${auth_xuid}", &placeholders), "");
+}
+
 #[test]
 fn minecraft_launch_args_drop_quick_play_options() {
     let args = vec![
