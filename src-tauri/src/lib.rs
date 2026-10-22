@@ -20,6 +20,7 @@ pub mod loader_metadata;
 pub mod local_content_packs;
 pub mod microsoft_auth;
 pub mod minecraft_downloader;
+pub mod minecraft_versions;
 pub mod mod_cache;
 pub mod mod_icons;
 pub mod mod_version_pin;
@@ -134,7 +135,7 @@ pub fn run() {
             options_share::derive_option_keys_command,
             resolver::resolve_modlist_command,
             resolver::backfill_availability_command,
-            minecraft_downloader::fetch_minecraft_versions_command,
+            minecraft_versions::fetch_minecraft_versions_command,
             content_packs::load_content_list_command,
             content_packs::add_content_command,
             content_packs::remove_content_command,

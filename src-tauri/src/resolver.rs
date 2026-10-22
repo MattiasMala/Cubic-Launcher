@@ -393,7 +393,12 @@ pub async fn resolve_modlist_command(
             .filter(|id| !cached_ids.contains(id))
             .collect();
 
-        if !uncached_ids.is_empty() {
+        // D140: with the active account playing offline only the cache
+        // answers; a mod it knows nothing about stays as the rules resolved it.
+        let plays_offline = crate::app_shell::active_account_plays_offline(&launcher_paths)
+            .map_err(|e| e.to_string())?;
+
+        if !uncached_ids.is_empty() && !plays_offline {
             let client = ModrinthClient::new();
             let mut tasks = tokio::task::JoinSet::new();
             let semaphore = Arc::new(Semaphore::new(10));
@@ -823,6 +828,11 @@ pub async fn backfill_availability_command(
     mc_version: String,
     mod_loader: String,
 ) -> Result<(), String> {
+    // D140: nothing to fill from Modrinth while the active account plays
+    // offline; the editor reads the availability already cached.
+    if crate::app_shell::active_account_plays_offline(&launcher_paths).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
     let client = ModrinthClient::new();
     backfill_availability(
         &launcher_paths,
