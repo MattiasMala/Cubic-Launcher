@@ -192,7 +192,13 @@ fn build_java_invocation_args(request: &JavaLaunchRequest) -> Vec<String> {
     }
 
     args.push("-cp".to_string());
-    args.push(join_classpath_entries(&request.classpath_entries));
+    args.push(join_classpath_entries(
+        &request
+            .classpath_entries
+            .iter()
+            .map(|entry| path_for_java(entry, &request.working_directory))
+            .collect::<Vec<_>>(),
+    ));
     args.push(request.loader_metadata.main_class.clone());
     args.extend(request.loader_metadata.game_arguments.clone());
     args.extend(request.additional_game_arguments.clone());
@@ -206,8 +212,25 @@ impl FlightRecording {
     pub fn to_jvm_arg(&self) -> String {
         format!(
             "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename={}",
-            self.output_file.display()
+            jfr_option_value(&self.output_file.to_string_lossy())
         )
+    }
+}
+
+/// Un valore per le opzioni di `-XX:StartFlightRecording`, che JFR separa con «,».
+///
+/// todo.md:1812: con una virgola nel percorso dei dati (una home «Rossi, Mario») il nome
+/// del file si spezzava: la JVM partiva ma scriveva il file altrove, e il bottone Profile
+/// non compariva. Il parser delle opzioni JFR (quello dei comandi diagnostici) accetta un
+/// valore fra virgolette doppie o semplici, e dentro la virgola non separa più: provato su
+/// Java 17 e 25. Senza virgola il valore resta com'era.
+fn jfr_option_value(value: &str) -> String {
+    if !value.contains(',') {
+        value.to_string()
+    } else if !value.contains('"') {
+        format!("\"{value}\"")
+    } else {
+        format!("'{value}'")
     }
 }
 
@@ -247,6 +270,26 @@ pub fn split_argument_string(arguments: &str) -> Vec<String> {
     parsed_arguments
 }
 
+/// Un percorso come lo riceve Java, che parte con `working_directory` come cartella
+/// corrente: relativo quando ci sta dentro, com'era altrimenti.
+///
+/// r2-percorsi-non-ascii-e-limiti-windows-1 e -2: la cartella di lavoro è la radice
+/// dell'istanza, `mod-lists/<nome>/instances/<versione>-<loader>`, e ogni percorso assoluto
+/// sotto di lei porta con sé il nome della mod list. Con «:» (Linux) o «;» (Windows) nel
+/// nome il separatore del `-cp` e di `java.library.path` spezzava quel percorso in due; su
+/// Windows `java.exe` legge la riga di comando nella code page ANSI, e un nome fuori da
+/// quella code page (un'emoji) arrivava alla JVM come «??». Relativi, quei percorsi non
+/// contengono più il nome. Restano assoluti solo i percorsi fuori dall'istanza (le librerie
+/// e il client di Minecraft, gli asset, la configurazione di log4j, la cartella del lancio):
+/// stanno nella cache condivisa e nei log, e il loro nome non ha niente della mod list.
+pub fn path_for_java(path: &Path, working_directory: &Path) -> PathBuf {
+    match path.strip_prefix(working_directory) {
+        Ok(relative) if relative.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 pub fn join_classpath_entries(classpath_entries: &[PathBuf]) -> String {
     let separator = if cfg!(target_os = "windows") {
         ';'
@@ -273,6 +316,87 @@ mod tests {
         build_launch_command, join_classpath_entries, split_argument_string, FlightRecording,
         JavaLaunchRequest, JavaLaunchSettings, PreparedLaunchCommand,
     };
+
+    /// r2-percorsi-non-ascii-e-limiti-windows-1: le voci del `-cp` sotto la cartella di
+    /// lavoro arrivano a Java relative, e il nome della mod list, anche con il separatore
+    /// del classpath, non c'è più; quelle della cache condivisa restano com'erano.
+    #[test]
+    fn classpath_entries_inside_the_instance_are_relative_to_it() {
+        let separator = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
+        let instance_root = PathBuf::from("data")
+            .join("mod-lists")
+            .join(format!("Create{separator} Astral 🌲"))
+            .join("instances")
+            .join("1.20.1-fabric");
+        let shared_library = PathBuf::from("data")
+            .join("cache")
+            .join("minecraft")
+            .join("libraries")
+            .join("asm-9.6.jar");
+        let mut request = sample_request();
+        request.working_directory = instance_root.clone();
+        request.classpath_entries = vec![
+            shared_library.clone(),
+            instance_root
+                .join("libraries")
+                .join("net")
+                .join("fabricmc")
+                .join("fabric-loader.jar"),
+        ];
+
+        let command = build_launch_command(&request).expect("launch command should build");
+        let classpath_index = command
+            .args
+            .iter()
+            .position(|argument| argument == "-cp")
+            .expect("-cp")
+            + 1;
+        let classpath = &command.args[classpath_index];
+
+        assert_eq!(
+            classpath,
+            &join_classpath_entries(&[
+                shared_library,
+                PathBuf::from("libraries")
+                    .join("net")
+                    .join("fabricmc")
+                    .join("fabric-loader.jar"),
+            ])
+        );
+        assert!(!classpath.contains("Astral"), "{classpath}");
+        assert_eq!(classpath.matches(separator).count(), 1, "{classpath}");
+        assert_eq!(
+            super::path_for_java(&instance_root, &instance_root),
+            PathBuf::from(".")
+        );
+    }
+
+    /// todo.md:1812: con una virgola nel percorso il nome del file va fra virgolette, o
+    /// JFR prende il pezzo dopo la virgola per un'altra opzione.
+    #[test]
+    fn a_comma_in_the_jfr_path_is_quoted_and_a_plain_path_is_not() {
+        let plain = FlightRecording {
+            output_file: PathBuf::from("/home/mario/logs/launches/1-pack/profile.jfr"),
+        };
+        assert_eq!(
+            plain.to_jvm_arg(),
+            "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=/home/mario/logs/launches/1-pack/profile.jfr"
+        );
+
+        let with_comma = FlightRecording {
+            output_file: PathBuf::from("/home/Rossi, Mario/logs/launches/1-pack/profile.jfr"),
+        };
+        assert_eq!(
+            with_comma.to_jvm_arg(),
+            "-XX:StartFlightRecording=settings=profile,dumponexit=true,filename=\"/home/Rossi, Mario/logs/launches/1-pack/profile.jfr\""
+        );
+
+        assert_eq!(super::jfr_option_value("a,\"b"), "'a,\"b'");
+    }
 
     fn sample_loader_metadata() -> LoaderMetadata {
         LoaderMetadata {

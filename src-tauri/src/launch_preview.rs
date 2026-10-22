@@ -13,17 +13,22 @@ use crate::instance_configs::{
     materialize_custom_configs, prepare_instance_config_directory, CachedConfigPlacement,
 };
 use crate::instance_mods::prepare_instance_mods_directory;
-use crate::java_runtime::required_java_version_for_minecraft;
+use crate::java_runtime::required_java_for_minecraft_version;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
-use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
+use crate::minecraft_downloader::{
+    ensure_minecraft_version, extract_natives, MinecraftCachePolicy,
+};
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
-use crate::process_streaming::ProcessLogStream;
+use crate::process_streaming::{
+    stop_process, ProcessExitSignal, ProcessLogStream, StopOutcome, GRACEFUL_STOP_TIMEOUT,
+};
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 use crate::worlds::quick_play_arguments;
 
+use std::path::Path;
 use std::sync::Mutex;
 
 #[path = "launch_preview_fabric.rs"]
@@ -74,14 +79,24 @@ use content::*;
 mod vanilla;
 use vanilla::*;
 
+#[path = "launch_preview_loader_cache.rs"]
+mod loader_cache;
+
 #[path = "launch_preview_runtime.rs"]
 mod runtime;
 use runtime::*;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 
-/// Tracks the PID of the currently running Minecraft process so it can be killed.
-static ACTIVE_MC_PID: Mutex<Option<u32>> = Mutex::new(None);
+/// The currently running Minecraft process, so that it can be stopped. The
+/// monitor clears it when the process exits, and only then (windows-1): a STOP
+/// that fails leaves it there, and the next STOP can try again.
+static ACTIVE_MC: Mutex<Option<RunningMinecraft>> = Mutex::new(None);
+
+pub(super) struct RunningMinecraft {
+    pub(super) pid: u32,
+    pub(super) exit_signal: ProcessExitSignal,
+}
 
 #[tauri::command]
 pub fn start_launch_command(
@@ -129,15 +144,41 @@ pub async fn update_precheck_command(
         .map_err(|error| format!("{error:#}"))
 }
 
-/// Kills the currently running Minecraft process, if any.
+/// Stops the currently running Minecraft process, if any: first by asking it
+/// to close, so that the world is saved, and only after
+/// `GRACEFUL_STOP_TIMEOUT` by force (windows-1).
+///
+/// `async` because the wait can last seconds, and a synchronous command runs on
+/// the main thread, which would freeze the window meanwhile.
 #[tauri::command]
-pub fn stop_minecraft_command() -> Result<(), String> {
-    let pid = ACTIVE_MC_PID.lock().unwrap().take();
-    if let Some(pid) = pid {
-        terminate_minecraft_pid(pid).map_err(|error| error.to_string())
-    } else {
-        Err("No Minecraft process is running.".into())
-    }
+pub async fn stop_minecraft_command(app_handle: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stop_active_minecraft(&app_handle))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn stop_active_minecraft(app_handle: &tauri::AppHandle) -> Result<()> {
+    let Some(pid) = current_minecraft_pid() else {
+        bail!("No Minecraft process is running.");
+    };
+    let _ = emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[Launch] STOP: asking Minecraft (PID {pid}) to close and save"),
+    );
+    let outcome = terminate_minecraft_pid(pid)?;
+    let line = match outcome {
+        StopOutcome::AlreadyExited | StopOutcome::Graceful => {
+            "[Launch] Minecraft closed after STOP".to_string()
+        }
+        StopOutcome::Forced => format!(
+            "[Launch] Minecraft did not close within {} s of STOP and was forced to stop; the last minutes of an open world may not be saved",
+            GRACEFUL_STOP_TIMEOUT.as_secs()
+        ),
+    };
+    let _ = emit_log(app_handle, ProcessLogStream::Stdout, line);
+    Ok(())
 }
 
 /// Il file JFR dell'ultimo lancio, se esiste sul disco (D109). Il frontend lo chiede quando
@@ -149,7 +190,11 @@ pub fn last_profile_recording_command() -> Option<String> {
 }
 
 pub(super) fn current_minecraft_pid() -> Option<u32> {
-    *ACTIVE_MC_PID.lock().unwrap()
+    ACTIVE_MC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|running| running.pid)
 }
 
 pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
@@ -175,41 +220,89 @@ pub(super) fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -
     )
 }
 
-pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let output = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .with_context(|| format!("failed to terminate Minecraft PID {pid}"))?;
+/// Ferma `pid` se è ancora il Minecraft in corso: prima con garbo, poi con la
+/// forza (windows-1). Un PID che non è più tracciato è già uscito.
+pub(super) fn terminate_minecraft_pid(pid: u32) -> Result<StopOutcome> {
+    let exit_signal = ACTIVE_MC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|running| running.pid == pid)
+        .map(|running| running.exit_signal.clone());
+    let Some(exit_signal) = exit_signal else {
+        return Ok(StopOutcome::AlreadyExited);
+    };
+    stop_process(pid, &exit_signal, GRACEFUL_STOP_TIMEOUT)
+        .with_context(|| format!("failed to stop Minecraft PID {pid}"))
+}
 
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            bail!(
-                "failed to terminate Minecraft PID {pid}: {}",
-                if stderr.is_empty() {
-                    "taskkill returned a non-zero exit code"
-                } else {
-                    &stderr
-                }
-            )
-        }
-    }
+/// Primo avvio di questa istanza: si semina da `options.txt` della modlist, e
+/// mai più (D66). Il "mai più" non ha bisogno di uno stato nostro — dal secondo
+/// avvio il file c'è, perché l'abbiamo scritto noi o perché il gioco l'ha
+/// riscritto — e la semina lascia comunque una riga nel log, anche quando non
+/// fa niente. Uguale per il percorso moddato e per Vanilla (condivisi-5).
+fn seed_instance_options(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    instance_root: &Path,
+) {
+    let options_seed = crate::options_share::seed_instance_from_modlist(
+        launcher_paths,
+        modlist_name,
+        instance_root,
+    );
+    let _ = emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[options] {}", options_seed.describe()),
+    );
+}
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            Ok(())
-        } else {
-            bail!("failed to terminate Minecraft PID {pid}")
-        }
+/// Download and install content packs (resource packs, data packs, shaders),
+/// at the versions the pre-check named when it named any (D58). The same step
+/// for the modded and the Vanilla pipeline (contentpack-3); with Vanilla the
+/// shaders are skipped inside, since no loader would read them.
+///
+/// D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
+/// Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
+/// i file del lancio precedente. Il lookup fallito lasciava già lo stesso
+/// risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
+/// funzionante un account offline si vedeva aggiornare i pack.
+// Nove input distinti di un passo del lancio, gli stessi di
+// `resolve_and_install_content_packs` più la scelta dell'account: il lint è
+// sospeso solo qui, come là (D120).
+#[allow(clippy::too_many_arguments)]
+async fn install_launch_content_packs(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    modrinth_client: &ModrinthClient,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+    instance_root: &Path,
+    resolved_content: Option<&ResolvedContentVersions>,
+    plays_offline: bool,
+) -> Result<()> {
+    if plays_offline {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
+        )?;
+        return Ok(());
     }
+    resolve_and_install_content_packs(
+        app_handle,
+        launcher_paths,
+        http_client,
+        modrinth_client,
+        modlist_name,
+        target,
+        instance_root,
+        resolved_content,
+    )
+    .await
 }
 
 pub(in crate::launch_preview) async fn run_launch_pipeline(
@@ -262,10 +355,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &shell_snapshot.global_settings,
         &shell_snapshot.selected_modlist_overrides,
     );
-    // D115: read once, before anything is chosen, so that the identity and
-    // the resolution path of this launch come from the same reading of the
-    // active account's row. The vanilla pipeline needs it for the identity.
-    let plays_offline = active_account_plays_offline(&launcher_paths)?;
+    // shell-5: la RAM sbagliata si dice qui, prima di risolvere e scaricare
+    // qualunque cosa, e non alla fine della preparazione.
+    crate::app_shell::validate_effective_ram(
+        shell_snapshot.global_settings.min_ram_mb,
+        shell_snapshot.global_settings.max_ram_mb,
+        shell_snapshot.selected_modlist_overrides.min_ram_mb,
+        shell_snapshot.selected_modlist_overrides.max_ram_mb,
+    )?;
+    // D115, concorrenza-8: the active account's row, read once, before
+    // anything is chosen. The resolution path, the content step and the
+    // identity of this launch all come from this one reading: an account
+    // switched to or removed during the launch does not change any of them.
+    let launch_account = load_launch_account(&launcher_paths)?;
+    let plays_offline = launch_account
+        .as_ref()
+        .is_some_and(|account| account.plays_offline);
     if plays_offline {
         emit_log(
             &app_handle,
@@ -273,6 +378,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             "[Launcher] The active account is set to play offline: no update check, no version lookups, offline identity".to_string(),
         )?;
     }
+
+    remove_stale_partial_downloads(&app_handle, &launcher_paths);
 
     let http_client = crate::modrinth::build_download_client();
     if target.mod_loader == ModLoader::Vanilla {
@@ -285,10 +392,46 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             effective_settings,
             http_client,
             request.quick_play_singleplayer.clone(),
-            plays_offline,
+            request.resolved_content.clone(),
+            launch_account,
         )
         .await;
     }
+
+    let minecraft_progress = |label: &str, detail: &str| {
+        let _ = emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            format!("[MC] {label}: {detail}"),
+        );
+    };
+    // D142: con l'account offline Minecraft deve essere già tutto in cache, e
+    // lo si guarda prima dei mod e di Java: se manca qualcosa il lancio si
+    // ferma qui con un errore che lo dice, senza una richiesta (D132). Prima
+    // partivano manifest, client, librerie e migliaia di asset.
+    let cached_minecraft = if plays_offline {
+        Some(
+            ensure_minecraft_version(
+                &http_client,
+                &target.minecraft_version,
+                &launcher_paths,
+                MinecraftCachePolicy::CacheOnly,
+                &minecraft_progress,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // lancio-11: i metadati del loader prima di risolvere e scaricare
+    // qualunque cosa. Una coppia versione/loader che non esiste (NeoForge
+    // 1.19.2) si ferma qui, invece che dopo centinaia di MB di mod e di
+    // Minecraft. Con l'account offline vengono dalla cache scritta dall'ultimo
+    // lancio online della combinazione (D137): senza la voce il lancio si
+    // ferma qui, prima di toccare mods/ e i config dell'istanza.
+    let mut loader_metadata =
+        fetch_launch_loader_metadata(&app_handle, &launcher_paths, &target, plays_offline).await?;
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let modrinth_client = ModrinthClient::new();
@@ -363,13 +506,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
 
-    let (
-        all_remote_versions,
-        cached_remote_records,
-        missing_jar_records,
-        effective_required_java,
-        project_aliases,
-    ) = if matches!(
+    let (all_remote_versions, cached_remote_records, missing_jar_records, project_aliases) = if matches!(
         resolution_path,
         LaunchResolutionPath::Preresolved(_) | LaunchResolutionPath::Offline
     ) {
@@ -417,7 +554,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             parent_versions,
             split.cached_records,
             split.missing_jar_records,
-            required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     } else {
@@ -493,7 +629,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             parent_versions,
             fallback.cached_records,
             fallback.missing_jar_records,
-            required_java_version_for_minecraft(&target.minecraft_version)?,
             project_aliases,
         )
     };
@@ -514,10 +649,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     launch_log_session.append_summary_line(&format!(
         "resolved_cached_records={}",
         cached_remote_records.len()
-    ))?;
-    launch_log_session.append_summary_line(&format!(
-        "required_java_before_loader={}",
-        effective_required_java
     ))?;
     emit_progress(
         &app_handle,
@@ -575,30 +706,37 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &project_aliases,
     )?;
 
-    emit_progress(
-        &app_handle,
-        "resolving",
-        58,
-        "Download Minecraft",
-        &format!(
-            "Ensuring Minecraft {} client, libraries and assets are cached.",
-            target.minecraft_version
-        ),
-    )?;
-
-    let mc_data = ensure_minecraft_version(
-        &http_client,
-        &target.minecraft_version,
-        &launcher_paths,
-        |label, detail| {
-            let _ = emit_log(
+    let mc_data = match cached_minecraft {
+        Some(mc_data) => mc_data,
+        None => {
+            emit_progress(
                 &app_handle,
-                ProcessLogStream::Stdout,
-                format!("[MC] {label}: {detail}"),
-            );
-        },
-    )
-    .await?;
+                "resolving",
+                58,
+                "Download Minecraft",
+                &format!(
+                    "Ensuring Minecraft {} client, libraries and assets are cached.",
+                    target.minecraft_version
+                ),
+            )?;
+            ensure_minecraft_version(
+                &http_client,
+                &target.minecraft_version,
+                &launcher_paths,
+                MinecraftCachePolicy::Download,
+                &minecraft_progress,
+            )
+            .await?
+        }
+    };
+    // download-3: la major di Java la dice il version.json, che conosce anche
+    // snapshot, pre-release e release candidate.
+    let effective_required_java =
+        required_java_for_minecraft_version(mc_data.java_major_version, &target.minecraft_version);
+    launch_log_session.append_summary_line(&format!(
+        "required_java_before_loader={}",
+        effective_required_java
+    ))?;
 
     emit_progress(
         &app_handle,
@@ -617,21 +755,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     std::fs::create_dir_all(&instance_natives_dir)
         .with_context(|| format!("failed to create {}", instance_natives_dir.display()))?;
 
-    // Primo avvio di questa istanza: si semina da `options.txt` della modlist,
-    // e mai più (D66). Il "mai più" non ha bisogno di uno stato nostro — dal
-    // secondo avvio il file c'è, perché l'abbiamo scritto noi o perché il
-    // gioco l'ha riscritto — e la semina lascia comunque una riga nel log,
-    // anche quando non fa niente.
-    let options_seed = crate::options_share::seed_instance_from_modlist(
-        &launcher_paths,
-        &modlist_name,
-        &instance_root,
-    );
-    let _ = emit_log(
-        &app_handle,
-        ProcessLogStream::Stdout,
-        format!("[options] {}", options_seed.describe()),
-    );
+    seed_instance_options(&app_handle, &launcher_paths, &modlist_name, &instance_root);
 
     let cached_mod_jars = build_cached_mod_jars(
         &app_handle,
@@ -685,35 +809,19 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         )?;
     }
 
-    // Download and install content packs (resource packs, data packs, shaders),
-    // at the versions the pre-check named when it named any (D58).
-    //
-    // D-c (onda 8a): con l'account offline il passo non gira. Nessun lookup su
-    // Modrinth, nessuna installazione, nessuno svuotamento: restano nell'istanza
-    // i file del lancio precedente. Il lookup fallito lasciava già lo stesso
-    // risultato, ma dopo ~70 s di tentativi (report 098, S3), e con la rete
-    // funzionante un account offline si vedeva aggiornare i pack.
-    if plays_offline {
-        emit_log(
-            &app_handle,
-            ProcessLogStream::Stdout,
-            "[Content] The active account plays offline: content packs are not looked up or installed; the instance keeps the ones from the previous launch".to_string(),
-        )?;
-    } else {
-        resolve_and_install_content_packs(
-            &app_handle,
-            &launcher_paths,
-            &http_client,
-            &modrinth_client,
-            &modlist_name,
-            &target,
-            &instance_root,
-            request.resolved_content.as_ref(),
-        )
-        .await?;
-    }
+    install_launch_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &modrinth_client,
+        &modlist_name,
+        &target,
+        &instance_root,
+        request.resolved_content.as_ref(),
+        plays_offline,
+    )
+    .await?;
 
-    let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
     let mut loader_library_paths =
         materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;
     let loader_maven_file_paths =
@@ -731,6 +839,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     }
     if let Some(preparation) = prepare_forge_wrapper_launch(
         &http_client,
+        &instance_root,
         &instance_library_dir,
         &mc_data.client_jar_path,
         &mut loader_metadata,
@@ -791,7 +900,8 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
+    let player_identity =
+        load_player_identity(&app_handle, &launcher_paths, launch_account.as_ref()).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -807,12 +917,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &player_identity,
         &modlist_name,
         &target,
-        &instance_root,
-        &mc_data.assets_dir,
-        &mc_data.asset_index_id,
-        &instance_library_dir,
-        &instance_natives_dir,
-        mc_data.is_virtual_assets,
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &mc_data.assets_dir,
+            asset_index_id: &mc_data.asset_index_id,
+            library_directory: &instance_library_dir,
+            natives_directory: &instance_natives_dir,
+            is_virtual_assets: mc_data.is_virtual_assets,
+        },
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
@@ -835,7 +947,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "required_java_after_loader={}",
         effective_required_java
     ))?;
-    let java_binary_path = select_or_download_java(
+    let selected_java = select_or_download_java(
         &app_handle,
         &launcher_paths,
         &effective_settings,
@@ -847,17 +959,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        format!("[Java] Using {}", java_binary_path.display()),
+        format!(
+            "[Java] Using {} (Java {})",
+            selected_java.path.display(),
+            selected_java.major
+        ),
     )?;
 
     let profiler = launch_profiler(
         &app_handle,
         &effective_settings,
-        effective_required_java,
+        // todo.md:1800: la Java che parte davvero, non il requisito.
+        selected_java.major,
         launch_log_session.dir(),
     )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
-        java_binary_path: java_binary_path.clone(),
+        java_binary_path: selected_java.path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries: build_modded_classpath_entries(
             &mc_data.library_paths,

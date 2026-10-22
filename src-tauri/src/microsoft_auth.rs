@@ -14,6 +14,63 @@ const MICROSOFT_AUTHORIZE_URL: &str =
 const MICROSOFT_TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const BUNDLED_MICROSOFT_CLIENT_ID: &str = "7dce88aa-79b0-4b77-9666-0fdb8addd50c";
 
+/// How long a sign-in or refresh request waits for a connection to open.
+const AUTH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one request of the sign-in and refresh chain may take, body
+/// included: every answer is a small JSON document.
+const AUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client of the Microsoft, Xbox and Minecraft services. Before audit 101
+/// (account-7) it was `reqwest::Client::new()`, with no timeout at all: a
+/// service that accepted the connection and said nothing kept the launch on
+/// «Authenticating» for as long as the operating system allowed.
+fn auth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(AUTH_CONNECT_TIMEOUT)
+        .timeout(AUTH_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
+/// The token endpoint refused a request, with the OAuth `error` code of its
+/// answer when it had one. Only the code: `error_description` carries trace
+/// ids and timestamps, never a token, but nothing here needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicrosoftTokenEndpointError {
+    pub status: u16,
+    pub error: Option<String>,
+}
+
+impl std::fmt::Display for MicrosoftTokenEndpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.error {
+            Some(error) => write!(formatter, "HTTP status {} ({error})", self.status),
+            None => write!(formatter, "HTTP status {}", self.status),
+        }
+    }
+}
+
+impl std::error::Error for MicrosoftTokenEndpointError {}
+
+/// D143 (audit 101, account-1): whether a failed refresh means the saved
+/// sign-in is dead and only a new interactive sign-in can bring it back.
+/// `invalid_grant` is the revoked or expired refresh token (password change,
+/// ~90 days unused); `interaction_required` is Microsoft asking the user
+/// to sign in themselves. A network error, a 5xx or a refusal of the client
+/// itself (`invalid_client`) say nothing about the account and keep it.
+pub fn refresh_needs_sign_in_again(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<MicrosoftTokenEndpointError>()
+            .is_some_and(|error| {
+                matches!(
+                    error.error.as_deref(),
+                    Some("invalid_grant") | Some("interaction_required")
+                )
+            })
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftOAuthConfig {
     pub client_id: String,
@@ -45,7 +102,7 @@ pub struct MicrosoftOAuthClient {
 impl MicrosoftOAuthClient {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: MICROSOFT_AUTHORIZE_URL.to_string(),
             token_url: MICROSOFT_TOKEN_URL.to_string(),
         }
@@ -53,7 +110,7 @@ impl MicrosoftOAuthClient {
 
     pub fn with_endpoints(authorize_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: authorize_url.into(),
             token_url: token_url.into(),
         }
@@ -125,9 +182,24 @@ impl MicrosoftOAuthClient {
             ])
             .send()
             .await
-            .context("failed to refresh Microsoft access token")?
-            .error_for_status()
-            .context("Microsoft refresh token endpoint returned an error")?;
+            .context("failed to refresh Microsoft access token")?;
+        let status = response.status();
+        if !status.is_success() {
+            #[derive(Deserialize)]
+            struct TokenErrorBody {
+                error: Option<String>,
+            }
+            let error = response
+                .json::<TokenErrorBody>()
+                .await
+                .ok()
+                .and_then(|body| body.error);
+            return Err(anyhow::Error::new(MicrosoftTokenEndpointError {
+                status: status.as_u16(),
+                error,
+            })
+            .context("Microsoft refresh token endpoint returned an error"));
+        }
 
         response
             .json::<MicrosoftTokenResponse>()
@@ -165,6 +237,16 @@ pub struct AccountRecord {
     /// row; written only by `set_plays_offline`: `upsert_account` saves a
     /// sign-in and leaves the choice as it was, so this field is ignored there.
     pub plays_offline: bool,
+}
+
+/// The columns `AccountsRepository::update_session_tokens` writes. The refresh
+/// token always; `None` in any other field keeps what the row has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTokenUpdate {
+    pub refresh_token_enc: Vec<u8>,
+    pub access_token_enc: Option<Vec<u8>>,
+    pub minecraft_uuid: Option<String>,
+    pub profile_data: Option<String>,
 }
 
 pub struct AccountsRepository<'connection> {
@@ -341,6 +423,55 @@ impl<'connection> AccountsRepository<'connection> {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Saves the tokens of a refresh made by the launch on the row it read at
+    /// the start (concorrenza-8): the token blobs, and the identity the fresh
+    /// sign-in reported, when there is one. `last_login` is not touched: it
+    /// orders Manage Accounts by sign-in, and a launch is not one. Not an upsert: `is_active`, the
+    /// play-offline choice and the other rows stay as they are, so an account
+    /// switched away from, or removed, during the launch is not made active
+    /// again or re-created. Returns whether the row still existed.
+    pub fn update_session_tokens(
+        &self,
+        microsoft_id: &str,
+        tokens: &SessionTokenUpdate,
+    ) -> Result<bool> {
+        let updated_rows = self.connection.execute(
+            r#"
+            UPDATE accounts SET
+                access_token_enc = COALESCE(?2, access_token_enc),
+                refresh_token_enc = ?3,
+                minecraft_uuid = COALESCE(?4, minecraft_uuid),
+                profile_data = COALESCE(?5, profile_data)
+            WHERE microsoft_id = ?1
+            "#,
+            params![
+                microsoft_id,
+                &tokens.access_token_enc,
+                &tokens.refresh_token_enc,
+                &tokens.minecraft_uuid,
+                &tokens.profile_data,
+            ],
+        )?;
+        Ok(updated_rows > 0)
+    }
+
+    /// D143: Microsoft refused the saved refresh token for good, so it is
+    /// dropped and the row reads as signed out, which is what offers «Sign in
+    /// again». Only if the row still holds the blob the launch read: a sign-in
+    /// saved in the meantime is not thrown away. Returns whether it cleared.
+    pub fn clear_rejected_refresh_token(
+        &self,
+        microsoft_id: &str,
+        rejected_refresh_token_enc: &[u8],
+    ) -> Result<bool> {
+        let updated_rows = self.connection.execute(
+            "UPDATE accounts SET refresh_token_enc = NULL \
+             WHERE microsoft_id = ?1 AND refresh_token_enc = ?2",
+            params![microsoft_id, rejected_refresh_token_enc],
+        )?;
+        Ok(updated_rows > 0)
     }
 
     /// Sets every token blob to NULL and keeps the rows. Only the explicit
@@ -642,7 +773,7 @@ impl Default for MinecraftAuthChain {
 impl MinecraftAuthChain {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
         }
     }
 
@@ -964,8 +1095,9 @@ mod tests {
         build_authorization_url, build_pkce_code_challenge, callback_url_from_request_line,
         default_agent_author_name, default_loopback_redirect_uri, generate_url_safe_random_bytes,
         join_scopes, microsoft_client_id_from_env, parse_authorization_callback,
-        validate_oauth_config, AccountRecord, AccountsRepository, MicrosoftOAuthClient,
-        MicrosoftOAuthConfig, MinecraftProfile, SkinVariant, TextureState,
+        refresh_needs_sign_in_again, validate_oauth_config, AccountRecord, AccountsRepository,
+        MicrosoftOAuthClient, MicrosoftOAuthConfig, MinecraftProfile, SessionTokenUpdate,
+        SkinVariant, TextureState,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -1288,5 +1420,172 @@ mod tests {
                 .expect("our own spelling must read back"),
             SkinVariant::Slim
         );
+    }
+
+    /// A local token endpoint that answers one request with `status` and a
+    /// JSON `body`.
+    fn one_shot_token_endpoint(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}/token")
+    }
+
+    async fn refresh_against(status: &'static str, body: &'static str) -> anyhow::Error {
+        let token_url = one_shot_token_endpoint(status, body);
+        MicrosoftOAuthClient::with_endpoints("http://127.0.0.1:9/authorize", token_url)
+            .refresh_access_token(&sample_config(), "saved-refresh-token")
+            .await
+            .expect_err("the endpoint refuses the refresh")
+    }
+
+    /// D143 (account-1): a refresh token Microsoft refuses for good asks for a
+    /// new sign-in; a refusal of the client or a server error does not, and
+    /// the error never carries the token that was sent.
+    #[tokio::test]
+    async fn only_a_dead_grant_asks_to_sign_in_again() {
+        let invalid_grant = refresh_against(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"AADSTS70000: expired"}"#,
+        )
+        .await;
+        assert!(refresh_needs_sign_in_again(&invalid_grant));
+        assert!(format!("{invalid_grant:#}").contains("invalid_grant"));
+        assert!(!format!("{invalid_grant:#}").contains("saved-refresh-token"));
+
+        let interaction =
+            refresh_against("400 Bad Request", r#"{"error":"interaction_required"}"#).await;
+        assert!(refresh_needs_sign_in_again(&interaction));
+
+        let client = refresh_against("400 Bad Request", r#"{"error":"invalid_client"}"#).await;
+        assert!(!refresh_needs_sign_in_again(&client));
+
+        let unavailable = refresh_against("503 Service Unavailable", "").await;
+        assert!(!refresh_needs_sign_in_again(&unavailable));
+    }
+
+    fn signed_in_account(microsoft_id: &str, is_active: bool) -> AccountRecord {
+        AccountRecord {
+            microsoft_id: microsoft_id.into(),
+            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+            access_token_enc: Some(vec![1, 2, 3]),
+            refresh_token_enc: Some(vec![4, 5, 6]),
+            profile_data: Some("{\"name\":\"Before\"}".into()),
+            is_active,
+            plays_offline: false,
+        }
+    }
+
+    /// concorrenza-8: the launch's refresh writes the tokens of its own row and
+    /// nothing else; `None` keeps what the row has.
+    #[test]
+    fn session_token_update_touches_only_the_tokens_of_its_row() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        repository
+            .upsert_account(&signed_in_account("account-a", true))
+            .expect("A should insert");
+        repository
+            .set_plays_offline("account-a", true)
+            .expect("A's choice should save");
+        repository
+            .upsert_account(&signed_in_account("account-b", true))
+            .expect("B should insert and become active");
+
+        let updated = repository
+            .update_session_tokens(
+                "account-a",
+                &SessionTokenUpdate {
+                    refresh_token_enc: vec![9, 9, 9],
+                    access_token_enc: None,
+                    minecraft_uuid: None,
+                    profile_data: None,
+                },
+            )
+            .expect("update should run");
+        assert!(updated);
+        let missing = repository
+            .update_session_tokens(
+                "account-gone",
+                &SessionTokenUpdate {
+                    refresh_token_enc: vec![9],
+                    access_token_enc: None,
+                    minecraft_uuid: None,
+                    profile_data: None,
+                },
+            )
+            .expect("update should run");
+        assert!(!missing);
+
+        let accounts = repository.list_accounts().expect("accounts should list");
+        assert_eq!(accounts.len(), 2, "no row is created");
+        let account_a = accounts
+            .iter()
+            .find(|account| account.microsoft_id == "account-a")
+            .expect("A exists");
+        assert_eq!(account_a.refresh_token_enc.as_deref(), Some(&[9, 9, 9][..]));
+        assert_eq!(account_a.access_token_enc.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(account_a.minecraft_uuid.as_deref(), Some("account-a-uuid"));
+        assert!(!account_a.is_active);
+        assert!(account_a.plays_offline);
+        assert_eq!(
+            repository
+                .load_active_account()
+                .expect("active should load")
+                .expect("one is active")
+                .microsoft_id,
+            "account-b"
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D143: the refused refresh token is dropped only while the row still
+    /// holds it; a sign-in saved during the launch is kept.
+    #[test]
+    fn a_rejected_refresh_token_is_cleared_only_if_it_is_still_the_saved_one() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        repository
+            .upsert_account(&signed_in_account("account-a", true))
+            .expect("A should insert");
+
+        let stale = repository
+            .clear_rejected_refresh_token("account-a", &[7, 7, 7])
+            .expect("clear should run");
+        assert!(!stale, "a newer sign-in is not thrown away");
+        let cleared = repository
+            .clear_rejected_refresh_token("account-a", &[4, 5, 6])
+            .expect("clear should run");
+        assert!(cleared);
+
+        let account_a = repository
+            .load_active_account()
+            .expect("active should load")
+            .expect("A stays active");
+        assert_eq!(account_a.refresh_token_enc, None);
+        assert_eq!(account_a.minecraft_uuid.as_deref(), Some("account-a-uuid"));
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 }

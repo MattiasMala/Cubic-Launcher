@@ -245,10 +245,23 @@ pub fn host_adoptium_os() -> &'static str {
     }
 }
 
-pub fn normalize_adoptium_architecture(architecture: &str) -> &'static str {
+/// The Adoptium name of an architecture (`std::env::consts::ARCH` or a Java
+/// `os.arch`), or `None` when Adoptium has no name for it.
+///
+/// Before, everything that was not arm became `x64`: a 32-bit or exotic
+/// machine downloaded a runtime it cannot run, and the launch then failed
+/// on a binary that does not execute (todo.md:1768).
+pub fn normalize_adoptium_architecture(architecture: &str) -> Option<&'static str> {
     match architecture.to_ascii_lowercase().as_str() {
-        "aarch64" | "arm64" => "aarch64",
-        _ => "x64",
+        "x86_64" | "amd64" | "x64" => Some("x64"),
+        "x86" | "i386" | "i486" | "i586" | "i686" => Some("x86"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        "arm" => Some("arm"),
+        "powerpc64" if cfg!(target_endian = "little") => Some("ppc64le"),
+        "powerpc64" => Some("ppc64"),
+        "s390x" => Some("s390x"),
+        "riscv64" => Some("riscv64"),
+        _ => None,
     }
 }
 
@@ -426,9 +439,18 @@ mod tests {
 
     #[test]
     fn normalizes_supported_adoptium_architectures() {
-        assert_eq!(normalize_adoptium_architecture("arm64"), "aarch64");
-        assert_eq!(normalize_adoptium_architecture("aarch64"), "aarch64");
-        assert_eq!(normalize_adoptium_architecture("x86_64"), "x64");
+        assert_eq!(normalize_adoptium_architecture("arm64"), Some("aarch64"));
+        assert_eq!(normalize_adoptium_architecture("aarch64"), Some("aarch64"));
+        assert_eq!(normalize_adoptium_architecture("x86_64"), Some("x64"));
+        assert_eq!(normalize_adoptium_architecture("x86"), Some("x86"));
+        assert_eq!(normalize_adoptium_architecture("riscv64"), Some("riscv64"));
+    }
+
+    #[test]
+    fn unknown_architectures_are_not_mapped_to_x64() {
+        assert_eq!(normalize_adoptium_architecture("loongarch64"), None);
+        assert_eq!(normalize_adoptium_architecture("mips64"), None);
+        assert_eq!(normalize_adoptium_architecture(""), None);
     }
     #[tokio::test]
     async fn runtime_archive_lands_whole_and_replaces_a_stale_partial() {

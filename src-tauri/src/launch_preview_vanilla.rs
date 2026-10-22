@@ -3,24 +3,27 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
-use crate::java_runtime::required_java_version_for_minecraft;
+use crate::java_runtime::required_java_for_minecraft_version;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::LoaderMetadataClient;
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::ModAcquisitionPlan;
+use crate::modrinth::ModrinthClient;
 use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::worlds::quick_play_arguments;
 
 use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
-    launch_profiler, load_player_identity, merge_minecraft_and_loader_jvm_arguments,
+    install_launch_content_packs, launch_profiler, load_player_identity,
+    merge_minecraft_and_loader_jvm_arguments, minecraft_cache_policy, seed_instance_options,
     select_or_download_java, spawn_minecraft_process, substitute_loader_placeholders,
-    EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders, SelectedMod, StartedLaunch,
+    EffectiveLaunchSettings, LaunchDirectories, LaunchLogSession, LaunchPlaceholders,
+    ResolvedContentVersions, SelectedMod, StartedLaunch,
 };
 
-// Nove input distinti di un passo del lancio. Una struct di parametri
+// Dieci input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
 #[allow(clippy::too_many_arguments)]
@@ -33,14 +36,19 @@ pub(super) async fn run_vanilla_launch_pipeline(
     effective_settings: EffectiveLaunchSettings,
     http_client: reqwest::Client,
     quick_play_singleplayer: Option<String>,
-    // The active account's choice (D115), read once by the caller.
-    plays_offline: bool,
+    // The pre-check's content-pack versions (D58), when it named any.
+    resolved_content: Option<ResolvedContentVersions>,
+    // The active account's row, read once by the caller (D115, concorrenza-8):
+    // its play-offline choice and its identity come from this one reading.
+    launch_account: Option<crate::microsoft_auth::AccountRecord>,
 ) -> Result<StartedLaunch> {
+    let plays_offline = launch_account
+        .as_ref()
+        .is_some_and(|account| account.plays_offline);
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        "[Launch] Vanilla loader selected; skipping mod resolution, mod downloads and content packs."
-            .to_string(),
+        "[Launch] Vanilla loader selected; skipping mod resolution and mod downloads.".to_string(),
     )?;
 
     let selected_mods: Vec<SelectedMod> = Vec::new();
@@ -63,12 +71,6 @@ pub(super) async fn run_vanilla_launch_pipeline(
     launch_log_session.append_summary_line("resolved_remote_versions=0")?;
     launch_log_session.append_summary_line("resolved_cached_records=0")?;
 
-    let effective_required_java = required_java_version_for_minecraft(&target.minecraft_version)?;
-    launch_log_session.append_summary_line(&format!(
-        "required_java_before_loader={}",
-        effective_required_java
-    ))?;
-
     emit_progress(
         &app_handle,
         "resolving",
@@ -80,10 +82,13 @@ pub(super) async fn run_vanilla_launch_pipeline(
         ),
     )?;
 
+    // D142: offline la cache deve avere tutto, e nessuna richiesta parte. Qui
+    // non ci sono mod, e Java viene dopo: il controllo è già il primo passo.
     let mc_data = ensure_minecraft_version(
         &http_client,
         &target.minecraft_version,
         &launcher_paths,
+        minecraft_cache_policy(plays_offline),
         |label, detail| {
             let _ = emit_log(
                 &app_handle,
@@ -94,12 +99,20 @@ pub(super) async fn run_vanilla_launch_pipeline(
     )
     .await?;
 
+    // download-3: la major di Java la dice il version.json appena letto.
+    let effective_required_java =
+        required_java_for_minecraft_version(mc_data.java_major_version, &target.minecraft_version);
+    launch_log_session.append_summary_line(&format!(
+        "required_java_before_loader={}",
+        effective_required_java
+    ))?;
+
     emit_progress(
         &app_handle,
         "resolving",
         74,
         "Prepare Instance",
-        "Preparing a clean vanilla instance without mod or content-pack materialization.",
+        "Preparing the vanilla instance: game settings and content packs, no mods.",
     )?;
 
     let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target)?;
@@ -115,6 +128,24 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &cached_mod_jars,
     )?;
     extract_natives(&mc_data.native_paths, &instance_natives_dir)?;
+
+    // condivisi-5: le impostazioni di gioco della mod list valgono anche per
+    // un'istanza Vanilla, con la stessa riga `[options]` del percorso moddato.
+    seed_instance_options(&app_handle, &launcher_paths, &modlist_name, &instance_root);
+    // contentpack-3: resource pack e data pack anche con Vanilla, con lo stesso
+    // cancello dell'account offline del percorso moddato; gli shader no.
+    install_launch_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &ModrinthClient::new(),
+        &modlist_name,
+        &target,
+        &instance_root,
+        resolved_content.as_ref(),
+        plays_offline,
+    )
+    .await?;
 
     let mut loader_metadata = LoaderMetadataClient::new()
         .fetch_loader_metadata(&target.minecraft_version, ModLoader::Vanilla)
@@ -132,7 +163,8 @@ pub(super) async fn run_vanilla_launch_pipeline(
         "Authenticating",
         "Refreshing Minecraft session...",
     )?;
-    let player_identity = load_player_identity(&app_handle, &launcher_paths, plays_offline).await?;
+    let player_identity =
+        load_player_identity(&app_handle, &launcher_paths, launch_account.as_ref()).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -148,12 +180,14 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &player_identity,
         &modlist_name,
         &target,
-        &instance_root,
-        &mc_data.assets_dir,
-        &mc_data.asset_index_id,
-        &instance_library_dir,
-        &instance_natives_dir,
-        mc_data.is_virtual_assets,
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &mc_data.assets_dir,
+            asset_index_id: &mc_data.asset_index_id,
+            library_directory: &instance_library_dir,
+            natives_directory: &instance_natives_dir,
+            is_virtual_assets: mc_data.is_virtual_assets,
+        },
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
@@ -175,7 +209,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         effective_required_java
     ))?;
 
-    let java_binary_path = select_or_download_java(
+    let selected_java = select_or_download_java(
         &app_handle,
         &launcher_paths,
         &effective_settings,
@@ -187,7 +221,11 @@ pub(super) async fn run_vanilla_launch_pipeline(
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        format!("[Java] Using {}", java_binary_path.display()),
+        format!(
+            "[Java] Using {} (Java {})",
+            selected_java.path.display(),
+            selected_java.major
+        ),
     )?;
 
     let mut classpath_entries = mc_data.library_paths.clone();
@@ -195,11 +233,12 @@ pub(super) async fn run_vanilla_launch_pipeline(
     let profiler = launch_profiler(
         &app_handle,
         &effective_settings,
-        effective_required_java,
+        // todo.md:1800: la Java che parte davvero, non il requisito.
+        selected_java.major,
         launch_log_session.dir(),
     )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
-        java_binary_path: java_binary_path.clone(),
+        java_binary_path: selected_java.path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries,
         loader_metadata,

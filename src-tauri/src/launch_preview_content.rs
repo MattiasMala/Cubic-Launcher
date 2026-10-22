@@ -9,7 +9,7 @@ use crate::local_content_packs::{link_local_pack, plan_local_pack_installs, Pack
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
-use crate::resolver::ResolutionTarget;
+use crate::resolver::{ModLoader, ResolutionTarget};
 use crate::rules::VersionRuleKind;
 
 use super::{download_file, emit_log, select_preferred_version};
@@ -482,6 +482,16 @@ pub(super) async fn resolve_and_install_content_packs(
         .filter(|(content_type, _)| *content_type != DATAPACK_CATEGORY)
         .copied()
     {
+        // contentpack-3: Vanilla has no shader loader, so its instance gets
+        // resource packs and data packs, and the shader list is left alone.
+        if content_type == "shader" && target.mod_loader == ModLoader::Vanilla {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                "[Content] Vanilla loads no shaders: shader packs are skipped".to_string(),
+            )?;
+            continue;
+        }
         let list = load_content_list(&modlist_dir, content_type).unwrap_or_else(|_| ContentList {
             content_type: content_type.to_string(),
             entries: vec![],

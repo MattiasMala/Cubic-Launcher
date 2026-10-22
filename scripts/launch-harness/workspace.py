@@ -258,6 +258,26 @@ class HarnessWorkspace:
         finally:
             connection.close()
 
+    def set_plays_offline(self, microsoft_id: str, plays_offline: bool) -> None:
+        """`UPDATE` esplicito di `plays_offline` su un account già seminato.
+
+        `seed_offline_account` salta una riga che esiste già, quindi non basta
+        per passare lo stesso account da offline a online fra due lanci (D160:
+        l'innesco della guardia gioca online, la misura offline).
+        """
+        self._assert_under_root(self.database_path)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            updated = connection.execute(
+                "UPDATE accounts SET plays_offline = ? WHERE microsoft_id = ?",
+                (1 if plays_offline else 0, microsoft_id),
+            ).rowcount
+            connection.commit()
+        finally:
+            connection.close()
+        if updated != 1:
+            raise RuntimeError(f"no account {microsoft_id!r} in {self.database_path}")
+
     def link_tree(self, source: Path, relative: str) -> Path:
         """Hard-link a read-only real tree into the workspace (`cp -al`).
 

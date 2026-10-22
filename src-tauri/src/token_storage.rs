@@ -132,7 +132,7 @@ impl<S: SecretStore> AccountTokenCipher<S> {
         self.encrypt_token_with_key_creation(token, true)
     }
 
-    fn encrypt_token_with_key_creation(
+    pub(crate) fn encrypt_token_with_key_creation(
         &self,
         token: &str,
         create_key_if_missing: bool,

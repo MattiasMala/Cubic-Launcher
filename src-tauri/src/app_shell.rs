@@ -570,10 +570,55 @@ pub fn save_global_settings(
     upsert_global_settings(connection, &values)
 }
 
+/// shell-5: la RAM che un lancio di questa mod list userebbe davvero, cioè
+/// l'override dove c'è e il valore globale altrove, va bene insieme. Min e
+/// max si combinano ognuno per conto suo, quindi un «Max RAM» di 1536 sopra
+/// un minimo globale di 2048 passava il salvataggio e faceva fallire il
+/// lancio solo alla fine della preparazione, download compresi.
+pub fn validate_effective_ram(
+    global_min_ram_mb: u32,
+    global_max_ram_mb: u32,
+    override_min_ram_mb: Option<u32>,
+    override_max_ram_mb: Option<u32>,
+) -> Result<()> {
+    let describe = |value: u32, from_override: bool| {
+        if from_override {
+            format!("{value} MB, set for this mod list")
+        } else {
+            format!("{value} MB, from the global settings")
+        }
+    };
+    let min = override_min_ram_mb.unwrap_or(global_min_ram_mb);
+    let max = override_max_ram_mb.unwrap_or(global_max_ram_mb);
+    let min_label = describe(min, override_min_ram_mb.is_some());
+    let max_label = describe(max, override_max_ram_mb.is_some());
+
+    if min == 0 {
+        bail!("Minimum RAM ({min_label}) must be greater than zero.");
+    }
+    if max == 0 {
+        bail!("Maximum RAM ({max_label}) must be greater than zero.");
+    }
+    if min > max {
+        bail!(
+            "Minimum RAM ({min_label}) cannot exceed maximum RAM ({max_label}). Change one of them in Settings."
+        );
+    }
+    Ok(())
+}
+
 pub fn save_modlist_overrides(
     connection: &Connection,
     overrides: &ShellModListOverridesInput,
 ) -> Result<()> {
+    let global = load_global_settings(connection)?;
+    validate_effective_ram(
+        global.min_ram_mb,
+        global.max_ram_mb,
+        overrides.min_ram_mb,
+        overrides.max_ram_mb,
+    )?;
+
     let mut values = Vec::new();
 
     if let Some(value) = overrides.min_ram_mb {
@@ -1078,7 +1123,7 @@ mod tests {
             &connection,
             &ShellModListOverridesInput {
                 modlist_name: "Beta Pack".into(),
-                min_ram_mb: Some(8192),
+                min_ram_mb: Some(4096),
                 max_ram_mb: None,
                 custom_jvm_args: Some("-Dbeta=true".into()),
                 profiler_enabled: Some(false),
@@ -1114,7 +1159,7 @@ mod tests {
             snapshot.selected_modlist_overrides.modlist_name.as_deref(),
             Some("Beta Pack")
         );
-        assert_eq!(snapshot.selected_modlist_overrides.min_ram_mb, Some(8192));
+        assert_eq!(snapshot.selected_modlist_overrides.min_ram_mb, Some(4096));
         assert_eq!(
             snapshot
                 .selected_modlist_overrides

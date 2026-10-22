@@ -31,6 +31,9 @@ tauri-build = { version = "2", features = [] }
 aes-gcm = "0.10"
 anyhow = "1"
 base64 = "0.22"
+# Already compiled through `trash` with these features: the local time of the
+# game's log4j XML events (download-1), with no new crate in the build.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Without a backend feature `keyring` silently falls back to its in-memory
 # mock store, which forgets the token key between two `Entry` values: every
 # saved account became undecryptable and every launch fell back to offline
