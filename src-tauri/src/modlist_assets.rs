@@ -810,20 +810,44 @@ fn normalize_icon_label(icon_label: &str, modlist_name: &str) -> String {
     }
 }
 
+/// The folder at the root of the archive, which the import takes as the name
+/// of the new mod list: so it has to pass `validate_new_modlist_name`
+/// (review-contenuti-13). A mod list made before that check — `Create; Astral`,
+/// `Pack.` on Linux — keeps its name here, and its archive used to be refused
+/// on import, renaming the zip being no help. Forbidden and control characters
+/// become `_`, a trailing dot or space goes, and a name Windows reserves for a
+/// device gets a `_` after its stem.
 fn normalize_archive_root(modlist_name: &str) -> String {
     let sanitized = modlist_name
-        .trim()
         .chars()
-        .map(|character| match character {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            other => other,
+        .map(|character| {
+            if crate::path_safety::MODLIST_NAME_FORBIDDEN_CHARS.contains(&character)
+                || character.is_control()
+            {
+                '_'
+            } else {
+                character
+            }
         })
         .collect::<String>();
-
+    let sanitized = sanitized.trim().trim_end_matches(['.', ' ']).to_string();
     if sanitized.is_empty() {
-        "modlist-export".to_string()
+        return "modlist-export".to_string();
+    }
+    if crate::path_safety::validate_new_modlist_name(&sanitized).is_ok() {
+        return sanitized;
+    }
+
+    // The only refusal left is a reserved device name (`CON`, `nul.txt`).
+    let (stem, rest) = match sanitized.split_once('.') {
+        Some((stem, rest)) => (stem, format!(".{rest}")),
+        None => (sanitized.as_str(), String::new()),
+    };
+    let renamed = format!("{stem}_{rest}");
+    if crate::path_safety::validate_new_modlist_name(&renamed).is_ok() {
+        renamed
     } else {
-        sanitized
+        "modlist-export".to_string()
     }
 }
 
@@ -1258,6 +1282,28 @@ mod tests {
         drop(entry);
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// review-contenuti-13: the root of the archive is always a name the
+    /// import accepts.
+    #[test]
+    fn the_archive_root_is_a_name_the_import_accepts() {
+        for (name, expected) in [
+            ("Create; Astral", "Create_ Astral"),
+            ("Pack.", "Pack"),
+            ("Pack. . ", "Pack"),
+            ("tab\there", "tab_here"),
+            ("a:b", "a_b"),
+            ("CON", "CON_"),
+            ("nul.txt", "nul_.txt"),
+            ("...", "modlist-export"),
+            ("Normal Pack", "Normal Pack"),
+        ] {
+            let root = super::normalize_archive_root(name);
+            assert_eq!(root, expected, "for {name:?}");
+            crate::path_safety::validate_new_modlist_name(&root)
+                .unwrap_or_else(|error| panic!("{root:?} is refused: {error}"));
+        }
     }
 
     /// review-decisioni-35: un'istanza esportata intera non porta con sé il
