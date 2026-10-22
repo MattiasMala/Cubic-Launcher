@@ -379,6 +379,10 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
         if !path.is_dir() {
             continue;
         }
+        // An import in progress, or one cut short, is not a mod list.
+        if crate::modlist_manager::is_import_staging_dir(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
 
         let rules_path = path.join(RULES_FILENAME);
         if rules_path.exists() {

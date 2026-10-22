@@ -8,6 +8,7 @@ import {
   modListCards,
   modRowsState,
   onToggleEnabled,
+  pushUiError,
   search,
   selectedModListName,
   setActiveContentTab,
@@ -33,6 +34,8 @@ import {
 
 interface Props {
   onAddMod: () => void;
+  /** Opens a mod list that was just imported, through the shell snapshot. */
+  onImported: (modlistName: string) => Promise<void>;
   onDeleteSelected: () => void;
   onReorder: (orderedIds: string[]) => void;
   onReorderAlts?: (parentId: string, orderedIds: string[]) => void;
@@ -46,6 +49,38 @@ const TABS: Array<{ id: ContentTabId; label: string; icon: string }> = [
 ];
 
 export function ModListEditor(props: Props) {
+  // `modlist-3`: closing the dialog is the only way to "do nothing". An import
+  // that fails says why, and one that succeeds opens the new mod list through
+  // the shell snapshot instead of reloading the page, which forgot a running
+  // game (`concorrenza-4`).
+  const importModList = async () => {
+    let selected: string | string[] | null;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      selected = await open({
+        title: "Import Mod List",
+        filters: [
+          { name: "Mod List Archive", extensions: ["zip"] },
+          { name: "Rules JSON", extensions: ["json"] },
+        ],
+        multiple: false,
+      });
+    } catch (err) {
+      pushUiError({ title: "Import failed", message: "The file picker could not be opened.", detail: String(err), severity: "error", scope: "launch" });
+      return;
+    }
+    if (!selected || Array.isArray(selected)) return;
+    let imported: string;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      imported = await invoke<string>("import_modlist_command", { sourcePath: selected });
+    } catch (err) {
+      pushUiError({ title: "Import failed", message: "The mod list could not be imported. Nothing was added.", detail: String(err), severity: "error", scope: "launch" });
+      return;
+    }
+    await props.onImported(imported);
+  };
+
   const activeModList = () => modListCards().find((modList) => modList.name === selectedModListName());
   const hasContent = () => modRowsState().length > 0;
 
@@ -85,27 +120,7 @@ export function ModListEditor(props: Props) {
                   New
                 </button>
                 <button
-                  onClick={() => {
-                    void (async () => {
-                      try {
-                        const { open } = await import("@tauri-apps/plugin-dialog");
-                        const selected = await open({
-                          title: "Import Mod List",
-                          filters: [
-                            { name: "Mod List Archive", extensions: ["zip"] },
-                            { name: "Rules JSON", extensions: ["json"] },
-                          ],
-                          multiple: false,
-                        });
-                        if (!selected) return;
-                        const { invoke } = await import("@tauri-apps/api/core");
-                        await invoke("import_modlist_command", { sourcePath: selected as string });
-                        window.location.reload();
-                      } catch {
-                        // cancelled or error
-                      }
-                    })();
-                  }}
+                  onClick={() => void importModList()}
                   class="flex items-center gap-1.5 rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
                 >
                   <MaterialIcon name="download" size="sm" />
@@ -138,27 +153,7 @@ export function ModListEditor(props: Props) {
                 Settings
               </button>
               <button
-                onClick={() => {
-                  void (async () => {
-                    try {
-                      const { open } = await import("@tauri-apps/plugin-dialog");
-                      const selected = await open({
-                        title: "Import Mod List",
-                        filters: [
-                          { name: "Mod List Archive", extensions: ["zip"] },
-                          { name: "Rules JSON", extensions: ["json"] },
-                        ],
-                        multiple: false,
-                      });
-                      if (!selected) return;
-                      const { invoke } = await import("@tauri-apps/api/core");
-                      await invoke("import_modlist_command", { sourcePath: selected as string });
-                      window.location.reload();
-                    } catch {
-                      // cancelled or error
-                    }
-                  })();
-                }}
+                onClick={() => void importModList()}
                 class="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 title="Import mod list from a zip archive or rules.json"
               >

@@ -1122,6 +1122,7 @@ export default function App() {
             <div class="flex flex-col flex-1 min-w-0">
               <ModListEditor
                 onAddMod={() => setAddModModalOpen(true)}
+                onImported={handleSelectModList}
                 onDeleteSelected={handleDeleteSelected}
                 onReorder={orderedIds => void handleReorderRules(orderedIds)}
                 onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
