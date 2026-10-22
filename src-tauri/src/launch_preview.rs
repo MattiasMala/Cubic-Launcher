@@ -221,6 +221,9 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     };
     let modlist_name = request.modlist_name.trim().to_string();
     anyhow::ensure!(!modlist_name.is_empty(), "modlist_name cannot be empty");
+    // D153: la mod list non si cancella mentre il lancio la prepara; dallo
+    // spawn in poi la tiene il processo del gioco (`spawn_minecraft_process`).
+    let _in_use = crate::modlist_manager::mark_modlist_in_use(&modlist_name);
     let launch_log_session = LaunchLogSession::create(&launcher_paths, &modlist_name, &target)?;
     set_active_launch_log_session(Some(launch_log_session.clone()));
 

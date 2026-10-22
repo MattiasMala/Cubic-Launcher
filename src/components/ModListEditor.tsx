@@ -75,7 +75,11 @@ export function ModListEditor(props: Props) {
       const { invoke } = await import("@tauri-apps/api/core");
       imported = await invoke<string>("import_modlist_command", { sourcePath: selected });
     } catch (err) {
-      pushUiError({ title: "Import failed", message: "The mod list could not be imported. Nothing was added.", detail: String(err), severity: "error", scope: "launch" });
+      // A name that Windows or the Java classpath cannot take (windows-5) is
+      // the user's to fix, so the backend's sentence is the message itself.
+      const reported = String(err);
+      const badName = reported.includes("cannot be used as a mod list name");
+      pushUiError({ title: "Import failed", message: badName ? reported : "The mod list could not be imported. Nothing was added.", detail: reported, severity: "error", scope: "launch" });
       return;
     }
     await props.onImported(imported);

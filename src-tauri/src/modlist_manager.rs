@@ -1,27 +1,122 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{bail, Context, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::editor_data::{add_mod_rule_from_root, AddModRuleInput};
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_icons::LOCAL_JARS_DIR;
-use crate::path_safety::{contained_join, validate_path_component};
+use crate::path_safety::{contained_join, validate_new_modlist_name, validate_path_component};
 use crate::rules::{ModList, ModSource, RULES_FILENAME};
 use std::io;
+
+fn open_database(launcher_paths: &LauncherPaths) -> Result<Connection> {
+    Connection::open(launcher_paths.database_path()).context("failed to open the database")
+}
+
+/// Tutto lo stato che il database tiene sotto il **nome** di una mod list:
+/// le righe di `modlist_settings` (versione, loader, RAM, wrapper…), i
+/// gruppi e gli interruttori dei file condivisi, i mondi nascosti delle sue
+/// istanze. Si toglie dopo una cancellazione riuscita e prima che nasca una
+/// mod list con lo stesso nome, così una «Pack» nuova non eredita niente da
+/// una «Pack» cancellata, nemmeno da una cancellata con una build che non
+/// puliva (`r2-ciclo-vita-nome-1`, todo.md:1742). Una sola transazione: o
+/// sparisce tutto, o niente.
+fn forget_modlist_state(connection: &Connection, modlist_name: &str) -> Result<()> {
+    let transaction = connection
+        .unchecked_transaction()
+        .context("failed to start the transaction")?;
+    transaction
+        .execute(
+            "DELETE FROM modlist_settings WHERE modlist_name = ?1",
+            [modlist_name],
+        )
+        .context("failed to remove the mod list settings")?;
+    crate::shared_files::forget_modlist(&transaction, modlist_name)?;
+    for hidden in crate::worlds::load_hidden_worlds(&transaction)? {
+        if hidden.id.modlist_name() == Some(modlist_name) {
+            crate::worlds::set_world_hidden(&transaction, &hidden.id, false, None)?;
+        }
+    }
+    transaction
+        .commit()
+        .context("failed to commit the cleanup of the mod list state")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mod list in uso
+// ---------------------------------------------------------------------------
+
+/// Le mod list che un lancio sta usando, con quanti lanci le usano: dalla
+/// preparazione fino all'uscita del gioco. È quello che la cancellazione
+/// guarda per rifiutare (D153, `windows-6`): su Windows i file aperti dal
+/// gioco lascerebbero la cartella cancellata a metà, altrove il gioco
+/// scriverebbe in una cartella che non c'è più.
+static MODLISTS_IN_USE: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+fn modlists_in_use() -> MutexGuard<'static, BTreeMap<String, usize>> {
+    MODLISTS_IN_USE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Il segno che un lancio sta usando una mod list; sparisce quando viene
+/// lasciato cadere.
+#[must_use = "the mod list is in use only while this is alive"]
+pub struct ModlistInUse {
+    name: String,
+}
+
+impl Drop for ModlistInUse {
+    fn drop(&mut self) {
+        let mut in_use = modlists_in_use();
+        if let Some(count) = in_use.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                in_use.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// Segna `modlist_name` come in uso finché il valore restituito vive. Se una
+/// cancellazione della stessa lista è in corso, aspetta che finisca: il
+/// lancio troverà la lista già andata e si fermerà da solo.
+pub fn mark_modlist_in_use(modlist_name: &str) -> ModlistInUse {
+    *modlists_in_use()
+        .entry(modlist_name.to_string())
+        .or_insert(0) += 1;
+    ModlistInUse {
+        name: modlist_name.to_string(),
+    }
+}
+
+pub fn modlist_in_use(modlist_name: &str) -> bool {
+    modlists_in_use().contains_key(modlist_name)
+}
 
 // ---------------------------------------------------------------------------
 // Create Mod-list
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateModlistInput {
     pub name: String,
     pub author: String,
     pub description: String,
+    /// La versione e il loader che la tendina proponeva quando la mod list è
+    /// nata: salvati subito, così non seguono più l'ultima release di Mojang
+    /// né il ripiego senza rete (`r2-primo-avvio-ambiente-degradato-1`).
+    #[serde(default)]
+    pub minecraft_version: Option<String>,
+    #[serde(default)]
+    pub mod_loader: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,18 +132,26 @@ pub fn create_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: CreateModlistInput,
 ) -> Result<CreateModlistResult, String> {
-    create_modlist_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
+    (|| {
+        let connection = open_database(&launcher_paths)?;
+        create_modlist_from_root(launcher_paths.root_dir(), &connection, &input)
+    })()
+    .map_err(|e| format!("{e:#}"))
 }
 
 pub fn create_modlist_from_root(
     root_dir: &Path,
+    connection: &Connection,
     input: &CreateModlistInput,
 ) -> Result<CreateModlistResult> {
     let name = input.name.trim().to_string();
     if name.is_empty() {
         bail!("mod-list name cannot be empty");
     }
-    validate_path_component(&name)?;
+    validate_new_modlist_name(&name)?;
+    if is_launcher_work_dir(&name) {
+        bail!("'{name}' cannot be the name of a mod list");
+    }
 
     let author = if input.author.trim().is_empty() {
         "Author".to_string()
@@ -64,6 +167,27 @@ pub fn create_modlist_from_root(
 
     if rules_path.exists() {
         bail!("a mod-list named '{}' already exists", name);
+    }
+
+    // Prima il database, poi la cartella: se il database non si scrive non
+    // nasce niente; se è la cartella a fallire restano solo righe per un nome
+    // senza mod list, che la prossima creazione toglie qui.
+    forget_modlist_state(connection, &name)?;
+    let initial_target = [
+        ("minecraft_version", input.minecraft_version.as_deref()),
+        ("mod_loader", input.mod_loader.as_deref()),
+    ];
+    for (key, value) in initial_target {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        connection
+            .execute(
+                "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(modlist_name, key) DO UPDATE SET value = excluded.value",
+                [name.as_str(), key, value],
+            )
+            .with_context(|| format!("failed to save the {key} of '{name}'"))?;
     }
 
     // Create subdirectories
@@ -109,37 +233,261 @@ pub fn create_modlist_from_root(
 // Delete Mod-list
 // ---------------------------------------------------------------------------
 
+/// The start of the name a mod list gets for the moment between leaving the
+/// sidebar and leaving the disk, when it is deleted for good (no trash).
+/// Hidden like an import in progress, see [`is_launcher_work_dir`].
+pub const DELETE_STAGING_PREFIX: &str = ".cubic-delete-";
+
+/// Whether a folder of `mod-lists/` is the launcher's own work — an import
+/// in progress, or a permanent deletion that could not finish — rather than a
+/// mod list.
+pub fn is_launcher_work_dir(name: &str) -> bool {
+    is_import_staging_dir(name) || name.starts_with(DELETE_STAGING_PREFIX)
+}
+
+/// What the confirmation of «Delete Mod-list» says before anything is touched
+/// (D153): how many worlds and screenshots go with the mod list, whether a
+/// game of it is running (the deletion is then refused), and whether this
+/// platform has a trash at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModlistDeletePreview {
+    pub worlds: usize,
+    pub screenshots: usize,
+    pub running: bool,
+    pub trash_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModlistDisposal {
+    /// Moved into the system trash with everything in it; recoverable.
+    Trashed,
+    /// Removed. Only when the caller said "permanently" (`allow_permanent`).
+    Deleted,
+}
+
+/// Real directories (and, with `files`, regular files) directly inside
+/// `dir`. A link is not counted: a shared world linked into `saves/` lives
+/// in `<root>/worlds/` and is not deleted with the mod list.
+fn count_entries(dir: &Path, files: bool) -> usize {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read_dir
+        .filter_map(|entry| entry.ok()?.file_type().ok())
+        .filter(|kind| !kind.is_symlink() && if files { kind.is_file() } else { kind.is_dir() })
+        .count()
+}
+
+pub fn modlist_delete_preview_from_root(
+    root_dir: &Path,
+    modlist_name: &str,
+) -> Result<ModlistDeletePreview> {
+    validate_path_component(modlist_name)?;
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let instances_dir = launcher_paths
+        .modlists_dir()
+        .join(modlist_name)
+        .join("instances");
+
+    let mut worlds = 0;
+    let mut screenshots = 0;
+    if let Ok(instances) = std::fs::read_dir(&instances_dir) {
+        for instance in instances.flatten() {
+            let is_real_dir = instance
+                .file_type()
+                .map(|kind| kind.is_dir() && !kind.is_symlink())
+                .unwrap_or(false);
+            if !is_real_dir {
+                continue;
+            }
+            worlds += count_entries(&instance.path().join("saves"), false);
+            screenshots += count_entries(&instance.path().join("screenshots"), true);
+        }
+    }
+
+    Ok(ModlistDeletePreview {
+        worlds,
+        screenshots,
+        running: modlist_in_use(modlist_name),
+        trash_supported: crate::screenshots::trash_supported(),
+    })
+}
+
+#[tauri::command]
+pub fn modlist_delete_preview_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+) -> Result<ModlistDeletePreview, String> {
+    modlist_delete_preview_from_root(launcher_paths.root_dir(), modlist_name.trim())
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// `allow_permanent` is what the confirmation said: only when it promised a
+/// permanent deletion may a trash that does not work become one. Otherwise
+/// the refusal starts with [`crate::screenshots::TRASH_UNAVAILABLE`], as for
+/// a screenshot, and the dialog asks again with the permanent wording.
 #[tauri::command]
 pub fn delete_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-) -> Result<(), String> {
-    delete_modlist_from_root(launcher_paths.root_dir(), &modlist_name).map_err(|e| e.to_string())
+    allow_permanent: Option<bool>,
+) -> Result<ModlistDisposal, String> {
+    (|| {
+        let connection = open_database(&launcher_paths)?;
+        delete_modlist_from_root(
+            launcher_paths.root_dir(),
+            &connection,
+            &modlist_name,
+            allow_permanent.unwrap_or(false),
+        )
+    })()
+    .map_err(|e| format!("{e:#}"))
 }
 
-pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<()> {
+pub fn delete_modlist_from_root(
+    root_dir: &Path,
+    connection: &Connection,
+    modlist_name: &str,
+    allow_permanent: bool,
+) -> Result<ModlistDisposal> {
+    let send_to_trash = |path: &Path| trash::delete(path).map_err(anyhow::Error::from);
+    let send_to_trash: SendToTrash<'_> = if crate::screenshots::trash_supported() {
+        Some(&send_to_trash)
+    } else {
+        None
+    };
+    delete_modlist_with(
+        root_dir,
+        connection,
+        modlist_name,
+        allow_permanent,
+        send_to_trash,
+    )
+}
+
+/// The injected "put this in the trash" step; `None` is a platform with no
+/// trash. Same shape as the screenshots' one.
+type SendToTrash<'a> = Option<&'a (dyn Fn(&Path) -> Result<()> + 'a)>;
+
+/// The deletion with the "put this in the trash" step injected, so the tests
+/// never touch the trash of whoever runs them. `None` is a platform with no
+/// trash at all.
+///
+/// The order is what keeps a mod list from being left half deleted
+/// (`windows-6`): refused while a launch uses it; the shared files handed to
+/// the group first; then **one move** — into the trash, or, for a permanent
+/// deletion, to a hidden name before anything is removed — so the mod list
+/// is either all there or gone from the sidebar; and only after the move,
+/// the state the database keeps under its name.
+fn delete_modlist_with(
+    root_dir: &Path,
+    connection: &Connection,
+    modlist_name: &str,
+    allow_permanent: bool,
+    send_to_trash: SendToTrash<'_>,
+) -> Result<ModlistDisposal> {
     let name = modlist_name.trim();
     if name.is_empty() {
         bail!("mod-list name cannot be empty");
     }
+    // Not the rules of a new name: a mod list that exists keeps working
+    // under the name it has, including being deleted.
     validate_path_component(name)?;
+    if is_launcher_work_dir(name) {
+        bail!("'{name}' is not a mod list");
+    }
 
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
-    let modlist_dir = launcher_paths.modlists_dir().join(name);
+    let modlists_dir = launcher_paths.modlists_dir();
+    let modlist_dir = modlists_dir.join(name);
 
-    if !modlist_dir.exists() {
+    if !modlist_dir.is_dir() {
         bail!("mod-list '{}' does not exist", name);
     }
 
-    std::fs::remove_dir_all(&modlist_dir).with_context(|| {
-        format!(
-            "failed to delete mod-list '{}' at {}",
-            name,
-            modlist_dir.display()
-        )
+    // Held to the end: a launch of this mod list that starts now waits, and
+    // then finds it gone.
+    let in_use = modlists_in_use();
+    if in_use.contains_key(name) {
+        bail!(
+            "'{name}' is being launched or played right now. Close the game, then delete the mod list."
+        );
+    }
+
+    sweep_unfinished_deletions(modlists_dir);
+    crate::shared_files::hand_over_before_delete(&launcher_paths, connection, name)?;
+
+    let trash_error = match send_to_trash {
+        Some(send_to_trash) => match send_to_trash(&modlist_dir) {
+            Ok(()) => None,
+            Err(error) => Some(format!("{error:#}")),
+        },
+        None => Some("this platform has no system trash".to_string()),
+    };
+
+    let disposal = match trash_error {
+        None => ModlistDisposal::Trashed,
+        Some(trash_error) => {
+            if !allow_permanent {
+                bail!("{} {trash_error}", crate::screenshots::TRASH_UNAVAILABLE);
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            let doomed = modlists_dir.join(format!(
+                "{DELETE_STAGING_PREFIX}{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::rename(&modlist_dir, &doomed).with_context(|| {
+                format!(
+                    "failed to delete mod-list '{}' at {}: a file in it may be open in another program",
+                    name,
+                    modlist_dir.display()
+                )
+            })?;
+            if let Err(error) = std::fs::remove_dir_all(&doomed) {
+                // The mod list is already gone from the sidebar; what is left
+                // is hidden, and the next deletion tries again.
+                eprintln!(
+                    "[delete] '{name}' is deleted, but {} could not be removed yet: {error}",
+                    doomed.display()
+                );
+            }
+            ModlistDisposal::Deleted
+        }
+    };
+    drop(in_use);
+
+    forget_modlist_state(connection, name).with_context(|| {
+        format!("'{name}' was deleted, but the settings saved under its name could not be cleared")
     })?;
 
-    Ok(())
+    Ok(disposal)
+}
+
+/// Best effort: the hidden leftovers of permanent deletions that could not
+/// remove everything at the time.
+fn sweep_unfinished_deletions(modlists_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(modlists_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(DELETE_STAGING_PREFIX)
+        {
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                eprintln!(
+                    "[delete] could not remove the leftover {}: {error}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +506,11 @@ pub fn import_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     source_path: String,
 ) -> Result<String, String> {
-    import_modlist_from_root(launcher_paths.root_dir(), &source_path).map_err(|e| e.to_string())
+    (|| {
+        let connection = open_database(&launcher_paths)?;
+        import_modlist_from_root(launcher_paths.root_dir(), &connection, &source_path)
+    })()
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Pick a unique name: if `base` already exists, try `base (1)`, `base (2)`, etc.
@@ -292,7 +644,11 @@ fn legacy_local_jar_name<'a>(relative: &'a str, local_ids: &HashSet<String>) -> 
     Some(file_name)
 }
 
-fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String> {
+fn import_modlist_from_root(
+    root_dir: &Path,
+    connection: &Connection,
+    source_path: &str,
+) -> Result<String> {
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
     let modlists_dir = launcher_paths.modlists_dir();
     std::fs::create_dir_all(modlists_dir)
@@ -336,8 +692,12 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         };
 
         let base_name = archive_root.clone().unwrap_or(file_stem);
-        validate_path_component(&base_name)?;
-        if is_import_staging_dir(&base_name) {
+        validate_new_modlist_name(&base_name).map_err(|error| {
+            anyhow::anyhow!(
+                "{error}. Rename the archive (or the folder inside it) and import it again."
+            )
+        })?;
+        if is_launcher_work_dir(&base_name) {
             bail!("'{base_name}' cannot be the name of a mod list");
         }
         let rules_index = file_names
@@ -423,20 +783,25 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
             crate::modlist_assets::forget_display_name(&staging.path)?;
         }
 
+        // A new mod list under this name: nothing saved for an old one with
+        // the same name carries over (`r2-ciclo-vita-nome-1`).
+        forget_modlist_state(connection, &modlist_name)?;
         staging.finish(&modlists_dir.join(&modlist_name))?;
         Ok(modlist_name)
     } else {
         // Legacy: plain rules.json import — use filename as base name
         let mut modlist = ModList::read_from_file(source).with_context(|| "invalid rules file")?;
 
-        validate_path_component(&file_stem)?;
-        if is_import_staging_dir(&file_stem) {
+        validate_new_modlist_name(&file_stem)
+            .map_err(|error| anyhow::anyhow!("{error}. Rename the file and import it again."))?;
+        if is_launcher_work_dir(&file_stem) {
             bail!("'{file_stem}' cannot be the name of a mod list");
         }
         let modlist_name = unique_modlist_name(modlists_dir, &file_stem);
         let staging = StagingDir::create(modlists_dir)?;
         modlist.modlist_name = modlist_name.clone();
         modlist.write_to_file(&staging.path.join(RULES_FILENAME))?;
+        forget_modlist_state(connection, &modlist_name)?;
         staging.finish(&modlists_dir.join(&modlist_name))?;
 
         Ok(modlist_name)
@@ -560,10 +925,23 @@ mod tests {
     use crate::editor_data::load_editor_snapshot_from_root;
     use crate::rules::ModList;
 
+    use rusqlite::Connection;
+
+    use crate::launcher_paths::LauncherPaths;
+
     use super::{
-        copy_local_jar_from_root, create_modlist_from_root, delete_modlist_from_root,
-        import_modlist_from_root, CopyLocalJarInput, CreateModlistInput,
+        copy_local_jar_from_root, create_modlist_from_root, delete_modlist_with,
+        import_modlist_from_root, mark_modlist_in_use, modlist_delete_preview_from_root,
+        CopyLocalJarInput, CreateModlistInput, ModlistDisposal,
     };
+
+    /// The launcher database of a test root, created on first use.
+    fn test_db(root: &Path) -> Connection {
+        let paths = LauncherPaths::new(root.to_path_buf());
+        crate::database::initialize_database(paths.database_path())
+            .expect("the test database should initialize");
+        Connection::open(paths.database_path()).expect("the test database should open")
+    }
 
     fn unique_test_root() -> PathBuf {
         let ts = SystemTime::now()
@@ -590,10 +968,12 @@ mod tests {
 
         create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "My New Pack".into(),
                 author: "PlayerLine".into(),
                 description: "A fresh mod-list".into(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -632,10 +1012,12 @@ mod tests {
 
         let result = create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "Blank Author Pack".into(),
                 author: "   ".into(),
                 description: String::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -651,20 +1033,24 @@ mod tests {
 
         create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "Dup Pack".into(),
                 author: "Author".into(),
                 description: String::new(),
+                ..Default::default()
             },
         )
         .unwrap();
 
         let result = create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "Dup Pack".into(),
                 author: "Author".into(),
                 description: String::new(),
+                ..Default::default()
             },
         );
         assert!(result.is_err());
@@ -679,10 +1065,12 @@ mod tests {
 
         let result = create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "../evil".into(),
                 author: "Author".into(),
                 description: String::new(),
+                ..Default::default()
             },
         );
         assert!(result.is_err());
@@ -690,10 +1078,12 @@ mod tests {
 
         create_modlist_from_root(
             &root,
+            &test_db(&root),
             &CreateModlistInput {
                 name: "Safe Pack".into(),
                 author: "Author".into(),
                 description: String::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -711,11 +1101,12 @@ mod tests {
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("marker.txt"), b"keep me").unwrap();
 
-        let result = delete_modlist_from_root(&root, "../../victim");
+        let connection = test_db(&root);
+        let result = delete_modlist_with(&root, &connection, "../../victim", true, None);
         assert!(result.is_err());
         assert!(victim.join("marker.txt").exists());
 
-        delete_modlist_from_root(&root, "Safe Pack").unwrap();
+        delete_modlist_with(&root, &connection, "Safe Pack", true, None).unwrap();
         assert!(!root.join("mod-lists").join("Safe Pack").exists());
 
         fs::remove_dir_all(&test_root).unwrap();
@@ -757,7 +1148,8 @@ mod tests {
             let malicious_zip = root.join(format!("malicious-{tag}.zip"));
             write_test_zip(&malicious_zip, &entries);
 
-            let result = import_modlist_from_root(&root, malicious_zip.to_str().unwrap());
+            let result =
+                import_modlist_from_root(&root, &test_db(&root), malicious_zip.to_str().unwrap());
             assert!(result.is_err(), "{tag}");
             assert!(!root.join("mod-lists").join("outside.txt").exists());
             assert!(!root.join("outside.txt").exists());
@@ -776,7 +1168,8 @@ mod tests {
                 ("Valid Pack/note.txt", b"valid" as &[u8]),
             ],
         );
-        let imported_name = import_modlist_from_root(&root, valid_zip.to_str().unwrap()).unwrap();
+        let imported_name =
+            import_modlist_from_root(&root, &test_db(&root), valid_zip.to_str().unwrap()).unwrap();
         assert_eq!(imported_name, "Valid Pack");
         assert!(root
             .join("mod-lists")
@@ -815,7 +1208,7 @@ mod tests {
             }
             write_test_zip(&archive, &entries);
 
-            let error = import_modlist_from_root(&root, archive.to_str().unwrap())
+            let error = import_modlist_from_root(&root, &test_db(&root), archive.to_str().unwrap())
                 .expect_err("an invalid mod list must not import");
             assert!(format!("{error:#}").contains("rules.json"), "{tag}: {error:#}");
             assert!(
@@ -844,7 +1237,8 @@ mod tests {
             ],
         );
 
-        let name = import_modlist_from_root(&root, archive.to_str().unwrap()).unwrap();
+        let name =
+            import_modlist_from_root(&root, &test_db(&root), archive.to_str().unwrap()).unwrap();
 
         assert_eq!(name, "My Pack");
         let modlist_dir = root.join("mod-lists").join("My Pack");
@@ -882,7 +1276,8 @@ mod tests {
             ],
         );
 
-        let name = import_modlist_from_root(&root, archive.to_str().unwrap()).unwrap();
+        let name =
+            import_modlist_from_root(&root, &test_db(&root), archive.to_str().unwrap()).unwrap();
 
         assert_eq!(name, "Pack (1)");
         let presentation =
@@ -931,7 +1326,8 @@ mod tests {
             ],
         );
 
-        let name = import_modlist_from_root(&root, archive.to_str().unwrap()).unwrap();
+        let name =
+            import_modlist_from_root(&root, &test_db(&root), archive.to_str().unwrap()).unwrap();
 
         let modlist_dir = root.join("mod-lists").join(&name);
         assert_eq!(
@@ -1005,7 +1401,12 @@ mod tests {
 
         let recipient = unique_test_root();
         fs::create_dir_all(recipient.join("mod-lists")).unwrap();
-        let name = import_modlist_from_root(&recipient, archive_path.to_str().unwrap()).unwrap();
+        let name = import_modlist_from_root(
+            &recipient,
+            &test_db(&recipient),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
         let imported_dir = recipient.join("mod-lists").join(&name);
         let imported = ModList::read_from_file(&imported_dir.join("rules.json")).unwrap();
 
@@ -1035,7 +1436,8 @@ mod tests {
         let archive_path = root.join("...zip");
         write_test_zip(&archive_path, &[]);
 
-        let result = import_modlist_from_root(&root, archive_path.to_str().unwrap());
+        let result =
+            import_modlist_from_root(&root, &test_db(&root), archive_path.to_str().unwrap());
         assert!(result.is_err());
 
         fs::remove_dir_all(&root).unwrap();
@@ -1211,10 +1613,12 @@ mod tests {
         fs::create_dir_all(sender.join("mod-lists")).unwrap();
         create_modlist_from_root(
             &sender,
+            &test_db(&sender),
             &CreateModlistInput {
                 name: "Shared Pack".into(),
                 author: "Author".into(),
                 description: String::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1251,8 +1655,12 @@ mod tests {
 
         let recipient = unique_test_root();
         fs::create_dir_all(recipient.join("mod-lists")).unwrap();
-        let imported_name =
-            import_modlist_from_root(&recipient, archive_path.to_str().unwrap()).unwrap();
+        let imported_name = import_modlist_from_root(
+            &recipient,
+            &test_db(&recipient),
+            archive_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let imported_jar = recipient
             .join("mod-lists")
@@ -1268,5 +1676,370 @@ mod tests {
 
         fs::remove_dir_all(&sender).unwrap();
         fs::remove_dir_all(&recipient).unwrap();
+    }
+
+    // ── Ciclo di vita: creazione, cancellazione, nomi ───────────────────────
+
+    fn settings_of(connection: &Connection, name: &str) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare("SELECT key, value FROM modlist_settings WHERE modlist_name = ?1 ORDER BY key")
+            .unwrap();
+        statement
+            .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn global_value(connection: &Connection, key: &str) -> Option<String> {
+        connection
+            .query_row(
+                "SELECT value FROM global_settings WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn hidden_world(modlist: &str) -> crate::worlds::WorldId {
+        crate::worlds::WorldId {
+            home: crate::worlds::WorldHome::Instance {
+                modlist_name: modlist.to_string(),
+                instance_name: "1.20.1-forge".to_string(),
+            },
+            folder_name: "Survival".to_string(),
+        }
+    }
+
+    /// Everything the database can hold under a mod list's name.
+    fn give_state(connection: &Connection, name: &str) {
+        connection
+            .execute(
+                "INSERT INTO modlist_settings (modlist_name, key, value) VALUES \
+                 (?1, 'minecraft_version', '1.20.1'), (?1, 'mod_loader', 'forge'), \
+                 (?1, 'max_ram_mb', '8192'), (?1, 'wrapper_command', 'gamemoderun')",
+                [name],
+            )
+            .unwrap();
+        crate::shared_files::link_modlists(connection, name, "Survival").unwrap();
+        crate::shared_files::set_shared_file_enabled(
+            connection,
+            name,
+            crate::shared_files::SharedFile::Hotbar,
+            false,
+        )
+        .unwrap();
+        crate::worlds::set_world_hidden(connection, &hidden_world(name), true, Some(1)).unwrap();
+    }
+
+    fn assert_no_state(connection: &Connection, name: &str) {
+        assert!(settings_of(connection, name).is_empty(), "modlist_settings");
+        assert!(
+            !crate::shared_files::load_groups(connection)
+                .unwrap()
+                .iter()
+                .any(|group| group.contains(name)),
+            "shared_file_groups"
+        );
+        let options = global_value(connection, crate::shared_files::SHARED_FILE_OPTIONS_KEY)
+            .unwrap_or_default();
+        assert!(!options.contains(&format!("\"{name}\"")), "{options}");
+        assert!(
+            !crate::worlds::load_hidden_worlds(connection)
+                .unwrap()
+                .iter()
+                .any(|hidden| hidden.id.modlist_name() == Some(name)),
+            "hidden_worlds"
+        );
+    }
+
+    fn make_modlist(root: &Path, name: &str) {
+        create_modlist_from_root(
+            root,
+            &test_db(root),
+            &CreateModlistInput {
+                name: name.into(),
+                author: "Author".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// A trash that is a folder of the test root: the tests never touch the
+    /// trash of whoever runs them.
+    fn fake_trash(root: &Path) -> impl Fn(&Path) -> anyhow::Result<()> {
+        let bin = root.join("fake-trash");
+        move |path: &Path| {
+            fs::create_dir_all(&bin)?;
+            fs::rename(path, bin.join(path.file_name().unwrap()))?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn create_saves_the_initial_version_and_loader() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+
+        create_modlist_from_root(
+            &root,
+            &connection,
+            &CreateModlistInput {
+                name: "Fresh".into(),
+                author: "Author".into(),
+                minecraft_version: Some("1.21.10".into()),
+                mod_loader: Some(" fabric ".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings_of(&connection, "Fresh"),
+            vec![
+                ("minecraft_version".to_string(), "1.21.10".to_string()),
+                ("mod_loader".to_string(), "fabric".to_string()),
+            ]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_mod_list_inherits_nothing_from_a_deleted_one_with_its_name() {
+        // Righe lasciate da una build che non puliva alla cancellazione: la
+        // cartella non c'è più, lo stato sì (todo.md:1742).
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        give_state(&connection, "Pack");
+
+        create_modlist_from_root(
+            &root,
+            &connection,
+            &CreateModlistInput {
+                name: "Pack".into(),
+                author: "Author".into(),
+                minecraft_version: Some("1.21.1".into()),
+                mod_loader: Some("vanilla".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings_of(&connection, "Pack"),
+            vec![
+                ("minecraft_version".to_string(), "1.21.1".to_string()),
+                ("mod_loader".to_string(), "vanilla".to_string()),
+            ]
+        );
+        assert!(crate::shared_files::load_groups(&connection)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn create_refuses_a_name_windows_or_the_classpath_cannot_take() {
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+        for bad in ["Create: Astral", "Create; Astral", "CON", "Pack.", "a?b"] {
+            let error = create_modlist_from_root(
+                &root,
+                &test_db(&root),
+                &CreateModlistInput {
+                    name: bad.into(),
+                    author: "Author".into(),
+                    ..Default::default()
+                },
+            )
+            .expect_err(bad);
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot be used as a mod list name"),
+                "{bad}: {error}"
+            );
+        }
+        assert!(modlist_folders(&root).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn delete_moves_the_mod_list_to_the_trash_and_clears_its_state() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        make_modlist(&root, "Doomed");
+        make_modlist(&root, "Survival");
+        let world = root.join("mod-lists/Doomed/instances/1.20.1-forge/saves/Survival");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), b"world").unwrap();
+        give_state(&connection, "Doomed");
+
+        let disposal = delete_modlist_with(
+            &root,
+            &connection,
+            "Doomed",
+            false,
+            Some(&fake_trash(&root)),
+        )
+        .unwrap();
+
+        assert_eq!(disposal, ModlistDisposal::Trashed);
+        assert!(!root.join("mod-lists/Doomed").exists());
+        assert!(
+            root.join("fake-trash/Doomed/instances/1.20.1-forge/saves/Survival/level.dat")
+                .is_file(),
+            "the world is in the trash, recoverable"
+        );
+        assert_no_state(&connection, "Doomed");
+        assert!(
+            root.join("mod-lists/Survival/rules.json").is_file(),
+            "the other member of the group is untouched"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn delete_is_refused_while_a_launch_uses_the_mod_list() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        let name = format!("Busy {}", root.file_name().unwrap().to_string_lossy());
+        make_modlist(&root, &name);
+        give_state(&connection, &name);
+
+        let in_use = mark_modlist_in_use(&name);
+        assert!(
+            modlist_delete_preview_from_root(&root, &name)
+                .unwrap()
+                .running
+        );
+        let error = delete_modlist_with(&root, &connection, &name, true, None)
+            .expect_err("a running mod list must not be deleted");
+        assert!(error.to_string().contains("Close the game"), "{error}");
+        assert!(root
+            .join("mod-lists")
+            .join(&name)
+            .join("rules.json")
+            .is_file());
+        assert!(
+            !settings_of(&connection, &name).is_empty(),
+            "nothing cleared"
+        );
+
+        drop(in_use);
+        assert!(
+            !modlist_delete_preview_from_root(&root, &name)
+                .unwrap()
+                .running
+        );
+        delete_modlist_with(&root, &connection, &name, true, None).unwrap();
+        assert!(!root.join("mod-lists").join(&name).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn without_a_trash_delete_asks_before_deleting_for_good() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        make_modlist(&root, "Kept");
+        give_state(&connection, "Kept");
+        let broken_trash = |_: &Path| -> anyhow::Result<()> { anyhow::bail!("no trash here") };
+
+        let error = delete_modlist_with(&root, &connection, "Kept", false, Some(&broken_trash))
+            .expect_err("a broken trash is not a permanent deletion");
+        assert!(
+            error
+                .to_string()
+                .starts_with(crate::screenshots::TRASH_UNAVAILABLE),
+            "{error}"
+        );
+        assert!(root.join("mod-lists/Kept/rules.json").is_file());
+        assert!(
+            !settings_of(&connection, "Kept").is_empty(),
+            "nothing cleared"
+        );
+
+        let disposal =
+            delete_modlist_with(&root, &connection, "Kept", true, Some(&broken_trash)).unwrap();
+        assert_eq!(disposal, ModlistDisposal::Deleted);
+        assert!(
+            modlist_folders(&root).is_empty(),
+            "no mod list and no hidden leftover"
+        );
+        assert_no_state(&connection, "Kept");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_hand_made_copy_never_touches_the_original() {
+        // `dati-6`: «Pack copy» è una copia a mano di «Pack», e il suo
+        // rules.json dice ancora «Pack».
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        make_modlist(&root, "Pack");
+        let copy = root.join("mod-lists/Pack copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(
+            root.join("mod-lists/Pack/rules.json"),
+            copy.join("rules.json"),
+        )
+        .unwrap();
+
+        delete_modlist_with(&root, &connection, "Pack copy", true, None).unwrap();
+
+        assert!(!copy.exists());
+        assert!(root.join("mod-lists/Pack/rules.json").is_file());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_delete_preview_counts_worlds_and_screenshots_but_not_shared_worlds() {
+        let root = unique_test_root();
+        make_modlist(&root, "Counted");
+        let instances = root.join("mod-lists/Counted/instances");
+        for (instance, world) in [("1.20.1-forge", "Survival"), ("1.21.1-fabric", "Creative")] {
+            fs::create_dir_all(instances.join(instance).join("saves").join(world)).unwrap();
+        }
+        let shots = instances.join("1.20.1-forge/screenshots");
+        fs::create_dir_all(&shots).unwrap();
+        for shot in ["a.png", "b.png", "c.png"] {
+            fs::write(shots.join(shot), b"png").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let shared = root.join("worlds/Shared");
+            fs::create_dir_all(&shared).unwrap();
+            std::os::unix::fs::symlink(&shared, instances.join("1.20.1-forge/saves/Shared"))
+                .unwrap();
+        }
+
+        let preview = modlist_delete_preview_from_root(&root, "Counted").unwrap();
+        assert_eq!(preview.worlds, 2);
+        assert_eq!(preview.screenshots, 3);
+        assert!(!preview.running);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn import_refuses_a_name_windows_cannot_take_and_forgets_old_state() {
+        let root = unique_test_root();
+        let connection = test_db(&root);
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
+
+        let bad = root.join("Create: Astral.zip");
+        write_test_zip(&bad, &[("Create: Astral/rules.json", VALID_RULES)]);
+        let error = import_modlist_from_root(&root, &connection, bad.to_str().unwrap())
+            .expect_err("a name with ':' must be refused");
+        assert!(error.to_string().contains("Rename the archive"), "{error}");
+        assert!(modlist_folders(&root).is_empty());
+
+        give_state(&connection, "Pack");
+        let good = root.join("Pack.zip");
+        write_test_zip(&good, &[("Pack/rules.json", VALID_RULES)]);
+        let name = import_modlist_from_root(&root, &connection, good.to_str().unwrap()).unwrap();
+        assert_eq!(name, "Pack");
+        assert_no_state(&connection, "Pack");
+        fs::remove_dir_all(&root).unwrap();
     }
 }

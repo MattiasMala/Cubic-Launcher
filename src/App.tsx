@@ -821,17 +821,32 @@ export default function App() {
     }
   };
 
-  const handleDeleteModList = async () => {
+  // D153: the mod list goes to the trash. Resolves to the reason the trash
+  // refused (nothing was deleted, the dialog asks again saying "permanently"),
+  // or null when it is done or failed for another reason (shown as an error).
+  const handleDeleteModList = async (allowPermanent: boolean): Promise<string | null> => {
     const name = selectedModListName();
-    if (!name) return;
+    if (!name) return null;
 
     if (!isTauri()) {
       setInstancePresentationOpen(false);
-      return;
+      return null;
     }
 
     try {
-      await invoke("delete_modlist_command", { modlistName: name });
+      await invoke("delete_modlist_command", { modlistName: name, allowPermanent });
+    } catch (err) {
+      const reported = String(err);
+      if (reported.includes("trash-unavailable:")) {
+        return reported.split("trash-unavailable:").pop()?.trim() || reported;
+      }
+      pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: reported, severity: "error", scope: "launch" });
+      // The folder is gone but its saved settings stayed: the sidebar still
+      // has to forget it.
+      if (!reported.includes("was deleted, but")) return null;
+    }
+
+    try {
       setInstancePresentationOpen(false);
       // Reload shell to refresh mod-list sidebar
       const snap: any = await invoke("load_shell_snapshot_command");
@@ -857,8 +872,9 @@ export default function App() {
         setModRowsState([]);
       }
     } catch (err) {
-      pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Could not reload the mod lists", message: `'${name}' was deleted, but the sidebar could not be refreshed.`, detail: String(err), severity: "error", scope: "launch" });
     }
+    return null;
   };
 
   const handleExport = async () => {

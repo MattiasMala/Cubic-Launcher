@@ -45,6 +45,68 @@ pub fn validate_path_component(name: &str) -> Result<()> {
     }
 }
 
+/// Characters a **new** mod-list name may not contain, on every platform.
+///
+/// `< > : " / \ | ? *` are illegal in a Windows file name, and the name is a
+/// folder: a mod list made on Linux would not survive an export to Windows
+/// (`windows-5`). `;` and `:` are the classpath separators of Windows and
+/// Linux: the loader's libraries live under a path that contains the name,
+/// and `-cp` would split it in two (`r2-percorsi-non-ascii-e-limiti-windows-1`).
+pub const MODLIST_NAME_FORBIDDEN_CHARS: &[char] =
+    &['<', '>', ':', '"', '/', '\\', '|', '?', '*', ';'];
+
+/// The device names Windows reserves, whatever the extension: `CON`,
+/// `con.txt` and `Con .zip` are all the console.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+    "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+];
+
+/// Validate the name of a mod list **about to be made** (create, import).
+///
+/// Stricter than [`validate_path_component`], and the same on every platform:
+/// besides being one path segment, the name must be a legal Windows folder
+/// name and must not hold a classpath separator ([`MODLIST_NAME_FORBIDDEN_CHARS`],
+/// control characters, a reserved device name, a trailing dot or space).
+/// Only new names go through here: a mod list that already exists keeps
+/// working under its name, so delete, launch and the editor still use
+/// [`validate_path_component`].
+pub fn validate_new_modlist_name(name: &str) -> Result<()> {
+    let refuse = |reason: String| -> Result<()> {
+        bail!("'{name}' cannot be used as a mod list name: {reason}")
+    };
+
+    if name.trim().is_empty() {
+        return refuse("the name is empty".to_string());
+    }
+    if let Some(found) = name
+        .chars()
+        .find(|c| MODLIST_NAME_FORBIDDEN_CHARS.contains(c) || c.is_control())
+    {
+        let shown = if found.is_control() {
+            "a control character".to_string()
+        } else {
+            format!("'{found}'")
+        };
+        return refuse(format!(
+            "it contains {shown}. A mod list name cannot contain any of < > : \" / \\ | ? * ;"
+        ));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return refuse("it cannot end with a dot or a space".to_string());
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
+    {
+        return refuse(format!("'{stem}' is a name Windows reserves for a device"));
+    }
+
+    validate_path_component(name).or_else(|error| refuse(error.to_string()))
+}
+
 /// Join `relative` onto `base`, guaranteeing the result stays within `base`.
 ///
 /// Rejects absolute paths, drive prefixes, and any `..` traversal that would
@@ -125,7 +187,59 @@ pub fn normalize_relative_dir(path: &str) -> Result<String> {
 mod tests {
     use std::path::Path;
 
-    use super::{contained_join, normalize_relative_dir, validate_path_component};
+    use super::{
+        contained_join, normalize_relative_dir, validate_new_modlist_name, validate_path_component,
+    };
+
+    #[test]
+    fn a_new_mod_list_name_must_be_legal_on_windows_and_in_a_classpath() {
+        for good in [
+            "Cubic Vanilla+",
+            "Sky Pack",
+            "日本語パック",
+            "Mañana",
+            "Pack (1)",
+            "v1.2 final",
+            "CONSOLE",
+            "COM10",
+            "Nul Pack",
+        ] {
+            validate_new_modlist_name(good).expect(good);
+        }
+
+        for bad in [
+            "Create: Above and Beyond",
+            "Create; Astral",
+            "a<b",
+            "a>b",
+            "say \"hi\"",
+            "a|b",
+            "why?",
+            "star*",
+            "a/b",
+            "a\\b",
+            "tab\there",
+            "CON",
+            "con",
+            "Con.txt",
+            "NUL .zip",
+            "COM1",
+            "lpt9",
+            "COM¹",
+            "Pack.",
+            "Pack ",
+            "..",
+            "",
+        ] {
+            let error = validate_new_modlist_name(bad).expect_err(bad);
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot be used as a mod list name"),
+                "{bad}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn normalize_relative_dir_unifies_separators_and_drops_dots() {
