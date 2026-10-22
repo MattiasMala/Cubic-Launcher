@@ -29,8 +29,16 @@ import {
   selectedModListName,
   tagFilter,
   advancedPanelModId,
+  updateCheckRunning,
   versionRules,
 } from "./store-state";
+
+/**
+ * From Play to the spawn: the pre-check and the launch work on the selection
+ * Play was pressed with, so the version, the loader, the mod list and the
+ * account cannot change under them (precheck-1).
+ */
+export const launchPreparing = () => updateCheckRunning() || launchState() === "resolving";
 
 function collectRowsRecursive(rows: ModRow[], map: Map<string, ModRow>) {
   for (const row of rows) {

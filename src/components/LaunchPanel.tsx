@@ -9,7 +9,7 @@ import {
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
   launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath, setLaunchStopRequested,
   activeAccount, accounts, setAccountsModalOpen, pushUiError, accountAvatarUrl,
-  minecraftVersionsNotice,
+  minecraftVersionsNotice, launchPreparing,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
 import { Select } from "./Select";
@@ -226,7 +226,10 @@ export function LaunchPanel(props: LaunchPanelProps) {
           <div class="relative">
             <button
               onClick={() => setAccountMenuOpen(v => !v)}
-              class="flex items-center gap-3 cursor-pointer hover:bg-bgHover p-2 rounded-lg transition-colors duration-75 border border-transparent hover:border-borderColor"
+              // precheck-1: the launch being prepared reads the active account.
+              disabled={launchPreparing()}
+              title={launchPreparing() ? "The account can change once the launch has started" : undefined}
+              class="flex items-center gap-3 cursor-pointer hover:bg-bgHover p-2 rounded-lg transition-colors duration-75 border border-transparent hover:border-borderColor disabled:cursor-not-allowed disabled:opacity-70"
             >
               <Show when={accountAvatarUrl(activeAccount())} fallback={
                 <div class="w-10 h-10 rounded-full border border-borderColor bg-primary/20 flex items-center justify-center text-primary font-bold">
@@ -247,7 +250,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
             </button>
 
             {/* Account dropdown menu */}
-            <Show when={accountMenuOpen()}>
+            <Show when={accountMenuOpen() && !launchPreparing()}>
               <div class="absolute bottom-full left-0 mb-2 w-64 rounded-lg border border-borderColor bg-bgPanel py-2 shadow-lg z-50">
                 <For each={accounts()}>
                   {(account) => (
@@ -299,6 +302,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 onChange={value => { props.onLoaderChange ? props.onLoaderChange(value) : setSelectedModLoader(value); }}
                 class="text-sm text-textMain font-medium"
                 direction="up"
+                disabled={launchPreparing()}
               />
             </div>
             <div class="flex items-center gap-1">
@@ -309,6 +313,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 onChange={value => { props.onVersionChange ? props.onVersionChange(value) : setSelectedMcVersion(value); }}
                 class="text-xs text-textMuted"
                 direction="up"
+                disabled={launchPreparing()}
               />
               <Show when={minecraftVersionsNotice()}>
                 {notice => (
