@@ -18,9 +18,9 @@ use tokio::io::AsyncWriteExt;
 use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
-    cache_record_from_version, cached_artifact_path_for_record, cached_local_artifact_path,
-    pending_download_from_record, pending_download_from_version, CacheProbe, ModAcquisitionPlan,
-    ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
+    cache_record_from_version, cached_artifact_path_for_record, pending_download_from_record,
+    pending_download_from_version, CacheProbe, ModAcquisitionPlan, ModCacheLookup, ModCacheRecord,
+    SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
 use crate::path_safety::validate_path_component;
@@ -496,6 +496,49 @@ pub(super) fn local_mod_jar_path(
         .join(file_name))
 }
 
+/// Where the instance link of a local mod points, or why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LocalJarSource {
+    Link(CachedModJar),
+    /// No jar in `local-jars/` under this name.
+    Missing(PathBuf),
+    /// A jar that does not open: the launch skips it instead of stopping on
+    /// "failed to read JAR metadata" (audit 101, risoluzione-9).
+    Unreadable(PathBuf, String),
+    /// The jar's own metadata excludes this target.
+    Incompatible,
+}
+
+/// The jar of a local mod is linked straight from `mod-lists/<name>/local-jars/`
+/// (audit 101, dati-1).
+///
+/// It used to be copied to `cache/mods/<loader>/local/<file>` only when that
+/// copy was missing: the path named neither the mod list nor the bytes, so a
+/// jar replaced in `local-jars/`, or a jar with the same name in another mod
+/// list, never reached the game — the first copy stayed forever. Linking the
+/// source leaves nothing that can go stale; the instance's `mods/` is rebuilt
+/// at every launch, so it always points at the bytes the mod list holds now.
+pub(super) fn local_jar_source(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    mod_id: &str,
+    target: &ResolutionTarget,
+) -> Result<LocalJarSource> {
+    let file_name = format!("{mod_id}.jar");
+    let source = local_mod_jar_path(launcher_paths, modlist_name, &file_name)?;
+    if !source.is_file() {
+        return Ok(LocalJarSource::Missing(source));
+    }
+    match jar_metadata_allows_target(&source, target) {
+        Ok(true) => Ok(LocalJarSource::Link(CachedModJar {
+            jar_filename: file_name,
+            cache_path: source,
+        })),
+        Ok(false) => Ok(LocalJarSource::Incompatible),
+        Err(error) => Ok(LocalJarSource::Unreadable(source, format!("{error:#}"))),
+    }
+}
+
 // Otto input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
@@ -512,44 +555,47 @@ pub(super) fn build_cached_mod_jars(
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
-    let mod_loader = target.mod_loader.as_modrinth_loader();
 
-    // Local mods: JAR lives at local-jars/{mod_id}.jar; copy to cache/mods/.
+    // Local mods: the instance links the jar in `local-jars/` itself.
     for selected in selected_mods {
         if !matches!(selected.source, ModSource::Local) {
             continue;
         }
 
         let file_name = format!("{}.jar", selected.mod_id);
-        if seen.insert(file_name.clone()) {
-            let source = local_mod_jar_path(launcher_paths, modlist_name, &file_name)?;
-            let dest =
-                cached_local_artifact_path(launcher_paths.mods_cache_dir(), mod_loader, &file_name);
-            if source.exists() && !jar_metadata_allows_target(&source, target)? {
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Launch] skipping local mod '{}': embedded metadata is incompatible with {} / {}",
-                        selected.mod_id,
-                        target.minecraft_version,
-                        target.mod_loader.as_modrinth_loader()
-                    ),
-                )?;
-                continue;
-            }
-            if source.exists() && !dest.exists() {
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::copy(&source, &dest).with_context(|| {
-                    format!("failed to copy local JAR '{}' to mod cache", file_name)
-                })?;
-            }
-            jars.push(CachedModJar {
-                jar_filename: file_name,
-                cache_path: dest,
-            });
+        if !seen.insert(file_name.clone()) {
+            continue;
+        }
+        match local_jar_source(launcher_paths, modlist_name, &selected.mod_id, target)? {
+            LocalJarSource::Link(jar) => jars.push(jar),
+            LocalJarSource::Missing(path) => emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Launch] skipping local mod '{}': its jar is not in the mod list ({})",
+                    selected.mod_id,
+                    path.display()
+                ),
+            )?,
+            LocalJarSource::Unreadable(path, error) => emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Launch] skipping local mod '{}': its jar cannot be read ({}: {error})",
+                    selected.mod_id,
+                    path.display()
+                ),
+            )?,
+            LocalJarSource::Incompatible => emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Launch] skipping local mod '{}': embedded metadata is incompatible with {} / {}",
+                    selected.mod_id,
+                    target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader()
+                ),
+            )?,
         }
     }
 
@@ -744,6 +790,78 @@ mod tests {
             Ok(CacheProbe::Ready(_))
         ));
         drop(connection);
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    fn local_jar(paths: &LauncherPaths, modlist: &str, mod_id: &str, bytes: &[u8]) -> PathBuf {
+        let path = local_mod_jar_path(paths, modlist, &format!("{mod_id}.jar")).expect("path");
+        fs::create_dir_all(path.parent().expect("local-jars")).expect("local-jars");
+        fs::write(&path, bytes).expect("local jar");
+        path
+    }
+
+    /// Audit 101, dati-1: the link follows the source, so a jar replaced in
+    /// `local-jars/` and a same-named jar in another mod list each reach the
+    /// game with their own bytes.
+    #[test]
+    fn a_local_jar_is_linked_from_its_own_mod_list_with_its_current_bytes() {
+        let root = scratch_root("local-jars");
+        let paths = LauncherPaths::new(&root);
+        let first = local_jar(
+            &paths,
+            "Pack A",
+            "mymod",
+            &crate::mod_cache::test_jar_bytes("v1"),
+        );
+        let other = local_jar(
+            &paths,
+            "Pack B",
+            "mymod",
+            &crate::mod_cache::test_jar_bytes("b"),
+        );
+
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack A", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(jar.cache_path, first);
+        assert_eq!(jar.jar_filename, "mymod.jar");
+
+        fs::write(&first, crate::mod_cache::test_jar_bytes("v2")).expect("updated jar");
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack A", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(
+            fs::read(&jar.cache_path).expect("linked bytes"),
+            crate::mod_cache::test_jar_bytes("v2")
+        );
+
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack B", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(jar.cache_path, other);
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_local_jar_is_skipped_not_fatal() {
+        let root = scratch_root("local-jars-bad");
+        let paths = LauncherPaths::new(&root);
+        local_jar(&paths, "Pack A", "broken", b"not a zip");
+
+        assert!(matches!(
+            local_jar_source(&paths, "Pack A", "broken", &target()).expect("source"),
+            LocalJarSource::Unreadable(..)
+        ));
+        assert!(matches!(
+            local_jar_source(&paths, "Pack A", "absent", &target()).expect("source"),
+            LocalJarSource::Missing(_)
+        ));
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 
