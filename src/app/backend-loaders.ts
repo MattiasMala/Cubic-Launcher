@@ -224,14 +224,24 @@ function toAccountSummary(account: ShellAccount): AccountSummary {
  * (D117). The list replaces what the session had instead of being merged
  * with it; status and credentials are the backend's word, never assumed (F1).
  */
+let accountsLoadedOnce = false;
+
 export async function loadAccounts() {
   try {
     const list = await invoke<ShellAccount[]>("list_accounts_command");
+    const wasOffline = activePlaysOffline();
     setAccounts(list.map(toAccountSummary));
     // The active account is the backend's word too (todo.md:1390): after a
     // removal the backend may have activated another row.
     setActiveAccountId(list.find(account => account.is_active)?.microsoft_id ?? "");
     setAccountsRevision(revision => revision + 1);
+    // «Play offline» turned on or off, or a switch to an account that plays
+    // the other way: the version list and its notice follow (the backend asks
+    // Mojang only for an account that plays online, D140). Not at the first
+    // reading: the startup already asked, for the account it found
+    // (review-frontend-shell-27).
+    if (accountsLoadedOnce && activePlaysOffline() !== wasOffline) void loadMinecraftVersions();
+    accountsLoadedOnce = true;
   } catch (error) {
     logger.error("App", "loadAccounts failed", error);
     pushUiError({ title: "Could not load saved accounts", message: "The backend could not list the saved accounts.", detail: String(error), severity: "error", scope: "account" });
