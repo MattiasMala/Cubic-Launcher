@@ -209,15 +209,25 @@ export function useContentTabState(props: ContentTabViewProps) {
     }
   };
 
-  /** Toglie una voce; restituisce l'errore se il backend l'ha rifiutata (la riga resta), `null` se è andata. */
-  const removeEntryQuietly = async (id: string): Promise<unknown | null> => {
+  /**
+   * Toglie una voce; restituisce l'errore se il backend l'ha rifiutata (la riga resta), `null` se è andata.
+   * `target` è la lista e la categoria lette al clic: un ciclo di rimozioni che
+   * attraversa un cambio di mod list o di scheda non deve togliere voci da
+   * quella aperta dopo (review-frontend-stato-18).
+   */
+  const removeEntryQuietly = async (
+    id: string,
+    target = { modlistName: props.modlistName, contentType: props.type },
+  ): Promise<unknown | null> => {
     try {
       await invoke("remove_content_command", {
-        input: { modlistName: props.modlistName, contentType: props.type, id },
+        input: { modlistName: target.modlistName, contentType: target.contentType, id },
       });
     } catch (error) {
       return error ?? "unknown error";
     }
+    // La vista mostra ormai un'altra lista: la sua non va toccata.
+    if (props.modlistName !== target.modlistName || props.type !== target.contentType) return null;
     setEntries(current => current.filter(entry => entry.id !== id));
     setGroups(current => current
       .map(group => ({ ...group, entryIds: group.entryIds.filter(entryId => entryId !== id) }))
@@ -243,10 +253,11 @@ export function useContentTabState(props: ContentTabViewProps) {
   // selezionate, così si vede cosa non è andato.
   const removeSelectedEntries = async () => {
     const ids = [...selectedIds()];
+    const target = { modlistName: props.modlistName, contentType: props.type };
     const failed: string[] = [];
     let lastError: unknown = null;
     for (const id of ids) {
-      const error = await removeEntryQuietly(id);
+      const error = await removeEntryQuietly(id, target);
       if (error !== null) {
         failed.push(meta().get(id)?.name ?? id);
         lastError = error;
