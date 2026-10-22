@@ -42,22 +42,37 @@ fn db_availability_get(
 }
 
 /// Persist Modrinth availability results to the database.
+///
+/// Una scrittura fallita non ferma la risoluzione — la cache serve solo a
+/// risparmiare richieste — ma si dice nel log: prima finiva in `let _`, e una
+/// cache che non si riempie rifaceva tutte le richieste in silenzio (audit 101,
+/// «Cache delle disponibilità»).
 fn db_availability_set(db_path: &Path, entries: &[(String, String, String, bool)]) {
-    let Ok(conn) = Connection::open(db_path) else {
-        return;
-    };
-    let Ok(tx) = conn.unchecked_transaction() else {
-        return;
-    };
+    if let Err(error) = try_db_availability_set(db_path, entries) {
+        eprintln!(
+            "[Availability] could not save {} availability result(s) to {}: {error:#}",
+            entries.len(),
+            db_path.display()
+        );
+    }
+}
+
+fn try_db_availability_set(
+    db_path: &Path,
+    entries: &[(String, String, String, bool)],
+) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    let tx = conn.unchecked_transaction()?;
     for (mod_id, mc_version, loader, available) in entries {
-        let _ = tx.execute(
+        tx.execute(
             r#"INSERT INTO modrinth_availability (project_id, mc_version, mod_loader, available)
                VALUES (?1, ?2, ?3, ?4)
                ON CONFLICT(project_id, mc_version, mod_loader) DO UPDATE SET available = excluded.available"#,
             params![mod_id, mc_version, loader, available],
-        );
+        )?;
     }
-    let _ = tx.commit();
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1240,6 +1255,50 @@ mod tests {
             peak > 1,
             "the stage serialized every request, so the permit count buys nothing"
         );
+    }
+
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cubic-resolver-{label}-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("launcher.db")
+    }
+
+    #[test]
+    fn availability_rows_are_saved_and_a_failed_save_is_an_error_not_a_silence() {
+        let entries = vec![
+            ("sodium".to_string(), "1.20.1".into(), "fabric".into(), true),
+            ("iris".to_string(), "1.20.1".into(), "fabric".into(), false),
+        ];
+
+        let db_path = temp_db_path("availability");
+        crate::database::initialize_database(&db_path).expect("initialize database");
+        try_db_availability_set(&db_path, &entries).expect("the rows are saved");
+        let mut saved = db_availability_get(
+            &db_path,
+            &["sodium".to_string(), "iris".to_string()],
+            "1.20.1",
+            "fabric",
+        );
+        saved.sort();
+        assert_eq!(
+            saved,
+            vec![("iris".to_string(), false), ("sodium".to_string(), true)]
+        );
+
+        // Un database senza la tabella: prima `let _` lo ingoiava.
+        let bare = temp_db_path("availability-bare");
+        assert!(try_db_availability_set(&bare, &entries).is_err());
+
+        for path in [db_path, bare] {
+            std::fs::remove_dir_all(path.parent().unwrap()).expect("remove temp dir");
+        }
     }
 
     #[test]
