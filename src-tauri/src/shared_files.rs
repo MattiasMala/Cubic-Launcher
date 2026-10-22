@@ -1407,6 +1407,11 @@ fn list_modlist_names(launcher_paths: &LauncherPaths) -> Result<Vec<String>> {
             continue;
         }
         if let Some(name) = entry.file_name().to_str() {
+            // Nemmeno una cancellazione o un import a metà, che il rules.json
+            // ce l'hanno ancora (review-contenuti-14).
+            if crate::modlist_manager::is_launcher_work_dir(name) {
+                continue;
+            }
             names.push(name.to_string());
         }
     }

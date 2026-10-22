@@ -284,6 +284,11 @@ pub fn list_worlds(root_dir: &Path, hidden: &[HiddenWorld]) -> Result<Vec<WorldE
         let Some(modlist_name) = utf8_file_name(&modlist_dir) else {
             continue;
         };
+        // A deletion or an import that did not finish is not a mod list
+        // (review-contenuti-14).
+        if crate::modlist_manager::is_launcher_work_dir(&modlist_name) {
+            continue;
+        }
         for instance_dir in child_directories(&modlist_dir.join(INSTANCES_DIR_NAME))? {
             let Some(instance_name) = utf8_file_name(&instance_dir) else {
                 continue;

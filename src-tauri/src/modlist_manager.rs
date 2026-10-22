@@ -469,17 +469,20 @@ fn delete_modlist_with(
 }
 
 /// Best effort: the hidden leftovers of permanent deletions that could not
-/// remove everything at the time.
+/// remove everything at the time, and of imports cut short by a launcher that
+/// was killed (review-contenuti-14). An import of this process may be running:
+/// its folder carries this process id and is left alone. Runs at every delete
+/// and once at startup ([`sweep_leftover_work_dirs`]).
 fn sweep_unfinished_deletions(modlists_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(modlists_dir) else {
         return;
     };
+    let own_import = format!("{IMPORT_STAGING_PREFIX}{}-", std::process::id());
     for entry in entries.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(DELETE_STAGING_PREFIX)
-        {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let leftover = name.starts_with(DELETE_STAGING_PREFIX)
+            || (is_import_staging_dir(&name) && !name.starts_with(&own_import));
+        if leftover {
             if let Err(error) = std::fs::remove_dir_all(entry.path()) {
                 eprintln!(
                     "[delete] could not remove the leftover {}: {error}",
@@ -488,6 +491,13 @@ fn sweep_unfinished_deletions(modlists_dir: &Path) {
             }
         }
     }
+}
+
+/// At startup, off the main thread: what [`sweep_unfinished_deletions`] does at
+/// every delete, so a leftover does not wait for the next one.
+pub fn sweep_leftover_work_dirs(launcher_paths: &LauncherPaths) {
+    let modlists_dir = launcher_paths.modlists_dir().to_path_buf();
+    std::thread::spawn(move || sweep_unfinished_deletions(&modlists_dir));
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +961,8 @@ mod tests {
     use super::{
         copy_local_jar_from_root, create_modlist_from_root, delete_modlist_with,
         import_modlist_from_root, mark_modlist_in_use, modlist_delete_preview_from_root,
-        CopyLocalJarInput, CreateModlistInput, ModlistDisposal,
+        sweep_unfinished_deletions, CopyLocalJarInput, CreateModlistInput, ModlistDisposal,
+        DELETE_STAGING_PREFIX, IMPORT_STAGING_PREFIX,
     };
 
     /// The launcher database of a test root, created on first use.
@@ -1198,6 +1209,31 @@ mod tests {
             .join("note.txt")
             .exists());
         assert_eq!(modlist_folders(&root), vec!["Valid Pack".to_string()]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// review-contenuti-14: a deletion that could not finish and an import of
+    /// a launcher that was killed are swept; an import of this process is not.
+    #[test]
+    fn the_sweep_removes_leftovers_but_not_an_import_in_progress() {
+        let root = unique_test_root();
+        let modlists = root.join("mod-lists");
+        let delete_leftover = modlists.join(format!("{DELETE_STAGING_PREFIX}1-2"));
+        let dead_import = modlists.join(format!("{IMPORT_STAGING_PREFIX}{}-3", u32::MAX));
+        let own_import = modlists.join(format!("{IMPORT_STAGING_PREFIX}{}-4", std::process::id()));
+        let pack = modlists.join("Pack");
+        for dir in [&delete_leftover, &dead_import, &own_import, &pack] {
+            fs::create_dir_all(dir.join("instances/1.20.1-fabric/screenshots")).unwrap();
+            fs::write(dir.join("rules.json"), VALID_RULES).unwrap();
+        }
+
+        sweep_unfinished_deletions(&modlists);
+
+        assert!(!delete_leftover.exists());
+        assert!(!dead_import.exists());
+        assert!(own_import.exists());
+        assert!(pack.exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -95,6 +95,9 @@ pub fn run() {
             app.manage(launcher_paths.clone());
             app.manage(skins::SkinsState::default());
             app.manage(app_shell::MicrosoftLoginState::default());
+            // review-contenuti-14: a deletion or an import a previous run did
+            // not finish, removed in the background.
+            modlist_manager::sweep_leftover_work_dirs(&launcher_paths);
 
             if launch_preview::automation_mode_enabled() {
                 if let Some(window) = app.get_webview_window("main") {
