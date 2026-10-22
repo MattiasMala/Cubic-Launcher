@@ -112,17 +112,15 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from run_combo import ComboSpec, run_combo
+from run_combo import REPO_ROOT, ComboSpec, run_combo, stale_binary_reason
 from workspace import HarnessWorkspace, vanilla_modlist
 
 DEFAULT_REAL_DATA = Path.home() / ".local/share/com.cubic.launcher"
 DEFAULT_WORK_DIR = Path.home() / ".cache/cubic-offline-guard"
 DEFAULT_MODLIST = "Drehmal APOTHEOSIS"
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# Il binario debug, esplicito: `run_combo` sceglierebbe un release se c'è.
+# Il binario debug, esplicito: è quello che `cargo build` rifà. Più vecchio dei
+# sorgenti, `stale_binary_reason` (in `run_combo`) lo rifiuta.
 DEFAULT_BINARY = REPO_ROOT / "src-tauri/target/debug/cubic_launcher"
-# Oltre a `src-tauri/src/`: quello che, cambiato, cambia il binario.
-SOURCE_FILES = ("src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json")
 DEFAULT_MC = "1.20.1"
 DEFAULT_MISSING_JAR = "fabric/unerR5MN/ferritecore-6.0.1-fabric.jar"
 VANILLA_MODLIST = "offline-guard-vanilla"
@@ -642,29 +640,6 @@ def start_display(choice: str) -> tuple[str, dict[str, str], subprocess.Popen | 
         process.terminate()
         raise RuntimeError(f"broadwayd :{number} did not start")
     return "native", {"GDK_BACKEND": "broadway", "BROADWAY_DISPLAY": f":{number}"}, process
-
-
-# ---- binario --------------------------------------------------------------------
-
-
-def stale_binary_reason(binary: Path) -> str | None:
-    """Why `binary` cannot be the measurement, or None.
-
-    Un binario più vecchio dei sorgenti misura un altro codice, e lo fa in
-    silenzio: è già successo con questa guardia, che prendeva il binario release
-    di tre settimane prima (`run_combo._resolve_binary` preferisce release).
-    """
-    if not binary.is_file():
-        return f"no launcher binary at {binary}: build it with `cargo build --bin cubic_launcher`"
-    sources = [
-        path
-        for path in (REPO_ROOT / "src-tauri/src").rglob("*")
-        if path.is_file()
-    ] + [REPO_ROOT / name for name in SOURCE_FILES if (REPO_ROOT / name).is_file()]
-    newest = max(sources, key=lambda path: path.stat().st_mtime)
-    if newest.stat().st_mtime > binary.stat().st_mtime:
-        return f"{binary} is older than {newest}: rebuild it before measuring"
-    return None
 
 
 # ---- main -----------------------------------------------------------------------
