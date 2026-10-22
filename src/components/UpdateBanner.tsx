@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   launchState,
@@ -30,7 +31,6 @@ const MINECRAFT_RUNNING = "minecraft-running:";
  * reloaded window) still asks.
  */
 const confirmInstallWhileRunning = async () => {
-  const { ask } = await import("@tauri-apps/plugin-dialog");
   return ask(
     "Minecraft is still running. Installing the update restarts Cubic Launcher, and the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.",
     {

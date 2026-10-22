@@ -1,5 +1,7 @@
 import { createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
 import logoUrl from "../../assets/icon.png";
@@ -24,10 +26,8 @@ export function Header() {
     let disposed = false;
     let unlisten: (() => void) | null = null;
     void (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
       const stop = await listen("close-requested-while-running", async () => {
         try {
-          const { ask } = await import("@tauri-apps/plugin-dialog");
           const close = await ask(CLOSE_WHILE_RUNNING_MESSAGE, {
             title: "Close Cubic Launcher?",
             kind: "warning",

@@ -23,7 +23,7 @@
 // asking Mojang, and the screen hides what would reach Mojang — Apply, the
 // reset, the capes — saying why instead.
 
-import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
+import { For, Show, Suspense, createEffect, createMemo, createSignal, lazy, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { inferModelType, loadImage, loadSkinToCanvas } from "skinview-utils";
@@ -31,7 +31,12 @@ import { accountsRevision, setAccountsModalOpen } from "../store";
 import type { SkinCard, SkinError, SkinVariant, SkinsView } from "../lib/types";
 import { AlertTriangleIcon, CheckIcon, Loader2Icon, PencilIcon, PlusIcon, Trash2Icon, XIcon } from "./icons";
 import { CapeFigure, SkinFigure } from "./skins/SkinFigures";
-import { SkinPreview, type PreviewLoad } from "./skins/SkinPreview";
+import type { PreviewLoad } from "./skins/SkinPreview";
+
+// skinview3d brings three.js, more than half of the app's JavaScript: the
+// preview loads in its own chunk the first time the Skins screen draws it,
+// not at every start of the launcher (todo.md:1589).
+const SkinPreview = lazy(() => import("./skins/SkinPreview").then(module => ({ default: module.SkinPreview })));
 
 type CardId = Pick<SkinCard, "source" | "textureKey" | "variant">;
 
@@ -368,13 +373,15 @@ export function SkinsScreen() {
               </div>
 
               <div class="relative h-[calc(80vh-9rem)] min-h-[320px] rounded-xl border border-borderColor bg-bgPanel overflow-hidden">
-                <SkinPreview
-                  skinUrl={selectedCard()?.textureUrl ?? null}
-                  variant={selectedCard()?.variant ?? "classic"}
-                  capeUrl={previewCape()?.textureUrl ?? null}
-                  onSkinLoad={setSkinLoad}
-                  onCapeLoad={setCapeLoad}
-                />
+                <Suspense>
+                  <SkinPreview
+                    skinUrl={selectedCard()?.textureUrl ?? null}
+                    variant={selectedCard()?.variant ?? "classic"}
+                    capeUrl={previewCape()?.textureUrl ?? null}
+                    onSkinLoad={setSkinLoad}
+                    onCapeLoad={setCapeLoad}
+                  />
+                </Suspense>
                 <Show when={previewing()}>
                   <span class="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-full border border-primary bg-primary/15 px-3 py-1 text-xs font-semibold text-white">
                     Previewing

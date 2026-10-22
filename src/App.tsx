@@ -7,6 +7,7 @@
 
 import { Match, Show, Switch, batch, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
 import { updateAltsDeep } from "./lib/dragUtils";
@@ -640,7 +641,6 @@ export default function App() {
       });
       return null;
     }
-    const { open } = await import("@tauri-apps/plugin-dialog");
     if (contentType === "mod") {
       try {
         const selected = await open({ title: "Select a mod JAR", filters: [{ name: "JAR files", extensions: ["jar"] }], multiple: false, directory: false });
@@ -982,7 +982,6 @@ export default function App() {
     }
 
     try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
       const destination = await save({
         title: "Export Mod List",
         defaultPath: `${selectedModListName()}.zip`,

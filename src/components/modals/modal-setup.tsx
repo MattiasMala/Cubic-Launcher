@@ -1,6 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
 import type { AccountCredentials } from "../../lib/types";
@@ -709,8 +710,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
     setConfirmDelete(true);
     if (!isTauriEnv()) return;
     try {
-      const { invoke: invokeCore } = await import("@tauri-apps/api/core");
-      setDeletePreview(await invokeCore<ModlistDeletePreview>("modlist_delete_preview_command", { modlistName: selectedModListName() }));
+      setDeletePreview(await invoke<ModlistDeletePreview>("modlist_delete_preview_command", { modlistName: selectedModListName() }));
     } catch (err) {
       setDeletePreviewError(String(err));
     }
@@ -751,14 +751,12 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
   const pickIcon = async () => {
     if (!isTauriEnv()) return;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const { invoke: invokeCore } = await import("@tauri-apps/api/core");
       const selected = await open({
         multiple: false,
         filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
       });
       if (typeof selected === "string") {
-        const dataUrl: string = await invokeCore("read_image_as_data_url_command", { path: selected });
+        const dataUrl: string = await invoke("read_image_as_data_url_command", { path: selected });
         setDraft(cur => ({ ...cur, iconImage: dataUrl }));
       }
     } catch (_) {

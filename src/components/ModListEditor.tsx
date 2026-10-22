@@ -1,4 +1,6 @@
 import { For, Show } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { ContentTabId } from "../store";
 import {
   activeContentTab,
@@ -55,7 +57,6 @@ export function ModListEditor(props: Props) {
   const importModList = async () => {
     let selected: string | string[] | null;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
       selected = await open({
         title: "Import Mod List",
         filters: [
@@ -71,7 +72,6 @@ export function ModListEditor(props: Props) {
     if (!selected || Array.isArray(selected)) return;
     let imported: string;
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
       imported = await invoke<string>("import_modlist_command", { sourcePath: selected });
     } catch (err) {
       // A name that Windows or the Java classpath cannot take (windows-5) is

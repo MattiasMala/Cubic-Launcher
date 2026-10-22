@@ -8,6 +8,16 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [solid()],
 
+  build: {
+    rollupOptions: {
+      output: {
+        // three.js, which skinview3d draws with, in a chunk of its own next to
+        // the lazily loaded skin preview (todo.md:1589).
+        manualChunks: (id: string) => (id.includes("/node_modules/three/") ? "three" : undefined),
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
