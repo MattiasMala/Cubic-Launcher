@@ -9,9 +9,7 @@ use tauri::State;
 // orchestrator makes launch behavior easier to audit without returning to one
 // very large mixed-responsibility file.
 use crate::app_shell::load_shell_snapshot_from_root;
-use crate::instance_configs::{
-    materialize_custom_configs, prepare_instance_config_directory, CachedConfigPlacement,
-};
+use crate::instance_configs::materialize_custom_configs;
 use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_version_for_minecraft;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest};
@@ -649,11 +647,12 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &instance_mods_dir,
         &cached_mod_jars,
     )?;
-    prepare_instance_config_directory(
-        launcher_paths.configs_cache_dir(),
-        &instance_config_dir,
-        &Vec::<CachedConfigPlacement>::new(),
-    )?;
+    std::fs::create_dir_all(&instance_config_dir).with_context(|| {
+        format!(
+            "failed to create instance config directory at {}",
+            instance_config_dir.display()
+        )
+    })?;
     // D105: the custom configs of the mod list that apply to this target,
     // copied into the instance at every launch (D118). A file that does not
     // resolve does not stop the launch, but it is never silent.
@@ -664,6 +663,30 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &target.minecraft_version,
         target.mod_loader.as_modrinth_loader(),
     )?;
+    for skipped in &custom_configs.skipped_configs {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Config] Custom config '{}' of '{}' has Path '{}', which cannot be used ({}): not placed",
+                skipped.config_id, skipped.mod_id, skipped.target_path, skipped.reason
+            ),
+        )?;
+    }
+    for collision in &custom_configs.collisions {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!(
+                "[Config] {} is written by custom config '{}' of '{}' and again by '{}' of '{}': the later one in the mod list is kept",
+                collision.target.display(),
+                collision.overridden_config_id,
+                collision.overridden_mod_id,
+                collision.winner_config_id,
+                collision.winner_mod_id
+            ),
+        )?;
+    }
     for missing in &custom_configs.missing_files {
         emit_log(
             &app_handle,

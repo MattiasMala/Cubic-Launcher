@@ -626,3 +626,98 @@ fn import_custom_config_files_does_not_replace_a_listed_file_with_different_byte
 
     fs::remove_dir_all(&root).unwrap();
 }
+
+fn batch_with_config(target_path: &str, files: &[&str]) -> SaveAdvancedBatchInput {
+    SaveAdvancedBatchInput {
+        modlist_name: "Pack".into(),
+        requires_entries: vec![],
+        version_rules_entries: vec![],
+        custom_configs_entries: vec![CustomConfigsEntry {
+            mod_id: "sodium".into(),
+            custom_configs: vec![SaveCustomConfigInput {
+                id: "cc-1".into(),
+                mc_versions: vec![],
+                loader: "any".into(),
+                target_path: target_path.into(),
+                files: files.iter().map(|name| name.to_string()).collect(),
+            }],
+        }],
+    }
+}
+
+/// `modlist-10`: a «Path» that leaves the instance is refused when it is
+/// saved, with the reason, and `rules.json` keeps what it had.
+#[test]
+fn a_custom_config_path_that_leaves_the_instance_is_refused_at_save() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    for bad in ["../outside", "/etc", "C:\\Users\\me\\config"] {
+        let error = save_advanced_batch_from_root(&root, &batch_with_config(bad, &[]))
+            .expect_err("an escaping Path must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains(bad), "{message}");
+        assert!(message.contains("inside the instance"), "{message}");
+    }
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert!(on_disk
+        .find_rule("sodium")
+        .unwrap()
+        .custom_configs
+        .is_empty());
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// `r2-percorsi-non-ascii-e-limiti-windows-4`: backslashes are stored as `/`.
+#[test]
+fn a_custom_config_path_is_stored_with_forward_slashes() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    save_advanced_batch_from_root(&root, &batch_with_config(".\\config\\create\\", &[]))
+        .expect("a relative Path with backslashes is valid");
+
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        on_disk.find_rule("sodium").unwrap().custom_configs[0].target_path,
+        "config/create"
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// todo.md:1291: a file taken off a custom config's list leaves
+/// `config-files/` at the save; the one still listed stays.
+#[test]
+fn a_file_taken_off_a_custom_config_leaves_config_files_at_save() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+    let outside = root.join("user-disk");
+    fs::create_dir_all(&outside).unwrap();
+    let kept = outside.join("kept.json");
+    let dropped = outside.join("dropped.json");
+    fs::write(&kept, b"kept").unwrap();
+    fs::write(&dropped, b"dropped").unwrap();
+    import_custom_config_files_from_root(&root, &import_input(&[&kept, &dropped], &[])).unwrap();
+    save_advanced_batch_from_root(
+        &root,
+        &batch_with_config("", &["kept.json", "dropped.json"]),
+    )
+    .unwrap();
+    let files_dir = root
+        .join("mod-lists")
+        .join("Pack")
+        .join("config-files")
+        .join("sodium")
+        .join("cc-1");
+    assert!(files_dir.join("dropped.json").is_file());
+
+    save_advanced_batch_from_root(&root, &batch_with_config("", &["kept.json"])).unwrap();
+
+    assert!(files_dir.join("kept.json").is_file());
+    assert!(!files_dir.join("dropped.json").exists());
+    assert!(dropped.is_file(), "the user's own file is never touched");
+
+    fs::remove_dir_all(&root).unwrap();
+}

@@ -10,7 +10,7 @@ use tauri::State;
 // live in `editor_data_tests.rs`, so new editor behavior should usually extend
 // those files instead of growing unrelated modules.
 use crate::launcher_paths::LauncherPaths;
-use crate::path_safety::validate_path_component;
+use crate::path_safety::{normalize_relative_dir, validate_path_component};
 use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
 };
@@ -169,7 +169,27 @@ fn save_modlist(root_dir: &Path, modlist_name: &str, modlist: &ModList) -> Resul
         .modlists_dir()
         .join(modlist_name)
         .join(RULES_FILENAME);
-    modlist.write_to_file(&rules_path)
+    modlist.write_to_file(&rules_path)?;
+
+    // todo.md:1291: the bytes of a file taken off a custom config, or of a
+    // config that is gone, leave `config-files/` with it. The rules are saved
+    // by now, so a cleanup that fails is a line in the log, not a failed save.
+    let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
+    match crate::instance_configs::prune_orphan_custom_config_files(&modlist_dir, &modlist.rules)
+    {
+        Ok(removed) => {
+            for path in removed {
+                eprintln!(
+                    "[config-files] removed {}: no custom config lists it any more",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "[config-files] could not clean up the files of removed custom configs in '{modlist_name}': {error:#}"
+        ),
+    }
+    Ok(())
 }
 
 pub fn load_editor_snapshot_from_root(
@@ -622,11 +642,20 @@ fn custom_config_from_input(input: &SaveCustomConfigInput) -> Result<CustomConfi
             .with_context(|| format!("invalid custom config id '{}'", input.id))?;
         input.id.clone()
     };
+    // `modlist-10`: the «Path» is checked here, where the user can still fix
+    // it, and stored in one form (`/`, no `.`), so a launch never meets one
+    // that leaves the instance.
+    let target_path = normalize_relative_dir(&input.target_path).with_context(|| {
+        format!(
+            "the Path '{}' of a custom config must be a folder inside the instance, like 'config' or 'config/create'",
+            input.target_path
+        )
+    })?;
     Ok(CustomConfig {
         id,
         mc_versions: input.mc_versions.clone(),
         loader: input.loader.clone(),
-        target_path: input.target_path.clone(),
+        target_path,
         files: input.files.clone(),
     })
 }
