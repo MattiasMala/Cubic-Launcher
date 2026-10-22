@@ -442,18 +442,34 @@ pub fn open_screenshot_folder_command(
     instance_name: String,
     file_name: String,
 ) -> Result<(), String> {
-    let resolved = resolve_screenshot(
+    let folder = screenshot_folder(
         launcher_paths.root_dir(),
         &modlist_name,
         &instance_name,
         &file_name,
     )
     .map_err(|error| format!("{error:#}"))?;
+    open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
+}
+
+/// The folder the file manager opens for one screenshot.
+///
+/// The containment check runs on the canonical path, inside
+/// `resolve_screenshot`; the file manager gets the same path without the
+/// `\\?\` prefix Windows' `canonicalize` adds, which `cmd /c start` rejects
+/// (windows-3). `dunce::simplified` keeps the prefix only where the path
+/// cannot be spelled without it.
+fn screenshot_folder(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
+) -> Result<PathBuf> {
+    let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
     let folder = resolved
         .parent()
-        .ok_or_else(|| format!("'{file_name}' has no folder"))?
-        .to_path_buf();
-    open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
+        .with_context(|| format!("'{file_name}' has no folder"))?;
+    Ok(dunce::simplified(folder).to_path_buf())
 }
 
 #[cfg(test)]
@@ -502,6 +518,26 @@ mod tests {
             )
             .expect("failed to set the screenshot mtime");
         path
+    }
+
+    #[test]
+    fn the_folder_for_the_file_manager_is_the_plain_form_of_the_screenshots_folder() {
+        let root = unique_root("open-folder");
+        write_screenshot(&root, "Drehmal", "1.20.1-forge", "a.png", 1_000);
+
+        let folder = screenshot_folder(&root, "Drehmal", "1.20.1-forge", "a.png")
+            .expect("the folder should resolve");
+
+        assert!(
+            !folder.to_string_lossy().starts_with(r"\\?\"),
+            "cmd /c start does not accept a verbatim path: {}",
+            folder.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&folder).unwrap(),
+            fs::canonicalize(screenshots_dir(&root, "Drehmal", "1.20.1-forge")).unwrap()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
