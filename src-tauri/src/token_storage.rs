@@ -379,18 +379,9 @@ impl<'connection, S: SecretStore> EncryptedAccountsRepository<'connection, S> {
             .transpose()
     }
 
-    pub fn list_accounts(&self) -> Result<Vec<PlaintextAccountRecord>> {
-        Ok(self
-            .accounts_repository
-            .list_accounts()?
-            .into_iter()
-            .filter_map(|account| self.decrypt_account(account).ok())
-            .collect())
-    }
-
     /// Every saved row as stored, blobs still encrypted, each with the state
-    /// of its credentials. Nothing is decrypted, so unlike `list_accounts` a
-    /// row whose tokens no longer open is kept, and reported as such. Same
+    /// of its credentials. Nothing is decrypted, so a row whose tokens no
+    /// longer open is kept, and reported as such. Same
     /// order as `AccountsRepository::list_accounts`; the keyring is asked at
     /// most once.
     pub fn list_accounts_with_credentials(&self) -> Result<Vec<(AccountRecord, CredentialState)>> {
@@ -768,7 +759,7 @@ mod tests {
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
     #[test]
-    fn list_accounts_skips_corrupted_blob() {
+    fn list_accounts_with_credentials_keeps_a_corrupted_blob_as_unreadable() {
         let root_dir = unique_test_root();
         let database_path = root_dir.join("launcher_data.db");
 
@@ -806,11 +797,21 @@ mod tests {
             .expect("corrupted account should store");
 
         let accounts = repository
-            .list_accounts()
-            .expect("corrupted account should be skipped");
+            .list_accounts_with_credentials()
+            .expect("accounts should list");
+        let mut states = accounts
+            .iter()
+            .map(|(account, state)| (account.microsoft_id.as_str(), state.clone()))
+            .collect::<Vec<_>>();
+        states.sort_by_key(|(microsoft_id, _)| *microsoft_id);
 
-        assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].microsoft_id, "account-valid");
+        assert_eq!(
+            states,
+            vec![
+                ("account-corrupted", CredentialState::Unreadable),
+                ("account-valid", CredentialState::Usable),
+            ]
+        );
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");

@@ -108,6 +108,8 @@ impl MicrosoftOAuthClient {
         }
     }
 
+    /// Test seam: the same client against a local token endpoint.
+    #[cfg(test)]
     pub fn with_endpoints(authorize_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
             http_client: auth_http_client(),
@@ -1168,11 +1170,15 @@ pub fn microsoft_client_id_from_env(env_file_path: &Path) -> Result<Option<Strin
     Ok(None)
 }
 
-pub fn configured_microsoft_client_id(env_file_path: &Path) -> Result<Option<String>> {
+/// The client id for Microsoft sign-in: the launcher's `.env`, then the
+/// process environment, then the build environment, then the id bundled in
+/// the launcher. There is always one, so the only error is an unreadable
+/// `.env`.
+pub fn configured_microsoft_client_id(env_file_path: &Path) -> Result<String> {
     Ok(microsoft_client_id_from_env(env_file_path)?
         .or_else(microsoft_client_id_from_runtime_env)
         .or_else(microsoft_client_id_from_build_env)
-        .or_else(|| Some(BUNDLED_MICROSOFT_CLIENT_ID.to_string())))
+        .unwrap_or_else(|| BUNDLED_MICROSOFT_CLIENT_ID.to_string()))
 }
 
 fn microsoft_client_id_from_runtime_env() -> Option<String> {

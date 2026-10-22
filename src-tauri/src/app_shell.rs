@@ -319,18 +319,7 @@ pub async fn microsoft_login_command(
 ) -> Result<String, String> {
     let replace_unreadable = replace_unreadable.unwrap_or(false);
     let env_path = launcher_paths.root_dir().join(".env");
-    let client_id = configured_microsoft_client_id(&env_path)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| {
-            [
-                "Microsoft login is not configured.",
-                "Set MICROSOFT_CLIENT_ID in the launcher .env file, process environment,",
-                "or build environment to a public Microsoft Entra app registration",
-                "that allows personal Microsoft accounts and redirects to",
-                "http://localhost/callback.",
-            ]
-            .join(" ")
-        })?;
+    let client_id = configured_microsoft_client_id(&env_path).map_err(|e| e.to_string())?;
 
     let db_path = launcher_paths.database_path().to_path_buf();
 

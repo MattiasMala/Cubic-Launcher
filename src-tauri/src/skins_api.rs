@@ -547,10 +547,7 @@ async fn refresh_minecraft_token(paths: &LauncherPaths) -> Result<AccessToken, S
     };
 
     let client_id = configured_microsoft_client_id(&paths.root_dir().join(".env"))
-        .map_err(SkinError::library)?
-        .ok_or_else(|| {
-            SkinError::not_signed_in("Microsoft sign-in is not configured in this build")
-        })?;
+        .map_err(SkinError::library)?;
     let config = MicrosoftOAuthConfig {
         client_id,
         redirect_uri: REGISTERED_LOOPBACK_REDIRECT_URI.to_string(),

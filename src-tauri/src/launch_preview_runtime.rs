@@ -986,16 +986,7 @@ pub(super) async fn load_player_identity(
 
     let env_path = launcher_paths.root_dir().join(".env");
     let client_id = match crate::microsoft_auth::configured_microsoft_client_id(&env_path) {
-        Ok(Some(client_id)) => client_id,
-        Ok(None) => {
-            return Ok(fall_back_to_offline(
-                app_handle,
-                username,
-                uuid,
-                OfflineFallback::SessionNotRefreshed,
-                "Microsoft token refresh failed because MICROSOFT_CLIENT_ID is not configured",
-            ));
-        }
+        Ok(client_id) => client_id,
         Err(error) => {
             return Ok(fall_back_to_offline(
                 app_handle,
