@@ -32,6 +32,7 @@ import {
   setIncompatibilityModalOpen,
   setLauncherErrors,
   setLaunchLogs,
+  setLaunchStopRequested,
   setLaunchProgress,
   setLaunchStageDetail,
   setLaunchStageLabel,
@@ -359,6 +360,7 @@ export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: strin
 
 export function resetLaunchUiState() {
   setLaunchState("idle");
+  setLaunchStopRequested(false);
   setLaunchProgress(0);
   setLaunchStageLabel(LAUNCH_STAGES[0].label);
   setLaunchStageDetail(LAUNCH_STAGES[0].detail);

@@ -101,6 +101,8 @@ export const [launchStageDetail, setLaunchStageDetail] = createSignal(LAUNCH_STA
 export const [profileRecordingPath, setProfileRecordingPath] = createSignal<string | null>(null);
 export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
+/** Set by STOP: the exit that follows is the user's, not a crash to report (concorrenza-9). */
+export const [launchStopRequested, setLaunchStopRequested] = createSignal(false);
 export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);
 export const [launcherErrors, setLauncherErrors] = createSignal<LauncherUiError[]>([]);
 export const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);

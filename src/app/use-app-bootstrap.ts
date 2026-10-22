@@ -4,16 +4,20 @@ import { onCleanup, onMount } from "solid-js";
 import { logger } from "../lib/logger";
 import {
   launchState,
+  launchStopRequested,
   modRowsState,
   pushUiError,
   selectedMcVersion,
   selectedModLoader,
+  setActiveRailView,
   setAppLoading,
   setLaunchLogs,
+  setLaunchStopRequested,
   setLaunchProgress,
   setLaunchStageDetail,
   setLaunchStageLabel,
   setLaunchState,
+  setLogViewerOpen,
   setProfileRecordingPath,
 } from "../store";
 import {
@@ -65,14 +69,39 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
       }),
 
       listen<{ success: boolean; exitCode: number | null }>("minecraft-exit", (event) => {
+        const { success, exitCode } = event.payload;
+        const stoppedByUser = launchStopRequested();
+        setLaunchStopRequested(false);
         setLaunchState("idle");
         setLaunchProgress(0);
         setLaunchStageLabel("Ready");
         setLaunchStageDetail(
-          event.payload.success
+          success
             ? "Minecraft exited normally."
-            : `Minecraft exited with code ${event.payload.exitCode ?? "unknown"}.`
+            : `Minecraft exited with code ${exitCode ?? "unknown"}.`
         );
+        // A game that dies a second after the spawn (no memory for -Xmx, a bad
+        // JVM argument, a crash while loading) used to leave only a PLAY
+        // button and a closed log (concorrenza-9). STOP is the user's own
+        // exit, not one to report.
+        if (!success && !stoppedByUser) {
+          pushUiError({
+            title: "Minecraft closed with an error",
+            message: exitCode === null
+              ? "The game was terminated without an exit code. The launch log shows what happened before it stopped."
+              : `The game exited with code ${exitCode}. The launch log shows what went wrong.`,
+            detail: "",
+            severity: "error",
+            scope: "launch",
+            action: {
+              label: "Show log",
+              run: () => {
+                setActiveRailView("modlist");
+                setLogViewerOpen(true);
+              },
+            },
+          });
+        }
         // Il backend ha messo da parte il file prima dello spawn e risponde solo se esiste.
         invoke<string | null>("last_profile_recording_command")
           .then(setProfileRecordingPath)

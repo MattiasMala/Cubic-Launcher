@@ -102,6 +102,8 @@ export type LauncherUiError = {
   detail: string;
   severity: "warning" | "error";
   scope: "launch" | "download" | "account";
+  /** One button next to the notice, e.g. "Show log" after a crash (concorrenza-9). */
+  action?: { label: string; run: () => void };
 };
 
 /** Why an account is online or not (F1): mirrors `CredentialState` in `token_storage.rs`. */

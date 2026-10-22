@@ -7,7 +7,7 @@ import {
   selectedModLoader, setSelectedModLoader,
   minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
-  launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath,
+  launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath, setLaunchStopRequested,
   activeAccount, accounts, setAccountsModalOpen, pushUiError, accountAvatarUrl,
   minecraftVersionsNotice,
 } from "../store";
@@ -78,6 +78,8 @@ export function LaunchPanel(props: LaunchPanelProps) {
   });
 
   const handleStop = async () => {
+    // The exit that follows is a choice, not a crash to report (concorrenza-9).
+    setLaunchStopRequested(true);
     try {
       await invoke("stop_minecraft_command");
     } catch { /* already exited */ }
