@@ -267,7 +267,7 @@ impl EffectiveLaunchSettings {
             .unwrap_or_else(|| global.wrapper_command.clone())
             .trim()
             .to_string();
-        let java_path_override = global.java_path_override.trim();
+        let java_path_override = unquote_path_setting(&global.java_path_override);
 
         Self {
             min_ram_mb: overrides.min_ram_mb.unwrap_or(global.min_ram_mb),
@@ -371,6 +371,28 @@ impl LaunchPlaceholders {
             resolution_height: "480".to_string(),
         }
     }
+}
+
+/// A path typed or pasted into a setting, without the quotes around it.
+///
+/// Windows' "Copy as path" puts the path between double quotes, and a path
+/// with the quotes is no file at all: every launch failed with "is not
+/// runnable". A quote can never be part of a Windows path, so the ones
+/// around it are always the clipboard's, never the user's.
+pub(super) fn unquote_path_setting(value: &str) -> &str {
+    let mut value = value.trim();
+    while let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+    {
+        value = inner.trim();
+    }
+    value
 }
 
 fn default_verification_timeout_seconds() -> u64 {

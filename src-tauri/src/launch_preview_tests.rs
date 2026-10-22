@@ -192,6 +192,39 @@ fn effective_launch_settings_prefer_modlist_overrides() {
     );
 }
 
+/// r2-percorsi-non-ascii-e-limiti-windows-5 (audit 101): «Copia come percorso»
+/// di Windows mette il percorso tra virgolette, e con le virgolette ogni lancio
+/// falliva con «is not runnable».
+#[test]
+fn java_path_override_loses_the_quotes_of_a_pasted_path() {
+    let mut global = global_settings();
+    for pasted in [
+        r#""C:\Program Files\Java\jdk-21\bin\java.exe""#,
+        r#"  "C:\Program Files\Java\jdk-21\bin\java.exe"  "#,
+        r#"'C:\Program Files\Java\jdk-21\bin\java.exe'"#,
+        "\t C:\\Program Files\\Java\\jdk-21\\bin\\java.exe \n",
+    ] {
+        global.java_path_override = pasted.into();
+        assert_eq!(
+            EffectiveLaunchSettings::from_shell_settings(&global, &modlist_overrides())
+                .java_path_override,
+            Some(PathBuf::from(r"C:\Program Files\Java\jdk-21\bin\java.exe")),
+            "{pasted:?}"
+        );
+    }
+
+    // Only quotes, or nothing: no override at all.
+    for empty in [r#""""#, "  ", r#"" ""#] {
+        global.java_path_override = empty.into();
+        assert_eq!(
+            EffectiveLaunchSettings::from_shell_settings(&global, &modlist_overrides())
+                .java_path_override,
+            None,
+            "{empty:?}"
+        );
+    }
+}
+
 #[test]
 fn effective_launch_settings_prefer_the_modlist_profiler_override() {
     // L'override vince in tutte e due le direzioni; senza override vale il globale.
