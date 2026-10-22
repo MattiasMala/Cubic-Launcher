@@ -181,7 +181,7 @@ pub(super) async fn run_vanilla_launch_pipeline(
         effective_required_java
     ))?;
 
-    let java_binary_path = select_or_download_java(
+    let selected_java = select_or_download_java(
         &app_handle,
         &launcher_paths,
         &effective_settings,
@@ -193,7 +193,11 @@ pub(super) async fn run_vanilla_launch_pipeline(
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        format!("[Java] Using {}", java_binary_path.display()),
+        format!(
+            "[Java] Using {} (Java {})",
+            selected_java.path.display(),
+            selected_java.major
+        ),
     )?;
 
     let mut classpath_entries = mc_data.library_paths.clone();
@@ -201,11 +205,12 @@ pub(super) async fn run_vanilla_launch_pipeline(
     let profiler = launch_profiler(
         &app_handle,
         &effective_settings,
-        effective_required_java,
+        // todo.md:1800: la Java che parte davvero, non il requisito.
+        selected_java.major,
         launch_log_session.dir(),
     )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
-        java_binary_path: java_binary_path.clone(),
+        java_binary_path: selected_java.path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries,
         loader_metadata,

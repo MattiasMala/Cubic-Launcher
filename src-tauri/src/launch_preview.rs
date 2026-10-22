@@ -891,7 +891,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "required_java_after_loader={}",
         effective_required_java
     ))?;
-    let java_binary_path = select_or_download_java(
+    let selected_java = select_or_download_java(
         &app_handle,
         &launcher_paths,
         &effective_settings,
@@ -903,17 +903,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        format!("[Java] Using {}", java_binary_path.display()),
+        format!(
+            "[Java] Using {} (Java {})",
+            selected_java.path.display(),
+            selected_java.major
+        ),
     )?;
 
     let profiler = launch_profiler(
         &app_handle,
         &effective_settings,
-        effective_required_java,
+        // todo.md:1800: la Java che parte davvero, non il requisito.
+        selected_java.major,
         launch_log_session.dir(),
     )?;
     let prepared_command = build_launch_command(&JavaLaunchRequest {
-        java_binary_path: java_binary_path.clone(),
+        java_binary_path: selected_java.path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries: build_modded_classpath_entries(
             &mc_data.library_paths,

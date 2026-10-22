@@ -292,8 +292,8 @@ impl EffectiveLaunchSettings {
         }
     }
 
-    /// Il profiler di questo lancio: `java_major` è la Java che il lancio richiede, e il file
-    /// finisce nella cartella del lancio (D109).
+    /// Il profiler di questo lancio: `java_major` è la major della Java che il lancio usa
+    /// davvero (todo.md:1800), e il file finisce nella cartella del lancio (D109).
     pub(super) fn profiler_decision(
         &self,
         java_major: u32,

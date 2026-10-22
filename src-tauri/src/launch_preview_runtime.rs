@@ -1014,6 +1014,27 @@ pub(super) async fn load_player_identity(
     })
 }
 
+/// La Java che il lancio userà e la sua major.
+///
+/// todo.md:1800: le decisioni che dipendono dalla JVM che parte (il profiler
+/// JFR) guardano `major`, non il requisito della versione di Minecraft. Un
+/// Java Path Override o una major sostituita possono essere più nuovi del
+/// requisito, e il log diceva «this launch uses Java 8» su una Java 17.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SelectedJava {
+    pub(super) path: PathBuf,
+    pub(super) major: u32,
+}
+
+impl SelectedJava {
+    fn from_installation(installation: JavaInstallation) -> Self {
+        Self {
+            path: installation.path,
+            major: installation.version,
+        }
+    }
+}
+
 pub(super) async fn select_or_download_java(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
@@ -1022,7 +1043,7 @@ pub(super) async fn select_or_download_java(
     required_version: u32,
     // The active account's choice (D115), read once by the caller.
     plays_offline: bool,
-) -> Result<PathBuf> {
+) -> Result<SelectedJava> {
     if let Some(path) = &settings.java_path_override {
         let inspector = CommandJavaBinaryInspector;
         let probe = inspector
@@ -1039,7 +1060,10 @@ pub(super) async fn select_or_download_java(
             );
         }
 
-        return Ok(path.clone());
+        return Ok(SelectedJava {
+            path: path.clone(),
+            major: probe.version,
+        });
     }
 
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
@@ -1065,7 +1089,7 @@ pub(super) async fn select_or_download_java(
                 installation.version,
             )?;
         }
-        return Ok(installation.path);
+        return Ok(SelectedJava::from_installation(installation));
     }
 
     let adoptium = AdoptiumClient::new();
@@ -1089,7 +1113,7 @@ pub(super) async fn select_or_download_java(
         if let Some(installation) =
             select_exact_java_for_requirement(&installations, effective_version)
         {
-            return Ok(installation.path);
+            return Ok(SelectedJava::from_installation(installation));
         }
     }
 
@@ -1141,7 +1165,7 @@ pub(super) async fn select_or_download_java(
     let installations = installations_for_this_computer(app_handle, installations)?;
 
     select_java_for_requirement(&installations, required_version)
-        .map(|installation| installation.path)
+        .map(SelectedJava::from_installation)
         .with_context(|| {
             format!(
                 "Java {} was downloaded but could not be found after extraction. Check {}",
