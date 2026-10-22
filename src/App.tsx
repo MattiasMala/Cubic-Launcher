@@ -26,7 +26,7 @@ import {
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   globalSettings, setGlobalSettings, setModlistOverrides,
-  pushUiError, resetLaunchUiState, launchPreparing,
+  pushUiError, resetLaunchUiState, launchPreparing, activePlaysOffline,
   setAestheticGroups, setFunctionalGroups,
   setSavedIncompatibilities,
   setSavedLinks,
@@ -976,6 +976,9 @@ export default function App() {
       minecraftVersion: selectedMcVersion(),
       modLoader: normalizeModLoader(selectedModLoader()),
     };
+    // Read with the target: the account cannot change before the launch
+    // starts (precheck-1), and the message below has to describe this one.
+    const playsOffline = activePlaysOffline();
 
     if (isTauri()) {
       // The pre-check command runs before every launch. With an account that
@@ -991,9 +994,17 @@ export default function App() {
       } catch (err) {
         // D19: an update check must never be the reason the game does not
         // start. No map means the launch picks versions exactly as it did
-        // before this feature existed.
-        pushUiError({ title: "Update check failed", message: "Launching with the versions already in your cache.", detail: String(err), severity: "warning", scope: "launch" });
-        appendLaunchLog(`[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`);
+        // before this feature existed — and the message says what that is
+        // (todo.md:1492). An account that plays offline reads the cache
+        // (D115); any other resolves again online, and a mod with a newer
+        // build is updated without the popup.
+        const message = playsOffline
+          ? "Launching with the versions already in your cache."
+          : "The launch looks the mods up again and may install newer versions without asking.";
+        pushUiError({ title: "Update check failed", message, detail: String(err), severity: "warning", scope: "launch" });
+        appendLaunchLog(playsOffline
+          ? `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`
+          : `[Launcher] WARN update check failed, the launch resolves the mods again and may update them without asking — ${String(err)}`);
         await startLaunch(target);
         return;
       } finally {
