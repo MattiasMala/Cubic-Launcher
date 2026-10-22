@@ -25,7 +25,7 @@ use crate::content_packs::{load_content_list, ContentEntry};
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
-use crate::resolver::ResolutionTarget;
+use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     build_instance_root, emit_log, is_content_entry_active, preferred_version,
@@ -292,6 +292,11 @@ pub(super) async fn run_content_precheck(
     let mut precheck = ContentPrecheck::default();
 
     for (category, instance_subdir) in CONTENT_CATEGORIES {
+        // The launch skips shaders on Vanilla (contentpack-3): no row for a
+        // pack it will not install.
+        if category == "shader" && target.mod_loader == ModLoader::Vanilla {
+            continue;
+        }
         // A missing category file is an empty list, exactly as it is for the
         // launch. One that cannot be read offers no row and promises nothing:
         // the launch leaves that category as it is and reports it as an

@@ -25,7 +25,7 @@ use super::{
     load_cached_version_ids_for_selected, load_modlist, load_modlist_pins, parse_mod_loader,
     read_instance_jars, resolve_offline_selection, resolve_online_selection, run_content_precheck,
     versions_for_final_selection, ContentEntryWithoutVersions, ContentLookupFailure,
-    ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
+    ContentPrecheck, ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -167,16 +167,28 @@ pub struct UpdatePrecheckResult {
     pub dropped_mods: Vec<DroppedModGroup>,
 }
 
-/// A vanilla target loads no mods: an empty payload, not an error, and no
-/// mod-list read at all. `None` means the target needs the full selection.
+/// A vanilla target loads no mods, so its pre-check has no mod half: no
+/// selection, no mod rows, no mod map.
 ///
-/// Empty covers the packs too. Since audit 101 (contentpack-3) the vanilla
-/// pipeline installs resource packs and data packs; without a pre-checked
-/// version it resolves them at launch, as a modded launch with no map does.
-pub(super) fn empty_precheck_for_loaderless_target(
-    target: &ResolutionTarget,
-) -> Option<UpdatePrecheckResult> {
-    matches!(target.mod_loader, ModLoader::Vanilla).then(UpdatePrecheckResult::default)
+/// It still has packs. Since audit 101 (contentpack-3) the vanilla pipeline
+/// installs resource packs and data packs, so the packs get their rows and
+/// their map like on a modded target (review-risoluzione-6): without the map
+/// the launch would resolve every pack to its newest version, and an update
+/// nobody accepted would land in silence (D16, D17, D58).
+pub(super) fn target_loads_mods(target: &ResolutionTarget) -> bool {
+    !matches!(target.mod_loader, ModLoader::Vanilla)
+}
+
+/// The pack half of the payload, copied in.
+fn with_content(
+    mut result: UpdatePrecheckResult,
+    content: ContentPrecheck,
+) -> UpdatePrecheckResult {
+    result.content_updates = content.updates;
+    result.resolved_content = content.resolved;
+    result.content_without_versions = content.without_versions;
+    result.content_lookup_failures = content.lookup_failures;
+    result
 }
 
 /// The registered version ids a row would have to name, and whose version
@@ -342,8 +354,30 @@ pub(super) async fn run_update_precheck(
     let modlist_name = request.modlist_name.trim().to_string();
     anyhow::ensure!(!modlist_name.is_empty(), "modlist_name cannot be empty");
 
-    if let Some(empty) = empty_precheck_for_loaderless_target(&target) {
-        return Ok(empty);
+    if !target_loads_mods(&target) {
+        // Offline the launch leaves the Modrinth packs as they are (D139), so
+        // there is nothing to promise and nothing is asked.
+        if active_account_plays_offline(launcher_paths)? {
+            return Ok(UpdatePrecheckResult::default());
+        }
+        return tokio::time::timeout(
+            PRECHECK_TIME_LIMIT,
+            run_content_precheck(
+                app_handle,
+                launcher_paths,
+                &ModrinthClient::new(),
+                &modlist_name,
+                &target,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the update check took longer than {} s",
+                PRECHECK_TIME_LIMIT.as_secs()
+            )
+        })?
+        .map(|content| with_content(UpdatePrecheckResult::default(), content));
     }
 
     // D115, D116: an account that plays offline launches with zero requests,
@@ -457,7 +491,7 @@ async fn run_online_precheck(
         );
     }
 
-    let mut result = build_precheck_result(
+    let result = build_precheck_result(
         &selection.selected_mods,
         &candidates,
         &cached_version_ids,
@@ -475,12 +509,8 @@ async fn run_online_precheck(
         &target,
     )
     .await?;
-    result.content_updates = content.updates;
-    result.resolved_content = content.resolved;
-    result.content_without_versions = content.without_versions;
-    result.content_lookup_failures = content.lookup_failures;
 
-    Ok(result)
+    Ok(with_content(result, content))
 }
 
 #[cfg(test)]
@@ -783,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vanilla_target_has_nothing_to_check() {
+    fn a_vanilla_target_has_no_mod_half() {
         // The command path parses the loader string first, so the short-circuit
         // is only reachable if "vanilla" parses instead of erroring.
         let vanilla = ResolutionTarget {
@@ -792,11 +822,26 @@ mod tests {
         };
 
         assert_eq!(vanilla.mod_loader, ModLoader::Vanilla);
-        assert_eq!(
-            empty_precheck_for_loaderless_target(&vanilla),
-            Some(UpdatePrecheckResult::default())
-        );
-        assert_eq!(empty_precheck_for_loaderless_target(&target()), None);
+        assert!(!target_loads_mods(&vanilla));
+        assert!(target_loads_mods(&target()));
+    }
+
+    /// review-risoluzione-6: the pack half lands in the payload whole, so a
+    /// vanilla launch gets the map and keeps a refused pack update.
+    #[test]
+    fn the_pack_half_is_copied_into_the_payload() {
+        let mut resolved = ResolvedContentVersions::default();
+        resolved
+            .entry("resourcepack".to_string())
+            .or_default()
+            .insert("faithful".to_string(), "v1".to_string());
+        let content = ContentPrecheck {
+            resolved: resolved.clone(),
+            ..ContentPrecheck::default()
+        };
+        let result = with_content(UpdatePrecheckResult::default(), content);
+        assert_eq!(result.resolved_content, resolved);
+        assert!(result.updates.is_empty());
     }
 
     #[test]
