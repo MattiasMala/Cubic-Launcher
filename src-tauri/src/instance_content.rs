@@ -107,6 +107,11 @@ impl InstalledContent {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentSyncOutcome {
     pub removed: Vec<String>,
+    /// `(name, error)` for every stale entry that would not go: a file held
+    /// open on Windows, a permission. A warning for the launch log, never a
+    /// launch that stops (contentpack-10); the name stays in the manifest, so
+    /// the next launch tries again.
+    pub failed_removals: Vec<(String, String)>,
     /// `(old name, new name)` for every entry whose file name changed since
     /// the last launch: what the game's own settings still call by the old
     /// name (D145).
@@ -358,29 +363,37 @@ pub fn sync_managed_content(
         );
         write_manifest_with_origins(&manifest_path, category, &files, &origins)?;
         return Ok(ContentSyncOutcome {
-            removed: Vec::new(),
             renamed,
+            ..ContentSyncOutcome::default()
         });
     }
 
     let present = present_entries(instance_dir)?;
     let removals = plan_stale_removals(&previous.files, &installed.files, &present);
 
-    for name in &removals {
-        let path = instance_dir.join(name);
-        remove_managed_entry(&path)
-            .with_context(|| format!("failed to remove stale content pack {}", path.display()))?;
+    let mut removed = Vec::new();
+    let mut failed_removals = Vec::new();
+    for name in removals {
+        match remove_managed_entry(&instance_dir.join(&name)) {
+            Ok(()) => removed.push(name),
+            Err(error) => failed_removals.push((name, error.to_string())),
+        }
     }
 
-    write_manifest_with_origins(
-        &manifest_path,
-        category,
-        &installed.files,
-        &installed.origins,
-    )?;
+    // What would not go is still ours: it stays listed, with its origin.
+    let mut files = installed.files.clone();
+    let mut origins = installed.origins.clone();
+    for (name, _) in &failed_removals {
+        files.push(name.clone());
+        if let Some(origin) = previous.origins.get(name) {
+            origins.insert(name.clone(), origin.clone());
+        }
+    }
+    write_manifest_with_origins(&manifest_path, category, &files, &origins)?;
 
     Ok(ContentSyncOutcome {
-        removed: removals,
+        removed,
+        failed_removals,
         renamed,
     })
 }
@@ -881,11 +894,18 @@ fn remove_managed_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// On Windows a symlink to a directory is removed with `remove_dir`, not
-/// `remove_file`; `Path::is_dir` follows the link and tells the two apart.
+/// On Windows a symlink to a directory — or a junction — is removed with
+/// `remove_dir`, not `remove_file`. Which kind of link it is comes from the
+/// link itself (`symlink_metadata`), never from what it points at
+/// (contentpack-10): `Path::is_dir` follows the link, and on a directory link
+/// whose folder is gone it answered "not a directory", `remove_file` failed,
+/// and every launch stopped on «failed to remove stale content pack» until the
+/// user deleted the link by hand. Shared by every caller that removes a link.
 #[cfg(target_family = "windows")]
-fn remove_symlink(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
+pub(crate) fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
         fs::remove_dir(path)
     } else {
         fs::remove_file(path)
@@ -894,7 +914,7 @@ fn remove_symlink(path: &Path) -> std::io::Result<()> {
 
 /// On unix `unlink` removes a symlink regardless of what it points at.
 #[cfg(target_family = "unix")]
-fn remove_symlink(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_symlink(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
@@ -1819,6 +1839,101 @@ mod tests {
         assert!(instance_world_dirs(&root_dir.join("never-ran"))
             .expect("no saves is no world")
             .is_empty());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// contentpack-10: a link to a folder that is gone is still a link, and it
+    /// goes like any other. On Windows the kind of link is read from the link
+    /// itself (`is_symlink_dir`); this exercises the unix side of the same
+    /// promise — no Windows runner executes tests yet.
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn a_dangling_directory_link_is_removed_and_does_not_stop_the_launch() {
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let folder = root_dir.join("MyPack");
+        fs::create_dir_all(&folder).expect("pack folder should be created");
+        std::os::unix::fs::symlink(&folder, instance_dir.join("MyPack"))
+            .expect("directory link should be created");
+        sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["MyPack"]),
+            true,
+        )
+        .expect("first sync should succeed");
+        fs::remove_dir_all(&folder).expect("the pack folder is deleted");
+
+        let removed =
+            sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[], true)
+                .expect("a dangling link does not stop the launch");
+
+        assert_eq!(removed, names(&["MyPack"]));
+        assert!(fs::symlink_metadata(instance_dir.join("MyPack")).is_err());
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// contentpack-10: an entry that will not go is a warning, and it stays in
+    /// the manifest so that the next launch, which can, removes it.
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn a_removal_that_fails_is_reported_and_retried_by_the_next_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_dir = unique_test_root();
+        let instance_dir = fixture_instance(&root_dir, "resourcepacks");
+        let cached = root_dir.join("old.zip");
+        fs::write(&cached, b"pack").expect("cached pack should exist");
+        std::os::unix::fs::symlink(&cached, instance_dir.join("old.zip"))
+            .expect("link should be created");
+        sync_managed_content_dir(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &names(&["old.zip"]),
+            true,
+        )
+        .expect("first sync should succeed");
+
+        // A directory nobody may delete from: the unix stand-in for a file
+        // Windows holds open.
+        fs::set_permissions(&instance_dir, fs::Permissions::from_mode(0o555))
+            .expect("the directory should become read-only");
+        let previous = super::previous_from_manifest(&root_dir, "resourcepacks");
+        let outcome = sync_managed_content(
+            &root_dir,
+            "resourcepacks",
+            &instance_dir,
+            &previous,
+            &InstalledContent::default(),
+            true,
+        );
+        fs::set_permissions(&instance_dir, fs::Permissions::from_mode(0o755))
+            .expect("the directory should become writable again");
+
+        let outcome = outcome.expect("a failed removal does not stop the launch");
+        assert!(outcome.removed.is_empty());
+        assert_eq!(
+            outcome
+                .failed_removals
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+            names(&["old.zip"])
+        );
+        assert_eq!(
+            read_manifest_files(&manifest_path(&root_dir, "resourcepacks")),
+            names(&["old.zip"]),
+            "still ours, still listed"
+        );
+
+        let removed =
+            sync_managed_content_dir(&root_dir, "resourcepacks", &instance_dir, &[], true)
+                .expect("the next sync should succeed");
+        assert_eq!(removed, names(&["old.zip"]));
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

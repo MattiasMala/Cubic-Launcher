@@ -515,7 +515,7 @@ fn remove_existing_target(target: &Path) -> Result<()> {
     let file_type = metadata.file_type();
 
     let removed = if file_type.is_symlink() {
-        remove_symlink(target)
+        crate::instance_content::remove_symlink(target)
     } else if file_type.is_dir() {
         fs::remove_dir_all(target)
     } else {
@@ -523,20 +523,6 @@ fn remove_existing_target(target: &Path) -> Result<()> {
     };
 
     removed.with_context(|| format!("failed to replace {}", target.display()))
-}
-
-#[cfg(target_family = "windows")]
-fn remove_symlink(target: &Path) -> std::io::Result<()> {
-    if target.is_dir() {
-        fs::remove_dir(target)
-    } else {
-        fs::remove_file(target)
-    }
-}
-
-#[cfg(target_family = "unix")]
-fn remove_symlink(target: &Path) -> std::io::Result<()> {
-    fs::remove_file(target)
 }
 
 #[cfg(target_family = "unix")]

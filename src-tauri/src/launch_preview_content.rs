@@ -829,6 +829,15 @@ pub(super) async fn resolve_and_install_content_packs(
                 format!("[Content] Removed {} from {}", name, instance_subdir),
             )?;
         }
+        for (name, error) in &outcome.failed_removals {
+            emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Content] Could not remove {name} from {instance_subdir} ({error}); it stays, and the next launch tries again"
+                ),
+            )?;
+        }
         // D145: an update renamed the file, and the game still calls the pack
         // by its old name. Never fatal: at worst the pack comes back disabled,
         // which is what happened before.
@@ -1047,6 +1056,14 @@ fn sync_world_datapacks(
         log(
             ProcessLogStream::Stdout,
             format!("[Content] Removed {name} from {label}"),
+        )?;
+    }
+    for (name, error) in &outcome.failed_removals {
+        log(
+            ProcessLogStream::Stderr,
+            format!(
+                "[Content] Could not remove {name} from {label} ({error}); it stays, and the next launch tries again"
+            ),
         )?;
     }
     Ok(())
