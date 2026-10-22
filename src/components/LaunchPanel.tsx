@@ -9,6 +9,7 @@ import {
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
   launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath,
   activeAccount, accounts, setAccountsModalOpen, pushUiError,
+  minecraftVersionsNotice,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
 import { Select } from "./Select";
@@ -286,6 +287,13 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 class="text-xs text-textMuted"
                 direction="up"
               />
+              <Show when={minecraftVersionsNotice()}>
+                {notice => (
+                  <span class="text-warning cursor-help" title={notice()} aria-label={notice()} data-testid="minecraft-versions-partial">
+                    <MaterialIcon name="info" size="sm" />
+                  </span>
+                )}
+              </Show>
             </div>
             <label class="flex items-center gap-1 cursor-pointer select-none">
               <input

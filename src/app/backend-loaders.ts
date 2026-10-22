@@ -12,6 +12,7 @@ import {
   setInstancePresentation,
   setModIcons, modIcons, setModNames, modNames,
   minecraftVersions, setSelectedMcVersion, setSelectedModLoader, selectedMcVersion, selectedModLoader,
+  setMinecraftVersions, setMcWithSnapshots, setMinecraftVersionsNotice,
   setVersionRules, setCustomConfigs,
   setResolvedModIds, setResolvedTarget, setExpandedRows,
 } from "../store";
@@ -45,6 +46,53 @@ export async function runResolution(modlistName?: string, mcVersion?: string, mo
     logger.warn("App", "resolution failed", { error });
     setResolvedTarget(target);
     setResolvedModIds(null);
+  }
+}
+
+/** `MinecraftVersionsPayload` in minecraft_versions.rs. */
+type MinecraftVersionsPayload = {
+  releases: string[];
+  withSnapshots: string[];
+  /** `mojang`: fetched now; `saved`: the manifest saved last time; `installed`: only the versions on disk. */
+  source: "mojang" | "saved" | "installed";
+  playsOffline: boolean;
+};
+
+function minecraftVersionsNoticeFor(payload: MinecraftVersionsPayload): string | null {
+  if (payload.source === "mojang") return null;
+  const why = payload.playsOffline
+    ? "This account plays offline, so Mojang wasn't asked"
+    : "Mojang couldn't be reached";
+  const what = payload.source === "saved"
+    ? "the list is the one saved last time, plus the versions already downloaded. Newer versions may be missing."
+    : "only the versions already downloaded are listed.";
+  const fallback = payload.releases.length === 0
+    ? " No version is downloaded yet, so a few common versions are shown instead."
+    : "";
+  return `${why}: ${what}${fallback}`;
+}
+
+/**
+ * The version dropdown's lists. Never awaited by the startup (stato-frontend-7):
+ * the backend has a 20 s timeout, falls back to what is on disk, and asks
+ * nobody while the active account plays offline (D140); the notice says when
+ * the list may be partial (r2-primo-avvio-ambiente-degradato-2).
+ */
+export async function loadMinecraftVersions() {
+  if (!isTauri()) return;
+  try {
+    const payload = await invoke<MinecraftVersionsPayload>("fetch_minecraft_versions_command");
+    logger.debug("App", "fetched minecraft versions", {
+      releases: payload.releases.length,
+      withSnapshots: payload.withSnapshots.length,
+      source: payload.source,
+    });
+    if (payload.releases.length > 0) setMinecraftVersions(payload.releases);
+    if (payload.withSnapshots.length > 0) setMcWithSnapshots(payload.withSnapshots);
+    setMinecraftVersionsNotice(minecraftVersionsNoticeFor(payload));
+  } catch (error) {
+    logger.warn("App", "failed to fetch minecraft versions, using defaults", error);
+    setMinecraftVersionsNotice("The version list couldn't be loaded, so a few common versions are shown instead.");
   }
 }
 
