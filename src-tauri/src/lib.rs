@@ -76,8 +76,8 @@ fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                     eprintln!(
                         "[close] the window did not answer the last close request while Minecraft runs: closing"
                     );
+                    // Not prevented: the window closes.
                     *unanswered = None;
-                    return;
                 }
                 Some(_) => api.prevent_close(),
                 None => {
