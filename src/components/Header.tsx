@@ -4,7 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
-import logoUrl from "../../assets/icon.png";
+// 64×64 copy of assets/icon.png (1254×1254, 1.48 MB): the header draws it at
+// 32 px, 64 for HiDPI. The original stays for the README (audit 101, 069 M5).
+import logoUrl from "../../assets/icon-64.png";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
