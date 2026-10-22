@@ -1037,6 +1037,83 @@ use self::skin_context as command_context;
 #[cfg(feature = "skins-fake-backend")]
 use fake::skin_context as command_context;
 
+/// The backend a command talks to: Mojang (or the fake), or nobody at all
+/// when the active account plays offline (D141). Offline, every Mojang call
+/// answers `PlaysOffline` without a request, so the read-only operations show
+/// the library with that as the profile error, and the writes (apply, reset,
+/// cape, save worn) are refused. No sign-in is read or refreshed.
+pub(crate) enum ScreenBackend<B> {
+    Online(B),
+    Offline,
+}
+
+impl<B: SkinBackend> SkinBackend for ScreenBackend<B> {
+    async fn profile(&self) -> Result<MinecraftProfile, SkinError> {
+        match self {
+            Self::Online(backend) => backend.profile().await,
+            Self::Offline => Err(SkinError::plays_offline()),
+        }
+    }
+
+    async fn upload_skin(
+        &self,
+        png: Vec<u8>,
+        variant: SkinVariant,
+    ) -> Result<MinecraftProfile, SkinError> {
+        match self {
+            Self::Online(backend) => backend.upload_skin(png, variant).await,
+            Self::Offline => Err(SkinError::plays_offline()),
+        }
+    }
+
+    async fn reset_skin(&self) -> Result<MinecraftProfile, SkinError> {
+        match self {
+            Self::Online(backend) => backend.reset_skin().await,
+            Self::Offline => Err(SkinError::plays_offline()),
+        }
+    }
+
+    async fn set_cape(&self, cape_id: Option<&str>) -> Result<MinecraftProfile, SkinError> {
+        match self {
+            Self::Online(backend) => backend.set_cape(cape_id).await,
+            Self::Offline => Err(SkinError::plays_offline()),
+        }
+    }
+
+    async fn download_texture(&self, texture_key: &str) -> Result<Vec<u8>, SkinError> {
+        match self {
+            Self::Online(backend) => backend.download_texture(texture_key).await,
+            Self::Offline => Err(SkinError::plays_offline()),
+        }
+    }
+
+    fn cached_profile(&self) -> Option<MinecraftProfile> {
+        match self {
+            Self::Online(backend) => backend.cached_profile(),
+            // The profile read while the account was online is not shown: the
+            // offline screen marks nothing as worn.
+            Self::Offline => None,
+        }
+    }
+
+    fn remember_profile(&self, profile: &MinecraftProfile) {
+        if let Self::Online(backend) = self {
+            backend.remember_profile(profile);
+        }
+    }
+}
+
+/// The backend for the active account, offline when it plays offline (D141).
+fn command_backend<'a>(
+    paths: &'a LauncherPaths,
+    skins: &'a SkinsState,
+) -> Result<ScreenBackend<CommandBackend<'a>>, SkinError> {
+    if crate::app_shell::active_account_plays_offline(paths).map_err(SkinError::library)? {
+        return Ok(ScreenBackend::Offline);
+    }
+    Ok(ScreenBackend::Online(CommandBackend::new(paths, skins)?))
+}
+
 /// The active account's player, from the database: the library opens without
 /// a network.
 #[cfg_attr(feature = "skins-fake-backend", allow(dead_code))]
@@ -1082,7 +1159,7 @@ pub async fn load_skins_command(
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    load_view(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
+    load_view(&ctx, &command_backend(&launcher_paths, &skins)?).await
 }
 
 #[tauri::command]
@@ -1094,7 +1171,7 @@ pub async fn add_skin_command(
     name: Option<String>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     add_file(&ctx, &backend, Path::new(&path), variant, name).await
 }
 
@@ -1107,7 +1184,7 @@ pub async fn set_saved_skin_variant_command(
     new_variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     set_saved_variant(&ctx, &backend, &texture_key, variant, new_variant).await
 }
 
@@ -1120,7 +1197,7 @@ pub async fn rename_saved_skin_command(
     name: Option<String>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     rename_saved(&ctx, &backend, &texture_key, variant, name).await
 }
 
@@ -1132,7 +1209,7 @@ pub async fn remove_saved_skin_command(
     variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     remove_saved(&ctx, &backend, &texture_key, variant).await
 }
 
@@ -1144,7 +1221,7 @@ pub async fn equip_skin_command(
     variant: SkinVariant,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     equip(&ctx, &backend, &texture_key, variant).await
 }
 
@@ -1154,7 +1231,7 @@ pub async fn reset_skin_command(
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    reset(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
+    reset(&ctx, &command_backend(&launcher_paths, &skins)?).await
 }
 
 #[tauri::command]
@@ -1164,7 +1241,7 @@ pub async fn set_cape_command(
     cape_id: Option<String>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    let backend = CommandBackend::new(&launcher_paths, &skins)?;
+    let backend = command_backend(&launcher_paths, &skins)?;
     set_cape(&ctx, &backend, cape_id.as_deref()).await
 }
 
@@ -1174,5 +1251,5 @@ pub async fn save_worn_skin_command(
     skins: State<'_, SkinsState>,
 ) -> Result<SkinsView, SkinError> {
     let ctx = command_context(&launcher_paths)?;
-    save_worn(&ctx, &CommandBackend::new(&launcher_paths, &skins)?).await
+    save_worn(&ctx, &command_backend(&launcher_paths, &skins)?).await
 }

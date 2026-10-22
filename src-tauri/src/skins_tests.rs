@@ -978,3 +978,89 @@ async fn keys_from_the_frontend_never_leave_the_skins_folder() {
 
     fs::remove_dir_all(&root).unwrap();
 }
+
+// ── D141: an account that plays offline ────────────────────────────────────
+
+#[tokio::test]
+async fn an_offline_account_sees_its_library_and_mojang_is_never_asked() {
+    let root = unique_root("plays-offline");
+    let connection = open_test_database(&root);
+    let ctx = context(&root);
+    let saved_png = fake_png(64, 64, b"saved before going offline");
+    add_to_library(
+        &connection,
+        &ctx.skins_dir,
+        PLAYER,
+        &saved_png,
+        SkinVariant::Classic,
+        Some("Mine".into()),
+    )
+    .unwrap();
+    drop(connection);
+
+    let offline: ScreenBackend<FakeMojang> = ScreenBackend::Offline;
+
+    let view = load_view(&ctx, &offline).await.expect("the library opens");
+    assert_eq!(
+        view.profile_error.as_ref().map(|error| error.kind),
+        Some(SkinErrorKind::PlaysOffline)
+    );
+    assert!(view.capes.is_empty());
+    assert!(view.skins.iter().all(|card| !card.skin.active));
+    assert!(view
+        .skins
+        .iter()
+        .any(|card| card.skin.source == SkinSource::Saved
+            && card.skin.texture_key == sha(&saved_png)));
+
+    // The library still changes offline: nothing of it needs Mojang.
+    let renamed = rename_saved(
+        &ctx,
+        &offline,
+        &sha(&saved_png),
+        SkinVariant::Classic,
+        Some("Renamed".into()),
+    )
+    .await
+    .expect("a rename is local");
+    assert_eq!(
+        renamed.profile_error.map(|error| error.kind),
+        Some(SkinErrorKind::PlaysOffline)
+    );
+
+    // What would reach Mojang is refused before any request.
+    for error in [
+        equip(&ctx, &offline, &sha(&saved_png), SkinVariant::Classic)
+            .await
+            .expect_err("apply is refused"),
+        reset(&ctx, &offline).await.expect_err("reset is refused"),
+        set_cape(&ctx, &offline, None)
+            .await
+            .expect_err("a cape change is refused"),
+        save_worn(&ctx, &offline)
+            .await
+            .expect_err("saving the worn skin is refused"),
+    ] {
+        assert_eq!(error.kind, SkinErrorKind::PlaysOffline);
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn the_online_screen_backend_is_the_one_it_wraps() {
+    let root = unique_root("screen-online");
+    open_test_database(&root);
+    let ctx = context(&root);
+    let mojang = FakeMojang::wearing(profile_wearing(KAI_SLIM, SkinVariant::Slim));
+    let online = ScreenBackend::Online(mojang);
+
+    let view = load_view(&ctx, &online).await.expect("the screen opens");
+    assert!(view.profile_error.is_none());
+    let ScreenBackend::Online(mojang) = &online else {
+        unreachable!()
+    };
+    assert_eq!(*mojang.calls.lock(), 1);
+
+    fs::remove_dir_all(&root).ok();
+}
