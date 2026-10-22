@@ -17,8 +17,8 @@ use super::{
     build_instance_root, emit_log, emit_progress, filter_minecraft_launch_game_arguments,
     launch_profiler, load_player_identity, merge_minecraft_and_loader_jvm_arguments,
     minecraft_cache_policy, select_or_download_java, spawn_minecraft_process,
-    substitute_loader_placeholders, EffectiveLaunchSettings, LaunchLogSession, LaunchPlaceholders,
-    SelectedMod, StartedLaunch,
+    substitute_loader_placeholders, EffectiveLaunchSettings, LaunchDirectories, LaunchLogSession,
+    LaunchPlaceholders, SelectedMod, StartedLaunch,
 };
 
 // Nove input distinti di un passo del lancio. Una struct di parametri
@@ -154,12 +154,14 @@ pub(super) async fn run_vanilla_launch_pipeline(
         &player_identity,
         &modlist_name,
         &target,
-        &instance_root,
-        &mc_data.assets_dir,
-        &mc_data.asset_index_id,
-        &instance_library_dir,
-        &instance_natives_dir,
-        mc_data.is_virtual_assets,
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &mc_data.assets_dir,
+            asset_index_id: &mc_data.asset_index_id,
+            library_directory: &instance_library_dir,
+            natives_directory: &instance_natives_dir,
+            is_virtual_assets: mc_data.is_virtual_assets,
+        },
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 

@@ -787,6 +787,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     }
     if let Some(preparation) = prepare_forge_wrapper_launch(
         &http_client,
+        &instance_root,
         &instance_library_dir,
         &mc_data.client_jar_path,
         &mut loader_metadata,
@@ -863,12 +864,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &player_identity,
         &modlist_name,
         &target,
-        &instance_root,
-        &mc_data.assets_dir,
-        &mc_data.asset_index_id,
-        &instance_library_dir,
-        &instance_natives_dir,
-        mc_data.is_virtual_assets,
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &mc_data.assets_dir,
+            asset_index_id: &mc_data.asset_index_id,
+            library_directory: &instance_library_dir,
+            natives_directory: &instance_natives_dir,
+            is_virtual_assets: mc_data.is_virtual_assets,
+        },
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 

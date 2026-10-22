@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
 use crate::launch_command::{
-    decide_profiler, FlightRecording, JavaLaunchSettings, ProfilerDecision,
+    decide_profiler, path_for_java, FlightRecording, JavaLaunchSettings, ProfilerDecision,
 };
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
@@ -321,19 +321,38 @@ impl EffectiveLaunchSettings {
     }
 }
 
+/// Le cartelle di un lancio da cui escono i segnaposto dei percorsi.
+///
+/// Una struct e non sei argomenti di `LaunchPlaceholders::new` (todo.md:1431): sono
+/// percorsi dello stesso genere, e scambiarne due di posto compilava lo stesso.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LaunchDirectories<'a> {
+    /// La radice dell'istanza: è la cartella di lavoro del processo e la `--gameDir`.
+    pub(super) instance_root: &'a Path,
+    pub(super) assets_root: &'a Path,
+    pub(super) asset_index_id: &'a str,
+    pub(super) library_directory: &'a Path,
+    pub(super) natives_directory: &'a Path,
+    pub(super) is_virtual_assets: bool,
+}
+
 impl LaunchPlaceholders {
-    #[allow(clippy::too_many_arguments)]
+    /// I percorsi dentro l'istanza diventano relativi alla cartella di lavoro, che è
+    /// la radice dell'istanza: `--gameDir .`, `libraries`, `natives`
+    /// (r2-percorsi-non-ascii-e-limiti-windows-1 e -2, vedi `path_for_java`). Gli
+    /// asset stanno nella cache condivisa e restano assoluti.
     pub(super) fn new(
         player_identity: &PlayerIdentity,
         modlist_name: &str,
         target: &ResolutionTarget,
-        game_directory: &Path,
-        assets_root: &Path,
-        asset_index_id: &str,
-        library_directory: &Path,
-        natives_directory: &Path,
-        is_virtual_assets: bool,
+        directories: &LaunchDirectories<'_>,
     ) -> Self {
+        let for_java = |path: &Path| {
+            path_for_java(path, directories.instance_root)
+                .display()
+                .to_string()
+        };
+        let assets_root = directories.assets_root;
         Self {
             auth_player_name: player_identity.username.clone(),
             version_name: format!(
@@ -342,24 +361,20 @@ impl LaunchPlaceholders {
                 target.minecraft_version,
                 target.mod_loader.as_modrinth_loader()
             ),
-            game_directory: game_directory.display().to_string(),
-            assets_root: assets_root.display().to_string(),
-            assets_index_name: asset_index_id.to_string(),
-            game_assets: if is_virtual_assets {
-                assets_root
-                    .join("virtual")
-                    .join(asset_index_id)
-                    .display()
-                    .to_string()
+            game_directory: for_java(directories.instance_root),
+            assets_root: for_java(assets_root),
+            assets_index_name: directories.asset_index_id.to_string(),
+            game_assets: if directories.is_virtual_assets {
+                for_java(&assets_root.join("virtual").join(directories.asset_index_id))
             } else {
-                assets_root.display().to_string()
+                for_java(assets_root)
             },
             auth_uuid: player_identity.uuid.clone(),
             auth_access_token: player_identity.access_token.clone(),
             user_type: player_identity.user_type.clone(),
             version_type: player_identity.version_type.clone(),
-            library_directory: library_directory.display().to_string(),
-            natives_directory: natives_directory.display().to_string(),
+            library_directory: for_java(directories.library_directory),
+            natives_directory: for_java(directories.natives_directory),
             launcher_name: "Cubic Launcher".to_string(),
             launcher_version: env!("CARGO_PKG_VERSION").to_string(),
             classpath_separator: if cfg!(target_os = "windows") {

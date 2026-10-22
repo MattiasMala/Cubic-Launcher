@@ -17,8 +17,8 @@ use super::{
     minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
     split_installations_by_host_architecture, substitute_known_placeholders,
     validate_content_filename, EffectiveLaunchSettings, EmbeddedFabricRequirementSet,
-    EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest, LaunchResolutionPath,
-    LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
+    EmbeddedFabricRequirements, LaunchDirectories, LaunchPlaceholders, LaunchRequest,
+    LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
 };
 use crate::java_runtime::{JavaInstallation, JavaInstallationSource};
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -773,12 +773,14 @@ fn known_launch_placeholders_are_substituted() {
             minecraft_version: "1.21.1".into(),
             mod_loader: ModLoader::Fabric,
         },
-        PathBuf::from("game-dir").as_path(),
-        PathBuf::from("assets-root").as_path(),
-        "1.21",
-        PathBuf::from("libraries-root").as_path(),
-        PathBuf::from("natives-root").as_path(),
-        false,
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "1.21",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: false,
+        },
     );
 
     let substituted = substitute_known_placeholders(
@@ -786,9 +788,10 @@ fn known_launch_placeholders_are_substituted() {
         &placeholders,
     );
 
+    // The game directory is the working directory of the process: `.`.
     assert_eq!(
         substituted,
-        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480:assets-root"
+        "PlayerOne:uuid-123:.:Pack-1.21.1-fabric:854x480:assets-root"
     );
 }
 
@@ -807,12 +810,14 @@ fn legacy_virtual_assets_redirect_game_assets_and_session() {
             minecraft_version: "1.6.4".into(),
             mod_loader: ModLoader::Vanilla,
         },
-        PathBuf::from("game-dir").as_path(),
-        PathBuf::from("assets-root").as_path(),
-        "legacy",
-        PathBuf::from("libraries-root").as_path(),
-        PathBuf::from("natives-root").as_path(),
-        true,
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "legacy",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: true,
+        },
     );
 
     // Legacy: --assetsDir ${game_assets} must point at the materialized virtual
@@ -852,12 +857,14 @@ fn legacy_and_optional_placeholders_never_reach_the_game_literally() {
             minecraft_version: "1.8.9".into(),
             mod_loader: ModLoader::Vanilla,
         },
-        PathBuf::from("game-dir").as_path(),
-        PathBuf::from("assets-root").as_path(),
-        "1.8",
-        PathBuf::from("libraries-root").as_path(),
-        PathBuf::from("natives-root").as_path(),
-        false,
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "1.8",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: false,
+        },
     );
     // `minecraftArguments` di 1.8.9 com'è nel version.json di Mojang.
     let minecraft_arguments = "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userProperties ${user_properties} --userType ${user_type}";
@@ -979,7 +986,6 @@ fn modded_jvm_args_keep_natives_and_drop_minecraft_classpath_placeholder() {
             "-Djava.library.path=${natives_directory}".to_string(),
             "-Dminecraft.launcher.brand=${launcher_name}".to_string(),
             "-Dforgewrapper.installer=forge-installer.jar".to_string(),
-            "-Dorg.lwjgl.librarypath=${natives_directory}".to_string(),
         ]
     );
 }
@@ -993,7 +999,106 @@ fn legacy_vanilla_jvm_args_gain_natives_path_when_absent() {
     let merged = merge_minecraft_and_loader_jvm_arguments(&[], Vec::new());
 
     assert!(merged.contains(&"-Djava.library.path=${natives_directory}".to_string()));
-    assert!(merged.contains(&"-Dorg.lwjgl.librarypath=${natives_directory}".to_string()));
+    // r2-percorsi-non-ascii-e-limiti-windows-2: not `-Dorg.lwjgl.librarypath`. LWJGL 2
+    // hands it to `System.load`, which wants an absolute path, and the natives now reach
+    // Java relative to the instance; `java.library.path` is what Mojang's launcher passes.
+    assert!(!merged
+        .iter()
+        .any(|argument| argument.starts_with("-Dorg.lwjgl.librarypath=")));
+}
+
+/// r2-percorsi-non-ascii-e-limiti-windows-1 e -2: dentro l'istanza i segnaposto dei
+/// percorsi sono relativi alla cartella di lavoro, e il nome della mod list, con «:», «;» o
+/// un'emoji, non arriva più a Java; gli asset della cache condivisa restano assoluti.
+#[test]
+fn path_placeholders_inside_the_instance_reach_java_relative() {
+    let data_root = PathBuf::from("/data/cubic");
+    let instance_root = data_root
+        .join("mod-lists")
+        .join("🌲 Create: Astral; v2")
+        .join("instances")
+        .join("1.20.1-forge");
+    let assets_root = data_root.join("cache").join("minecraft").join("assets");
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "🌲 Create: Astral; v2",
+        &ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Forge,
+        },
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &assets_root,
+            asset_index_id: "5",
+            library_directory: &instance_root.join("libraries"),
+            natives_directory: &instance_root.join("natives"),
+            is_virtual_assets: false,
+        },
+    );
+
+    let jvm_and_game_arguments = [
+        "-Djava.library.path=${natives_directory}",
+        "-DlibraryDirectory=${library_directory}",
+        "--gameDir",
+        "${game_directory}",
+        "--assetsDir",
+        "${assets_root}",
+    ]
+    .map(|argument| substitute_known_placeholders(argument, &placeholders));
+
+    assert_eq!(
+        jvm_and_game_arguments,
+        [
+            "-Djava.library.path=natives".to_string(),
+            "-DlibraryDirectory=libraries".to_string(),
+            "--gameDir".to_string(),
+            ".".to_string(),
+            "--assetsDir".to_string(),
+            assets_root.display().to_string(),
+        ]
+    );
+}
+
+/// r2-percorsi-non-ascii-e-limiti-windows-2: con Forge si rompeva anche
+/// `-Dforgewrapper.installer`; installer e librerie ora sono relativi all'istanza.
+#[test]
+fn forge_wrapper_properties_point_inside_the_instance_relatively() {
+    let instance_root = PathBuf::from("/data/cubic/mod-lists/🌲 Cozy/instances/1.20.1-forge");
+    let library_root = instance_root.join("libraries");
+    let installer = library_root
+        .join("net")
+        .join("minecraftforge")
+        .join("forge-installer.jar");
+    let client_jar = PathBuf::from("/data/cubic/cache/minecraft/versions/1.20.1/1.20.1.jar");
+
+    let arguments = super::runtime::forge_wrapper_jvm_arguments(
+        &instance_root,
+        &installer,
+        &library_root,
+        &client_jar,
+    );
+
+    assert_eq!(
+        arguments,
+        [
+            format!(
+                "-Dforgewrapper.installer={}",
+                PathBuf::from("libraries")
+                    .join("net")
+                    .join("minecraftforge")
+                    .join("forge-installer.jar")
+                    .display()
+            ),
+            "-Dforgewrapper.librariesDir=libraries".to_string(),
+            format!("-Dforgewrapper.minecraft={}", client_jar.display()),
+        ]
+    );
 }
 
 #[test]

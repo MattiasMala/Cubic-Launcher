@@ -16,7 +16,7 @@ use crate::java_runtime::{
     persist_java_installations, select_exact_java_for_requirement, select_java_for_requirement,
     CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
 };
-use crate::launch_command::PreparedLaunchCommand;
+use crate::launch_command::{path_for_java, PreparedLaunchCommand};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
@@ -104,6 +104,8 @@ pub(super) fn contained_loader_library_path(
 
 pub(super) async fn prepare_forge_wrapper_launch(
     http_client: &reqwest::Client,
+    // La cartella di lavoro di Java: installer e librerie le passano relative.
+    working_directory: &Path,
     library_root: &Path,
     minecraft_jar_path: &Path,
     loader_metadata: &mut LoaderMetadata,
@@ -118,11 +120,14 @@ pub(super) async fn prepare_forge_wrapper_launch(
         download_file(http_client, &installer_artifact.url, &installer_path).await?;
     }
 
-    loader_metadata.jvm_arguments.extend([
-        format!("-Dforgewrapper.installer={}", installer_path.display()),
-        format!("-Dforgewrapper.librariesDir={}", library_root.display()),
-        format!("-Dforgewrapper.minecraft={}", minecraft_jar_path.display()),
-    ]);
+    loader_metadata
+        .jvm_arguments
+        .extend(forge_wrapper_jvm_arguments(
+            working_directory,
+            &installer_path,
+            library_root,
+            minecraft_jar_path,
+        ));
 
     let profile_libraries = read_forge_installer_profile_libraries(&installer_path)?;
     let profile_library_paths =
@@ -132,6 +137,33 @@ pub(super) async fn prepare_forge_wrapper_launch(
         installer_path,
         profile_library_paths,
     }))
+}
+
+/// Le tre proprietà di ForgeWrapper. Installer e librerie stanno nell'istanza e vanno
+/// relative alla cartella di lavoro (r2-percorsi-non-ascii-e-limiti-windows-2: con un nome
+/// fuori dalla code page ANSI `-Dforgewrapper.installer` arrivava rotto); il client di
+/// Minecraft sta nella cache condivisa e resta assoluto.
+pub(super) fn forge_wrapper_jvm_arguments(
+    working_directory: &Path,
+    installer_path: &Path,
+    library_root: &Path,
+    minecraft_jar_path: &Path,
+) -> [String; 3] {
+    let for_java = |path: &Path| path_for_java(path, working_directory);
+    [
+        format!(
+            "-Dforgewrapper.installer={}",
+            for_java(installer_path).display()
+        ),
+        format!(
+            "-Dforgewrapper.librariesDir={}",
+            for_java(library_root).display()
+        ),
+        format!(
+            "-Dforgewrapper.minecraft={}",
+            for_java(minecraft_jar_path).display()
+        ),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,17 +587,17 @@ pub(super) fn merge_minecraft_and_loader_jvm_arguments(
     let mut merged = filter_minecraft_launch_jvm_arguments(minecraft_arguments);
     merged.extend(loader_arguments);
 
+    // `${natives_directory}` arriva a Java relativo (`natives`), e la JVM lo risolve
+    // contro la cartella di lavoro. Il launcher non aggiunge più
+    // `-Dorg.lwjgl.librarypath`, come il launcher di Mojang: LWJGL 2 (1.12.2 e prima) lo
+    // passa a `System.load`, che vuole un percorso assoluto, e assoluto avrebbe di nuovo il
+    // nome della mod list (r2-percorsi-non-ascii-e-limiti-windows-2). Senza, LWJGL 2 usa
+    // `System.loadLibrary` e LWJGL 3 cerca in `java.library.path`, che bastano a tutti e due.
     if !merged
         .iter()
         .any(|argument| argument.starts_with("-Djava.library.path="))
     {
         merged.push("-Djava.library.path=${natives_directory}".to_string());
-    }
-    if !merged
-        .iter()
-        .any(|argument| argument.starts_with("-Dorg.lwjgl.librarypath="))
-    {
-        merged.push("-Dorg.lwjgl.librarypath=${natives_directory}".to_string());
     }
 
     merged
