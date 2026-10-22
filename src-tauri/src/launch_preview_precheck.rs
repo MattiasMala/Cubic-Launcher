@@ -23,9 +23,9 @@ use crate::rules::ModSource;
 use super::{
     active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
     load_cached_version_ids_for_selected, load_modlist, load_modlist_pins, parse_mod_loader,
-    resolve_compatible_versions_hybrid, resolve_offline_selection, resolve_online_selection,
-    run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
-    DroppedMod, ResolvedContentVersions, SelectedMod,
+    read_instance_jars, resolve_compatible_versions_hybrid, resolve_offline_selection,
+    resolve_online_selection, run_content_precheck, ContentEntryWithoutVersions,
+    ContentLookupFailure, ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -393,8 +393,15 @@ pub(super) async fn run_update_precheck(
     )
     .await?;
 
-    let cached_version_ids =
-        load_cached_version_ids_for_selected(launcher_paths, &selection.selected_mods, &target)?;
+    // D147: "current" is what this mod list's instance holds, not the newest
+    // row of the target (audit 101, precheck-2).
+    let instance_jars = read_instance_jars(launcher_paths, &modlist_name, &target)?;
+    let cached_version_ids = load_cached_version_ids_for_selected(
+        launcher_paths,
+        &selection.selected_mods,
+        &target,
+        &instance_jars,
+    )?;
     let wanted_numbers = version_ids_needing_a_number(&cached_version_ids, &candidates);
     // Degraded, not propagated: `resolved` is the part the launch cannot do
     // without (D16), and it is already complete here. One malformed version id

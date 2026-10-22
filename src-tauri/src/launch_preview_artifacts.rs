@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::launcher_paths::LauncherPaths;
-use crate::mod_cache::{CacheProbe, ModCacheRecord};
+use crate::mod_cache::{CacheProbe, InstanceJars, ModCacheRecord};
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::path_safety::validate_path_component;
 use crate::process_streaming::ProcessLogStream;
@@ -638,6 +638,7 @@ pub(super) fn probe_selected_mods(
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<Vec<(String, CacheProbe)>> {
     let mut probes = Vec::new();
     let mut seen = HashSet::new();
@@ -649,7 +650,7 @@ pub(super) fn probe_selected_mods(
 
         probes.push((
             selected.mod_id.clone(),
-            probe_cached_mod_for_target(launcher_paths, &selected.mod_id, target)?,
+            probe_cached_mod_for_target(launcher_paths, &selected.mod_id, target, instance)?,
         ));
     }
 
@@ -738,8 +739,9 @@ pub(super) fn resolve_cache_fallback_artifacts(
     selected_mods: &[SelectedMod],
     resolved: &HashMap<String, ModrinthVersion>,
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<RemoteArtifactSplit> {
-    let probes = probe_selected_mods(launcher_paths, selected_mods, target)?;
+    let probes = probe_selected_mods(launcher_paths, selected_mods, target, instance)?;
     let fallback = cached_artifacts_for_unresolved(&probes, resolved);
 
     for (mod_id, artifact) in &fallback {
@@ -915,6 +917,7 @@ pub(super) async fn resolve_selected_remote_artifacts(
     client: &ModrinthClient,
     target: &ResolutionTarget,
     preresolved: Option<&HashMap<String, String>>,
+    instance: &InstanceJars,
 ) -> Result<HashMap<String, RemoteArtifact>> {
     // An absent map behaves as a map that covers nothing, which is what makes
     // "no map means exactly today's behaviour" structural instead of asserted.
@@ -1030,7 +1033,7 @@ pub(super) async fn resolve_selected_remote_artifacts(
             continue;
         }
 
-        let probe = probe_cached_mod_for_target(launcher_paths, mod_id, target)?;
+        let probe = probe_cached_mod_for_target(launcher_paths, mod_id, target, instance)?;
         match probe {
             CacheProbe::Ready(record) => {
                 artifacts.insert(mod_id.clone(), RemoteArtifact::Cached(record));
@@ -1628,7 +1631,7 @@ pub(super) async fn resolve_online_selection(
         // went silent, and a failed download ends the launch instead of
         // costing one mod — measured.
         let cache_backed = cache_backed_mods(
-            &probe_selected_mods(launcher_paths, &pending, target)?,
+            &probe_selected_mods(launcher_paths, &pending, target, &InstanceJars::default())?,
             CacheBacking::JarOnDisk,
         );
         let unavailable = unavailable_selected_mods(&pending, |mod_id| {
@@ -1684,7 +1687,10 @@ pub(super) fn resolve_offline_selection(
             break;
         }
         let pending = pending_selection(&pending_ids);
-        let probes = probe_selected_mods(launcher_paths, &pending, target)?;
+        // Whether the cache can serve a mod does not depend on which version
+        // the instance holds: the artifact stage picks that one (D147).
+        let probes =
+            probe_selected_mods(launcher_paths, &pending, target, &InstanceJars::default())?;
         jar_gone.extend(
             probes
                 .iter()

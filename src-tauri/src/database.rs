@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS mod_cache (
     file_hash           TEXT,
     download_url        TEXT,
     is_local            BOOLEAN DEFAULT FALSE,
+    last_used           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
 );
 
@@ -94,7 +95,34 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     migrate_mod_cache_schema(&connection)?;
     migrate_mod_cache_target_key(&connection)?;
     migrate_accounts_plays_offline(&connection)?;
+    migrate_mod_cache_last_used(&connection)?;
 
+    Ok(())
+}
+
+/// Audit 101, risoluzione-8: which version of a project a target used last.
+/// The lookups ordered by `rowid`, i.e. by first insertion, and an upsert
+/// keeps the rowid: going back to a version already in the cache left the
+/// newer row "registered", so the popup proposed the same downgrade at every
+/// launch and offline loaded the version that had been withdrawn. A launch
+/// stamps the versions it links with a counter that only grows.
+///
+/// Runs after the two `mod_cache` rebuilds above, which recreate the table
+/// without the column. Same shape as `migrate_accounts_plays_offline`: it asks
+/// the table and only adds a column that is missing; 0 means "never stamped",
+/// so existing rows keep their old order among themselves.
+fn migrate_mod_cache_last_used(connection: &Connection) -> Result<()> {
+    let has_column: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mod_cache') WHERE name = 'last_used')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE mod_cache ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -445,6 +473,51 @@ mod tests {
                 .expect("database should have a parent"),
         )
         .expect("temporary directory should be removable");
+    }
+
+    #[test]
+    fn initialize_database_adds_last_used_to_an_existing_mod_cache() {
+        let database_path = unique_test_database_path();
+        fs::create_dir_all(database_path.parent().expect("database directory"))
+            .expect("database directory should be created");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE mod_cache (
+                    modrinth_project_id TEXT,
+                    modrinth_version_id TEXT,
+                    jar_filename        TEXT NOT NULL,
+                    mc_version          TEXT NOT NULL,
+                    mod_loader          TEXT NOT NULL,
+                    file_hash           TEXT,
+                    download_url        TEXT,
+                    is_local            BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
+                );
+                INSERT INTO mod_cache (modrinth_project_id, modrinth_version_id, jar_filename, mc_version, mod_loader)
+                VALUES ('sodium', 'v1', 'sodium.jar', '1.20.1', 'fabric');
+                "#,
+            )
+            .expect("legacy mod_cache should be created");
+        drop(connection);
+
+        initialize_database(&database_path).expect("database should migrate");
+        initialize_database(&database_path).expect("the migration is idempotent");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let last_used: i64 = connection
+            .query_row(
+                "SELECT last_used FROM mod_cache WHERE modrinth_version_id = 'v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the existing row keeps its data and gains the column");
+        assert_eq!(last_used, 0);
+
+        drop(connection);
+        fs::remove_dir_all(database_path.parent().expect("database directory"))
+            .expect("temporary database directory should be removable");
     }
 
     #[test]

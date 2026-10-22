@@ -19,8 +19,8 @@ use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
     cache_record_from_version, cached_artifact_path_for_record, pending_download_from_record,
-    pending_download_from_version, CacheProbe, ModAcquisitionPlan, ModCacheLookup, ModCacheRecord,
-    SqliteModCacheRepository,
+    pending_download_from_version, CacheProbe, InstanceJars, ModAcquisitionPlan, ModCacheLookup,
+    ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
 use crate::path_safety::validate_path_component;
@@ -28,7 +28,10 @@ use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
-use super::{emit_log, emit_progress, jar_metadata_allows_target, DownloadArtifact, SelectedMod};
+use super::{
+    build_instance_root, emit_log, emit_progress, jar_metadata_allows_target, DownloadArtifact,
+    SelectedMod,
+};
 
 pub(super) fn load_cached_mod_record_for_target(
     launcher_paths: &LauncherPaths,
@@ -62,11 +65,13 @@ pub(super) fn load_cached_mod_record_by_version(
 
 /// `load_cached_mod_record_for_target` plus the answer it cannot give: whether
 /// a mod with no usable artifact was never cached, or is registered and lost
-/// its jar.
+/// its jar. The version `instance` holds comes first (D147); an empty one
+/// leaves the project's answer, which is what the availability passes want.
 pub(super) fn probe_cached_mod_for_target(
     launcher_paths: &LauncherPaths,
     project_id: &str,
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<CacheProbe> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -75,7 +80,34 @@ pub(super) fn probe_cached_mod_for_target(
         )
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.probe_project(project_id, target)
+    repository.probe_project_in_instance(project_id, target, instance)
+}
+
+/// The jars the instance of this mod list on this target holds now, read
+/// before the launch rebuilds its `mods/` (D147).
+pub(super) fn read_instance_jars(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<InstanceJars> {
+    InstanceJars::read(&build_instance_root(launcher_paths, modlist_name, target)?.join("mods"))
+}
+
+/// Stamp the versions this launch linked as the last used on the target
+/// (audit 101, risoluzione-8).
+pub(super) fn record_versions_used(
+    launcher_paths: &LauncherPaths,
+    version_ids: &[String],
+    target: &ResolutionTarget,
+) -> Result<()> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir())
+        .mark_versions_used(version_ids, target)
 }
 
 /// Same, for the one version id a pre-check named.
@@ -147,16 +179,22 @@ pub(super) fn load_cached_file_hashes_for_selected(
     })
 }
 
-/// Registered `modrinth_version_id` per selected Modrinth mod — the "current"
-/// side of an update row. Absent means "never downloaded for this target",
-/// which by D17 is not an update.
+/// The `modrinth_version_id` this instance holds per selected Modrinth mod —
+/// the "current" side of an update row. Per instance, not per target (D147,
+/// audit 101 precheck-2): two mod lists on one target each keep their own
+/// version, and an update accepted in one never reaches the other unasked.
+/// Absent means the instance has no jar of that mod, which by D17 is a first
+/// install and not an update.
 pub(super) fn load_cached_version_ids_for_selected(
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<HashMap<String, String>> {
     load_cached_column_for_selected(launcher_paths, selected_mods, |repository, mod_id| {
-        repository.find_cached_version_id_by_project_or_alias(mod_id, target)
+        Ok(repository
+            .find_registered_in_instance(mod_id, target, instance)?
+            .map(|record| record.modrinth_version_id))
     })
 }
 

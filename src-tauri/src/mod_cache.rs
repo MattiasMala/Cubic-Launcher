@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha1::{Digest, Sha1};
 
 // Mod artifact cache and lookup helpers.
+//
+// Among several rows of one project on one target, "the registered version" is
+// the one a launch linked last (`last_used`, audit 101 risoluzione-8), and the
+// insertion order only breaks ties between rows never stamped. What one
+// instance has is narrower still (D147): `InstanceJars`.
 //
 // Cache records are keyed by canonical Modrinth project/version ids plus the
 // target Minecraft version and loader. The target is part of the key because
@@ -239,7 +244,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
             WHERE modrinth_project_id = ?1
               AND mc_version = ?2
               AND mod_loader = ?3
-            ORDER BY rowid DESC
+            ORDER BY last_used DESC, rowid DESC
             "#,
         )?;
 
@@ -359,7 +364,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
                   AND is_local = 0
                   AND file_hash IS NOT NULL
                   AND trim(file_hash) <> ''
-                ORDER BY rowid DESC
+                ORDER BY last_used DESC, rowid DESC
                 LIMIT 1
                 "#,
                 params![
@@ -436,6 +441,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
                   AND trim(modrinth_version_id) <> ''
                 ORDER BY
                     (file_hash IS NOT NULL AND trim(file_hash) <> '') DESC,
+                    last_used DESC,
                     rowid DESC
                 LIMIT 1
                 "#,
@@ -480,7 +486,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
     /// requiring the jar to be on disk.
     ///
     /// Ordering matches `find_cached_version_id_by_project` — hashed rows
-    /// first, then newest — so "the registered version" means the same thing
+    /// first, then last used — so "the registered version" means the same thing
     /// whether the pre-check reports it or the launch restores it. Unlike that
     /// lookup it keeps `is_local = 1` rows: a local jar that vanished has to be
     /// named to be reported, even though nothing can re-download it.
@@ -507,6 +513,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
                   AND mod_loader = ?3
                 ORDER BY
                     (file_hash IS NOT NULL AND trim(file_hash) <> '') DESC,
+                    last_used DESC,
                     rowid DESC
                 LIMIT 1
                 "#,
@@ -611,6 +618,219 @@ impl<'connection> SqliteModCacheRepository<'connection> {
         match self.find_registered_by_version_id(version_id, target)? {
             Some(record) => Ok(classify_missing_jar(record)),
             None => Ok(CacheProbe::NotCached),
+        }
+    }
+
+    /// Stamp the versions a launch linked as the last used on this target
+    /// (audit 101, risoluzione-8). One value for the whole launch, above every
+    /// stamp so far: a counter, not a clock, so a clock set back cannot reorder
+    /// anything.
+    pub fn mark_versions_used(
+        &self,
+        version_ids: &[String],
+        target: &ResolutionTarget,
+    ) -> Result<()> {
+        if version_ids.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        let stamp: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(last_used), 0) + 1 FROM mod_cache",
+            [],
+            |row| row.get(0),
+        )?;
+        for version_id in version_ids {
+            transaction.execute(
+                r#"
+                UPDATE mod_cache SET last_used = ?1
+                WHERE modrinth_version_id = ?2
+                  AND mc_version = ?3
+                  AND mod_loader = ?4
+                "#,
+                params![
+                    stamp,
+                    version_id,
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The registered row of a project that this **instance** holds: the jar
+    /// its last launch linked into `<instance>/mods/` (D147, audit 101
+    /// precheck-2). `None` when the instance holds no jar of the project —
+    /// for this instance that mod is a first install, whatever another mod
+    /// list on the same target has.
+    pub fn find_registered_in_instance(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+        instance: &InstanceJars,
+    ) -> Result<Option<ModCacheRecord>> {
+        if instance.is_empty() {
+            return Ok(None);
+        }
+        if let Some(record) = self.find_instance_row(project_id_or_alias, target, instance)? {
+            return Ok(Some(record));
+        }
+
+        let Some(canonical_project_id) = self.find_canonical_project_id(project_id_or_alias)?
+        else {
+            return Ok(None);
+        };
+        if canonical_project_id == project_id_or_alias.trim() {
+            return Ok(None);
+        }
+        self.find_instance_row(&canonical_project_id, target, instance)
+    }
+
+    fn find_instance_row(
+        &self,
+        project_id: &str,
+        target: &ResolutionTarget,
+        instance: &InstanceJars,
+    ) -> Result<Option<ModCacheRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                modrinth_project_id,
+                modrinth_version_id,
+                jar_filename,
+                mc_version,
+                mod_loader,
+                file_hash,
+                download_url,
+                is_local
+            FROM mod_cache
+            WHERE modrinth_project_id = ?1
+              AND mc_version = ?2
+              AND mod_loader = ?3
+              AND is_local = 0
+              AND modrinth_version_id IS NOT NULL
+              AND trim(modrinth_version_id) <> ''
+            ORDER BY last_used DESC, rowid DESC
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                project_id.trim(),
+                &target.minecraft_version,
+                target.mod_loader.as_modrinth_loader(),
+            ],
+            record_from_row,
+        )?;
+        for row in rows {
+            let record = row?;
+            if instance.holds(&record) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `probe_project`, preferring the version this instance holds (D147): a
+    /// mod list keeps its own version even when another one on the same target
+    /// moved on. When that jar is not usable the project's answer stands, so a
+    /// jar on disk still keeps the mod (D29); and when nothing is on disk the
+    /// instance's version is the one to restore.
+    pub fn probe_project_in_instance(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+        instance: &InstanceJars,
+    ) -> Result<CacheProbe> {
+        let Some(record) =
+            self.find_registered_in_instance(project_id_or_alias, target, instance)?
+        else {
+            return self.probe_project(project_id_or_alias, target);
+        };
+
+        let own = self.probe_version(&record.modrinth_version_id, target)?;
+        if matches!(own, CacheProbe::Ready(_)) {
+            return Ok(own);
+        }
+        match self.probe_project(project_id_or_alias, target)? {
+            CacheProbe::Ready(other) => Ok(CacheProbe::Ready(other)),
+            _ => Ok(own),
+        }
+    }
+}
+
+/// The mod jars an instance holds: what its last launch linked into
+/// `<instance>/mods/` (D147). The launch rebuilds that directory from scratch
+/// every time, so its names are exactly the last launch's set.
+///
+/// A symlink also says which version it is, from its target
+/// `<mods cache>/<loader>/<version id>/<file>`; a hard link (the fallback where
+/// symlinks are refused) only has its name, which is enough as long as two
+/// versions of a project do not publish the same file name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceJars {
+    by_filename: HashMap<String, Option<String>>,
+}
+
+impl InstanceJars {
+    /// An instance that was never launched has no `mods/` and holds nothing.
+    pub fn read(instance_mods_dir: &Path) -> Result<Self> {
+        let entries = match fs::read_dir(instance_mods_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read the instance mods directory {}",
+                        instance_mods_dir.display()
+                    )
+                })
+            }
+        };
+
+        let mut by_filename = HashMap::new();
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to inspect {}", instance_mods_dir.display()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let version_id = fs::read_link(entry.path()).ok().and_then(|target| {
+                target
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            });
+            by_filename.insert(name, version_id);
+        }
+        Ok(Self { by_filename })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: &[(&str, Option<&str>)]) -> Self {
+        Self {
+            by_filename: entries
+                .iter()
+                .map(|(name, version)| (name.to_string(), version.map(str::to_string)))
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_filename.is_empty()
+    }
+
+    /// The instance links this row's jar: same file name, and the same version
+    /// when the link says which one.
+    fn holds(&self, record: &ModCacheRecord) -> bool {
+        match self.by_filename.get(&record.jar_filename) {
+            None => false,
+            Some(None) => true,
+            Some(Some(version_id)) => version_id == &record.modrinth_version_id,
         }
     }
 }
@@ -1019,6 +1239,186 @@ mod tests {
         assert_eq!(record.jar_filename, "sodium.jar");
 
         drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// Two versions of one project on one target, both jars in the cache:
+    /// `older` inserted first, `newer` second.
+    fn two_versions(
+        repository: &SqliteModCacheRepository<'_>,
+        mods_cache_dir: &Path,
+    ) -> (ModCacheRecord, ModCacheRecord) {
+        let older = repository
+            .upsert_modrinth_version(
+                &version("sodium", "version-058", "sodium-0.5.8.jar"),
+                &target(),
+            )
+            .expect("older row");
+        let newer = repository
+            .upsert_modrinth_version(
+                &version("sodium", "version-060", "sodium-0.6.0.jar"),
+                &target(),
+            )
+            .expect("newer row");
+        write_jar_for(mods_cache_dir, &older);
+        write_jar_for(mods_cache_dir, &newer);
+        (older, newer)
+    }
+
+    /// Audit 101, risoluzione-8: going back to a version already in the cache
+    /// (a withdrawn release, a downgrade accepted in the popup) makes it the
+    /// registered one, although its row is the older.
+    #[test]
+    fn the_registered_version_is_the_last_one_used_not_the_last_inserted() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let (older, newer) = two_versions(&repository, &mods_cache_dir);
+
+        let registered = |repository: &SqliteModCacheRepository<'_>| {
+            repository
+                .find_registered_by_project("sodium", &target())
+                .expect("lookup")
+                .expect("row")
+                .modrinth_version_id
+        };
+        assert_eq!(registered(&repository), newer.modrinth_version_id);
+
+        repository
+            .mark_versions_used(std::slice::from_ref(&older.modrinth_version_id), &target())
+            .expect("stamp");
+        assert_eq!(registered(&repository), older.modrinth_version_id);
+        assert_eq!(
+            repository
+                .find_cached_version_id_by_project("sodium", &target())
+                .expect("lookup"),
+            Some(older.modrinth_version_id.clone())
+        );
+        assert_eq!(
+            repository
+                .find_compatible_by_project("sodium", &target())
+                .expect("lookup")
+                .map(|record| record.modrinth_version_id),
+            Some(older.modrinth_version_id.clone())
+        );
+        assert_eq!(
+            repository
+                .find_cached_file_hash_by_project("sodium", &target())
+                .expect("lookup"),
+            older.file_hash.clone()
+        );
+
+        repository
+            .mark_versions_used(std::slice::from_ref(&newer.modrinth_version_id), &target())
+            .expect("stamp");
+        assert_eq!(registered(&repository), newer.modrinth_version_id);
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D147, audit 101 precheck-2: the current version is the one this
+    /// instance links, whatever another mod list on the target moved to.
+    #[test]
+    fn the_current_version_is_the_one_the_instance_holds() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let (older, newer) = two_versions(&repository, &mods_cache_dir);
+        // Mod list B accepted the update: the newer row is the last used.
+        repository
+            .mark_versions_used(std::slice::from_ref(&newer.modrinth_version_id), &target())
+            .expect("stamp");
+
+        let instance_a = super::InstanceJars::from_entries(&[("sodium-0.5.8.jar", None)]);
+        let in_a = repository
+            .find_registered_in_instance("sodium", &target(), &instance_a)
+            .expect("lookup");
+        assert_eq!(in_a, Some(older.clone()));
+        assert!(matches!(
+            repository.probe_project_in_instance("sodium", &target(), &instance_a),
+            Ok(CacheProbe::Ready(record)) if record == older
+        ));
+
+        let never_launched = super::InstanceJars::default();
+        assert_eq!(
+            repository
+                .find_registered_in_instance("sodium", &target(), &never_launched)
+                .expect("lookup"),
+            None,
+            "an instance with no jar of the mod has no current version"
+        );
+        assert!(matches!(
+            repository.probe_project_in_instance("sodium", &target(), &never_launched),
+            Ok(CacheProbe::Ready(record)) if record == newer
+        ));
+
+        let linked_elsewhere =
+            super::InstanceJars::from_entries(&[("sodium-0.5.8.jar", Some("version-other"))]);
+        assert_eq!(
+            repository
+                .find_registered_in_instance("sodium", &target(), &linked_elsewhere)
+                .expect("lookup"),
+            None,
+            "a symlink names its version, and a different one does not count"
+        );
+
+        // The instance's jar is gone: another jar on disk keeps the mod (D29).
+        fs::remove_file(cached_artifact_path_for_record(&mods_cache_dir, &older))
+            .expect("remove the instance's jar");
+        assert!(matches!(
+            repository.probe_project_in_instance("sodium", &target(), &instance_a),
+            Ok(CacheProbe::Ready(record)) if record == newer
+        ));
+        // Nothing on disk: the instance's own version is the one to restore.
+        fs::remove_file(cached_artifact_path_for_record(&mods_cache_dir, &newer))
+            .expect("remove the other jar");
+        assert!(matches!(
+            repository.probe_project_in_instance("sodium", &target(), &instance_a),
+            Ok(CacheProbe::JarMissing(record)) if record == older
+        ));
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_jars_read_the_version_from_a_symlink_and_the_name_from_a_file() {
+        let root_dir = unique_test_root();
+        let mods_dir = root_dir.join("instance").join("mods");
+        let cached = root_dir
+            .join("cache")
+            .join("mods")
+            .join("fabric")
+            .join("version-058")
+            .join("sodium-0.5.8.jar");
+        fs::create_dir_all(cached.parent().expect("cache parent")).expect("cache parent");
+        fs::create_dir_all(&mods_dir).expect("mods dir");
+        fs::write(&cached, b"jar").expect("cached jar");
+        std::os::unix::fs::symlink(&cached, mods_dir.join("sodium-0.5.8.jar")).expect("symlink");
+        fs::write(mods_dir.join("hardlinked.jar"), b"jar").expect("plain file");
+
+        let jars = super::InstanceJars::read(&mods_dir).expect("read");
+        assert_eq!(
+            jars,
+            super::InstanceJars::from_entries(&[
+                ("sodium-0.5.8.jar", Some("version-058")),
+                ("hardlinked.jar", None),
+            ])
+        );
+        assert!(super::InstanceJars::read(&root_dir.join("never-launched"))
+            .expect("a missing mods dir is an empty instance")
+            .is_empty());
+
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 

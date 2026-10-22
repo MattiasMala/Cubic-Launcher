@@ -292,6 +292,9 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let pins = load_modlist_pins(&launcher_paths, &modlist_name, &modlist);
+    // D147: what this instance holds, read before its `mods/` is rebuilt —
+    // the version a mod keeps when nothing newer was chosen for it.
+    let instance_jars = read_instance_jars(&launcher_paths, &modlist_name, &target)?;
     let modrinth_client = ModrinthClient::new();
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
@@ -385,6 +388,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &modrinth_client,
             &target,
             resolution_path.preresolved(),
+            &instance_jars,
         )
         .await?;
         // The rows for the versions fetched here are written at the end of the
@@ -442,6 +446,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             &selected_mods,
             &compatible_versions,
             &target,
+            &instance_jars,
         )?;
         let parent_versions = selected_mods
             .iter()
@@ -624,6 +629,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &instance_mods_dir,
         &cached_mod_jars,
     )?;
+    // Audit 101, risoluzione-8: the versions just linked become the last used
+    // on this target. Only an ordering: a failure costs the launch nothing,
+    // and is said.
+    let linked_versions = cached_remote_records
+        .iter()
+        .chain(&missing_jar_records)
+        .map(|record| record.modrinth_version_id.clone())
+        .chain(all_remote_versions.iter().map(|version| version.id.clone()))
+        .collect::<Vec<_>>();
+    if let Err(error) = record_versions_used(&launcher_paths, &linked_versions, &target) {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Cache] could not record which versions this launch used: {error:#}"),
+        )?;
+    }
     prepare_instance_config_directory(
         launcher_paths.configs_cache_dir(),
         &instance_config_dir,
