@@ -314,7 +314,18 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
         .collect::<std::collections::HashSet<_>>();
     remove_references(&mut modlist.rules, &gone);
 
-    save_modlist(root_dir, &input.modlist_name, &modlist)
+    save_modlist(root_dir, &input.modlist_name, &modlist)?;
+
+    // review-risoluzione-8: a pin deleted with Delete takes its marker along,
+    // or a jar added by hand later under the same name would count as a pin
+    // that owns it. The jar itself stays, as for any deleted local entry.
+    let modlist_dir = LauncherPaths::new(root_dir.to_path_buf())
+        .modlists_dir()
+        .join(&input.modlist_name);
+    for mod_id in &gone {
+        crate::mod_version_pin::forget_pin_marker(&modlist_dir, mod_id)?;
+    }
+    Ok(())
 }
 
 fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&str>) {

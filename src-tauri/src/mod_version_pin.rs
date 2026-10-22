@@ -93,6 +93,22 @@ pub fn pin_marker_path(modlist_dir: &Path, pinned_mod_id: &str) -> Result<PathBu
         .join(format!("{pinned_mod_id}{PIN_MARKER_SUFFIX}")))
 }
 
+/// Removes the marker of `mod_id`, if there is one (review-risoluzione-8).
+/// A marker that outlives its entry would turn the next jar added by hand
+/// under the same name into a pin that owns it, and "Remove pin" would delete
+/// it. So every way an entry leaves the mod list takes its marker along.
+pub fn forget_pin_marker(modlist_dir: &Path, mod_id: &str) -> Result<()> {
+    let Ok(path) = pin_marker_path(modlist_dir, mod_id) else {
+        // An id that cannot name a file never had a marker.
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 fn read_pin_marker(modlist_dir: &Path, pinned_mod_id: &str) -> Result<Option<PinMarker>> {
     let path = pin_marker_path(modlist_dir, pinned_mod_id)?;
     let contents = match std::fs::read_to_string(&path) {
@@ -1520,6 +1536,81 @@ mod tests {
         assert!(removed.jar_deleted);
         assert!(!marker.exists());
         assert!(!modlist_dir.join("local-jars").join(PINNED_JAR).exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// review-risoluzione-8: a pin deleted with the editor's Delete takes its
+    /// marker along; the same jar uploaded by hand afterwards is a plain local
+    /// entry, and "Remove pin" refuses it instead of deleting it.
+    #[test]
+    fn a_pin_deleted_with_delete_leaves_no_marker_to_claim_a_hand_uploaded_jar() {
+        let root = unique_test_root();
+        let modlist_dir = seed_modlist(&root, vec![modrinth_rule("modernfix")]);
+        apply_pin_from_root(&root, &pin_input(&root, true)).unwrap();
+        let marker = super::pin_marker_path(&modlist_dir, PINNED_ID).unwrap();
+        assert!(marker.is_file());
+
+        crate::editor_data::delete_rules_from_root(
+            &root,
+            &crate::editor_data::DeleteRulesInput {
+                modlist_name: "Test Pack".into(),
+                mod_ids: vec![PINNED_ID.into()],
+            },
+        )
+        .unwrap();
+        assert!(!marker.exists());
+
+        crate::modlist_manager::copy_local_jar_from_root(
+            &root,
+            &crate::modlist_manager::CopyLocalJarInput {
+                source_path: source_jar(&root).to_string_lossy().into_owned(),
+                modlist_name: "Test Pack".into(),
+            },
+        )
+        .unwrap();
+        let modlist = ModList::read_from_file(&modlist_dir.join("rules.json")).unwrap();
+        let uploaded = modlist
+            .rules
+            .iter()
+            .find(|rule| rule.mod_id == PINNED_ID)
+            .expect("the hand-uploaded entry");
+        assert_eq!(super::pin_kind(uploaded, &modlist_dir), None);
+        assert!(remove_pin_from_root(
+            &root,
+            &RemovePinInput {
+                modlist_name: "Test Pack".into(),
+                pinned_mod_id: PINNED_ID.into(),
+            },
+        )
+        .is_err());
+        assert!(modlist_dir.join("local-jars").join(PINNED_JAR).is_file());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A marker already left behind by an older build: the hand upload under
+    /// that name clears it.
+    #[test]
+    fn a_hand_upload_clears_a_stale_marker_of_its_name() {
+        let root = unique_test_root();
+        let modlist_dir = seed_modlist(&root, vec![]);
+        let marker = super::pin_marker_path(&modlist_dir, PINNED_ID).unwrap();
+        fs::write(
+            &marker,
+            r#"{"dynamic_mod_id":"modernfix","minecraft_version":"1.20.1","loader":"forge"}"#,
+        )
+        .unwrap();
+
+        crate::modlist_manager::copy_local_jar_from_root(
+            &root,
+            &crate::modlist_manager::CopyLocalJarInput {
+                source_path: source_jar(&root).to_string_lossy().into_owned(),
+                modlist_name: "Test Pack".into(),
+            },
+        )
+        .unwrap();
+        assert!(!marker.exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -887,6 +887,14 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
         )
     })?;
 
+    // review-risoluzione-8: no entry has this id, so a marker left by a pin
+    // deleted before markers were cleaned up belongs to nobody. Left there, it
+    // would make this hand-added jar a pin that "Remove pin" deletes.
+    crate::mod_version_pin::forget_pin_marker(
+        &launcher_paths.modlists_dir().join(&input.modlist_name),
+        &mod_id,
+    )?;
+
     let dest_path = local_jars_dir.join(format!("{}.jar", mod_id));
     std::fs::copy(source_path, &dest_path).with_context(|| {
         format!(
