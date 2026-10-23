@@ -1060,7 +1060,7 @@ export default function App() {
         },
       });
     } catch (err) {
-      pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch", fromLaunch: true });
     } finally {
       // One launch, one world: a second Play from the panel must not inherit
       // the world the card asked for.

@@ -419,6 +419,10 @@ export function resetLaunchUiState() {
   setLaunchStageDetail(LAUNCH_STAGES[0].detail);
   pendingLaunchLogLines = [];
   setLaunchLogs([]);
+  // What the previous launch said about itself is not about this one: a
+  // "Launch failed" left on screen while the next launch runs reads as this
+  // launch's failure.
+  setLauncherErrors(current => current.filter(error => !error.fromLaunch));
 }
 
 export function addModToFunctionalGroup(groupId: string, modId: string) {

@@ -59,6 +59,7 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
         appendLaunchLog(event.payload.line);
       }),
 
+      // The backend only emits this from inside a launch (`emit_launcher_issue`).
       listen<{ title: string; message: string; detail: string; severity?: "warning" | "error"; scope?: "launch" | "download" | "account" }>("launcher-error", (event) => {
         pushUiError({
           title: event.payload.title,
@@ -66,6 +67,7 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
           detail: event.payload.detail,
           severity: event.payload.severity ?? "error",
           scope: event.payload.scope ?? "launch",
+          fromLaunch: true,
         });
       }),
 
@@ -94,6 +96,7 @@ export function useAppBootstrap(options: AppBootstrapOptions) {
             detail: "",
             severity: "error",
             scope: "launch",
+            fromLaunch: true,
             action: {
               label: "Show log",
               run: () => {

@@ -106,6 +106,11 @@ export type LauncherUiError = {
   scope: "launch" | "download" | "account";
   /** One button next to the notice, e.g. "Show log" after a crash (concorrenza-9). */
   action?: { label: string; run: () => void };
+  /**
+   * The notice tells how one launch went (it failed, the game crashed, a mod
+   * was left out): the next launch replaces it, so Play clears it.
+   */
+  fromLaunch?: boolean;
 };
 
 /** Why an account is online or not (F1): mirrors `CredentialState` in `token_storage.rs`. */
