@@ -20,6 +20,19 @@ fn unique_root(tag: &str) -> PathBuf {
     env::temp_dir().join(format!("cubic-worlds-{tag}-{stamp}"))
 }
 
+/// A directory link the way the launcher makes one on this platform: a
+/// symlink on unix, a junction on Windows (D97, `create_directory_link` in
+/// `shared_worlds.rs`).
+#[cfg(unix)]
+fn link_dir(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn link_dir(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    junction::create(target, link)
+}
+
 #[derive(Serialize)]
 struct TestLevelDat {
     #[serde(rename = "Data")]
@@ -586,7 +599,7 @@ fn a_link_that_stays_inside_the_mod_lists_directory_is_listed() {
         .join("1.20.1-fabric")
         .join(SAVES_DIR_NAME);
     fs::create_dir_all(&other_saves).expect("failed to create the second instance");
-    std::os::unix::fs::symlink(&real, other_saves.join("Shared")).expect("failed to link");
+    link_dir(&real, other_saves.join("Shared")).expect("failed to link");
 
     let entries = list_worlds(&root, &[]).expect("listing must not fail");
 
@@ -629,7 +642,7 @@ fn a_link_that_leaves_the_mod_lists_directory_is_not_listed() {
         .join(INSTANCES_DIR_NAME)
         .join("1.20.1-forge")
         .join(SAVES_DIR_NAME);
-    std::os::unix::fs::symlink(&elsewhere, saves.join("Escape")).expect("failed to link");
+    link_dir(&elsewhere, saves.join("Escape")).expect("failed to link");
 
     let entries = list_worlds(&root, &[]).expect("listing must not fail");
     let names: Vec<&str> = entries
@@ -664,12 +677,12 @@ fn a_world_shared_across_mod_lists_lists_every_instance_that_links_it() {
     let shared = root.join(WORLDS_DIR_NAME).join("Shared");
     write_level_dat(&shared, "Shared", 0, 4_000);
 
-    std::os::unix::fs::symlink(
+    link_dir(
         &shared,
         saves_of(&root, "test2", "26.3-fabric").join("Shared"),
     )
     .expect("failed to link");
-    std::os::unix::fs::symlink(
+    link_dir(
         &shared,
         saves_of(&root, "Drehmal APOTHEOSIS", "1.20.1-forge").join("Shared (2)"),
     )
@@ -729,7 +742,7 @@ fn a_hand_made_link_into_another_instances_world_is_not_a_way_in() {
     let root = unique_root("hand-made-link");
     write_world(&root, "test2", "26.3-fabric", "Mine", "Mine", 0, 4_000);
     let real = world_dir(&root, "test2", "26.3-fabric", "Mine");
-    std::os::unix::fs::symlink(
+    link_dir(
         &real,
         saves_of(&root, "Drehmal APOTHEOSIS", "1.20.1-forge").join("Borrowed"),
     )
@@ -767,7 +780,7 @@ fn a_link_into_another_folder_of_the_launcher_is_not_listed() {
     // Inside the launcher root, but in neither of the two places a world may be.
     let decoy = root.join("cache").join("Decoy");
     write_level_dat(&decoy, "Decoy", 0, 9_000);
-    std::os::unix::fs::symlink(
+    link_dir(
         &decoy,
         saves_of(&root, "pack", "1.20.1-forge").join("Decoy"),
     )
@@ -777,7 +790,7 @@ fn a_link_into_another_folder_of_the_launcher_is_not_listed() {
     // world is not a world.
     let nested = root.join(WORLDS_DIR_NAME).join("Real").join("DIM1");
     write_level_dat(&nested, "Nested", 0, 8_000);
-    std::os::unix::fs::symlink(
+    link_dir(
         &nested,
         saves_of(&root, "pack", "1.20.1-forge").join("Nested"),
     )

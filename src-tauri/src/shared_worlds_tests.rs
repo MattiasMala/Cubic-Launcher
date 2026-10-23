@@ -1,5 +1,6 @@
 use std::env;
 use std::io::Write;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,11 +34,13 @@ fn shared_id(folder: &str) -> WorldId {
 /// process that took it, so proving that a held lock is seen needs two
 /// processes, and re-running this test binary is the one second process every
 /// machine that can run the suite already has.
+#[cfg(unix)]
 const LOCK_HELPER_ENV: &str = "CUBIC_TEST_HOLD_SESSION_LOCK";
 
 /// Where the helper says it has the lock. A file and not a pipe: the test
 /// harness writes its own lines to the child's stdout, so a pipe would carry
 /// its banner first.
+#[cfg(unix)]
 const LOCK_MARKER_ENV: &str = "CUBIC_TEST_SESSION_LOCK_MARKER";
 
 fn unique_root(tag: &str) -> PathBuf {
@@ -206,6 +209,11 @@ fn sharing_moves_the_world_into_the_shared_folder_and_links_it_back() {
 /// The guard that protects a running game. A `session.lock` held by another
 /// process means Minecraft has the world open, and moving it then would pull
 /// the directory out from under a live save.
+///
+/// Unix only, like the two helpers below: there the game's lock is `fcntl`,
+/// which this file reproduces. On Windows `FileChannel.tryLock` is
+/// `LockFileEx`, and nothing here takes that one.
+#[cfg(unix)]
 #[test]
 fn a_world_open_in_minecraft_is_not_moved() {
     let root = scratch("open-world");
@@ -275,6 +283,7 @@ fn a_world_open_in_minecraft_is_not_moved() {
 /// Not a test: the second process the test above needs. Without the
 /// environment variable it does nothing at all, so a plain run of the suite
 /// costs one no-op.
+#[cfg(unix)]
 #[test]
 fn holds_a_session_lock_helper() {
     let (Ok(path), Ok(marker)) = (env::var(LOCK_HELPER_ENV), env::var(LOCK_MARKER_ENV)) else {
@@ -304,6 +313,7 @@ fn holds_a_session_lock_helper() {
 /// function, a silent return to `File::try_lock` would still pass, because two
 /// `flock`s in two processes conflict with each other perfectly well. Taking
 /// the game's own lock here means that regression turns the test red.
+#[cfg(unix)]
 fn take_the_lock_the_game_takes(file: &File) -> bool {
     use std::os::unix::io::AsRawFd;
 
@@ -425,7 +435,12 @@ fn nothing_that_is_not_our_link_is_ever_removed() {
 fn a_dangling_link_under_the_name_is_replaced_instead_of_failing() {
     let root = scratch("dangling");
     let target = instance_world(&root, "pack", "1.20.1-fabric", "Shared shared");
-    std::os::unix::fs::symlink(root.join("gone"), &target).expect("failed to make a dangling link");
+    // The platform's own directory link (a junction on Windows, D97), left
+    // dangling by removing what it points at.
+    let gone = root.join("gone");
+    fs::create_dir_all(&gone).expect("failed to create the link target");
+    create_directory_link(&gone, &target).expect("failed to make the link");
+    fs::remove_dir(&gone).expect("failed to remove the link target");
     assert!(
         !target.exists(),
         "`exists` follows the link and says nothing is there"
