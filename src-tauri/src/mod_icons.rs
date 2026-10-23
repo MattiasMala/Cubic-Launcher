@@ -506,7 +506,14 @@ mod tests {
         );
         let cache = modlist.join(icon_cache_relative_path("my-mod"));
         let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        fs::File::open(&cache).unwrap().set_modified(older).unwrap();
+        // Write access: Windows refuses to change the times of a file opened
+        // read-only.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&cache)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
 
         let second = local_mod_icon_data_url(&modlist, "my-mod");
         let cached_bytes = fs::read(&cache).unwrap();

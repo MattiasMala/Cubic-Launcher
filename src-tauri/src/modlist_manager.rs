@@ -1257,6 +1257,7 @@ mod tests {
         delete_modlist_with(&root, &connection, "Safe Pack", true, None).unwrap();
         assert!(!root.join("mod-lists").join("Safe Pack").exists());
 
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&test_root).unwrap();
     }
 
@@ -2006,6 +2007,7 @@ mod tests {
                 ("mod_loader".to_string(), "fabric".to_string()),
             ]
         );
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2040,6 +2042,7 @@ mod tests {
         assert!(crate::shared_files::load_groups(&connection)
             .unwrap()
             .is_empty());
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2101,6 +2104,7 @@ mod tests {
             root.join("mod-lists/Survival/rules.json").is_file(),
             "the other member of the group is untouched"
         );
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2139,6 +2143,7 @@ mod tests {
         );
         delete_modlist_with(&root, &connection, &name, true, None).unwrap();
         assert!(!root.join("mod-lists").join(&name).exists());
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2185,6 +2190,7 @@ mod tests {
         super::clear_running_game(&modlist_dir, std::process::id());
         delete_modlist_with(&root, &connection, &name, true, None).unwrap();
         assert!(!modlist_dir.exists());
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2218,6 +2224,7 @@ mod tests {
             "no mod list and no hidden leftover"
         );
         assert_no_state(&connection, "Kept");
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2240,6 +2247,7 @@ mod tests {
 
         assert!(!copy.exists());
         assert!(root.join("mod-lists/Pack/rules.json").is_file());
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2290,6 +2298,7 @@ mod tests {
         let name = import_modlist_from_root(&root, &connection, good.to_str().unwrap()).unwrap();
         assert_eq!(name, "Pack");
         assert_no_state(&connection, "Pack");
+        drop(connection); // Windows does not remove a database that is still open
         fs::remove_dir_all(&root).unwrap();
     }
 }
