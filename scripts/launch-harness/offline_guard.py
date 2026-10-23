@@ -47,12 +47,17 @@ Controlli negativi, eseguiti a ogni giro perché senza di loro il conteggio non
 prova niente:
 
 - `control-proxy-sees`  — vanilla senza `version.json` nella cache del
-                          workspace: il lancio **deve** chiedere il manifest, e il
-                          log deve contenerlo. Se è vuoto, il proxy non è nel giro.
-- `control-closed-port` — come sopra, ma il launcher punta a una porta chiusa
-                          mentre il proxy ascolta sulla sua: il log deve restare
-                          **vuoto** e il lancio fallire. Le righe arrivano solo dal
-                          traffico che passa dal proxy.
+                          workspace, account **online**: il lancio **deve**
+                          chiedere il manifest, e il log deve contenerlo. Se è
+                          vuoto, il proxy non è nel giro. Online, non offline: da
+                          D142 un lancio offline di una versione mai scaricata
+                          si ferma prima di ogni richiesta, e il controllo non
+                          vedrebbe niente qualunque cosa faccia il proxy.
+- `control-closed-port` — come sopra (account online), ma il launcher punta a una
+                          porta chiusa mentre il proxy ascolta sulla sua: il log
+                          deve restare **vuoto** e il lancio fallire. Le righe
+                          arrivano solo dal traffico che passa dal proxy. Offline
+                          passerebbe a vuoto: 0 richieste anche senza proxy (D142).
 - `control-no-cache-entry` — Fabric, `priming` (online), poi la sola voce di
                           cache tolta dal workspace e la misura (offline): 0
                           richieste, `java` non raggiunto, e il motivo dice che
@@ -93,8 +98,16 @@ sha1 dell'albero reale che gli hard link toccano:
     sha1sum -c --quiet ~/.cache/cubic-offline-guard/real-sha1-before.txt
 
 Display: `broadwayd` (GTK3) se c'è, altrimenti `xvfb-run`. Il frontend non
-viene servito (binario debug, `devUrl` su :1420 irraggiungibile): la guardia
-misura il lancio, non le richieste dell'app all'avvio (onda 8c).
+viene servito: la guardia misura il lancio, non le richieste dell'app
+all'avvio (onda 8c). Questo vale **solo** per un binario `devUrl`, cioè quello
+di `cargo build --manifest-path src-tauri/Cargo.toml --bin cubic_launcher`, con
+:1420 irraggiungibile. `npx tauri build --debug` scrive lo **stesso** percorso
+(`target/debug/cubic_launcher`) ma con il frontend dentro (`tauri://localhost`):
+con l'account online l'app all'avvio chiede `github.com` (aggiornamenti),
+`piston-meta.mojang.com` (le versioni) e `api.modrinth.com` (le icone), e quelle
+righe finiscono nel log delle fasi di innesco (audit 102, R3). Per questo la
+guardia rifiuta un binario con il frontend dentro (`embedded_frontend_reason`),
+come rifiuta qualcuno in ascolto su :1420.
 
 Locale e advisory: in CI vorrebbe una cache di Minecraft come fixture.
 
@@ -106,6 +119,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import mmap
 import os
 import select
 import shutil
@@ -139,6 +153,12 @@ GUARD_ACCOUNT = "offline-guard"
 # Il `devUrl` del binario debug (`tauri.conf.json`): se qui risponde qualcuno,
 # la webview carica il frontend e le sue richieste finiscono nel log.
 DEV_SERVER_PORT = 1420
+# La chiave del chunk d'ingresso di Vite (`assets/index-<hash>.js`) fra gli asset
+# che `tauri build` incorpora nel binario. Un binario `devUrl` non incorpora
+# niente, e nel codice Rust la stringa non c'è. Se Vite cambiasse nome al chunk il
+# controllo non vedrebbe più il frontend: la guardia diventerebbe rossa nelle fasi
+# di innesco (righe dell'app nel log), mai verde per sbaglio.
+EMBEDDED_FRONTEND_MARKER = b"/assets/index-"
 # I JSON della mod list che il lancio può riscrivere: si copiano (trappola 9).
 MODLIST_JSON_FILES = (
     "rules.json",
@@ -267,6 +287,19 @@ def closed_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+def embedded_frontend_reason(binary: Path) -> str | None:
+    """Why `binary` cannot be measured because it serves the frontend itself, or None."""
+    with open(binary, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        if data.find(EMBEDDED_FRONTEND_MARKER) < 0:
+            return None
+    return (
+        f"{binary} embeds the frontend (a `tauri build` binary): with the account online "
+        "the app's own start-up requests would end up in the log. Build the devUrl binary "
+        "with `cargo build --manifest-path src-tauri/Cargo.toml --bin cubic_launcher` and "
+        "keep nothing listening on 127.0.0.1:1420."
+    )
 
 
 def port_is_open(port: int) -> bool:
@@ -444,11 +477,13 @@ CONTROLS = [
         "control-proxy-sees",
         "vanilla",
         [
+            # Online (D142): offline la versione mai scaricata non chiede niente.
             Phase(
-                "offline",
+                "online",
                 expected_hosts=None,
                 must_see="piston-meta.mojang.com",
                 expect_java=False,
+                plays_offline=False,
             )
         ],
         remove_version_json=True,
@@ -456,7 +491,15 @@ CONTROLS = [
     Scenario(
         "control-closed-port",
         "vanilla",
-        [Phase("offline", expected_hosts={}, expect_java=False, proxy_on_closed_port=True)],
+        [
+            Phase(
+                "online",
+                expected_hosts={},
+                expect_java=False,
+                proxy_on_closed_port=True,
+                plays_offline=False,
+            )
+        ],
         remove_version_json=True,
     ),
     # La misura senza la voce di cache: se resta verde, il verde non veniva dalla cache.
@@ -702,6 +745,10 @@ def main() -> int:
     stale = stale_binary_reason(args.binary)
     if stale:
         print(f"[guard] {stale}")
+        return 1
+    embedded = embedded_frontend_reason(args.binary)
+    if embedded:
+        print(f"[guard] {embedded}")
         return 1
     print(f"[guard] binary {args.binary}")
     if port_is_open(DEV_SERVER_PORT):
