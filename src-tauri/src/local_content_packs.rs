@@ -874,7 +874,8 @@ mod tests {
     use super::{
         build_local_entry, description_from_mcmeta, display_name_for, icon_relative_path,
         import_local_content_pack_from_root, link_local_pack, plan_local_pack_installs,
-        read_icon_data_url, ContentImportErrorCode, ImportLocalContentPackInput, PackLinkOutcome,
+        read_icon_data_url, remove_existing_target, ContentImportErrorCode,
+        ImportLocalContentPackInput, PackLinkOutcome,
     };
 
     /// The eight bytes every PNG starts with, plus a little payload.
@@ -1890,7 +1891,9 @@ mod tests {
 
         // A stale file under that name is replaced when the manifest names it:
         // it is the hard-link fallback of our own last launch.
-        fs::remove_file(&target).expect("the link should be removable");
+        // The production remover: a directory link is not a file on Windows,
+        // where `remove_file` on it is "Access is denied".
+        remove_existing_target(&target).expect("the link should be removable");
         fs::write(&target, b"stale file").expect("stale file should be written");
         link_local_pack(&source, &target, true).expect("install over our own file");
         assert!(target.join("pack.png").exists());

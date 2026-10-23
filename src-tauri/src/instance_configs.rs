@@ -482,6 +482,9 @@ mod custom_config_tests {
             fs::read(instance.join("config").join("create").join("create.toml")).unwrap(),
             b"create"
         );
+        // On Windows that name *is* the nested folder, so the check only
+        // means something where a backslash can be part of a name.
+        #[cfg(unix)]
         assert!(!instance.join("config\\create").exists());
         fs::remove_dir_all(&root).unwrap();
     }
