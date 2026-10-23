@@ -130,8 +130,12 @@ fn scratch(tag: &str) -> PathBuf {
 /// The move is the operation that touches bytes that do not come back. It must
 /// leave the world identical — `level.dat` included — and it must leave the
 /// instance holding a link to it, not a copy and not a hole.
+///
+/// The world carries a `session.lock`, as every world that was played does:
+/// on Windows this is the case condivisi-2 is about, where holding the lock
+/// across the rename would make the rename fail.
 #[test]
-fn sharing_moves_the_world_into_the_mod_list_and_links_it_back() {
+fn sharing_moves_the_world_into_the_shared_folder_and_links_it_back() {
     let root = scratch("move");
     let source = instance_world(&root, "pack", "1.20.1-forge", "Shared");
 
@@ -153,7 +157,8 @@ fn sharing_moves_the_world_into_the_mod_list_and_links_it_back() {
         WorldHome::Shared,
         "a shared world belongs to no instance and no mod list"
     );
-    // D98: the folder takes the shared name on the way into the mod list.
+    // D98: the folder takes the shared name on the way into `<root>/worlds/`
+    // (D99), which is where it lives from now on.
     assert_eq!(id.folder_name, "Shared shared");
     let moved = root.join("worlds").join("Shared shared");
     assert!(

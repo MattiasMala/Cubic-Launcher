@@ -31,6 +31,17 @@ tauri-build = { version = "2", features = [] }
 aes-gcm = "0.10"
 anyhow = "1"
 base64 = "0.22"
+# Already compiled through `trash` with these features: the local time of the
+# game's log4j XML events (download-1), with no new crate in the build.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Already in the lock through tauri: the data folder has to be found before
+# Tauri starts (startup.rs), the same way Tauri's `app_local_data_dir` does.
+dirs = "6"
+# Already in the lock through tauri; direct for the "Open folder" commands
+# (windows-3): `fs::canonicalize` returns `\\?\C:\…` on Windows, which
+# `cmd /c start` does not accept, and `dunce::simplified` gives the plain form
+# back whenever it means the same path.
+dunce = "1"
 # Without a backend feature `keyring` silently falls back to its in-memory
 # mock store, which forgets the token key between two `Entry` values: every
 # saved account became undecryptable and every launch fell back to offline
@@ -39,13 +50,25 @@ base64 = "0.22"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 libc = "0.2"
 open = "5"
+# Already in the lock through tauri; direct for the screenshot thumbnails
+# (condivisi-7): the grid used to load every screenshot at full size as
+# base64, and a PNG decoder/encoder is all a downscaled copy needs.
+png = "0.17"
 # Already in the lock through tauri/tokio; direct for the skin screen's shared
 # state (E7), whose guards never need a poisoning branch.
 parking_lot = "0.12"
 rand = "0.8"
+# Already in the lock through tauri-plugin-dialog, same features: the startup
+# error dialog opens before Tauri, when the plugin cannot be used yet.
+rfd = { version = "0.16", default-features = false, features = ["gtk3", "common-controls-v6"] }
 # `multipart` for the skin upload (E7): Mojang takes the PNG as a form field.
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Already in the lock through walkdir; direct for the adoption of an instance
+# without manifest (review-contenuti-11): a pack is the launcher's only when it
+# is the cache's own file (a hard link: same device and inode on unix, same
+# volume and file index on Windows), never because its bytes match.
+same-file = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
@@ -53,7 +76,6 @@ tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-semver = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
@@ -61,7 +83,10 @@ tokio = { version = "1", features = ["full"] }
 # implementation only covered Linux, and Windows is a shipped target.
 trash = "5"
 uuid = { version = "1", features = ["v5"] }
-zip = "0.6"
+# The 4.x line tauri-plugin-updater already pulls in on Windows, so the build
+# carries one zip, not 0.6 beside it (audit 101, todo.md:1656). Deflate through
+# the `flate2` above; `time` keeps "now" as the default entry date on export.
+zip = { version = "4.6", default-features = false, features = ["deflate-flate2", "time"] }
 flate2 = "1"
 # The world list (E10) reads three fields out of `level.dat`, which is gzipped
 # NBT. `flate2` above handles the gzip; this handles the NBT.

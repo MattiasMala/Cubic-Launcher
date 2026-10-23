@@ -3,6 +3,7 @@ import { ModRuleItem } from "./ModRuleItem";
 import { ChevronDownIcon, ChevronRightIcon, FolderOpenIcon, PackageIcon, XIcon } from "./icons";
 import { altTlId, type AltSectionProps } from "./alt-section/types";
 import { useAltSectionDrag } from "./alt-section/use-alt-section-drag";
+import { offlineSafeImageUrl } from "../store";
 
 export function AltSection(props: AltSectionProps) {
   const drag = useAltSectionDrag(props);
@@ -34,7 +35,7 @@ export function AltSection(props: AltSectionProps) {
           <div class="flex items-center gap-3 px-2 py-2">
             <div class="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-md bg-muted">
               <Show
-                when={drag.draggingAlt()?.modrinth_id && drag.modIcons().get(drag.draggingAlt()!.modrinth_id!)}
+                when={drag.draggingAlt()?.modrinth_id && offlineSafeImageUrl(drag.modIcons().get(drag.draggingAlt()!.modrinth_id!))}
                 fallback={<PackageIcon class="h-4 w-4 text-muted-foreground" />}
               >
                 <img

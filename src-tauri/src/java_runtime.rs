@@ -46,40 +46,48 @@ impl JavaBinaryInspector for CommandJavaBinaryInspector {
             return Ok(None);
         }
 
-        let mut cmd = Command::new(path);
-        cmd.arg("-version");
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+        // `-XshowSettings:properties` aggiunge `os.arch = …`, l'unico dato
+        // esatto sull'architettura: `-version` da solo dice «64-Bit» anche su
+        // aarch64 e niente su una JVM a 32 bit (download-4). Una JVM che non
+        // conosce l'opzione non stampa la versione, e allora si riprova con
+        // `-version` soltanto.
+        for args in [
+            &["-XshowSettings:properties", "-version"][..],
+            &["-version"][..],
+        ] {
+            let Some(combined_output) = run_java_for_output(path, args) else {
+                return Ok(None); // binary not executable or missing
+            };
+            if let Some(version) = parse_java_major_version(&combined_output) {
+                return Ok(Some(JavaProbe {
+                    version,
+                    architecture: parse_java_architecture(&combined_output),
+                }));
+            }
         }
 
-        let output = match cmd.output() {
-            Ok(output) => output,
-            Err(_) => return Ok(None), // binary not executable or missing
-        };
-
-        let combined_output = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        if !output.status.success() && combined_output.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let Some(version) = parse_java_major_version(&combined_output) else {
-            return Ok(None);
-        };
-
-        Ok(Some(JavaProbe {
-            version,
-            architecture: parse_java_architecture(&combined_output),
-        }))
+        Ok(None)
     }
+}
+
+/// stdout e stderr di `java <args>`, insieme; `None` se il binario non parte.
+fn run_java_for_output(path: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(path);
+    cmd.args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().ok()?;
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 pub fn discover_java_installations(
@@ -172,10 +180,23 @@ pub fn persist_java_installations(
 pub fn select_java_for_minecraft(
     installations: &[JavaInstallation],
     minecraft_version: &str,
-) -> Result<Option<JavaInstallation>> {
-    let required_version = required_java_version_for_minecraft(minecraft_version)?;
+) -> Option<JavaInstallation> {
+    let required_version = required_java_for_minecraft_version(None, minecraft_version);
 
-    Ok(select_java_for_requirement(installations, required_version))
+    select_java_for_requirement(installations, required_version)
+}
+
+/// Which source wins between two Javas of the same major: the runtime the
+/// launcher installed from Adoptium first, the one found on `PATH` last.
+/// A system Java 8 older than 8u191 turns the Log4Shell lookup of 1.7–1.16
+/// into remote code execution (download-1); the launcher's runtime is current.
+/// The derived `Ord` of the enum is the display order, not this one.
+fn selection_rank(source: JavaInstallationSource) -> u8 {
+    match source {
+        JavaInstallationSource::LauncherManaged => 0,
+        JavaInstallationSource::PlatformDirectory => 1,
+        JavaInstallationSource::SystemPath => 2,
+    }
 }
 
 pub fn select_java_for_requirement(
@@ -194,15 +215,16 @@ pub fn select_java_for_requirement(
         .min_by(|left, right| {
             left.version
                 .cmp(&right.version)
-                .then(left.source.cmp(&right.source))
+                .then(selection_rank(left.source).cmp(&selection_rank(right.source)))
                 .then(left.path.cmp(&right.path))
         })
 }
 
-/// Select only an *exact* major match, never a higher one. Used as the
-/// pre-download gate so a legacy launch that genuinely needs an EOL-adjacent
-/// major (e.g. Java 8) still triggers the exact download instead of silently
-/// reusing a newer installed runtime.
+/// Select only an *exact* major match, never a higher one. The launch asks
+/// this before deciding to download a Java runtime from Adoptium, so a legacy
+/// launch that genuinely needs an EOL-adjacent major (e.g. Java 8) still gets
+/// the exact download instead of silently reusing a newer installed runtime
+/// (offline, where nothing is downloaded, D158 falls back to a newer one).
 pub fn select_exact_java_for_requirement(
     installations: &[JavaInstallation],
     required_version: u32,
@@ -212,10 +234,29 @@ pub fn select_exact_java_for_requirement(
         .filter(|installation| installation.version == required_version)
         .cloned()
         .min_by(|left, right| {
-            left.source
-                .cmp(&right.source)
+            selection_rank(left.source)
+                .cmp(&selection_rank(right.source))
                 .then(left.path.cmp(&right.path))
         })
+}
+
+/// La major di Java che una versione di Minecraft chiede: quella che il suo
+/// version.json dichiara (`javaVersion.majorVersion`), poi la tabella sul nome
+/// della versione, poi 8.
+///
+/// Il version.json prima di tutto (download-3): la tabella capisce solo i
+/// nomi numerici, e snapshot, pre-release e release candidate («25w14a»,
+/// «1.21-pre1») facevano fallire il lancio con `invalid Minecraft version`.
+/// Mai un errore: un nome che la tabella non capisce vale 8, come un
+/// version.json senza `javaVersion` (le versioni vecchie).
+pub fn required_java_for_minecraft_version(
+    declared_major: Option<u32>,
+    minecraft_version: &str,
+) -> u32 {
+    declared_major
+        .filter(|major| *major > 0)
+        .or_else(|| required_java_version_for_minecraft(minecraft_version).ok())
+        .unwrap_or(8)
 }
 
 pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u32> {
@@ -257,29 +298,89 @@ pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u3
 }
 
 pub fn parse_java_major_version(output: &str) -> Option<u32> {
+    // La riga di `-version` (`openjdk version "17.0.12"`) prima di tutto: con
+    // `-XshowSettings` l'output contiene anche le proprietà, e un loro valore
+    // tra virgolette non deve passare per la versione.
     let version_token = output
-        .split(|character: char| character.is_whitespace())
-        .find(|token| token.starts_with('"') && token.ends_with('"'))?
+        .lines()
+        .filter(|line| line.contains(" version \""))
+        .chain(output.lines())
+        .flat_map(|line| line.split(|character: char| character.is_whitespace()))
+        .find(|token| token.len() > 2 && token.starts_with('"') && token.ends_with('"'))?
         .trim_matches('"');
 
     let mut segments = version_token.split('.');
-    let first = segments.next()?.parse::<u32>().ok()?;
+    let first = leading_number(segments.next()?)?;
 
     if first == 1 {
-        segments.next()?.parse::<u32>().ok()
+        leading_number(segments.next()?)
     } else {
         Some(first)
     }
 }
 
+/// Le cifre iniziali di un segmento di versione: le build «early access» e
+/// interne scrivono `25-ea` o `17-internal` senza minor, e il suffisso non
+/// deve rendere la Java invisibile (r2-percorsi-non-ascii-e-limiti-windows-6).
+fn leading_number(segment: &str) -> Option<u32> {
+    let end = segment
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(segment.len());
+    segment[..end].parse().ok()
+}
+
+/// L'architettura di una JVM: `x64`, `arm64`, `x86`, oppure il nome di
+/// `os.arch` per le altre.
+///
+/// Prima `os.arch` di `-XshowSettings:properties`, che è esatto; senza, i
+/// segni di `-version`: aarch64/arm64, poi «64-Bit», e altrimenti una JVM a
+/// 32 bit, che è proprio quella che non lo scrive (download-4). Prima tutto
+/// quello che non era arm diventava `x64`, e una Java 8 a 32 bit nel PATH
+/// vinceva su quella a 64 bit del launcher, per poi non partire con `-Xmx4096M`.
 pub fn parse_java_architecture(output: &str) -> String {
+    let os_arch = output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("os.arch")?
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if let Some(os_arch) = os_arch {
+        return normalize_java_architecture(os_arch);
+    }
+
     let normalized = output.to_ascii_lowercase();
 
     if normalized.contains("aarch64") || normalized.contains("arm64") {
         "arm64".to_string()
-    } else {
+    } else if normalized.contains("64-bit") {
         "x64".to_string()
+    } else {
+        "x86".to_string()
     }
+}
+
+/// `os.arch` di Java e `std::env::consts::ARCH` di Rust con gli stessi nomi.
+fn normalize_java_architecture(architecture: &str) -> String {
+    match architecture.to_ascii_lowercase().as_str() {
+        "amd64" | "x86_64" | "x64" => "x64".to_string(),
+        "aarch64" | "arm64" => "arm64".to_string(),
+        "x86" | "i386" | "i486" | "i586" | "i686" => "x86".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// L'architettura di questo computer, nei nomi di [`parse_java_architecture`].
+pub fn host_java_architecture() -> String {
+    normalize_java_architecture(std::env::consts::ARCH)
+}
+
+/// Se una Java di questa architettura è adatta al lancio su questo computer.
+/// Una JVM a 32 bit su un sistema a 64 bit parte, ma non con la memoria che
+/// il lancio le chiede: si scarta, come ogni architettura diversa.
+pub fn java_architecture_matches_host(architecture: &str) -> bool {
+    architecture == host_java_architecture()
 }
 
 pub fn candidates_from_path_entries(path_entries: &[PathBuf]) -> Vec<JavaBinaryCandidate> {
@@ -420,12 +521,12 @@ mod tests {
     use crate::database::initialize_database;
 
     use super::{
-        candidates_from_java_home_root, candidates_from_path_entries,
-        inspect_java_binary_candidates, parse_java_architecture, parse_java_major_version,
-        persist_java_installations, required_java_version_for_minecraft,
-        select_exact_java_for_requirement, select_java_for_minecraft, select_java_for_requirement,
-        JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation, JavaInstallationSource,
-        JavaProbe,
+        candidates_from_java_home_root, candidates_from_path_entries, host_java_architecture,
+        inspect_java_binary_candidates, java_architecture_matches_host, parse_java_architecture,
+        parse_java_major_version, persist_java_installations, required_java_for_minecraft_version,
+        required_java_version_for_minecraft, select_exact_java_for_requirement,
+        select_java_for_minecraft, select_java_for_requirement, JavaBinaryCandidate,
+        JavaBinaryInspector, JavaInstallation, JavaInstallationSource, JavaProbe,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -457,6 +558,25 @@ mod tests {
         assert_eq!(required_java_version_for_minecraft("1.21.1").unwrap(), 21);
     }
 
+    /// download-3: il version.json decide, la tabella è il ripiego, e un nome
+    /// che non è numerico non è più un errore.
+    #[test]
+    fn required_java_comes_from_the_version_json_first() {
+        // Snapshot e release candidate: dal version.json.
+        assert_eq!(required_java_for_minecraft_version(Some(21), "25w14a"), 21);
+        assert_eq!(
+            required_java_for_minecraft_version(Some(17), "1.18-rc3"),
+            17
+        );
+        // Il version.json vince anche sulla tabella.
+        assert_eq!(required_java_for_minecraft_version(Some(25), "1.21.1"), 25);
+        // Senza `javaVersion`: la tabella, e per un nome che non capisce, 8.
+        assert_eq!(required_java_for_minecraft_version(None, "1.20.4"), 17);
+        assert_eq!(required_java_for_minecraft_version(None, "25w14a"), 8);
+        assert_eq!(required_java_for_minecraft_version(None, "1.21-pre1"), 8);
+        assert_eq!(required_java_for_minecraft_version(Some(0), "1.16.5"), 8);
+    }
+
     #[test]
     fn parses_legacy_and_modern_java_versions() {
         assert_eq!(
@@ -483,6 +603,68 @@ mod tests {
             parse_java_architecture("Java HotSpot(TM) 64-Bit Server VM"),
             "x64"
         );
+        // download-4: la Java 8 Oracle a 32 bit non scrive «64-Bit», e non è x64.
+        assert_eq!(
+            parse_java_architecture(
+                "java version \"1.8.0_381\"\nJava(TM) SE Runtime Environment (build 1.8.0_381-b09)\nJava HotSpot(TM) Client VM (build 25.381-b09, mixed mode, sharing)"
+            ),
+            "x86"
+        );
+    }
+
+    /// `os.arch` di `-XshowSettings:properties` vince sui segni di `-version`:
+    /// una JVM aarch64 scrive «64-Bit» come una x64.
+    #[test]
+    fn os_arch_property_decides_the_architecture() {
+        let output = |os_arch: &str| {
+            format!(
+                "Property settings:\n    file.encoding = UTF-8\n    os.arch = {os_arch}\n    os.name = Linux\n\nopenjdk version \"17.0.12\" 2024-07-16\nOpenJDK 64-Bit Server VM (build 17.0.12+7, mixed mode)\n"
+            )
+        };
+        assert_eq!(parse_java_architecture(&output("amd64")), "x64");
+        assert_eq!(parse_java_architecture(&output("x86_64")), "x64");
+        assert_eq!(parse_java_architecture(&output("aarch64")), "arm64");
+        assert_eq!(parse_java_architecture(&output("x86")), "x86");
+        assert_eq!(parse_java_architecture(&output("riscv64")), "riscv64");
+        assert_eq!(parse_java_major_version(&output("amd64")), Some(17));
+    }
+
+    #[test]
+    fn host_architecture_accepts_only_its_own_runtimes() {
+        let host = host_java_architecture();
+        assert!(java_architecture_matches_host(&host));
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(host, "x64");
+            assert!(!java_architecture_matches_host("x86"));
+            assert!(!java_architecture_matches_host("arm64"));
+        }
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(host, "arm64");
+            assert!(!java_architecture_matches_host("x64"));
+        }
+    }
+
+    /// r2-percorsi-non-ascii-e-limiti-windows-6: le build «early access» e
+    /// interne non hanno il minor, e prima non venivano mai rilevate.
+    #[test]
+    fn parses_early_access_and_internal_java_versions() {
+        assert_eq!(
+            parse_java_major_version("openjdk version \"25-ea\" 2025-09-16"),
+            Some(25)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"17-internal\" 2021-09-14"),
+            Some(17)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"1.8.0-internal\""),
+            Some(8)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"21.0.2-ea\" 2024-01-16"),
+            Some(21)
+        );
+        assert_eq!(parse_java_major_version("openjdk version \"ea\""), None);
     }
 
     #[test]
@@ -554,7 +736,7 @@ mod tests {
         let inspector = FakeInspector {
             probes: HashMap::from([
                 (
-                    managed_path,
+                    managed_path.clone(),
                     JavaProbe {
                         version: 17,
                         architecture: "x64".into(),
@@ -572,11 +754,19 @@ mod tests {
 
         let installations = inspect_java_binary_candidates(&candidates, &inspector).unwrap();
         let selected = select_java_for_minecraft(&installations, "1.20.4")
-            .unwrap()
             .expect("matching installation should exist");
 
-        assert_eq!(selected.path, system_path);
+        // download-1: at the same major the launcher's own runtime wins over
+        // the Java on PATH, which may be an old, vulnerable Java 8.
+        assert_eq!(selected.path, managed_path);
         assert_eq!(selected.version, 17);
+        assert_eq!(
+            select_exact_java_for_requirement(&installations, 17)
+                .expect("exact runtime")
+                .path,
+            managed_path
+        );
+        assert_ne!(selected.path, system_path);
     }
 
     #[test]

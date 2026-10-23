@@ -6,18 +6,19 @@ use crate::launch_command::{build_launch_command, split_argument_string, JavaLau
 use crate::modrinth::{ModrinthFile, ModrinthVersion};
 use crate::resolver::{ModLoader, ResolutionTarget};
 
+use super::verification::automation_exit_code;
 use super::{
-    active_account_plays_offline, automation_exit_code, build_instance_root,
-    build_modded_classpath_entries, contained_loader_library_path, embedded_min_java_requirement,
-    fabric_dependency_predicates_match, filter_minecraft_launch_game_arguments,
-    forge_wrapper_installer_artifact, installed_java_for_launch,
-    load_active_account_for_launch_with_diagnostics, load_modlist, local_mod_jar_path,
-    maven_artifact_relative_path, merge_minecraft_and_loader_game_arguments,
-    merge_minecraft_and_loader_jvm_arguments, minecraft_version_predicate_matches,
-    minimum_java_version_for_predicate, parse_mod_loader, relative_loader_library_path,
+    active_account_plays_offline, build_instance_root, build_modded_classpath_entries,
+    contained_loader_library_path, decrypt_launch_account, embedded_min_java_requirement,
+    filter_minecraft_launch_game_arguments, forge_wrapper_installer_artifact,
+    installed_java_for_launch, load_modlist, local_mod_jar_path, maven_artifact_relative_path,
+    merge_minecraft_and_loader_game_arguments, merge_minecraft_and_loader_jvm_arguments,
+    minecraft_version_predicate_matches, minimum_java_version_for_predicate, parse_mod_loader,
+    relative_loader_library_path, split_installations_by_host_architecture,
     substitute_known_placeholders, validate_content_filename, EffectiveLaunchSettings,
-    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders, LaunchRequest,
-    LaunchResolutionPath, LaunchVerificationRequest, LaunchVerificationResult, PlayerIdentity,
+    EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchDirectories,
+    LaunchPlaceholders, LaunchRequest, LaunchResolutionPath, LaunchVerificationRequest,
+    LaunchVerificationResult, PlayerIdentity,
 };
 use crate::java_runtime::{JavaInstallation, JavaInstallationSource};
 use crate::loader_metadata::{LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata};
@@ -59,10 +60,11 @@ fn launch_account_keeps_identity_when_token_key_is_unavailable() {
         })
         .expect("insert active account");
 
-    let (loaded, refresh_token_error) =
-        load_active_account_for_launch_with_diagnostics(&connection, UnavailableSecretStore)
-            .expect("load active account");
-    let loaded = loaded.expect("active account");
+    let row = crate::microsoft_auth::AccountsRepository::new(&connection)
+        .load_active_account()
+        .expect("load active account")
+        .expect("active account");
+    let (loaded, refresh_token_error) = decrypt_launch_account(&row, UnavailableSecretStore);
 
     assert_eq!(loaded.xbox_gamertag.as_deref(), Some("StoredPlayer"));
     assert_eq!(
@@ -159,8 +161,8 @@ fn global_settings() -> ShellGlobalSettings {
 fn modlist_overrides() -> ShellModListOverrides {
     ShellModListOverrides {
         modlist_name: Some("Pack".into()),
-        min_ram_mb: Some(8192),
-        max_ram_mb: None,
+        min_ram_mb: Some(3072),
+        max_ram_mb: Some(6144),
         custom_jvm_args: Some("-Dmodlist=true".into()),
         profiler_enabled: Some(false),
         wrapper_command: Some("mangohud".into()),
@@ -182,14 +184,155 @@ fn effective_launch_settings_prefer_modlist_overrides() {
     let settings =
         EffectiveLaunchSettings::from_shell_settings(&global_settings(), &modlist_overrides());
 
-    assert_eq!(settings.min_ram_mb, 8192);
-    assert_eq!(settings.max_ram_mb, 4096);
+    assert_eq!(settings.min_ram_mb, 3072);
+    assert_eq!(settings.max_ram_mb, 6144);
     assert_eq!(settings.custom_jvm_args, "-Dmodlist=true");
     assert_eq!(settings.wrapper_command, Some("mangohud".into()));
     assert_eq!(
         settings.java_path_override,
         Some(PathBuf::from("/custom/java"))
     );
+}
+
+/// shell-5 (audit 101): min e max si combinano ognuno per conto suo, quindi
+/// il controllo guarda la coppia effettiva. Globali 2048/4096 con il solo
+/// «Max RAM» della mod list a 1536 è il caso dell'audit; l'errore dice da dove
+/// viene ciascun valore.
+#[test]
+fn effective_ram_is_validated_as_a_pair_of_global_and_override_values() {
+    use crate::app_shell::validate_effective_ram;
+
+    let error = validate_effective_ram(2048, 4096, None, Some(1536))
+        .expect_err("an override max below the global min is invalid");
+    assert_eq!(
+        error.to_string(),
+        "Minimum RAM (2048 MB, from the global settings) cannot exceed maximum RAM (1536 MB, set for this mod list). Change one of them in Settings."
+    );
+    let error = validate_effective_ram(2048, 4096, Some(8192), None)
+        .expect_err("an override min above the global max is invalid");
+    assert!(error.to_string().contains("8192 MB, set for this mod list"));
+    let error =
+        validate_effective_ram(2048, 4096, Some(0), None).expect_err("zero minimum RAM is invalid");
+    assert!(error.to_string().contains("greater than zero"), "{error}");
+    let error =
+        validate_effective_ram(2048, 4096, None, Some(0)).expect_err("zero maximum RAM is invalid");
+    assert!(error.to_string().contains("Maximum RAM"), "{error}");
+
+    validate_effective_ram(2048, 4096, None, None).expect("the globals alone are valid");
+    validate_effective_ram(2048, 4096, Some(4096), None).expect("min equal to max is valid");
+    validate_effective_ram(2048, 4096, Some(8192), Some(12288))
+        .expect("both overrides, consistent, are valid");
+    let settings =
+        EffectiveLaunchSettings::from_shell_settings(&global_settings(), &modlist_overrides());
+    validate_effective_ram(
+        global_settings().min_ram_mb,
+        global_settings().max_ram_mb,
+        modlist_overrides().min_ram_mb,
+        modlist_overrides().max_ram_mb,
+    )
+    .expect("the fixture is a valid launch");
+    assert!(settings.min_ram_mb <= settings.max_ram_mb);
+}
+
+/// shell-5: il salvataggio degli override rifiuta una coppia effettiva
+/// sbagliata e non scrive niente; una coppia giusta si salva.
+#[test]
+fn saving_modlist_overrides_rejects_an_invalid_effective_ram_pair() {
+    use crate::app_shell::{
+        save_global_settings, save_modlist_overrides, ShellGlobalSettingsInput,
+        ShellModListOverridesInput,
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let database_path = std::env::temp_dir().join(format!(
+        "cubic-shell-5-{}-{timestamp}.db",
+        std::process::id()
+    ));
+    crate::database::initialize_database(&database_path).expect("initialize database");
+    let connection = rusqlite::Connection::open(&database_path).expect("open database");
+    save_global_settings(
+        &connection,
+        &ShellGlobalSettingsInput {
+            min_ram_mb: 2048,
+            max_ram_mb: 4096,
+            custom_jvm_args: String::new(),
+            profiler_enabled: false,
+            update_notifications_enabled: true,
+            update_notifications_resource_packs: true,
+            update_notifications_data_packs: true,
+            update_notifications_shaders: true,
+            wrapper_command: String::new(),
+            java_path_override: String::new(),
+        },
+    )
+    .expect("global settings");
+    let overrides = |min_ram_mb, max_ram_mb| ShellModListOverridesInput {
+        modlist_name: "Pack".into(),
+        min_ram_mb,
+        max_ram_mb,
+        custom_jvm_args: Some("-Dkept=true".into()),
+        profiler_enabled: None,
+        wrapper_command: None,
+        minecraft_version: None,
+        mod_loader: None,
+    };
+    let stored = || -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM modlist_settings WHERE modlist_name = 'Pack'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+    };
+
+    let error = save_modlist_overrides(&connection, &overrides(None, Some(1536)))
+        .expect_err("max override below the global min");
+    assert!(error.to_string().contains("cannot exceed"), "{error}");
+    assert_eq!(stored(), 0, "nothing is written when the pair is invalid");
+
+    save_modlist_overrides(&connection, &overrides(None, Some(3072)))
+        .expect("max override above the global min");
+    assert_eq!(stored(), 2);
+
+    drop(connection);
+    std::fs::remove_file(database_path).ok();
+}
+
+/// r2-percorsi-non-ascii-e-limiti-windows-5 (audit 101): «Copia come percorso»
+/// di Windows mette il percorso tra virgolette, e con le virgolette ogni lancio
+/// falliva con «is not runnable».
+#[test]
+fn java_path_override_loses_the_quotes_of_a_pasted_path() {
+    let mut global = global_settings();
+    for pasted in [
+        r#""C:\Program Files\Java\jdk-21\bin\java.exe""#,
+        r#"  "C:\Program Files\Java\jdk-21\bin\java.exe"  "#,
+        r#"'C:\Program Files\Java\jdk-21\bin\java.exe'"#,
+        "\t C:\\Program Files\\Java\\jdk-21\\bin\\java.exe \n",
+    ] {
+        global.java_path_override = pasted.into();
+        assert_eq!(
+            EffectiveLaunchSettings::from_shell_settings(&global, &modlist_overrides())
+                .java_path_override,
+            Some(PathBuf::from(r"C:\Program Files\Java\jdk-21\bin\java.exe")),
+            "{pasted:?}"
+        );
+    }
+
+    // Only quotes, or nothing: no override at all.
+    for empty in [r#""""#, "  ", r#"" ""#] {
+        global.java_path_override = empty.into();
+        assert_eq!(
+            EffectiveLaunchSettings::from_shell_settings(&global, &modlist_overrides())
+                .java_path_override,
+            None,
+            "{empty:?}"
+        );
+    }
 }
 
 #[test]
@@ -254,7 +397,6 @@ fn jvm_args_for(settings: &EffectiveLaunchSettings, java_major: u32) -> Vec<Stri
         },
         launch_settings: settings.java_launch_settings(decision.into_recording()),
         additional_game_arguments: Vec::new(),
-        config_attribution: None,
     };
     build_launch_command(&request)
         .expect("launch command should build")
@@ -631,12 +773,14 @@ fn known_launch_placeholders_are_substituted() {
             minecraft_version: "1.21.1".into(),
             mod_loader: ModLoader::Fabric,
         },
-        PathBuf::from("game-dir").as_path(),
-        PathBuf::from("assets-root").as_path(),
-        "1.21",
-        PathBuf::from("libraries-root").as_path(),
-        PathBuf::from("natives-root").as_path(),
-        false,
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "1.21",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: false,
+        },
     );
 
     let substituted = substitute_known_placeholders(
@@ -644,9 +788,10 @@ fn known_launch_placeholders_are_substituted() {
         &placeholders,
     );
 
+    // The game directory is the working directory of the process: `.`.
     assert_eq!(
         substituted,
-        "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric:854x480:assets-root"
+        "PlayerOne:uuid-123:.:Pack-1.21.1-fabric:854x480:assets-root"
     );
 }
 
@@ -665,12 +810,14 @@ fn legacy_virtual_assets_redirect_game_assets_and_session() {
             minecraft_version: "1.6.4".into(),
             mod_loader: ModLoader::Vanilla,
         },
-        PathBuf::from("game-dir").as_path(),
-        PathBuf::from("assets-root").as_path(),
-        "legacy",
-        PathBuf::from("libraries-root").as_path(),
-        PathBuf::from("natives-root").as_path(),
-        true,
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "legacy",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: true,
+        },
     );
 
     // Legacy: --assetsDir ${game_assets} must point at the materialized virtual
@@ -688,6 +835,63 @@ fn legacy_virtual_assets_redirect_game_assets_and_session() {
                 .join("legacy")
                 .display()
         )
+    );
+}
+
+/// download-2 (audit 101): 1.7.10–1.8.9 portano `--userProperties
+/// ${user_properties}`, e il Main lo passa a Gson; alla lettera il gioco esce
+/// in pochi secondi. Nessun segnaposto deve sopravvivere, nemmeno quelli
+/// facoltativi delle versioni nuove (`${clientid}`, `${auth_xuid}`).
+#[test]
+fn legacy_and_optional_placeholders_never_reach_the_game_literally() {
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "Pack",
+        &ResolutionTarget {
+            minecraft_version: "1.8.9".into(),
+            mod_loader: ModLoader::Vanilla,
+        },
+        &LaunchDirectories {
+            instance_root: Path::new("game-dir"),
+            assets_root: Path::new("assets-root"),
+            asset_index_id: "1.8",
+            library_directory: Path::new("libraries-root"),
+            natives_directory: Path::new("natives-root"),
+            is_virtual_assets: false,
+        },
+    );
+    // `minecraftArguments` di 1.8.9 com'è nel version.json di Mojang.
+    let minecraft_arguments = "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userProperties ${user_properties} --userType ${user_type}";
+
+    let substituted = minecraft_arguments
+        .split_whitespace()
+        .map(|argument| substitute_known_placeholders(argument, &placeholders))
+        .collect::<Vec<_>>();
+
+    assert!(
+        substituted.iter().all(|argument| !argument.contains("${")),
+        "{substituted:?}"
+    );
+    let user_properties = substituted
+        .iter()
+        .position(|argument| argument == "--userProperties")
+        .expect("the option stays");
+    assert_eq!(substituted[user_properties + 1], "{}");
+
+    // 1.19+: `--clientId ${clientid} --xuid ${auth_xuid}`.
+    assert_eq!(
+        substitute_known_placeholders("${clientid}", &placeholders),
+        ""
+    );
+    assert_eq!(
+        substitute_known_placeholders("${auth_xuid}", &placeholders),
+        ""
     );
 }
 
@@ -782,7 +986,6 @@ fn modded_jvm_args_keep_natives_and_drop_minecraft_classpath_placeholder() {
             "-Djava.library.path=${natives_directory}".to_string(),
             "-Dminecraft.launcher.brand=${launcher_name}".to_string(),
             "-Dforgewrapper.installer=forge-installer.jar".to_string(),
-            "-Dorg.lwjgl.librarypath=${natives_directory}".to_string(),
         ]
     );
 }
@@ -796,7 +999,106 @@ fn legacy_vanilla_jvm_args_gain_natives_path_when_absent() {
     let merged = merge_minecraft_and_loader_jvm_arguments(&[], Vec::new());
 
     assert!(merged.contains(&"-Djava.library.path=${natives_directory}".to_string()));
-    assert!(merged.contains(&"-Dorg.lwjgl.librarypath=${natives_directory}".to_string()));
+    // r2-percorsi-non-ascii-e-limiti-windows-2: not `-Dorg.lwjgl.librarypath`. LWJGL 2
+    // hands it to `System.load`, which wants an absolute path, and the natives now reach
+    // Java relative to the instance; `java.library.path` is what Mojang's launcher passes.
+    assert!(!merged
+        .iter()
+        .any(|argument| argument.starts_with("-Dorg.lwjgl.librarypath=")));
+}
+
+/// r2-percorsi-non-ascii-e-limiti-windows-1 e -2: dentro l'istanza i segnaposto dei
+/// percorsi sono relativi alla cartella di lavoro, e il nome della mod list, con «:», «;» o
+/// un'emoji, non arriva più a Java; gli asset della cache condivisa restano assoluti.
+#[test]
+fn path_placeholders_inside_the_instance_reach_java_relative() {
+    let data_root = PathBuf::from("/data/cubic");
+    let instance_root = data_root
+        .join("mod-lists")
+        .join("🌲 Create: Astral; v2")
+        .join("instances")
+        .join("1.20.1-forge");
+    let assets_root = data_root.join("cache").join("minecraft").join("assets");
+    let placeholders = LaunchPlaceholders::new(
+        &PlayerIdentity {
+            username: "PlayerOne".into(),
+            uuid: "uuid-123".into(),
+            access_token: "token-abc".into(),
+            user_type: "offline".into(),
+            version_type: "Cubic".into(),
+        },
+        "🌲 Create: Astral; v2",
+        &ResolutionTarget {
+            minecraft_version: "1.20.1".into(),
+            mod_loader: ModLoader::Forge,
+        },
+        &LaunchDirectories {
+            instance_root: &instance_root,
+            assets_root: &assets_root,
+            asset_index_id: "5",
+            library_directory: &instance_root.join("libraries"),
+            natives_directory: &instance_root.join("natives"),
+            is_virtual_assets: false,
+        },
+    );
+
+    let jvm_and_game_arguments = [
+        "-Djava.library.path=${natives_directory}",
+        "-DlibraryDirectory=${library_directory}",
+        "--gameDir",
+        "${game_directory}",
+        "--assetsDir",
+        "${assets_root}",
+    ]
+    .map(|argument| substitute_known_placeholders(argument, &placeholders));
+
+    assert_eq!(
+        jvm_and_game_arguments,
+        [
+            "-Djava.library.path=natives".to_string(),
+            "-DlibraryDirectory=libraries".to_string(),
+            "--gameDir".to_string(),
+            ".".to_string(),
+            "--assetsDir".to_string(),
+            assets_root.display().to_string(),
+        ]
+    );
+}
+
+/// r2-percorsi-non-ascii-e-limiti-windows-2: con Forge si rompeva anche
+/// `-Dforgewrapper.installer`; installer e librerie ora sono relativi all'istanza.
+#[test]
+fn forge_wrapper_properties_point_inside_the_instance_relatively() {
+    let instance_root = PathBuf::from("/data/cubic/mod-lists/🌲 Cozy/instances/1.20.1-forge");
+    let library_root = instance_root.join("libraries");
+    let installer = library_root
+        .join("net")
+        .join("minecraftforge")
+        .join("forge-installer.jar");
+    let client_jar = PathBuf::from("/data/cubic/cache/minecraft/versions/1.20.1/1.20.1.jar");
+
+    let arguments = super::runtime::forge_wrapper_jvm_arguments(
+        &instance_root,
+        &installer,
+        &library_root,
+        &client_jar,
+    );
+
+    assert_eq!(
+        arguments,
+        [
+            format!(
+                "-Dforgewrapper.installer={}",
+                PathBuf::from("libraries")
+                    .join("net")
+                    .join("minecraftforge")
+                    .join("forge-installer.jar")
+                    .display()
+            ),
+            "-Dforgewrapper.librariesDir=libraries".to_string(),
+            format!("-Dforgewrapper.minecraft={}", client_jar.display()),
+        ]
+    );
 }
 
 #[test]
@@ -884,30 +1186,6 @@ fn tilde_minecraft_predicates_match_target_patch_line() {
     assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.6"));
     assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.9"));
     assert!(!minecraft_version_predicate_matches("~1.21.6", "1.22.0"));
-}
-
-#[test]
-fn fabric_dependency_predicates_match_semver_ranges() {
-    assert!(fabric_dependency_predicates_match(
-        &["<7.0.0".into()],
-        "6.2.9"
-    ));
-    assert!(fabric_dependency_predicates_match(
-        &[">=17.0.6".into()],
-        "17.0.6"
-    ));
-    assert!(!fabric_dependency_predicates_match(
-        &["<3.0.0".into()],
-        "3.0.0"
-    ));
-    assert!(fabric_dependency_predicates_match(
-        &["<1.8.0".into()],
-        "1.8.0-beta.4+mc1.21.1"
-    ));
-    assert!(!fabric_dependency_predicates_match(
-        &[">=1.8.0".into()],
-        "1.8.0-beta.4+mc1.21.1"
-    ));
 }
 
 // ── Automation entry-point (env → full verification) ────────────────────────
@@ -1063,35 +1341,82 @@ fn a_launch_request_without_a_version_map_is_the_request_of_today() {
     );
 }
 
-/// D-d (onda 8a): offline e nessun runtime della major richiesta è un errore che
-/// nomina la major, la cartella dei runtime e la scelta dell'account — non una
-/// richiesta ad Adoptium. Una Java più nuova installata non basta: la selezione
-/// prima del download è a major esatta (`select_exact_java_for_requirement`).
-/// Online la stessa situazione resta un download (`Ok(None)`).
+/// D-d (onda 8a): offline e nessun runtime della major richiesta né di una
+/// più alta è un errore che nomina la major, la cartella dei runtime e la
+/// scelta dell'account — non una richiesta ad Adoptium. Online la stessa
+/// situazione resta un download (`Ok(None)`).
+///
+/// D158: offline, una Java più nuova installata basta: si usa la più vicina
+/// superiore, e il chiamante avvisa della sostituzione.
 #[test]
-fn offline_with_no_runtime_of_the_required_major_is_a_clear_error() {
+fn offline_with_no_runtime_of_the_required_major_or_newer_is_a_clear_error() {
     let runtimes_dir = Path::new("/launcher/java-runtimes");
-    let installed = vec![JavaInstallation {
-        path: PathBuf::from("/launcher/java-runtimes/java-21/bin/java"),
-        version: 21,
+    let java = |version: u32| JavaInstallation {
+        path: PathBuf::from(format!("/launcher/java-runtimes/java-{version}/bin/java")),
+        version,
         auto_detected: true,
         architecture: "x64".into(),
         source: JavaInstallationSource::LauncherManaged,
-    }];
+    };
+    let installed = vec![java(25), java(21)];
 
-    let error = installed_java_for_launch(&installed, 17, true, runtimes_dir)
-        .expect_err("offline, a missing Java 17 must stop the launch, not reach Adoptium");
+    let error = installed_java_for_launch(&installed, 26, true, runtimes_dir)
+        .expect_err("offline, nothing from Java 26 up must stop the launch, not reach Adoptium");
     let message = error.to_string();
-    assert!(message.contains("Java 17"), "{message}");
+    assert!(message.contains("Java 26"), "{message}");
     assert!(message.contains("/launcher/java-runtimes"), "{message}");
     assert!(message.contains("plays offline"), "{message}");
 
+    // Online the exact major is downloaded instead.
     assert_eq!(
         installed_java_for_launch(&installed, 17, false, runtimes_dir).expect("online"),
         None
     );
+    // Offline, exact major installed: that one.
     assert_eq!(
-        installed_java_for_launch(&installed, 21, true, runtimes_dir).expect("offline, installed"),
-        Some(PathBuf::from("/launcher/java-runtimes/java-21/bin/java"))
+        installed_java_for_launch(&installed, 21, true, runtimes_dir)
+            .expect("offline, installed")
+            .map(|java| java.version),
+        Some(21)
     );
+    // D158: offline, 17 missing → the nearest higher installed, 21, not 25.
+    assert_eq!(
+        installed_java_for_launch(&installed, 17, true, runtimes_dir)
+            .expect("offline, newer installed")
+            .map(|java| java.version),
+        Some(21)
+    );
+}
+
+/// download-4 (audit 101): una Java di un'altra architettura non entra nella
+/// scelta, nemmeno quando è la sola della major giusta o viene dal PATH.
+#[test]
+fn java_of_another_architecture_is_left_out_of_the_choice() {
+    let host = crate::java_runtime::host_java_architecture();
+    let foreign = if host == "x86" { "x64" } else { "x86" };
+    let installation = |path: &str, architecture: &str, source| JavaInstallation {
+        path: PathBuf::from(path),
+        version: 8,
+        auto_detected: true,
+        architecture: architecture.into(),
+        source,
+    };
+    let (usable, skipped) = split_installations_by_host_architecture(vec![
+        installation("/usr/bin/java", foreign, JavaInstallationSource::SystemPath),
+        installation(
+            "/launcher/java-runtimes/java-8/bin/java",
+            &host,
+            JavaInstallationSource::LauncherManaged,
+        ),
+    ]);
+
+    assert_eq!(
+        usable
+            .iter()
+            .map(|java| java.path.clone())
+            .collect::<Vec<_>>(),
+        vec![PathBuf::from("/launcher/java-runtimes/java-8/bin/java")]
+    );
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].architecture, foreign);
 }

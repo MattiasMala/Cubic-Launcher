@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::token_storage::{AccountTokenCipher, SecretStore};
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub const DATABASE_FILENAME: &str = "launcher_data.db";
 
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS mod_cache (
     file_hash           TEXT,
     download_url        TEXT,
     is_local            BOOLEAN DEFAULT FALSE,
+    last_used           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
 );
 
@@ -55,6 +56,8 @@ CREATE TABLE IF NOT EXISTS dependencies (
     PRIMARY KEY (mod_parent_id, dependency_id)
 );
 
+-- Unused: the Java agent that would have filled it was never built. Kept so
+-- existing databases need no destructive migration.
 CREATE TABLE IF NOT EXISTS config_attribution (
     config_path     TEXT NOT NULL,
     jar_filename    TEXT NOT NULL,
@@ -94,7 +97,34 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     migrate_mod_cache_schema(&connection)?;
     migrate_mod_cache_target_key(&connection)?;
     migrate_accounts_plays_offline(&connection)?;
+    migrate_mod_cache_last_used(&connection)?;
 
+    Ok(())
+}
+
+/// Audit 101, risoluzione-8: which version of a project a target used last.
+/// The lookups ordered by `rowid`, i.e. by first insertion, and an upsert
+/// keeps the rowid: going back to a version already in the cache left the
+/// newer row "registered", so the popup proposed the same downgrade at every
+/// launch and offline loaded the version that had been withdrawn. A launch
+/// stamps the versions it links with a counter that only grows.
+///
+/// Runs after the two `mod_cache` rebuilds above, which recreate the table
+/// without the column. Same shape as `migrate_accounts_plays_offline`: it asks
+/// the table and only adds a column that is missing; 0 means "never stamped",
+/// so existing rows keep their old order among themselves.
+fn migrate_mod_cache_last_used(connection: &Connection) -> Result<()> {
+    let has_column: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mod_cache') WHERE name = 'last_used')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE mod_cache ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -119,16 +149,22 @@ fn migrate_accounts_plays_offline(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
-    let table_sql: Option<String> = connection
+/// The `CREATE TABLE` of `mod_cache`, or `None` when the table does not
+/// exist. Only "no such row" means a missing table: any other SQLite error
+/// (a locked or damaged database) is returned, so a migration is never
+/// skipped as if there were nothing to migrate (audit 101, todo.md:1738).
+fn mod_cache_table_sql(connection: &Connection) -> Result<Option<String>> {
+    Ok(connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
             [],
             |row| row.get(0),
         )
-        .ok();
+        .optional()?)
+}
 
-    let Some(table_sql) = table_sql else {
+fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
+    let Some(table_sql) = mod_cache_table_sql(connection)? else {
         return Ok(());
     };
 
@@ -188,15 +224,7 @@ fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
 }
 
 fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
-    let table_sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(table_sql) = table_sql else {
+    let Some(table_sql) = mod_cache_table_sql(connection)? else {
         return Ok(());
     };
 
@@ -359,7 +387,10 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{initialize_database, migrate_account_tokens_from_profile_data, DATABASE_FILENAME};
+    use super::{
+        initialize_database, migrate_account_tokens_from_profile_data, migrate_mod_cache_schema,
+        migrate_mod_cache_target_key, DATABASE_FILENAME,
+    };
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     #[derive(Clone, Default)]
@@ -445,6 +476,90 @@ mod tests {
                 .expect("database should have a parent"),
         )
         .expect("temporary directory should be removable");
+    }
+
+    #[test]
+    fn initialize_database_adds_last_used_to_an_existing_mod_cache() {
+        let database_path = unique_test_database_path();
+        fs::create_dir_all(database_path.parent().expect("database directory"))
+            .expect("database directory should be created");
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE mod_cache (
+                    modrinth_project_id TEXT,
+                    modrinth_version_id TEXT,
+                    jar_filename        TEXT NOT NULL,
+                    mc_version          TEXT NOT NULL,
+                    mod_loader          TEXT NOT NULL,
+                    file_hash           TEXT,
+                    download_url        TEXT,
+                    is_local            BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
+                );
+                INSERT INTO mod_cache (modrinth_project_id, modrinth_version_id, jar_filename, mc_version, mod_loader)
+                VALUES ('sodium', 'v1', 'sodium.jar', '1.20.1', 'fabric');
+                "#,
+            )
+            .expect("legacy mod_cache should be created");
+        drop(connection);
+
+        initialize_database(&database_path).expect("database should migrate");
+        initialize_database(&database_path).expect("the migration is idempotent");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let last_used: i64 = connection
+            .query_row(
+                "SELECT last_used FROM mod_cache WHERE modrinth_version_id = 'v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the existing row keeps its data and gains the column");
+        assert_eq!(last_used, 0);
+
+        drop(connection);
+        fs::remove_dir_all(database_path.parent().expect("database directory"))
+            .expect("temporary database directory should be removable");
+    }
+
+    /// todo.md:1738: a database with no `mod_cache` table has nothing to
+    /// migrate, and both migrations say so without an error.
+    #[test]
+    fn mod_cache_migrations_skip_a_missing_table() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+
+        migrate_mod_cache_schema(&connection).expect("no table, nothing to migrate");
+        migrate_mod_cache_target_key(&connection).expect("no table, nothing to migrate");
+    }
+
+    /// todo.md:1738: a SQLite error while reading the schema is not a missing
+    /// table. Before, `.ok()` turned it into "nothing to migrate" and the
+    /// launcher went on with a `mod_cache` of the old shape.
+    #[test]
+    fn mod_cache_migrations_report_a_schema_read_error() {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("temporary directory");
+        fs::write(&database_path, vec![0x5a; 4096]).expect("a file that is not a database");
+        let connection = Connection::open(&database_path).expect("opening is lazy");
+
+        let schema = migrate_mod_cache_schema(&connection)
+            .expect_err("a damaged database is an error, not a missing table");
+        let target_key = migrate_mod_cache_target_key(&connection)
+            .expect_err("a damaged database is an error, not a missing table");
+        for error in [schema, target_key] {
+            assert!(
+                format!("{error:#}").contains("not a database"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        drop(connection);
+        fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
     }
 
     #[test]

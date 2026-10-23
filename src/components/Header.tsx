@@ -1,12 +1,62 @@
-import { createSignal } from "solid-js";
+import { createSignal, onCleanup, onMount } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
-import logoUrl from "../../assets/icon.png";
+// 64×64 copy of assets/icon.png (1254×1254, 1.48 MB): the header draws it at
+// 32 px, 64 for HiDPI. The original stays for the README (audit 101, 069 M5).
+import logoUrl from "../../assets/icon-64.png";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
+/**
+ * Closing the window while Minecraft runs skips the copy back of the shared
+ * files (servers.dat, hotbar.nbt, command_history.txt): it happens when the
+ * game exits, and a closed launcher is not there to see it. The backend stops
+ * every close request while the game runs — the button below, Alt+F4, the
+ * taskbar — and asks here (D152).
+ */
+const CLOSE_WHILE_RUNNING_MESSAGE =
+  "Minecraft is still running. If you close Cubic Launcher now, the server list, saved hotbars and command history the game changes reach the mod list only at the next launch of that instance.";
+
 export function Header() {
   const [maximized, setMaximized] = createSignal(false);
+
+  onMount(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      const stop = await listen("close-requested-while-running", async () => {
+        try {
+          // Heard: the next close asks again instead of going through
+          // (review-frontend-shell-30).
+          await invoke("close_request_received_command");
+          const close = await ask(CLOSE_WHILE_RUNNING_MESSAGE, {
+            title: "Close Cubic Launcher?",
+            kind: "warning",
+            okLabel: "Close anyway",
+            cancelLabel: "Keep open",
+          });
+          if (close) await invoke("close_launcher_anyway_command");
+        } catch (err) {
+          pushUiError({ title: "Window control failed", message: "The launcher could not be closed.", detail: String(err), severity: "error", scope: "launch" });
+        }
+      });
+      if (disposed) stop();
+      else {
+        unlisten = stop;
+        // Listening now: a close request lost while the window reloaded does
+        // not count as one nobody answers.
+        void invoke("close_request_received_command").catch(() => {});
+      }
+    })();
+    onCleanup(() => {
+      disposed = true;
+      unlisten?.();
+    });
+  });
 
   const handleWindowAction = async (action: "minimize" | "toggle-maximize" | "close") => {
     if (!isTauri()) return;

@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { MODRINTH_HEADERS } from "./modrinth-user-agent";
+import { activePlaysOffline } from "../store-selectors";
 
 /**
  * What Modrinth says about one content-pack project, cached for the whole app.
@@ -55,6 +56,9 @@ export function seedContentName(id: string, name: string) {
  * forever".
  */
 export async function fetchContentProjects(ids: string[]): Promise<void> {
+  // D140: nothing is asked while the active account plays offline. The rows
+  // keep what is already known, and the badge stays in its silent "pending".
+  if (activePlaysOffline()) return;
   const missing = ids.filter(id => contentProjects().get(id)?.gameVersions === undefined);
   if (missing.length === 0) return;
 
@@ -124,9 +128,16 @@ export type ContentCompatibility = "compatible" | "no-version" | "unknown" | "pe
  * concrete versions; it is there because the same helper reads the mod-list's
  * own version rules, which do use wildcards.
  *
- * Loader is not part of it, on purpose: content packs are `loaders:
- * ["minecraft"]` and the backend's pack lookup filters by game version alone,
- * so a loader here would make the badge stricter than the launch.
+ * Loader is not part of it, and here the badge is looser than the launch.
+ * The backend keeps only the versions published under the category's own
+ * loaders — `datapack` for data packs, `minecraft` for resource packs, the
+ * shader loaders (`iris`, `optifine`, `canvas`, `vanilla`) for shaders
+ * (contentpack-8) — so that a project shipping a data pack and a mod under one
+ * slug never installs the mod's `.jar`. The project object only carries the
+ * union of its versions' game versions, not which loader each one is for, so
+ * a project whose only versions for this target are mods reads `compatible`
+ * here and installs nothing at launch; the pre-check then reports it as
+ * having no version (D60).
  *
  * `pending` is the state before anyone has asked, and it shows nothing: a
  * badge that appears for half a second on every row and then goes away is

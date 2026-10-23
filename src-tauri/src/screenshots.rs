@@ -37,8 +37,8 @@ const SCREENSHOT_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenshotEntry {
-    /// Absolute path, which is also the identity the delete and the thumbnail
-    /// read use.
+    /// Absolute path: the identity of a row, and what the full-size preview
+    /// reads. The delete and the thumbnail take the three names instead.
     pub path: String,
     pub file_name: String,
     pub modlist_name: String,
@@ -88,6 +88,11 @@ pub fn list_screenshots(root_dir: &Path) -> Result<Vec<ScreenshotEntry>> {
         let Some(modlist_name) = utf8_file_name(&modlist_dir) else {
             continue;
         };
+        // A deletion or an import that did not finish is not a mod list
+        // (review-contenuti-14).
+        if crate::modlist_manager::is_launcher_work_dir(&modlist_name) {
+            continue;
+        }
         for instance_dir in child_directories(&modlist_dir.join(INSTANCES_DIR_NAME))? {
             let Some(instance_name) = utf8_file_name(&instance_dir) else {
                 continue;
@@ -399,6 +404,271 @@ pub fn trash_supported() -> bool {
     ))
 }
 
+// ── Thumbnails ───────────────────────────────────────────────────────────────
+
+/// Where the downscaled copies live: under the launcher's `cache/`, never next
+/// to the screenshots — that folder is the user's, and a file manager opened on
+/// it should show what the game wrote and nothing else.
+const THUMBNAILS_DIR: &str = "screenshot-thumbnails";
+
+/// Bumped when the way a thumbnail is made changes, so old copies stop
+/// matching instead of being served.
+const THUMBNAIL_FORMAT: u32 = 1;
+
+/// The widest copy anyone asks for. The grid asks for far less; the large
+/// preview of a file too big to send whole (condivisi-8) asks for this.
+const MAX_THUMBNAIL_WIDTH: u32 = 2560;
+
+/// A screenshot whose file is larger than this is never sent whole over the
+/// IPC: the same ceiling `read_image_as_data_url` applies.
+const MAX_WHOLE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What the PNG decoder may allocate. Only an interlaced PNG is decoded whole
+/// — Minecraft never writes one — so this is the ceiling of a rare case, not
+/// of every thumbnail.
+const DECODER_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+
+/// How many thumbnails are made at once. The grid asks for every one that
+/// scrolls into view; past two at a time the decodes only fight over the CPU
+/// and the memory.
+static THUMBNAIL_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// A downscaled copy of one screenshot as a `data:` URL, made once and then
+/// read from the cache (condivisi-7).
+///
+/// The screenshot is named by the same three names the deletion takes and
+/// goes through the same containment check. A PNG is decoded row by row and
+/// averaged down to `max_width` (never upscaled), so a 2560×1440 file costs a
+/// few hundred kilobytes of memory and of IPC instead of 15 MB of pixels and
+/// 4 MB of base64. A JPEG — never written by the game, only dropped into the
+/// folder by hand — has no decoder here and is sent whole when it is small
+/// enough.
+pub fn screenshot_thumbnail(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
+    max_width: u32,
+) -> Result<String> {
+    let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
+    let metadata = fs::metadata(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
+    let max_width = max_width.clamp(1, MAX_THUMBNAIL_WIDTH);
+
+    let is_png = resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !is_png {
+        if metadata.len() > MAX_WHOLE_BYTES {
+            bail!(
+                "{} is a {} MB JPEG: too large to send whole, and only PNG screenshots get a \
+                 thumbnail",
+                resolved.display(),
+                metadata.len() / 1_000_000
+            );
+        }
+        let bytes = fs::read(&resolved)
+            .with_context(|| format!("failed to read {}", resolved.display()))?;
+        return Ok(data_url("image/jpeg", &bytes));
+    }
+
+    let cached = thumbnail_cache_path(root_dir, &resolved, &metadata, max_width);
+    if let Ok(bytes) = fs::read(&cached) {
+        return Ok(data_url("image/png", &bytes));
+    }
+
+    let file = fs::File::open(&resolved)
+        .with_context(|| format!("failed to open {}", resolved.display()))?;
+    let thumbnail = downscale_png(std::io::BufReader::new(file), max_width)
+        .with_context(|| format!("failed to make a thumbnail of {}", resolved.display()))?;
+
+    // A cache that cannot be written costs the next view another decode, not
+    // the thumbnail: the bytes are returned either way.
+    if let Some(parent) = cached.parent() {
+        if fs::create_dir_all(parent).is_ok() {
+            let _ = crate::atomic_write::write_atomically(&cached, &thumbnail);
+        }
+    }
+    Ok(data_url("image/png", &thumbnail))
+}
+
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    format!("data:{mime};base64,{}", BASE64.encode(bytes))
+}
+
+/// The cached copy's name says which file, which version of it and which size:
+/// a screenshot rewritten in place gets a new mtime and so a new thumbnail.
+fn thumbnail_cache_path(
+    root_dir: &Path,
+    resolved: &Path,
+    metadata: &fs::Metadata,
+    max_width: u32,
+) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    let key = format!(
+        "{THUMBNAIL_FORMAT}|{}|{}|{modified_ns}|{max_width}",
+        resolved.display(),
+        metadata.len()
+    );
+    root_dir
+        .join("cache")
+        .join(THUMBNAILS_DIR)
+        .join(format!("{:x}.png", Sha256::digest(key.as_bytes())))
+}
+
+/// Average the source pixels into a picture at most `max_width` wide, keeping
+/// the aspect ratio, and encode it as an RGB PNG.
+fn downscale_png(reader: impl std::io::Read, max_width: u32) -> Result<Vec<u8>> {
+    let mut decoder = png::Decoder::new_with_limits(
+        reader,
+        png::Limits {
+            bytes: DECODER_LIMIT_BYTES,
+        },
+    );
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().context("not a readable PNG")?;
+
+    let (width, height) = reader.info().size();
+    if width == 0 || height == 0 {
+        bail!("the PNG has no pixels");
+    }
+    let (color, _) = reader.output_color_type();
+    let channels = match color {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => bail!("the PNG palette was not expanded"),
+    };
+
+    let out_width = width.min(max_width);
+    let out_height = ((u64::from(height) * u64::from(out_width) + u64::from(width) / 2)
+        / u64::from(width))
+    .max(1) as u32;
+    let mut scaler = BoxScaler::new(width, height, out_width, out_height, channels);
+
+    if reader.info().interlaced {
+        let mut frame = vec![0; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut frame)
+            .context("not a readable PNG")?;
+        for row in frame.chunks(info.line_size).take(height as usize) {
+            scaler.push_row(row);
+        }
+    } else {
+        while let Some(row) = reader.next_row().context("not a readable PNG")? {
+            scaler.push_row(row.data());
+        }
+    }
+    let pixels = scaler.finish();
+
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, out_width, out_height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .context("failed to encode the thumbnail")?;
+        writer
+            .write_image_data(&pixels)
+            .context("failed to encode the thumbnail")?;
+        writer.finish().context("failed to encode the thumbnail")?;
+    }
+    Ok(encoded)
+}
+
+/// A box filter fed one source row at a time, so the memory it needs is two
+/// rows of sums rather than the whole picture.
+struct BoxScaler {
+    channels: usize,
+    out_width: usize,
+    out_height: u32,
+    height: u32,
+    /// For each source column, the output column it falls into.
+    column_of: Vec<usize>,
+    sums: Vec<u64>,
+    counts: Vec<u64>,
+    current_out_row: u32,
+    source_row: u32,
+    pixels: Vec<u8>,
+}
+
+impl BoxScaler {
+    fn new(width: u32, height: u32, out_width: u32, out_height: u32, channels: usize) -> Self {
+        let column_of = (0..u64::from(width))
+            .map(|x| (x * u64::from(out_width) / u64::from(width)) as usize)
+            .collect();
+        Self {
+            channels,
+            out_width: out_width as usize,
+            out_height,
+            height,
+            column_of,
+            sums: vec![0; out_width as usize * 3],
+            counts: vec![0; out_width as usize],
+            current_out_row: 0,
+            source_row: 0,
+            pixels: Vec::with_capacity(out_width as usize * out_height as usize * 3),
+        }
+    }
+
+    fn push_row(&mut self, row: &[u8]) {
+        if self.source_row >= self.height {
+            return;
+        }
+        let out_row = (u64::from(self.source_row) * u64::from(self.out_height)
+            / u64::from(self.height)) as u32;
+        while self.current_out_row < out_row {
+            self.flush_row();
+        }
+
+        for (x, pixel) in row.chunks_exact(self.channels).enumerate() {
+            let Some(&column) = self.column_of.get(x) else {
+                break;
+            };
+            let rgb = match self.channels {
+                1 | 2 => [pixel[0]; 3],
+                _ => [pixel[0], pixel[1], pixel[2]],
+            };
+            for (channel, value) in rgb.into_iter().enumerate() {
+                self.sums[column * 3 + channel] += u64::from(value);
+            }
+            self.counts[column] += 1;
+        }
+        self.source_row += 1;
+    }
+
+    fn flush_row(&mut self) {
+        for column in 0..self.out_width {
+            let count = self.counts[column].max(1);
+            for channel in 0..3 {
+                let sum = self.sums[column * 3 + channel];
+                self.pixels.push(((sum + count / 2) / count) as u8);
+            }
+        }
+        self.sums.fill(0);
+        self.counts.fill(0);
+        self.current_out_row += 1;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        while self.current_out_row < self.out_height {
+            self.flush_row();
+        }
+        self.pixels
+    }
+}
+
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -411,6 +681,37 @@ pub fn list_screenshots_command(
         entries,
         trash_supported: trash_supported(),
     })
+}
+
+/// A thumbnail of one screenshot, off the main thread and a couple at a time
+/// (condivisi-7). The grid asks for one when it scrolls into view; the large
+/// preview asks for a wide one when the file is too big to send whole
+/// (condivisi-8).
+#[tauri::command]
+pub async fn screenshot_thumbnail_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    instance_name: String,
+    file_name: String,
+    max_width: u32,
+) -> Result<String, String> {
+    let root_dir = launcher_paths.root_dir().to_path_buf();
+    let _permit = THUMBNAIL_PERMITS
+        .acquire()
+        .await
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        screenshot_thumbnail(
+            &root_dir,
+            &modlist_name,
+            &instance_name,
+            &file_name,
+            max_width,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// `allow_permanent` is the confirmation the user actually saw: the dialog
@@ -442,18 +743,34 @@ pub fn open_screenshot_folder_command(
     instance_name: String,
     file_name: String,
 ) -> Result<(), String> {
-    let resolved = resolve_screenshot(
+    let folder = screenshot_folder(
         launcher_paths.root_dir(),
         &modlist_name,
         &instance_name,
         &file_name,
     )
     .map_err(|error| format!("{error:#}"))?;
+    open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
+}
+
+/// The folder the file manager opens for one screenshot.
+///
+/// The containment check runs on the canonical path, inside
+/// `resolve_screenshot`; the file manager gets the same path without the
+/// `\\?\` prefix Windows' `canonicalize` adds, which `cmd /c start` rejects
+/// (windows-3). `dunce::simplified` keeps the prefix only where the path
+/// cannot be spelled without it.
+fn screenshot_folder(
+    root_dir: &Path,
+    modlist_name: &str,
+    instance_name: &str,
+    file_name: &str,
+) -> Result<PathBuf> {
+    let resolved = resolve_screenshot(root_dir, modlist_name, instance_name, file_name)?;
     let folder = resolved
         .parent()
-        .ok_or_else(|| format!("'{file_name}' has no folder"))?
-        .to_path_buf();
-    open::that(&folder).map_err(|error| format!("failed to open {}: {error}", folder.display()))
+        .with_context(|| format!("'{file_name}' has no folder"))?;
+    Ok(dunce::simplified(folder).to_path_buf())
 }
 
 #[cfg(test)]
@@ -502,6 +819,157 @@ mod tests {
             )
             .expect("failed to set the screenshot mtime");
         path
+    }
+
+    #[test]
+    fn the_folder_for_the_file_manager_is_the_plain_form_of_the_screenshots_folder() {
+        let root = unique_root("open-folder");
+        write_screenshot(&root, "Drehmal", "1.20.1-forge", "a.png", 1_000);
+
+        let folder = screenshot_folder(&root, "Drehmal", "1.20.1-forge", "a.png")
+            .expect("the folder should resolve");
+
+        assert!(
+            !folder.to_string_lossy().starts_with(r"\\?\"),
+            "cmd /c start does not accept a verbatim path: {}",
+            folder.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&folder).unwrap(),
+            fs::canonicalize(screenshots_dir(&root, "Drehmal", "1.20.1-forge")).unwrap()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A real PNG, `width`×`height`, left half black and right half white.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for _ in 0..height {
+            for x in 0..width {
+                let value = if x < width / 2 { 0 } else { 255 };
+                pixels.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut reader = png::Decoder::new(bytes).read_info().unwrap();
+        let mut frame = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut frame).unwrap();
+        frame.truncate(info.buffer_size());
+        (info.width, info.height, frame)
+    }
+
+    fn decode_data_url(url: &str) -> Vec<u8> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        BASE64
+            .decode(url.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_thumbnail_is_a_smaller_png_with_the_same_picture() {
+        let thumbnail = downscale_png(png_bytes(64, 36).as_slice(), 16).unwrap();
+        let (width, height, pixels) = decode(&thumbnail);
+
+        assert_eq!((width, height), (16, 9));
+        // Left column black, right column white: the averaging did not smear
+        // the two halves into grey.
+        assert_eq!(&pixels[0..3], &[0, 0, 0]);
+        assert_eq!(&pixels[(15 * 3)..(16 * 3)], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn a_thumbnail_is_never_larger_than_the_screenshot() {
+        let thumbnail = downscale_png(png_bytes(8, 4).as_slice(), 480).unwrap();
+        assert_eq!(decode(&thumbnail).0, 8);
+    }
+
+    #[test]
+    fn a_thumbnail_is_made_once_and_then_read_from_the_cache() {
+        let root = unique_root("thumbnail-cache");
+        let path = write_screenshot(&root, "Drehmal", "1.20.1-forge", "a.png", 1_000);
+        fs::write(&path, png_bytes(40, 20)).unwrap();
+        let handle = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        handle
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_000)))
+            .unwrap();
+
+        let first = screenshot_thumbnail(&root, "Drehmal", "1.20.1-forge", "a.png", 10).unwrap();
+        assert_eq!(decode(&decode_data_url(&first)).0, 10);
+
+        let cache_dir = root.join("cache").join(THUMBNAILS_DIR);
+        let cached: Vec<_> = fs::read_dir(&cache_dir).unwrap().flatten().collect();
+        assert_eq!(cached.len(), 1, "one thumbnail on disk");
+        assert!(
+            !screenshots_dir(&root, "Drehmal", "1.20.1-forge")
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name() != "a.png"),
+            "nothing is written next to the user's screenshots"
+        );
+
+        // The cached copy is what comes back the second time.
+        fs::write(cached[0].path(), png_bytes(3, 3)).unwrap();
+        let second = screenshot_thumbnail(&root, "Drehmal", "1.20.1-forge", "a.png", 10).unwrap();
+        assert_eq!(decode(&decode_data_url(&second)).0, 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_screenshot_too_large_to_send_whole_still_gets_a_thumbnail() {
+        // condivisi-8: past 16 MB the full read refuses, and the preview stayed
+        // on «Loading…». The thumbnail has no such ceiling. Uncompressed rows
+        // make a real PNG of that size without a large picture.
+        let root = unique_root("thumbnail-large");
+        let path = write_screenshot(&root, "Drehmal", "1.20.1-forge", "big.png", 1_000);
+        let (width, height) = (2048u32, 2100u32);
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder.set_filter(png::FilterType::NoFilter);
+            let mut writer = encoder.write_header().unwrap();
+            let mut seed = 0x2545_f491_u32;
+            let pixels: Vec<u8> = (0..(width * height * 4))
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        fs::write(&path, &encoded).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MAX_WHOLE_BYTES);
+
+        let preview =
+            screenshot_thumbnail(&root, "Drehmal", "1.20.1-forge", "big.png", 512).unwrap();
+        assert_eq!(decode(&decode_data_url(&preview)).0, 512);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_thumbnail_is_refused_outside_the_screenshots_folders() {
+        let root = unique_root("thumbnail-escape");
+        write_screenshot(&root, "Drehmal", "1.20.1-forge", "a.png", 1_000);
+
+        assert!(screenshot_thumbnail(&root, "..", "1.20.1-forge", "a.png", 10).is_err());
+        assert!(screenshot_thumbnail(&root, "Drehmal", "1.20.1-forge", "../../a.png", 10).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

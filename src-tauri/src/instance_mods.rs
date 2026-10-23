@@ -123,7 +123,7 @@ pub fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
                 target_path.display()
             );
         }
-        fs::remove_file(target_path)
+        crate::instance_content::remove_symlink(target_path)
             .with_context(|| format!("failed to remove existing link {}", target_path.display()))?;
     }
 

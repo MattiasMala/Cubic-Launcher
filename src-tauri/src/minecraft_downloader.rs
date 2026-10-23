@@ -3,14 +3,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use tokio::task::JoinSet;
 
 use crate::launcher_paths::LauncherPaths;
 use crate::path_safety::{contained_join, validate_path_component};
 
-const VERSION_MANIFEST_URL: &str =
+/// Mojang's version manifest: the launch reads it here, the version list in
+/// `minecraft_versions`.
+pub(crate) const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const MC_ASSETS_BASE_URL: &str = "https://resources.download.minecraft.net";
 
@@ -48,7 +50,34 @@ pub struct MinecraftVersionData {
     /// Pre-1.13 versions, which carry a flat `minecraft_arguments` string,
     /// come out `false` — Quick Play arrived in 1.20.
     pub supports_quick_play_singleplayer: bool,
+    /// The Java major the version.json declares (`javaVersion.majorVersion`),
+    /// when it declares one. It is the only source that also knows snapshots,
+    /// pre-releases and release candidates (download-3).
+    pub java_major_version: Option<u32>,
 }
+
+/// Whether [`ensure_minecraft_version`] may download what the cache lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinecraftCachePolicy {
+    /// Download whatever is missing or does not match its hash.
+    Download,
+    /// D142: the active account plays offline. Everything must already be in
+    /// the cache, and nothing is requested (D132); what is missing stops the
+    /// launch with an error that says so.
+    CacheOnly,
+}
+
+/// A file a cache-only launch needs and does not find (D142).
+#[derive(Debug)]
+struct MissingFromCache(String);
+
+impl std::fmt::Display for MissingFromCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} is not in the cache", self.0)
+    }
+}
+
+impl std::error::Error for MissingFromCache {}
 
 // ── Mojang API serde structs ──────────────────────────────────────────────────
 
@@ -61,8 +90,6 @@ struct VersionManifest {
 struct VersionManifestEntry {
     id: String,
     url: String,
-    #[serde(rename = "type")]
-    version_type: String,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +106,42 @@ struct VersionJson {
     asset_index: AssetIndexRef,
     /// Asset index short ID (e.g. `"17"`).
     assets: String,
+    /// The Java the version runs on. Mojang declares it for every version,
+    /// snapshots included; a hand-made version.json may not.
+    #[serde(default)]
+    java_version: Option<JavaVersionRef>,
+    /// The log4j configuration of the client (download-1).
+    #[serde(default)]
+    logging: Option<VersionLogging>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JavaVersionRef {
+    major_version: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct VersionLogging {
+    #[serde(default)]
+    client: Option<LoggingClient>,
+}
+
+/// `logging.client`: the JVM argument (`-Dlog4j.configurationFile=${path}`)
+/// and the file it points to. It is how Mojang fixed Log4Shell for the
+/// versions with a log4j older than 2.15 (1.7–1.18.0): the file filters
+/// `${...}` lookups out of every message.
+#[derive(Deserialize)]
+struct LoggingClient {
+    argument: String,
+    file: LoggingFile,
+}
+
+#[derive(Deserialize)]
+struct LoggingFile {
+    id: String,
+    sha1: String,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -329,61 +392,6 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
     Ok(())
 }
 
-// ── Version list ──────────────────────────────────────────────────────────────
-
-/// Returns `true` if `client.jar` for the given version is already in the cache.
-pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool {
-    launcher_paths
-        .mc_version_dir(version)
-        .join("client.jar")
-        .exists()
-}
-
-// ── Tauri commands ────────────────────────────────────────────────────────────
-
-/// Payload returned to the frontend with releases and releases+snapshots lists.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MinecraftVersionsPayload {
-    pub releases: Vec<String>,
-    pub with_snapshots: Vec<String>,
-}
-
-/// Returns Minecraft versions for the UI dropdown, split into releases and releases+snapshots.
-#[tauri::command]
-pub async fn fetch_minecraft_versions_command() -> Result<MinecraftVersionsPayload, String> {
-    let http_client = reqwest::Client::new();
-    let manifest: VersionManifest = http_client
-        .get(VERSION_MANIFEST_URL)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let releases: Vec<String> = manifest
-        .versions
-        .iter()
-        .filter(|v| v.version_type == "release")
-        .map(|v| v.id.clone())
-        .collect();
-
-    let with_snapshots: Vec<String> = manifest
-        .versions
-        .iter()
-        .filter(|v| v.version_type == "release" || v.version_type == "snapshot")
-        .map(|v| v.id.clone())
-        .collect();
-
-    Ok(MinecraftVersionsPayload {
-        releases,
-        with_snapshots,
-    })
-}
-
 // ── Main public function ──────────────────────────────────────────────────────
 
 /// Ensures all Minecraft files for `minecraft_version` are present in the shared
@@ -391,11 +399,44 @@ pub async fn fetch_minecraft_versions_command() -> Result<MinecraftVersionsPaylo
 ///
 /// Returns a `MinecraftVersionData` describing all paths and arguments needed for
 /// a launch. Safe to call on every launch — skips files whose SHA1 already matches.
+///
+/// With [`MinecraftCachePolicy::CacheOnly`] nothing is requested: a file that
+/// is missing or does not match its hash stops the launch with an error that
+/// names the version and the cause (D142).
 pub async fn ensure_minecraft_version(
     http_client: &reqwest::Client,
     minecraft_version: &str,
     launcher_paths: &LauncherPaths,
+    policy: MinecraftCachePolicy,
     on_progress: impl Fn(&str, &str),
+) -> Result<MinecraftVersionData> {
+    let result = ensure_minecraft_version_files(
+        http_client,
+        minecraft_version,
+        launcher_paths,
+        policy,
+        &on_progress,
+    )
+    .await;
+    match result {
+        Err(error) if policy == MinecraftCachePolicy::CacheOnly => {
+            match error.downcast_ref::<MissingFromCache>() {
+                Some(missing) => Err(anyhow::anyhow!(
+                    "Minecraft {minecraft_version} has never been downloaded completely on this computer ({missing}), and the active account plays offline, so nothing is downloaded. Play this version once with the account online (switch the account to online for one launch); after that it plays offline too."
+                )),
+                None => Err(error),
+            }
+        }
+        result => result,
+    }
+}
+
+async fn ensure_minecraft_version_files(
+    http_client: &reqwest::Client,
+    minecraft_version: &str,
+    launcher_paths: &LauncherPaths,
+    policy: MinecraftCachePolicy,
+    on_progress: &impl Fn(&str, &str),
 ) -> Result<MinecraftVersionData> {
     let version_dir = launcher_paths.mc_version_dir(minecraft_version);
     let libraries_dir = launcher_paths.mc_libraries_dir();
@@ -408,16 +449,24 @@ pub async fn ensure_minecraft_version(
 
     // 1+2. The version JSON, from the cache when it is there.
     on_progress("Fetch version metadata", minecraft_version);
-    let version_json = load_version_json(http_client, minecraft_version, &version_dir).await?;
+    let version_json = load_version_json(
+        http_client,
+        minecraft_version,
+        &version_dir,
+        policy,
+        on_progress,
+    )
+    .await?;
 
     // 3. Ensure client JAR.
     on_progress("Ensure client JAR", minecraft_version);
-    let client_jar_path = ensure_client_jar(http_client, &version_json, &version_dir).await?;
+    let client_jar_path =
+        ensure_client_jar(http_client, &version_json, &version_dir, policy).await?;
 
     // 4. Ensure libraries.
     on_progress("Ensure libraries", minecraft_version);
     let (library_paths, native_paths) =
-        ensure_libraries(http_client, &version_json, &libraries_dir, &on_progress).await?;
+        ensure_libraries(http_client, &version_json, &libraries_dir, policy).await?;
 
     // 5. Ensure assets. Legacy indexes (<=1.7.2) are "virtual": the game reads
     //    real filenames from a materialized tree rather than the hashed object
@@ -428,14 +477,20 @@ pub async fn ensure_minecraft_version(
         &version_json,
         &assets_dir,
         &version_json.assets,
-        &on_progress,
+        policy,
+        on_progress,
     )
     .await?;
 
-    // 6. Extract arguments. `game_arguments` is unfiltered on purpose (the
+    // 6. The log4j configuration of `logging.client` (download-1).
+    let logging_arguments =
+        ensure_logging_config(http_client, &version_json, &assets_dir, policy, on_progress).await?;
+
+    // 7. Extract arguments. `game_arguments` is unfiltered on purpose (the
     //    launch strips the feature-gated entries later), which is also what
     //    makes it the honest place to read Quick Play support from.
-    let (game_arguments, jvm_arguments) = extract_arguments(&version_json);
+    let (game_arguments, mut jvm_arguments) = extract_arguments(&version_json);
+    jvm_arguments.extend(logging_arguments);
     let supports_quick_play_singleplayer = declares_quick_play_singleplayer(&game_arguments);
 
     Ok(MinecraftVersionData {
@@ -449,10 +504,34 @@ pub async fn ensure_minecraft_version(
         game_arguments,
         jvm_arguments,
         supports_quick_play_singleplayer,
+        java_major_version: version_json
+            .java_version
+            .map(|java_version| java_version.major_version),
     })
 }
 
 // ── Internal steps ────────────────────────────────────────────────────────────
+
+/// `dest` with the hash `expected_sha1`: downloaded when the policy allows
+/// it, otherwise it must already be there.
+async fn ensure_verified_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    expected_sha1: &str,
+    policy: MinecraftCachePolicy,
+    description: &str,
+) -> Result<()> {
+    match policy {
+        MinecraftCachePolicy::Download => {
+            download_file_verified(client, url, dest, expected_sha1).await
+        }
+        MinecraftCachePolicy::CacheOnly if file_matches_sha1(dest, expected_sha1) => Ok(()),
+        MinecraftCachePolicy::CacheOnly => {
+            Err(MissingFromCache(format!("{description} {}", dest.display())).into())
+        }
+    }
+}
 
 /// Il `version.json` di `minecraft_version`, da `version_dir` quando è in cache.
 ///
@@ -463,17 +542,40 @@ pub async fn ensure_minecraft_version(
 /// misurato (report 098, S1). Una strada sola per tutti gli account, non un
 /// ramo offline: il lancio online perde una richiesta di cui non leggeva il
 /// risultato.
+///
+/// Un `version.json` in cache che non si legge si riscarica (069 M2): prima
+/// l'errore di parse tornava a ogni lancio, e quella versione non partiva più
+/// finché qualcuno non cancellava il file a mano. Offline (D142) lo stesso
+/// caso è un errore che lo dice, senza richieste.
 async fn load_version_json(
     http_client: &reqwest::Client,
     minecraft_version: &str,
     version_dir: &Path,
+    policy: MinecraftCachePolicy,
+    on_progress: &impl Fn(&str, &str),
 ) -> Result<VersionJson> {
     let cached_path = version_dir.join("version.json");
     if cached_path.exists() {
-        let contents = std::fs::read_to_string(&cached_path)
-            .with_context(|| format!("failed to read {}", cached_path.display()))?;
-        return serde_json::from_str::<VersionJson>(&contents)
-            .with_context(|| format!("failed to parse cached {}", cached_path.display()));
+        let damage = match std::fs::read_to_string(&cached_path) {
+            Ok(contents) => match serde_json::from_str::<VersionJson>(&contents) {
+                Ok(version_json) => return Ok(version_json),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
+        };
+        if policy == MinecraftCachePolicy::CacheOnly {
+            return Err(MissingFromCache(format!(
+                "a readable version.json (the cached {} is damaged: {damage})",
+                cached_path.display()
+            ))
+            .into());
+        }
+        on_progress(
+            "Cached version metadata is damaged, downloading it again",
+            &format!("{}: {damage}", cached_path.display()),
+        );
+    } else if policy == MinecraftCachePolicy::CacheOnly {
+        return Err(MissingFromCache(format!("{}", cached_path.display())).into());
     }
 
     let version_url = fetch_version_url(http_client, minecraft_version).await?;
@@ -532,10 +634,11 @@ async fn ensure_client_jar(
     client: &reqwest::Client,
     version_json: &VersionJson,
     version_dir: &Path,
+    policy: MinecraftCachePolicy,
 ) -> Result<PathBuf> {
     let dest = version_dir.join("client.jar");
     let dl = &version_json.downloads.client;
-    download_file_verified(client, &dl.url, &dest, &dl.sha1).await?;
+    ensure_verified_file(client, &dl.url, &dest, &dl.sha1, policy, "the client jar").await?;
     Ok(dest)
 }
 
@@ -543,7 +646,7 @@ async fn ensure_libraries(
     client: &reqwest::Client,
     version_json: &VersionJson,
     libraries_dir: &Path,
-    _on_progress: &impl Fn(&str, &str),
+    policy: MinecraftCachePolicy,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let os_key = current_os_natives_key();
     let mut library_paths = Vec::new();
@@ -564,7 +667,15 @@ async fn ensure_libraries(
         if let Some(artifact) = &downloads.artifact {
             if let Some(path) = &artifact.path {
                 let dest = contained_join(libraries_dir, path)?;
-                download_file_verified(client, &artifact.url, &dest, &artifact.sha1).await?;
+                ensure_verified_file(
+                    client,
+                    &artifact.url,
+                    &dest,
+                    &artifact.sha1,
+                    policy,
+                    "the library",
+                )
+                .await?;
                 library_paths.push(dest);
             }
         }
@@ -575,11 +686,13 @@ async fn ensure_libraries(
                 if let Some(native_artifact) = classifiers.get(native_key.as_str()) {
                     if let Some(path) = &native_artifact.path {
                         let dest = contained_join(libraries_dir, path)?;
-                        download_file_verified(
+                        ensure_verified_file(
                             client,
                             &native_artifact.url,
                             &dest,
                             &native_artifact.sha1,
+                            policy,
+                            "the native library",
                         )
                         .await?;
                         native_paths.push(dest);
@@ -597,6 +710,7 @@ async fn ensure_assets(
     version_json: &VersionJson,
     assets_dir: &Path,
     asset_index_id: &str,
+    policy: MinecraftCachePolicy,
     on_progress: &impl Fn(&str, &str),
 ) -> Result<bool> {
     let indexes_dir = assets_dir.join("indexes");
@@ -609,7 +723,15 @@ async fn ensure_assets(
     // Download asset index JSON.
     let index_ref = &version_json.asset_index;
     let index_path = indexes_dir.join(format!("{}.json", index_ref.id));
-    download_file_verified(client, &index_ref.url, &index_path, &index_ref.sha1).await?;
+    ensure_verified_file(
+        client,
+        &index_ref.url,
+        &index_path,
+        &index_ref.sha1,
+        policy,
+        "the asset index",
+    )
+    .await?;
 
     // Parse asset index.
     let index_contents = std::fs::read_to_string(&index_path)
@@ -619,6 +741,15 @@ async fn ensure_assets(
     let is_virtual = asset_index.is_virtual;
 
     let to_download = missing_asset_hashes(&asset_index, &objects_dir)?;
+    if policy == MinecraftCachePolicy::CacheOnly && !to_download.is_empty() {
+        return Err(MissingFromCache(format!(
+            "{} of the {} asset objects of index '{}'",
+            to_download.len(),
+            asset_index.objects.len(),
+            index_ref.id
+        ))
+        .into());
+    }
 
     if !to_download.is_empty() {
         on_progress(
@@ -722,6 +853,115 @@ fn materialize_virtual_assets(
     Ok(())
 }
 
+/// Mojang's two client log4j configurations, the only ones `logging.client`
+/// has ever named: `client-1.7.xml` (1.7–1.11) and `client-1.12.xml` (1.12
+/// on). Shipped in the binary so that an offline launch of a version whose
+/// file was never downloaded is still protected (review-lancio-2). Matched by
+/// the SHA-1 the version.json declares, never by name.
+const EMBEDDED_LOG_CONFIGS: [&[u8]; 2] = [
+    include_bytes!("../assets/log_configs/client-1.7.xml"),
+    include_bytes!("../assets/log_configs/client-1.12.xml"),
+];
+
+/// Turns off message lookups in log4j 2.10+ (1.17–1.18.0): the second fence,
+/// for when the configuration file is not there. Older log4j ignores it.
+const LOG4J_NO_LOOKUPS_ARGUMENT: &str = "-Dlog4j2.formatMsgNoLookups=true";
+
+fn embedded_log_config(expected_sha1: &str) -> Option<&'static [u8]> {
+    EMBEDDED_LOG_CONFIGS.into_iter().find(|bytes| {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_sha1)
+    })
+}
+
+/// The JVM arguments of `logging.client` (download-1): the configuration file
+/// in the cache, plus `-Dlog4j2.formatMsgNoLookups=true`. Empty when the
+/// version declares no `logging.client`.
+///
+/// The file goes to `assets/log_configs/<id>`, shared by every version that
+/// names the same id (the official launcher's layout), downloaded with its
+/// SHA-1. Offline (D142) nothing is requested: a file that is not there yet is
+/// written from the copy in the binary when the SHA-1 matches. Only a file
+/// Mojang has never published goes without, said in the log, and the launch
+/// still carries the no-lookups switch.
+async fn ensure_logging_config(
+    client: &reqwest::Client,
+    version_json: &VersionJson,
+    assets_dir: &Path,
+    policy: MinecraftCachePolicy,
+    on_progress: &impl Fn(&str, &str),
+) -> Result<Vec<String>> {
+    let Some(logging) = version_json
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.client.as_ref())
+    else {
+        return Ok(Vec::new());
+    };
+    let config_path = log_config_path(assets_dir, &logging.file.id)?;
+    let no_lookups = LOG4J_NO_LOOKUPS_ARGUMENT.to_string();
+
+    match policy {
+        MinecraftCachePolicy::Download => {
+            on_progress("Ensure logging configuration", &logging.file.id);
+            download_file_verified(client, &logging.file.url, &config_path, &logging.file.sha1)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to download the log4j configuration '{}'",
+                        logging.file.id
+                    )
+                })?;
+        }
+        MinecraftCachePolicy::CacheOnly => {
+            if !file_matches_sha1(&config_path, &logging.file.sha1) {
+                let Some(bytes) = embedded_log_config(&logging.file.sha1) else {
+                    on_progress(
+                        "Logging configuration not in the cache",
+                        &format!(
+                            "'{}' is not downloaded while the account plays offline and is not one the launcher carries; this launch runs without Mojang's log4j configuration, with message lookups turned off, until the next online launch",
+                            logging.file.id
+                        ),
+                    );
+                    return Ok(vec![no_lookups]);
+                };
+                if let Some(parent) = config_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create {}", parent.display()))?;
+                }
+                crate::atomic_write::write_atomically(&config_path, bytes)
+                    .with_context(|| format!("failed to write {}", config_path.display()))?;
+                on_progress(
+                    "Logging configuration from the launcher",
+                    &format!(
+                        "'{}' was not downloaded yet; the copy the launcher carries is used",
+                        logging.file.id
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(vec![
+        logging_jvm_argument(&logging.argument, &config_path),
+        no_lookups,
+    ])
+}
+
+/// Where the configuration file `file_id` of `logging.client` lives.
+fn log_config_path(assets_dir: &Path, file_id: &str) -> Result<PathBuf> {
+    validate_path_component(file_id)
+        .with_context(|| format!("invalid log4j configuration id '{file_id}'"))?;
+    Ok(assets_dir.join("log_configs").join(file_id))
+}
+
+/// `logging.client.argument` with `${path}` replaced by the file. One argv
+/// entry: the path is never split or quoted, spaces included.
+fn logging_jvm_argument(argument: &str, config_path: &Path) -> String {
+    argument.replace("${path}", &config_path.to_string_lossy())
+}
+
 fn extract_arguments(version_json: &VersionJson) -> (Vec<String>, Vec<String>) {
     if let Some(arguments) = &version_json.arguments {
         let game = flatten_args(&arguments.game, false);
@@ -769,10 +1009,18 @@ fn flatten_args(entries: &[ArgEntry], filter_by_os: bool) -> Vec<String> {
 }
 
 /// Extract native JARs into the instance `natives/` directory.
+///
+/// Every file is checked against the jar on every launch: one whose bytes
+/// differ (a kill during the extraction left it truncated, or another
+/// version of the library wrote it) is written again, atomically, so a kill
+/// in the middle never leaves a half native that a later launch would keep
+/// (todo.md:1519). Within one extraction the first jar that carries a name
+/// wins, as before.
 pub fn extract_natives(native_paths: &[PathBuf], natives_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(natives_dir)
         .with_context(|| format!("failed to create natives dir {}", natives_dir.display()))?;
 
+    let mut extracted = std::collections::HashSet::new();
     for jar_path in native_paths {
         let file = std::fs::File::open(jar_path)
             .with_context(|| format!("failed to open native JAR {}", jar_path.display()))?;
@@ -795,22 +1043,35 @@ pub fn extract_natives(native_paths: &[PathBuf], natives_dir: &Path) -> Result<(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or(name.clone());
-
-            let dest = natives_dir.join(&file_name);
-            if dest.exists() {
+            if !extracted.insert(file_name.clone()) {
                 continue;
             }
 
+            let dest = natives_dir.join(&file_name);
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
                 .with_context(|| format!("failed to read entry '{name}' from ZIP"))?;
-            std::fs::write(&dest, &buf)
+            if native_is_current(&dest, &buf) {
+                continue;
+            }
+            crate::atomic_write::write_atomically(&dest, &buf)
                 .with_context(|| format!("failed to write native {}", dest.display()))?;
         }
     }
 
     Ok(())
+}
+
+/// Whether `dest` already holds exactly `expected`: the size first, which
+/// settles a truncated file without reading it.
+fn native_is_current(dest: &Path, expected: &[u8]) -> bool {
+    match std::fs::metadata(dest) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == expected.len() as u64 => {
+            std::fs::read(dest).is_ok_and(|current| current == expected)
+        }
+        _ => false,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1057,12 +1318,457 @@ mod tests {
             .build()
             .expect("client");
 
-        let version_json = load_version_json(&unreachable_manifest, "1.20.1", &root)
-            .await
-            .expect("the cached version.json must be enough, with no manifest");
+        let version_json = load_version_json(
+            &unreachable_manifest,
+            "1.20.1",
+            &root,
+            MinecraftCachePolicy::Download,
+            &|_, _| {},
+        )
+        .await
+        .expect("the cached version.json must be enough, with no manifest");
 
         assert_eq!(version_json.main_class, "net.minecraft.client.main.Main");
         assert_eq!(version_json.assets, "5");
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// A client whose every request goes to a listener nobody answers, and
+    /// the listener itself: after the call, `accept` says whether anyone
+    /// knocked. Zero requests is then something measured, not assumed.
+    fn counting_offline_client() -> (reqwest::Client, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("address").port();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).expect("proxy"))
+            .build()
+            .expect("client");
+        (client, listener)
+    }
+
+    fn no_request_reached(listener: &TcpListener) -> bool {
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        )
+    }
+
+    /// The shape of 1.12.2's version.json, cut to what the launch reads.
+    fn version_json_1_12_2(client_sha1: &str, index_sha1: &str, log_sha1: &str) -> String {
+        format!(
+            r#"{{
+              "mainClass": "net.minecraft.client.main.Main",
+              "downloads": {{ "client": {{ "url": "https://example.invalid/client.jar", "sha1": "{client_sha1}" }} }},
+              "libraries": [],
+              "assetIndex": {{ "id": "1.12", "url": "https://example.invalid/1.12.json", "sha1": "{index_sha1}" }},
+              "assets": "1.12",
+              "javaVersion": {{ "component": "jre-legacy", "majorVersion": 8 }},
+              "logging": {{ "client": {{
+                "argument": "-Dlog4j.configurationFile=${{path}}",
+                "file": {{ "id": "client-1.12.xml", "sha1": "{log_sha1}", "size": 888,
+                          "url": "https://example.invalid/client-1.12.xml" }},
+                "type": "log4j2-xml" }} }},
+              "minecraftArguments": "--username ${{auth_player_name}} --version ${{version_name}}"
+            }}"#
+        )
+    }
+
+    /// download-1: `logging.client` si legge, e l'argomento JVM porta il
+    /// percorso del file in cache al posto di `${path}`; download-3: anche
+    /// `javaVersion.majorVersion`.
+    #[test]
+    fn logging_block_and_java_major_are_read_from_the_version_json() {
+        let version_json: VersionJson = serde_json::from_str(&version_json_1_12_2(
+            "00",
+            "00",
+            "bd65e7d2e3c237be76cfbef4c2405033d7f91521",
+        ))
+        .expect("the 1.12.2 shape should deserialize");
+        let logging = version_json
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+            .expect("logging.client");
+        assert_eq!(logging.file.id, "client-1.12.xml");
+        assert_eq!(
+            version_json
+                .java_version
+                .as_ref()
+                .map(|java| java.major_version),
+            Some(8)
+        );
+
+        let assets_dir = Path::new("/launcher/cache/minecraft/assets");
+        let config_path = log_config_path(assets_dir, &logging.file.id).expect("a plain id");
+        assert_eq!(
+            config_path,
+            assets_dir.join("log_configs").join("client-1.12.xml")
+        );
+        assert_eq!(
+            logging_jvm_argument(&logging.argument, &config_path),
+            format!("-Dlog4j.configurationFile={}", config_path.display())
+        );
+        // A path with spaces stays one argument.
+        assert_eq!(
+            logging_jvm_argument(&logging.argument, Path::new("/My Games/client-1.12.xml")),
+            "-Dlog4j.configurationFile=/My Games/client-1.12.xml"
+        );
+
+        // Versions with no block, or an empty one, get no argument.
+        let bare: VersionJson = serde_json::from_str(
+            r#"{
+              "mainClass": "net.minecraft.client.Minecraft",
+              "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "00" } },
+              "libraries": [],
+              "assetIndex": { "id": "legacy", "url": "https://example.invalid/legacy.json", "sha1": "00" },
+              "assets": "legacy",
+              "logging": {}
+            }"#,
+        )
+        .expect("an empty logging block should deserialize");
+        assert!(bare.logging.and_then(|logging| logging.client).is_none());
+        assert!(bare.java_version.is_none());
+    }
+
+    #[test]
+    fn a_log_config_id_cannot_leave_the_log_configs_folder() {
+        let assets_dir = Path::new("/launcher/cache/minecraft/assets");
+        assert!(log_config_path(assets_dir, "../../evil.xml").is_err());
+        assert!(log_config_path(assets_dir, "nested/evil.xml").is_err());
+    }
+
+    /// Lays out a complete cache for the 1.12.2-shaped version: version.json,
+    /// client jar, asset index with one object, and (optionally) the log
+    /// configuration.
+    fn complete_cache(root: &Path, with_log_config: bool) -> LauncherPaths {
+        let paths = LauncherPaths::new(root);
+        let version_dir = paths.mc_version_dir("1.12.2");
+        let assets_dir = paths.mc_assets_dir();
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::create_dir_all(assets_dir.join("indexes")).expect("indexes");
+
+        let client_jar = b"client jar bytes";
+        fs::write(version_dir.join("client.jar"), client_jar).expect("client jar");
+        let object = b"an asset";
+        let object_hash = sha1_hex(object);
+        let object_path = assets_dir
+            .join("objects")
+            .join(&object_hash[..2])
+            .join(&object_hash);
+        fs::create_dir_all(object_path.parent().expect("object folder")).expect("object folder");
+        fs::write(&object_path, object).expect("object");
+        let index = format!(
+            r#"{{ "objects": {{ "minecraft/sounds/a.ogg": {{ "hash": "{object_hash}" }} }} }}"#
+        );
+        fs::write(assets_dir.join("indexes").join("1.12.json"), &index).expect("index");
+        let log_config = b"<Configuration/>";
+        if with_log_config {
+            fs::create_dir_all(assets_dir.join("log_configs")).expect("log configs");
+            fs::write(
+                assets_dir.join("log_configs").join("client-1.12.xml"),
+                log_config,
+            )
+            .expect("log config");
+        }
+        fs::write(
+            version_dir.join("version.json"),
+            version_json_1_12_2(
+                &sha1_hex(client_jar),
+                &sha1_hex(index.as_bytes()),
+                &sha1_hex(log_config),
+            ),
+        )
+        .expect("version.json");
+        paths
+    }
+
+    /// D142: offline, una versione tutta in cache parte senza una richiesta, e
+    /// porta l'argomento di log4j (download-1).
+    #[tokio::test]
+    async fn cache_only_launches_a_complete_cache_with_zero_requests() {
+        let root = scratch_root("cache-only-complete");
+        let paths = complete_cache(&root, true);
+        let (client, listener) = counting_offline_client();
+
+        let data = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &paths,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect("everything is in the cache");
+
+        assert!(
+            no_request_reached(&listener),
+            "a cache-only launch made a request"
+        );
+        assert_eq!(data.java_major_version, Some(8));
+        let config_path = paths
+            .mc_assets_dir()
+            .join("log_configs")
+            .join("client-1.12.xml");
+        assert!(data.jvm_arguments.contains(&format!(
+            "-Dlog4j.configurationFile={}",
+            config_path.display()
+        )));
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// Offline, la configurazione di log4j che manca non si scarica e non
+    /// ferma il lancio: si parte senza, e il log lo dice.
+    #[tokio::test]
+    async fn cache_only_without_the_log_config_goes_on_and_says_so() {
+        let root = scratch_root("cache-only-no-log-config");
+        let paths = complete_cache(&root, false);
+        let (client, listener) = counting_offline_client();
+        let notes = std::sync::Mutex::new(Vec::<String>::new());
+
+        let data = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &paths,
+            MinecraftCachePolicy::CacheOnly,
+            |label, detail| notes.lock().unwrap().push(format!("{label}: {detail}")),
+        )
+        .await
+        .expect("the log config is not required offline");
+
+        assert!(no_request_reached(&listener));
+        assert!(!data
+            .jvm_arguments
+            .iter()
+            .any(|argument| argument.starts_with("-Dlog4j.configurationFile=")));
+        // review-lancio-2: never without a fence.
+        assert!(data
+            .jvm_arguments
+            .contains(&LOG4J_NO_LOOKUPS_ARGUMENT.to_string()));
+        assert!(notes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|note| note.contains("client-1.12.xml") && note.contains("offline")));
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// review-lancio-2: offline, the real Mojang file that was never downloaded
+    /// comes from the copy in the binary, with no request, and the launch
+    /// carries it.
+    #[tokio::test]
+    async fn cache_only_writes_the_embedded_log_config_when_its_sha1_matches() {
+        let root = scratch_root("cache-only-embedded-log-config");
+        let paths = complete_cache(&root, false);
+        let version_json_path = paths.mc_version_dir("1.12.2").join("version.json");
+        let mojang = include_bytes!("../assets/log_configs/client-1.12.xml");
+        assert_eq!(sha1_hex(mojang), "bd65e7d2e3c237be76cfbef4c2405033d7f91521");
+        assert_eq!(
+            sha1_hex(include_bytes!("../assets/log_configs/client-1.7.xml")),
+            "50c9cc4af6d853d9fc137c84bcd153e2bd3a9a82"
+        );
+        let rewritten = fs::read_to_string(&version_json_path)
+            .expect("version.json")
+            .replace(&sha1_hex(b"<Configuration/>"), &sha1_hex(mojang));
+        fs::write(&version_json_path, rewritten).expect("version.json");
+        let (client, listener) = counting_offline_client();
+
+        let data = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &paths,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect("the embedded copy is enough");
+
+        assert!(no_request_reached(&listener));
+        let config_path = paths
+            .mc_assets_dir()
+            .join("log_configs")
+            .join("client-1.12.xml");
+        assert_eq!(fs::read(&config_path).expect("written"), mojang);
+        assert!(data.jvm_arguments.contains(&format!(
+            "-Dlog4j.configurationFile={}",
+            config_path.display()
+        )));
+        assert!(data
+            .jvm_arguments
+            .contains(&LOG4J_NO_LOOKUPS_ARGUMENT.to_string()));
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// D142: offline, una versione mai scaricata (o a metà) è un errore chiaro
+    /// nello stile di D-d, e nessuna richiesta parte.
+    #[tokio::test]
+    async fn cache_only_with_something_missing_is_a_clear_error_and_no_request() {
+        let root = scratch_root("cache-only-missing");
+        let (client, listener) = counting_offline_client();
+
+        // Mai scaricata: niente version.json.
+        let never = LauncherPaths::new(root.join("never"));
+        let message = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &never,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect_err("nothing is cached")
+        .to_string();
+        assert!(
+            message.contains("Minecraft 1.12.2 has never been downloaded"),
+            "{message}"
+        );
+        assert!(message.contains("plays offline"), "{message}");
+
+        // A metà: un oggetto degli asset manca.
+        let half = complete_cache(&root.join("half"), true);
+        fs::remove_dir_all(half.mc_assets_dir().join("objects")).expect("drop objects");
+        let message = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &half,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect_err("an asset object is missing")
+        .to_string();
+        assert!(message.contains("asset objects"), "{message}");
+        assert!(message.contains("plays offline"), "{message}");
+
+        // Client jar che non corrisponde al suo hash.
+        let damaged = complete_cache(&root.join("damaged"), true);
+        fs::write(
+            damaged.mc_version_dir("1.12.2").join("client.jar"),
+            b"truncated",
+        )
+        .expect("damage the jar");
+        let message = ensure_minecraft_version(
+            &client,
+            "1.12.2",
+            &damaged,
+            MinecraftCachePolicy::CacheOnly,
+            |_, _| {},
+        )
+        .await
+        .expect_err("the client jar does not match")
+        .to_string();
+        assert!(message.contains("client jar"), "{message}");
+
+        assert!(
+            no_request_reached(&listener),
+            "a cache-only launch made a request"
+        );
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    /// 069 M2: un version.json in cache che non si legge non ferma più quella
+    /// versione per sempre. Online si torna al manifest per riscaricarlo (qui
+    /// il manifest non risponde, e l'errore è quello del manifest, non il parse
+    /// di prima); offline è un errore che dice che il file è rovinato.
+    #[tokio::test]
+    async fn a_damaged_cached_version_json_is_downloaded_again_online_only() {
+        let root = scratch_root("damaged-version-json");
+        fs::write(root.join("version.json"), b"{ truncated").expect("damaged version.json");
+        let (client, listener) = counting_offline_client();
+
+        let offline = load_version_json(
+            &client,
+            "1.20.1",
+            &root,
+            MinecraftCachePolicy::CacheOnly,
+            &|_, _| {},
+        )
+        .await
+        .err()
+        .expect("offline, a damaged version.json is an error");
+        assert!(offline.downcast_ref::<MissingFromCache>().is_some());
+        assert!(offline.to_string().contains("damaged"), "{offline}");
+        assert!(no_request_reached(&listener));
+
+        // Online the request is wanted: a proxy port that refuses it at once,
+        // so the test does not wait on a listener that never answers.
+        let refusing_port = TcpListener::bind("127.0.0.1:0")
+            .expect("port")
+            .local_addr()
+            .expect("address")
+            .port();
+        let refused = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{refusing_port}")).expect("proxy"))
+            .build()
+            .expect("client");
+        let online = load_version_json(
+            &refused,
+            "1.20.1",
+            &root,
+            MinecraftCachePolicy::Download,
+            &|_, _| {},
+        )
+        .await
+        .err()
+        .expect("the manifest does not answer here");
+        assert!(
+            format!("{online:#}").contains("version manifest"),
+            "online must go back to the manifest, got: {online:#}"
+        );
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    fn native_jar(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).expect("native jar");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("entry");
+            zip.write_all(bytes).expect("entry bytes");
+        }
+        zip.finish().expect("jar");
+    }
+
+    /// todo.md:1519: un nativo troncato da un kill si riestrae, invece di
+    /// restare troncato per sempre perché il nome esiste già; il primo jar
+    /// che porta un nome vince ancora.
+    #[test]
+    fn a_truncated_native_is_extracted_again() {
+        let root = scratch_root("natives");
+        let natives_dir = root.join("natives");
+        fs::create_dir_all(&natives_dir).expect("natives dir");
+        let first = root.join("lwjgl-natives.jar");
+        let second = root.join("other-natives.jar");
+        native_jar(
+            &first,
+            &[
+                ("liblwjgl.so", b"the whole native library"),
+                ("META-INF/MANIFEST.MF", b"manifest"),
+                ("libopenal.so", b"openal"),
+            ],
+        );
+        native_jar(&second, &[("liblwjgl.so", b"another version")]);
+        fs::write(natives_dir.join("liblwjgl.so"), b"the whole").expect("truncated native");
+        fs::write(natives_dir.join("libopenal.so"), b"openal").expect("current native");
+
+        extract_natives(&[first, second], &natives_dir).expect("extraction");
+
+        assert_eq!(
+            fs::read(natives_dir.join("liblwjgl.so")).expect("native"),
+            b"the whole native library"
+        );
+        assert_eq!(
+            fs::read(natives_dir.join("libopenal.so")).expect("native"),
+            b"openal"
+        );
+        assert!(!natives_dir.join("MANIFEST.MF").exists());
+        assert!(!natives_dir.join("liblwjgl.so.part").exists());
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }

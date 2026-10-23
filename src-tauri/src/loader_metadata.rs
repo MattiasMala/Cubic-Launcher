@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Url;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::resolver::ModLoader;
@@ -7,6 +8,15 @@ use crate::resolver::ModLoader;
 const FABRIC_META_BASE_URL: &str = "https://meta.fabricmc.net/v2";
 const QUILT_META_BASE_URL: &str = "https://meta.quiltmc.org/v3";
 const PRISM_META_BASE_URL: &str = "https://meta.prismlauncher.org/v1";
+
+/// The client for the metadata servers: the launcher's User-Agent, and the
+/// connect and inactivity timeouts of the download client (audit 101, rete-4).
+/// Not the Modrinth API client: its 20 s bound the whole response, and Prism's
+/// Forge index arrives uncompressed at ~2 MB (measured 2026-10-22), too much
+/// for 20 s on a slow line.
+fn metadata_http_client() -> reqwest::Client {
+    crate::modrinth::build_download_client()
+}
 
 #[derive(Debug, Clone)]
 pub struct LoaderMetadataClient {
@@ -19,24 +29,47 @@ pub struct LoaderMetadataClient {
 impl LoaderMetadataClient {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: metadata_http_client(),
             fabric_base_url: FABRIC_META_BASE_URL.to_string(),
             quilt_base_url: QUILT_META_BASE_URL.to_string(),
             prism_base_url: PRISM_META_BASE_URL.to_string(),
         }
     }
 
+    /// Test seam: the same client against local servers.
+    #[cfg(test)]
     pub fn with_base_urls(
         fabric_base_url: impl Into<String>,
         quilt_base_url: impl Into<String>,
         prism_base_url: impl Into<String>,
     ) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: metadata_http_client(),
             fabric_base_url: fabric_base_url.into(),
             quilt_base_url: quilt_base_url.into(),
             prism_base_url: prism_base_url.into(),
         }
+    }
+
+    /// One GET of a JSON document from a loader metadata server, through the
+    /// same retry as the Modrinth API (5xx, 429, connect errors and timeouts
+    /// are retried). Before audit 101 (rete-4) a single 502 from
+    /// meta.prismlauncher.org killed a Forge launch at ~70%.
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        query_context: impl FnOnce() -> String,
+        status_context: impl FnOnce() -> String,
+        deserialize_context: impl FnOnce() -> String,
+    ) -> Result<T> {
+        crate::modrinth::send_with_retry(|| self.http_client.get(url.clone()))
+            .await
+            .with_context(query_context)?
+            .error_for_status()
+            .with_context(status_context)?
+            .json::<T>()
+            .await
+            .with_context(deserialize_context)
     }
 
     pub async fn fetch_loader_metadata(
@@ -75,31 +108,28 @@ impl LoaderMetadataClient {
         let versions_url =
             build_fabric_loader_versions_url(&self.fabric_base_url, minecraft_version)?;
         let versions = self
-            .http_client
-            .get(versions_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Fabric metadata for Minecraft {}",
-                    minecraft_version
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Fabric metadata returned an error for Minecraft {}",
-                    minecraft_version
-                )
-            })?
-            .json::<Vec<FabricLoaderVersionEntry>>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Fabric loader versions for Minecraft {}",
-                    minecraft_version
-                )
-            })?;
+            .get_json::<Vec<FabricLoaderVersionEntry>>(
+                versions_url,
+                || {
+                    format!(
+                        "failed to query Fabric metadata for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+                || {
+                    format!(
+                        "Fabric metadata returned an error for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Fabric loader versions for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+            )
+            .await?;
 
         let selected = select_fabric_loader_version(&versions).with_context(|| {
             format!(
@@ -113,31 +143,28 @@ impl LoaderMetadataClient {
             &selected.loader.version,
         )?;
         let profile = self
-            .http_client
-            .get(profile_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Fabric profile for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Fabric profile returned an error for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?
-            .json::<LauncherProfile>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Fabric profile for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?;
+            .get_json::<LauncherProfile>(
+                profile_url,
+                || {
+                    format!(
+                        "failed to query Fabric profile for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+                || {
+                    format!(
+                        "Fabric profile returned an error for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Fabric profile for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+            )
+            .await?;
 
         Ok(loader_metadata_from_profile(
             ModLoader::Fabric,
@@ -155,31 +182,28 @@ impl LoaderMetadataClient {
         let versions_url =
             build_quilt_loader_versions_url(&self.quilt_base_url, minecraft_version)?;
         let versions = self
-            .http_client
-            .get(versions_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Quilt metadata for Minecraft {}",
-                    minecraft_version
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Quilt metadata returned an error for Minecraft {}",
-                    minecraft_version
-                )
-            })?
-            .json::<Vec<QuiltLoaderVersionEntry>>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Quilt loader versions for Minecraft {}",
-                    minecraft_version
-                )
-            })?;
+            .get_json::<Vec<QuiltLoaderVersionEntry>>(
+                versions_url,
+                || {
+                    format!(
+                        "failed to query Quilt metadata for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+                || {
+                    format!(
+                        "Quilt metadata returned an error for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Quilt loader versions for Minecraft {}",
+                        minecraft_version
+                    )
+                },
+            )
+            .await?;
 
         let selected = select_quilt_loader_version(&versions).with_context(|| {
             format!(
@@ -193,31 +217,28 @@ impl LoaderMetadataClient {
             &selected.loader.version,
         )?;
         let profile = self
-            .http_client
-            .get(profile_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Quilt profile for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Quilt profile returned an error for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?
-            .json::<LauncherProfile>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Quilt profile for Minecraft {} and loader {}",
-                    minecraft_version, selected.loader.version
-                )
-            })?;
+            .get_json::<LauncherProfile>(
+                profile_url,
+                || {
+                    format!(
+                        "failed to query Quilt profile for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+                || {
+                    format!(
+                        "Quilt profile returned an error for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Quilt profile for Minecraft {} and loader {}",
+                        minecraft_version, selected.loader.version
+                    )
+                },
+            )
+            .await?;
 
         Ok(loader_metadata_from_profile(
             ModLoader::Quilt,
@@ -235,31 +256,28 @@ impl LoaderMetadataClient {
     ) -> Result<LoaderMetadata> {
         let index_url = build_prism_package_index_url(&self.prism_base_url, package_uid.uid())?;
         let index = self
-            .http_client
-            .get(index_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Prism metadata package index {}",
-                    package_uid.uid()
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Prism metadata returned an error for package index {}",
-                    package_uid.uid()
-                )
-            })?
-            .json::<PrismPackageIndex>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Prism package index {}",
-                    package_uid.uid()
-                )
-            })?;
+            .get_json::<PrismPackageIndex>(
+                index_url,
+                || {
+                    format!(
+                        "failed to query Prism metadata package index {}",
+                        package_uid.uid()
+                    )
+                },
+                || {
+                    format!(
+                        "Prism metadata returned an error for package index {}",
+                        package_uid.uid()
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Prism package index {}",
+                        package_uid.uid()
+                    )
+                },
+            )
+            .await?;
 
         let selected = select_prism_package_version(&index.versions, minecraft_version)
             .with_context(|| {
@@ -275,34 +293,31 @@ impl LoaderMetadataClient {
             &selected.version,
         )?;
         let version = self
-            .http_client
-            .get(version_url)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query Prism metadata {} version {}",
-                    package_uid.uid(),
-                    selected.version
-                )
-            })?
-            .error_for_status()
-            .with_context(|| {
-                format!(
-                    "Prism metadata returned an error for {} version {}",
-                    package_uid.uid(),
-                    selected.version
-                )
-            })?
-            .json::<PrismPackageVersionDetail>()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to deserialize Prism metadata {} version {}",
-                    package_uid.uid(),
-                    selected.version
-                )
-            })?;
+            .get_json::<PrismPackageVersionDetail>(
+                version_url,
+                || {
+                    format!(
+                        "failed to query Prism metadata {} version {}",
+                        package_uid.uid(),
+                        selected.version
+                    )
+                },
+                || {
+                    format!(
+                        "Prism metadata returned an error for {} version {}",
+                        package_uid.uid(),
+                        selected.version
+                    )
+                },
+                || {
+                    format!(
+                        "failed to deserialize Prism metadata {} version {}",
+                        package_uid.uid(),
+                        selected.version
+                    )
+                },
+            )
+            .await?;
 
         Ok(loader_metadata_from_prism(
             package_uid.mod_loader(),
@@ -1016,5 +1031,77 @@ mod tests {
             metadata.game_arguments[tweak_index + 1],
             "net.minecraftforge.fml.common.launcher.FMLTweaker"
         );
+    }
+
+    /// A local server that answers its connections, in order, with `responses`
+    /// (status line + body), and hands back the requests it read.
+    fn scripted_server(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("a request should arrive");
+                let mut request = [0u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .expect("request should be readable");
+                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should be written");
+            }
+            requests
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    /// rete-4: a 502 from a metadata server is retried like one from Modrinth,
+    /// instead of killing the launch, and every request carries the launcher's
+    /// User-Agent instead of reqwest's empty default.
+    #[tokio::test]
+    async fn a_transient_502_from_the_metadata_server_is_retried() {
+        let (base_url, server) = scripted_server(vec![
+            ("502 Bad Gateway", "{}"),
+            ("200 OK", fabric_versions_json()),
+            ("200 OK", fabric_profile_json()),
+        ]);
+        let client = super::LoaderMetadataClient::with_base_urls(
+            base_url,
+            "http://127.0.0.1:9/quilt",
+            "http://127.0.0.1:9/prism",
+        );
+
+        let metadata = client
+            .fetch_loader_metadata("1.21.1", ModLoader::Fabric)
+            .await
+            .expect("the retry should get past the 502");
+
+        assert_eq!(metadata.loader_version, "0.16.13");
+        let requests = server.join().expect("server thread should finish");
+        assert_eq!(requests.len(), 3, "one 502, then versions and profile");
+        let expected_user_agent = format!("cubic-launcher/{}", env!("CARGO_PKG_VERSION"));
+        for request in &requests {
+            let user_agent = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("user-agent")
+                        .then(|| value.trim().to_string())
+                })
+                .expect("every request should carry a User-Agent");
+            assert!(
+                user_agent.starts_with(&expected_user_agent),
+                "unexpected User-Agent {user_agent:?}"
+            );
+        }
     }
 }

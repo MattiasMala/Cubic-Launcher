@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { For, Show, createMemo, createSignal, onMount } from "solid-js";
 import { modListCards } from "../../store";
+import { ToggleSwitch } from "../ToggleSwitch";
 import { loadInstancesByModlist } from "../../lib/instances";
 import {
   worldIdOf,
@@ -69,12 +70,18 @@ export function WorldsPanel(props: Props) {
    * I mondi che questa modlist vede: i suoi, e quelli condivisi che almeno una
    * sua istanza apre. Anche quelli nascosti dalla home — nascondere è una cosa
    * della home, non della condivisione.
+   *
+   * E i mondi condivisi che **nessuna** istanza apre più, in ogni modlist: non
+   * sono di nessuno, e se la home li ha nascosti questo è l'unico posto da cui
+   * ridargli un'istanza. Senza, un mondo nascosto e senza istanze non si
+   * raggiungeva più da nessuna schermata, contro D65 (condivisi-10).
    */
   const ours = createMemo(() =>
     worlds().filter(world =>
       world.scope === "instance"
         ? world.modlistName === props.modlist
-        : world.instances.some(way => way.modlistName === props.modlist),
+        : world.instances.length === 0 ||
+          world.instances.some(way => way.modlistName === props.modlist),
     ),
   );
 
@@ -160,7 +167,9 @@ export function WorldsPanel(props: Props) {
                 <span class="block text-sm font-medium">{world.levelName}</span>
                 <span class="block text-[11px] text-muted-foreground">
                   {world.scope === "shared"
-                    ? `shared · ${world.folderName}`
+                    ? world.instances.length === 0
+                      ? `shared · ${world.folderName} · no instance opens it`
+                      : `shared · ${world.folderName}`
                     : `${world.instanceName} · ${world.folderName}`}
                 </span>
               </button>
@@ -217,23 +226,13 @@ export function WorldsPanel(props: Props) {
                                     </span>
                                   </Show>
                                 </span>
-                                <button
-                                  role="switch"
-                                  aria-checked={on()}
-                                  aria-label={`${modlistName} · ${instanceName} sees ${world().levelName}`}
+                                <ToggleSwitch
+                                  checked={on()}
+                                  label={`${modlistName} · ${instanceName} sees ${world().levelName}`}
                                   disabled={busy() || home()}
-                                  data-testid={`worlds-switch-${modlistName}-${instanceName}`}
-                                  onClick={() => void toggle(world(), modlistName, instanceName)}
-                                  class={`h-6 w-11 shrink-0 rounded-full border transition-colors disabled:opacity-60 ${
-                                    on() ? "border-primary bg-primary" : "border-border bg-muted"
-                                  }`}
-                                >
-                                  <span
-                                    class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                                      on() ? "translate-x-6" : "translate-x-1"
-                                    }`}
-                                  />
-                                </button>
+                                  testId={`worlds-switch-${modlistName}-${instanceName}`}
+                                  onToggle={() => void toggle(world(), modlistName, instanceName)}
+                                />
                               </div>
                             );
                           }}

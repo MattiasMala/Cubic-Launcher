@@ -112,6 +112,60 @@ jobs:
       - name: Lint Rust
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+  # I rami solo-Windows (junction::create, i link a cartella, il ripiego
+  # fs::hard_link di create_file_link, i percorsi \\?\, il session.lock dei
+  # mondi condivisi) `build` li compila ma non li esegue: qui girano i test
+  # (todo.md:1537, audit 101). Le due guardie restano in `checks`: leggono file
+  # del repository, non dipendono dalla piattaforma, e la toolchain di questo
+  # job è la stessa perché rust-toolchain.toml vince sul ref dell'action — che
+  # comunque deve restare uguale al file, o la guardia di `checks` fallisce.
+  windows-tests:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      # generate_context! incorpora dist/ nel binario: senza la build del
+      # frontend i test non compilano, come in `checks`.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      # test_client_jars.rs cerca i jar sotto $HOME/.local/share/..., ma su
+      # Windows HOME non è garantito e Path.home() di Python legge USERPROFILE.
+      # Qui HOME si fissa a mano e lo script riceve lo stesso percorso con
+      # --dest: test e download guardano la stessa cartella.
+      - name: Cache client jars
+        id: client-jars
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cubic-home/.local/share/com.cubic.launcher/cache/minecraft
+          key: client-jars-${{ runner.os }}-${{ hashFiles('scripts/ci/fetch_client_jars.py') }}
+
+      - name: Fetch client jars
+        if: steps.client-jars.outputs.cache-hit != 'true'
+        run: python scripts/ci/fetch_client_jars.py --dest "${{ runner.temp }}/cubic-home/.local/share/com.cubic.launcher/cache/minecraft"
+
+      - name: Test Rust
+        env:
+          HOME: ${{ runner.temp }}/cubic-home
+          # A missing jar fails the test instead of skipping it.
+          CUBIC_REQUIRE_CLIENT_JARS: "1"
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
   build:
     strategy:
       matrix:

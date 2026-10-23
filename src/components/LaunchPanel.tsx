@@ -1,4 +1,4 @@
-import { For, Show, createSignal, createEffect } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { MOD_LOADERS, type AccountSummary } from "../lib/types";
@@ -7,8 +7,9 @@ import {
   selectedModLoader, setSelectedModLoader,
   minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
   launchState, launchProgress, activeLaunchStage, updateCheckRunning,
-  launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath,
-  activeAccount, accounts, setAccountsModalOpen, pushUiError,
+  launchLogs, logViewerOpen, setLogViewerOpen, profileRecordingPath, setLaunchStopRequested,
+  activeAccount, accounts, setAccountsModalOpen, pushUiError, accountAvatarUrl,
+  minecraftVersionsNotice, launchPreparing,
 } from "../store";
 import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
 import { Select } from "./Select";
@@ -24,7 +25,7 @@ interface LaunchPanelProps {
 // said "Microsoft Account" even when every launch fell back to offline. An
 // account set to play offline (D115) launches offline whatever its sign-in
 // says, and that is a choice, not a warning.
-function accountSubtitle(account: AccountSummary | undefined): { text: string; warn: boolean } {
+function accountSubtitle(account: AccountSummary | null | undefined): { text: string; warn: boolean } {
   if (account?.playsOffline) return { text: "Offline · by choice", warn: false };
   switch (account?.credentials) {
     case "unreadable":
@@ -42,6 +43,26 @@ function accountSubtitle(account: AccountSummary | undefined): { text: string; w
   }
 }
 
+// The lines the launcher writes itself, by their prefix. Anything else is the
+// game's. A prefix missing here made its lines grey and hid them behind the
+// "Game" filter, among them the one that says why the profiler did not record
+// (todo.md:1807).
+const LAUNCHER_LINE_PREFIXES = [
+  "[Launcher]", "[Resolver]", "[Java]", "[Cache]", "[Launch]", "[Cubic]",
+  "[Profiler]", "[Auth]", "[Content]", "[Config]", "[Download]", "[Loader]",
+  "[MC]", "[options]", "[Precheck]", "[Backfill]", "[shared]",
+];
+
+type LogLevel = "error" | "warning" | "info" | "game";
+
+function logLevel(line: string): LogLevel {
+  const lower = line.toLowerCase();
+  if (lower.includes("error") || lower.includes("✗") || lower.includes("exception") || lower.includes("fatal") || line.startsWith("[Launch]") && lower.includes("fail")) return "error";
+  if (lower.includes("warn")) return "warning";
+  if (LAUNCHER_LINE_PREFIXES.some(prefix => line.startsWith(prefix))) return "info";
+  return "game";
+}
+
 export function LaunchPanel(props: LaunchPanelProps) {
   const isLaunching = () => launchState() === "resolving" || launchState() === "running";
   const isRunning = () => launchState() === "running";
@@ -53,33 +74,66 @@ export function LaunchPanel(props: LaunchPanelProps) {
   const [showGame, setShowGame] = createSignal(true);
   let logContainer: HTMLDivElement | undefined;
 
-  const logLevel = (line: string): "error" | "warning" | "info" | "game" => {
-    const lower = line.toLowerCase();
-    if (lower.includes("error") || lower.includes("✗") || lower.includes("exception") || lower.includes("fatal") || line.startsWith("[Launch]") && lower.includes("fail")) return "error";
-    if (lower.includes("warn")) return "warning";
-    if (line.startsWith("[Launcher]") || line.startsWith("[Resolver]") || line.startsWith("[Java]") || line.startsWith("[Cache]") || line.startsWith("[Launch]") || line.startsWith("[Cubic]")) return "info";
-    return "game";
+  // Mounted only while the viewer is open (ui-schermate-7): a closed viewer
+  // filters nothing and scrolls nothing, and the filter runs once per batch
+  // of lines instead of once per read. The items stay the strings themselves,
+  // so `For` keeps the rows it already drew.
+  const LogLines = () => {
+    const visible = (level: LogLevel) =>
+      level === "error" ? showErrors() :
+      level === "warning" ? showWarnings() :
+      level === "info" ? showInfo() :
+      showGame();
+    const filteredLogs = createMemo(() => launchLogs().filter(line => visible(logLevel(line))));
+
+    createEffect(() => {
+      filteredLogs(); // track changes
+      if (autoScroll() && logContainer) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+    });
+
+    return (
+      <div ref={logContainer} class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
+        <Show
+          when={filteredLogs().length > 0}
+          fallback={<p class="text-textMuted">Launch logs will appear here...</p>}
+        >
+          <For each={filteredLogs()}>
+            {(line, i) => {
+              const level = logLevel(line);
+              return (
+                <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
+                  level === "error" ? "text-red-400" :
+                  level === "warning" ? "text-amber-400" :
+                  level === "info" ? "text-primary" :
+                  "text-textMuted"
+                }`}>
+                  <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
+                  <span class="break-all">{line || "\u00A0"}</span>
+                </div>
+              );
+            }}
+          </For>
+        </Show>
+      </div>
+    );
   };
 
-  const filteredLogs = () => launchLogs().filter(line => {
-    const level = logLevel(line);
-    if (level === "error") return showErrors();
-    if (level === "warning") return showWarnings();
-    if (level === "info") return showInfo();
-    return showGame();
-  });
-
-  createEffect(() => {
-    filteredLogs(); // track changes
-    if (autoScroll() && logContainer) {
-      logContainer.scrollTop = logContainer.scrollHeight;
-    }
-  });
-
   const handleStop = async () => {
+    // The exit that follows is a choice, not a crash to report (concorrenza-9).
+    setLaunchStopRequested(true);
     try {
       await invoke("stop_minecraft_command");
-    } catch { /* already exited */ }
+    } catch (error) {
+      const detail = String(error);
+      // Nothing running: the game already exited, and its exit event took the flag.
+      if (detail.includes("No Minecraft process is running")) return;
+      // The game is still running: a crash of it later is a crash, not this STOP
+      // (review-lancio-3).
+      setLaunchStopRequested(false);
+      pushUiError({ title: "Minecraft did not stop", message: "The launcher could not close the game. It may still be running.", detail, severity: "warning", scope: "launch" });
+    }
   };
 
   const handleRevealProfile = async (path: string) => {
@@ -146,29 +200,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
               Game
             </button>
           </div>
-          <div ref={logContainer} class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
-            <Show
-              when={filteredLogs().length > 0}
-              fallback={<p class="text-textMuted">Launch logs will appear here...</p>}
-            >
-              <For each={filteredLogs()}>
-                {(line, i) => {
-                  const level = logLevel(line);
-                  return (
-                    <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
-                      level === "error" ? "text-red-400" :
-                      level === "warning" ? "text-amber-400" :
-                      level === "info" ? "text-primary" :
-                      "text-textMuted"
-                    }`}>
-                      <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
-                      <span class="break-all">{line || "\u00A0"}</span>
-                    </div>
-                  );
-                }}
-              </For>
-            </Show>
-          </div>
+          <LogLines />
         </div>
       </Show>
 
@@ -202,14 +234,17 @@ export function LaunchPanel(props: LaunchPanelProps) {
           <div class="relative">
             <button
               onClick={() => setAccountMenuOpen(v => !v)}
-              class="flex items-center gap-3 cursor-pointer hover:bg-bgHover p-2 rounded-lg transition-colors duration-75 border border-transparent hover:border-borderColor"
+              // precheck-1: the launch being prepared reads the active account.
+              disabled={launchPreparing()}
+              title={launchPreparing() ? "The account can change once the launch has started" : undefined}
+              class="flex items-center gap-3 cursor-pointer hover:bg-bgHover p-2 rounded-lg transition-colors duration-75 border border-transparent hover:border-borderColor disabled:cursor-not-allowed disabled:opacity-70"
             >
-              <Show when={activeAccount()?.avatarUrl} fallback={
+              <Show when={accountAvatarUrl(activeAccount())} fallback={
                 <div class="w-10 h-10 rounded-full border border-borderColor bg-primary/20 flex items-center justify-center text-primary font-bold">
                   {(activeAccount()?.gamertag ?? "?").slice(0, 2).toUpperCase()}
                 </div>
               }>
-                <img src={activeAccount()!.avatarUrl} alt="" class="w-10 h-10 rounded-md border border-borderColor" loading="lazy" />
+                {url => <img src={url()} alt="" class="w-10 h-10 rounded-md border border-borderColor" loading="lazy" />}
               </Show>
               <div class="flex flex-col">
                 <span class="text-sm font-semibold text-white">
@@ -223,7 +258,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
             </button>
 
             {/* Account dropdown menu */}
-            <Show when={accountMenuOpen()}>
+            <Show when={accountMenuOpen() && !launchPreparing()}>
               <div class="absolute bottom-full left-0 mb-2 w-64 rounded-lg border border-borderColor bg-bgPanel py-2 shadow-lg z-50">
                 <For each={accounts()}>
                   {(account) => (
@@ -236,12 +271,12 @@ export function LaunchPanel(props: LaunchPanelProps) {
                         account.id === activeAccount()?.id ? "text-primary" : "text-textMain"
                       }`}
                     >
-                      <Show when={account.avatarUrl} fallback={
+                      <Show when={accountAvatarUrl(account)} fallback={
                         <div class="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-xs">
                           {account.gamertag.slice(0, 2).toUpperCase()}
                         </div>
                       }>
-                        <img src={account.avatarUrl} alt="" class="w-8 h-8 rounded-md" loading="lazy" />
+                        {url => <img src={url()} alt="" class="w-8 h-8 rounded-md" loading="lazy" />}
                       </Show>
                       <span class="flex-1 text-left truncate">{account.gamertag}</span>
                       <Show when={account.id === activeAccount()?.id}>
@@ -275,6 +310,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 onChange={value => { props.onLoaderChange ? props.onLoaderChange(value) : setSelectedModLoader(value); }}
                 class="text-sm text-textMain font-medium"
                 direction="up"
+                disabled={launchPreparing()}
               />
             </div>
             <div class="flex items-center gap-1">
@@ -285,7 +321,15 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 onChange={value => { props.onVersionChange ? props.onVersionChange(value) : setSelectedMcVersion(value); }}
                 class="text-xs text-textMuted"
                 direction="up"
+                disabled={launchPreparing()}
               />
+              <Show when={minecraftVersionsNotice()}>
+                {notice => (
+                  <span class="text-warning cursor-help" title={notice()} aria-label={notice()} data-testid="minecraft-versions-partial">
+                    <MaterialIcon name="info" size="sm" />
+                  </span>
+                )}
+              </Show>
             </div>
             <label class="flex items-center gap-1 cursor-pointer select-none">
               <input

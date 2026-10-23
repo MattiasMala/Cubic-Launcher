@@ -931,8 +931,8 @@ mod tests {
     fn write_stub_jar(path: &std::path::Path, class_literal: Option<&str>) {
         let file = std::fs::File::create(path).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
 
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
@@ -1103,8 +1103,8 @@ mod tests {
         let jar = directory.join("client.jar");
         let file = std::fs::File::create(&jar).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
             &mut archive,
@@ -1170,8 +1170,8 @@ mod tests {
         let jar = directory.join("client.jar");
         let file = std::fs::File::create(&jar).expect("stub jar");
         let mut archive = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         archive.start_file("version.json", options).unwrap();
         std::io::Write::write_all(
             &mut archive,

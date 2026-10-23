@@ -1,5 +1,8 @@
 import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } from "../../store";
 import type { AccountCredentials } from "../../lib/types";
 import { loadAccounts, loadShellSnapshot } from "../../app/backend-loaders";
@@ -7,7 +10,8 @@ import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, modlistOverrides,
   updateCheckState, setUpdateCheckState, setUpdateInfo,
-  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, setActiveAccountId, activeAccount,
+  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId, activeAccount,
+  activePlaysOffline, accountAvatarUrl,
   instancePresentationOpen, setInstancePresentationOpen,
   instancePresentation, setInstancePresentation,
   createModlistModalOpen, setCreateModlistModalOpen,
@@ -21,9 +25,12 @@ import { GameOptionsPanel } from "./game-options-panel";
 import { SharedFilesPanel } from "./shared-files-panel";
 import { WorldsPanel } from "./worlds-panel";
 import { ChevronDownIcon, ChevronRightIcon } from "../icons";
+import { ToggleSwitch } from "../ToggleSwitch";
+import { modlistNameProblem } from "../../lib/modlist-name";
 const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
 
 export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
+  const nameProblem = () => modlistNameProblem(createModlistName().trim());
   return (
     <Show when={createModlistModalOpen()}>
       <Modal onClose={() => setCreateModlistModalOpen(false)}>
@@ -39,6 +46,9 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
               class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               autofocus
             />
+            <Show when={nameProblem()}>
+              <p class="mt-1.5 text-xs text-red-400">{nameProblem()}</p>
+            </Show>
           </div>
           <div>
             <label class="mb-1.5 block text-sm font-medium text-foreground">Description</label>
@@ -55,7 +65,7 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
           <button onClick={() => setCreateModlistModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
           <button
             onClick={() => void props.onCreate()}
-            disabled={!createModlistName().trim() || createModlistBusy()}
+            disabled={!createModlistName().trim() || nameProblem() !== null || createModlistBusy()}
             class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             Create
@@ -66,11 +76,38 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
   );
 }
 
+const OFFLINE_UPDATE_CHECK_TEXT =
+  "The active account plays offline, so the launcher doesn't check GitHub for updates. Turn off Play offline in Manage Accounts to check.";
+
 export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => Promise<void> }) {
   const [globalDraft, setGlobalDraft] = createSignal<GlobalSettingsState>({ ...globalSettings() });
   const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
   const [lastUpdateCheck, setLastUpdateCheck] = createSignal<UpdateCheckResponse | null>(null);
   const [notificationsAdvancedOpen, setNotificationsAdvancedOpen] = createSignal(false);
+  /** The Game settings panel's own save, for its pending options.txt edits (D154). */
+  const [saveGameOptions, setSaveGameOptions] = createSignal<(() => Promise<boolean>) | null>(null);
+  const [saving, setSaving] = createSignal(false);
+
+  /**
+   * Save Settings saves everything the modal shows, options.txt included
+   * (D154). The options go first: if they fail the modal stays open on the
+   * global tab, where the panel says why, instead of closing over edits that
+   * were never written.
+   */
+  const handleSave = async () => {
+    if (saving()) return;
+    setSaving(true);
+    try {
+      const saveOptions = saveGameOptions();
+      if (saveOptions && !(await saveOptions())) {
+        setSettingsTab("global");
+        return;
+      }
+      await props.onSave(globalDraft(), modlistDraft());
+    } finally {
+      setSaving(false);
+    }
+  };
 
   createEffect(on(settingsModalOpen, open => {
     if (!open) return;
@@ -106,6 +143,12 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
         return;
       }
 
+      // The backend asked nobody: the active account plays offline (D140).
+      if (result.status === "offline") {
+        setUpdateCheckState("offline");
+        return;
+      }
+
       setUpdateCheckState("error");
     } catch {
       setLastUpdateCheck(null);
@@ -120,6 +163,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
     if (state === "available" && result?.version) return `Version ${result.version} available`;
     if (state === "upToDate" && result) return `You're up to date (v${result.currentVersion})`;
     if (state === "error") return "Could not check for updates";
+    if (state === "offline") return OFFLINE_UPDATE_CHECK_TEXT;
     return null;
   };
 
@@ -169,23 +213,12 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                   <div class="flex gap-3">
                     <input type="checkbox" checked={modlistDraft().profilerEnabled} onChange={e => setModlistDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
                     <label class={`flex flex-1 items-center gap-2 text-sm text-foreground ${modlistDraft().profilerEnabled ? "" : "opacity-40"}`}>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={modlistDraft().profilerActive}
+                      <ToggleSwitch
+                        checked={modlistDraft().profilerActive}
                         disabled={!modlistDraft().profilerEnabled}
-                        data-testid="modlist-profiler-switch"
-                        onClick={() => setModlistDraft(c => ({ ...c, profilerActive: !c.profilerActive }))}
-                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                          modlistDraft().profilerActive ? "border-primary bg-primary" : "border-border bg-muted"
-                        }`}
-                      >
-                        <span
-                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                            modlistDraft().profilerActive ? "translate-x-6" : "translate-x-1"
-                          }`}
-                        />
-                      </button>
+                        testId="modlist-profiler-switch"
+                        onToggle={() => setModlistDraft(c => ({ ...c, profilerActive: !c.profilerActive }))}
+                      />
                       Record a JFR profile for this mod list
                     </label>
                   </div>
@@ -211,7 +244,8 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <button
                       type="button"
                       onClick={() => void handleCheckForUpdates()}
-                      disabled={!isTauriEnv() || updateCheckState() === "checking"}
+                      disabled={!isTauriEnv() || updateCheckState() === "checking" || activePlaysOffline()}
+                      title={activePlaysOffline() ? OFFLINE_UPDATE_CHECK_TEXT : undefined}
                       class="rounded-md bg-secondary px-3 py-1.5 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {updateCheckState() === "checking" ? "Checking..." : "Check for updates"}
@@ -237,7 +271,7 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     <input type="checkbox" checked={globalDraft().updateNotificationsEnabled} onChange={e => setGlobalDraft(c => ({ ...c, updateNotificationsEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Notify me when updates are available</span>
                   </label>
-                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. It checks Modrinth before every launch either way; when this is on and something can be updated, it stops and lets you choose what to update.</p>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Cubic Launcher always launches from the versions you have. With an account that plays online it checks Modrinth before every launch either way; when this is on and something can be updated, it stops and lets you choose what to update. An account set to Play offline checks nothing and launches from what is already downloaded.</p>
                   <div class="mt-2">
                     <div class="flex items-center gap-2">
                       <span class="flex-1 text-sm text-muted-foreground ml-7">Advanced</span>
@@ -264,28 +298,36 @@ export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState
                     </Show>
                   </div>
                 </div>
-                {/*
-                  Il terzo livello di D66. Stesso componente della scheda
-                  «Game settings» di una modlist, su uno scope diverso: senza
-                  di questo, «Promote to global default» scriveva un file che
-                  poi non si poteva né vedere né modificare da nessuna parte.
-                */}
-                <div class="rounded-md border border-border bg-background p-4">
-                  <p class="mb-1 text-sm font-medium text-foreground">Game settings</p>
-                  <p class="mb-3 text-xs text-muted-foreground">
-                    The global <code>options.txt</code>: the template new mod-lists are born
-                    from. Changing it here does not touch mod-lists or instances that already
-                    exist.
-                  </p>
-                  <GameOptionsPanel scope={{ level: "global" }} />
-                </div>
               </div>
             </Show>
+            {/*
+              Il terzo livello di D66. Stesso componente della scheda
+              «Game settings» di una modlist, su uno scope diverso: senza
+              di questo, «Promote to global default» scriveva un file che
+              poi non si poteva né vedere né modificare da nessuna parte.
+
+              Sta fuori dallo `<Show>` delle schede e si nasconde invece di
+              smontarsi: smontato, cambiare scheda buttava via le modifiche
+              non ancora salvate (ui-modali-7). «Save Settings» le salva
+              insieme al resto (D154).
+            */}
+            <div class={`rounded-md border border-border bg-background p-4 ${settingsTab() === "global" ? "" : "hidden"}`}>
+              <p class="mb-1 text-sm font-medium text-foreground">Game settings</p>
+              <p class="mb-3 text-xs text-muted-foreground">
+                The global <code>options.txt</code>: the template new mod-lists are born
+                from. Changing it here does not touch mod-lists or instances that already
+                exist. Save Settings also saves the changes made here.
+              </p>
+              <GameOptionsPanel
+                scope={{ level: "global" }}
+                registerPendingSave={save => setSaveGameOptions(() => save)}
+              />
+            </div>
           </div>
         </div>
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
           <button onClick={handleCancel} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
-          <button onClick={() => void props.onSave(globalDraft(), modlistDraft())} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save Settings</button>
+          <button onClick={() => void handleSave()} disabled={saving()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Save Settings</button>
         </div>
       </Modal>
     </Show>
@@ -302,9 +344,21 @@ const CREDENTIALS_PILL: Record<AccountCredentials, string> = {
   keyring_unavailable: "keyring unavailable",
 };
 
+// What `microsoft_login_command` answers after Cancel (`MICROSOFT_LOGIN_CANCELLED`
+// in app_shell.rs): not an error to show.
+const MICROSOFT_LOGIN_CANCELLED = "Microsoft sign-in cancelled";
+
 export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<void> }) {
   const [loggingIn, setLoggingIn] = createSignal(false);
   const [loginError, setLoginError] = createSignal<string | null>(null);
+  // The row a "Sign in again" belongs to while it runs, and the row its error
+  // belongs to after: `null` is the "Login with Microsoft" box at the top.
+  const [loginRowId, setLoginRowId] = createSignal<string | null>(null);
+  const [loginErrorRowId, setLoginErrorRowId] = createSignal<string | null>(null);
+  // The Microsoft page the browser was sent to (account-3): shown as a link so
+  // that a browser in the wrong profile, or none at all, is not a dead end.
+  const [loginUrl, setLoginUrl] = createSignal<string | null>(null);
+  const [linkCopied, setLinkCopied] = createSignal(false);
   const [savingOffline, setSavingOffline] = createSignal(false);
   // D134: "Remove" asks before deleting, one row at a time: the id of the row
   // waiting for confirmation, or null. Opening or closing the modal drops it.
@@ -317,10 +371,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
     if (removing()) return;
     setRemoving(true);
     try {
+      // Removing the active account activates another one in the database
+      // (todo.md:1390); the reload reads which one.
       await invoke("delete_account_command", { microsoftId });
-      if (activeAccountId() === microsoftId) setActiveAccountId("");
       await loadAccounts();
     } catch (err) {
+      setLoginErrorRowId(null);
       setLoginError(String(err));
     } finally {
       setRemoving(false);
@@ -336,6 +392,7 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
       await invoke("set_account_plays_offline_command", { microsoftId, playsOffline });
       await loadAccounts();
     } catch (err) {
+      setLoginErrorRowId(null);
       setLoginError(String(err));
     } finally {
       setSavingOffline(false);
@@ -344,19 +401,89 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
 
   // `replaceUnreadable` is the explicit "Sign in again" (F1): only that button
   // lets the backend discard saved sign-ins the keyring says nobody can read.
-  const signIn = async (replaceUnreadable: boolean) => {
+  // `rowId` is the row it was pressed on: the backend refuses, and says so, a
+  // sign-in that comes back with another Microsoft account (todo.md:1417).
+  const signIn = async (replaceUnreadable: boolean, rowId: string | null = null) => {
+    if (loggingIn()) return;
     setLoggingIn(true);
     setLoginError(null);
+    setLoginErrorRowId(rowId);
+    setLoginRowId(rowId);
+    setLoginUrl(null);
+    setLinkCopied(false);
+    const unlisten = await listen<string>("microsoft-login-url", event => setLoginUrl(event.payload));
     try {
-      await invoke("microsoft_login_command", { replaceUnreadable });
+      await invoke("microsoft_login_command", { replaceUnreadable, expectedMicrosoftId: rowId });
       setAccountsModalOpen(false);
       await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
-      setLoginError(String(err));
+      if (String(err) !== MICROSOFT_LOGIN_CANCELLED) setLoginError(String(err));
     } finally {
+      unlisten();
       setLoggingIn(false);
+      setLoginRowId(null);
+      setLoginUrl(null);
     }
   };
+
+  const cancelSignIn = () => {
+    void invoke("cancel_microsoft_login_command").catch(err => setLoginError(String(err)));
+  };
+
+  const copyLoginLink = async () => {
+    const url = loginUrl();
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 2000);
+    } catch (err) {
+      setLoginError(`Could not copy the link: ${String(err)}`);
+    }
+  };
+
+  /** While a sign-in waits for the browser: the link, and the ways out of it. */
+  const loginProgress = () => (
+    <div class="mt-3 rounded-md border border-border bg-background p-3 text-xs" data-testid="microsoft-login-progress">
+      <p class="text-foreground">Waiting for you to finish signing in in your browser…</p>
+      <Show
+        when={loginUrl()}
+        fallback={<p class="mt-1 text-muted-foreground">Opening your browser…</p>}
+      >
+        {url => (
+          <>
+            <p class="mt-1 text-muted-foreground">
+              If no browser opened, or it opened the wrong profile, copy this link into the browser
+              you want to use:
+            </p>
+            <p class="mt-1 max-h-16 overflow-y-auto break-all rounded bg-muted/40 p-2 font-mono text-[10px] text-muted-foreground select-all">
+              {url()}
+            </p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
+                onClick={() => void copyLoginLink()}
+              >
+                {linkCopied() ? "Copied" : "Copy link"}
+              </button>
+              <button
+                class="rounded-md bg-secondary px-3 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80"
+                onClick={() => void openUrl(url()).catch(err => setLoginError(String(err)))}
+              >
+                Open browser again
+              </button>
+            </div>
+          </>
+        )}
+      </Show>
+      <button
+        class="mt-2 rounded-md border border-destructive/40 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10"
+        onClick={cancelSignIn}
+      >
+        Cancel sign-in
+      </button>
+    </div>
+  );
 
   return (
     <Show when={accountsModalOpen()}>
@@ -376,8 +503,11 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
             >
               {loggingIn() ? "Logging in..." : "Login with Microsoft"}
             </button>
-            <Show when={loginError()}>
-              <p class="mt-2 text-xs text-destructive break-all">{loginError()}</p>
+            <Show when={loggingIn() && loginRowId() === null}>
+              {loginProgress()}
+            </Show>
+            <Show when={loginErrorRowId() === null && loginError()}>
+              <p class="mt-2 text-xs text-destructive break-words">{loginError()}</p>
             </Show>
           </div>
           <p class="text-xs text-muted-foreground">Saved accounts - click to switch</p>
@@ -389,12 +519,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     onClick={() => void props.onSwitchAccount(acc.id)}
                     class="flex items-start gap-3 text-left flex-1 min-w-0"
                   >
-                    <Show when={acc.avatarUrl} fallback={
+                    <Show when={accountAvatarUrl(acc)} fallback={
                       <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/20 text-sm font-semibold text-primary">
                         {acc.gamertag.slice(0, 2).toUpperCase()}
                       </div>
                     }>
-                      <img src={acc.avatarUrl} alt="" class="h-10 w-10 shrink-0 rounded-md" loading="lazy" />
+                      {url => <img src={url()} alt="" class="h-10 w-10 shrink-0 rounded-md" loading="lazy" />}
                     </Show>
                     <div class="min-w-0">
                       <p class="font-medium text-foreground truncate">{acc.gamertag}</p>
@@ -410,26 +540,16 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     </Show>
                     <div class="flex items-center gap-1.5">
                       <span class="text-[10px] text-muted-foreground">Play offline</span>
-                      <button
-                        role="switch"
-                        aria-checked={acc.playsOffline}
-                        aria-label={`Play ${acc.gamertag} offline`}
+                      <ToggleSwitch
+                        checked={acc.playsOffline}
+                        label={`Play ${acc.gamertag} offline`}
                         disabled={savingOffline()}
-                        data-testid={`account-plays-offline-switch-${acc.id}`}
-                        onClick={e => {
+                        testId={`account-plays-offline-switch-${acc.id}`}
+                        onToggle={e => {
                           e.stopPropagation();
                           void setPlaysOffline(acc.id, !acc.playsOffline);
                         }}
-                        class={`h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                          acc.playsOffline ? "border-primary bg-primary" : "border-border bg-muted"
-                        }`}
-                      >
-                        <span
-                          class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                            acc.playsOffline ? "translate-x-6" : "translate-x-1"
-                          }`}
-                        />
-                      </button>
+                      />
                     </div>
                     <Show when={confirmRemoveId() === acc.id} fallback={
                       <button
@@ -482,9 +602,9 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                           <button
                             class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
                             disabled={loggingIn()}
-                            onClick={() => void signIn(true)}
+                            onClick={() => void signIn(true, acc.id)}
                           >
-                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                            {loggingIn() && loginRowId() === acc.id ? "Signing in..." : "Sign in again"}
                           </button>
                         </Match>
                         <Match when={credentials() === "signed_out"}>
@@ -497,9 +617,9 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                           <button
                             class="mt-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
                             disabled={loggingIn()}
-                            onClick={() => void signIn(true)}
+                            onClick={() => void signIn(true, acc.id)}
                           >
-                            {loggingIn() ? "Signing in..." : "Sign in again"}
+                            {loggingIn() && loginRowId() === acc.id ? "Signing in..." : "Sign in again"}
                           </button>
                         </Match>
                         <Match when={credentials() === "keyring_unavailable"}>
@@ -517,6 +637,12 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
                     </div>
                   )}
                 </Show>
+                <Show when={loggingIn() && loginRowId() === acc.id}>
+                  {loginProgress()}
+                </Show>
+                <Show when={loginErrorRowId() === acc.id && loginError()}>
+                  <p class="mt-2 text-xs text-destructive break-words">{loginError()}</p>
+                </Show>
               </div>
             )}
           </For>
@@ -530,17 +656,30 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
 }
 
 
-export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: () => Promise<void> }) {
+type ModlistDeletePreview = { worlds: number; screenshots: number; running: boolean; trashSupported: boolean };
+
+const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+
+/**
+ * `onDelete(allowPermanent)` resolves to the reason the trash refused, when it
+ * did (nothing was deleted then), or null. `allowPermanent` is exactly what the
+ * confirmation promised, as for a screenshot (D153).
+ */
+export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: (allowPermanent: boolean) => Promise<string | null> }) {
   const [draft, setDraft] = createSignal({ ...instancePresentation() });
   const [saving, setSaving] = createSignal(false);
   const [confirmDelete, setConfirmDelete] = createSignal(false);
   const [deleting, setDeleting] = createSignal(false);
+  const [deletePreview, setDeletePreview] = createSignal<ModlistDeletePreview | null>(null);
+  const [deletePreviewError, setDeletePreviewError] = createSignal<string | null>(null);
+  const [trashRefusal, setTrashRefusal] = createSignal<string | null>(null);
   const [tab, setTab] = createSignal<"identity" | "game" | "shared" | "worlds">("identity");
 
   createEffect(() => {
     if (instancePresentationOpen()) {
       setDraft({ ...instancePresentation() });
       setConfirmDelete(false);
+      setTrashRefusal(null);
       setTab("identity");
     }
   });
@@ -548,6 +687,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
   const close = () => {
     setInstancePresentationOpen(false);
     setConfirmDelete(false);
+    setTrashRefusal(null);
   };
 
   const handleSave = async () => {
@@ -561,28 +701,62 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
     }
   };
 
+  // D153: before asking, count what goes with the mod list and whether its
+  // game is running (then the backend refuses, and the button is off).
+  const askDelete = async () => {
+    setDeletePreview(null);
+    setDeletePreviewError(null);
+    setTrashRefusal(null);
+    setConfirmDelete(true);
+    if (!isTauriEnv()) return;
+    try {
+      setDeletePreview(await invoke<ModlistDeletePreview>("modlist_delete_preview_command", { modlistName: selectedModListName() }));
+    } catch (err) {
+      setDeletePreviewError(String(err));
+    }
+  };
+
+  const cancelDelete = () => {
+    setConfirmDelete(false);
+    setTrashRefusal(null);
+  };
+
+  const permanentPromised = () => trashRefusal() !== null || deletePreview()?.trashSupported === false;
+
+  const deleteQuestion = () => {
+    const preview = deletePreview();
+    if (deletePreviewError()) return "Delete this mod list? Its worlds and screenshots could not be counted.";
+    if (!preview) return "Counting worlds and screenshots...";
+    if (preview.running) return "This mod list is being launched or played. Close the game first, then delete it.";
+    const contents = `${plural(preview.worlds, "world", "worlds")} and ${plural(preview.screenshots, "screenshot", "screenshots")}`;
+    const refusal = trashRefusal();
+    if (refusal !== null) return `The trash could not be used (${refusal}). Delete permanently, with ${contents}? This cannot be undone.`;
+    if (!preview.trashSupported) return `Delete permanently, with ${contents}? This cannot be undone.`;
+    return `Move this mod list to the trash, with ${contents}? You can restore it from the trash.`;
+  };
+
   const handleDelete = async () => {
     if (deleting()) return;
     setDeleting(true);
+    let refusal: string | null = null;
     try {
-      await props.onDelete();
+      refusal = await props.onDelete(permanentPromised());
     } finally {
       setDeleting(false);
-      setConfirmDelete(false);
+      setTrashRefusal(refusal);
+      if (refusal === null) setConfirmDelete(false);
     }
   };
 
   const pickIcon = async () => {
     if (!isTauriEnv()) return;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const { invoke: invokeCore } = await import("@tauri-apps/api/core");
       const selected = await open({
         multiple: false,
         filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
       });
       if (typeof selected === "string") {
-        const dataUrl: string = await invokeCore("read_image_as_data_url_command", { path: selected });
+        const dataUrl: string = await invoke("read_image_as_data_url_command", { path: selected });
         setDraft(cur => ({ ...cur, iconImage: dataUrl }));
       }
     } catch (_) {
@@ -704,23 +878,23 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
         <div class="flex items-center justify-between gap-2 border-t border-border px-6 py-4">
           <Show when={confirmDelete()} fallback={
             <button
-              onClick={() => setConfirmDelete(true)}
+              onClick={() => void askDelete()}
               class="rounded-md bg-red-900/40 px-4 py-2 text-sm text-red-300 hover:bg-red-900/70 border border-red-700/40 transition-colors"
             >
               Delete Mod-list
             </button>
           }>
             <div class="flex items-center gap-2">
-              <span class="text-sm text-red-400">Are you sure? This cannot be undone.</span>
+              <span class="max-w-md text-sm text-red-400">{deleteQuestion()}</span>
               <button
                 onClick={() => void handleDelete()}
-                disabled={deleting()}
-                class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                disabled={deleting() || (!deletePreview() && !deletePreviewError()) || deletePreview()?.running === true}
+                class="shrink-0 rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
               >
-                {deleting() ? "Deleting..." : "Yes, delete"}
+                {deleting() ? "Deleting..." : permanentPromised() ? "Yes, delete permanently" : "Yes, move to trash"}
               </button>
               <button
-                onClick={() => setConfirmDelete(false)}
+                onClick={cancelDelete}
                 class="rounded-md bg-secondary px-3 py-1.5 text-sm text-secondary-foreground hover:bg-secondary/80"
               >
                 Cancel

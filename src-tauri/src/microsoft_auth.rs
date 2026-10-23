@@ -14,6 +14,63 @@ const MICROSOFT_AUTHORIZE_URL: &str =
 const MICROSOFT_TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const BUNDLED_MICROSOFT_CLIENT_ID: &str = "7dce88aa-79b0-4b77-9666-0fdb8addd50c";
 
+/// How long a sign-in or refresh request waits for a connection to open.
+const AUTH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one request of the sign-in and refresh chain may take, body
+/// included: every answer is a small JSON document.
+const AUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client of the Microsoft, Xbox and Minecraft services. Before audit 101
+/// (account-7) it was `reqwest::Client::new()`, with no timeout at all: a
+/// service that accepted the connection and said nothing kept the launch on
+/// «Authenticating» for as long as the operating system allowed.
+fn auth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(AUTH_CONNECT_TIMEOUT)
+        .timeout(AUTH_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
+/// The token endpoint refused a request, with the OAuth `error` code of its
+/// answer when it had one. Only the code: `error_description` carries trace
+/// ids and timestamps, never a token, but nothing here needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicrosoftTokenEndpointError {
+    pub status: u16,
+    pub error: Option<String>,
+}
+
+impl std::fmt::Display for MicrosoftTokenEndpointError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.error {
+            Some(error) => write!(formatter, "HTTP status {} ({error})", self.status),
+            None => write!(formatter, "HTTP status {}", self.status),
+        }
+    }
+}
+
+impl std::error::Error for MicrosoftTokenEndpointError {}
+
+/// D143 (audit 101, account-1): whether a failed refresh means the saved
+/// sign-in is dead and only a new interactive sign-in can bring it back.
+/// `invalid_grant` is the revoked or expired refresh token (password change,
+/// ~90 days unused); `interaction_required` is Microsoft asking the user
+/// to sign in themselves. A network error, a 5xx or a refusal of the client
+/// itself (`invalid_client`) say nothing about the account and keep it.
+pub fn refresh_needs_sign_in_again(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<MicrosoftTokenEndpointError>()
+            .is_some_and(|error| {
+                matches!(
+                    error.error.as_deref(),
+                    Some("invalid_grant") | Some("interaction_required")
+                )
+            })
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftOAuthConfig {
     pub client_id: String,
@@ -45,15 +102,17 @@ pub struct MicrosoftOAuthClient {
 impl MicrosoftOAuthClient {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: MICROSOFT_AUTHORIZE_URL.to_string(),
             token_url: MICROSOFT_TOKEN_URL.to_string(),
         }
     }
 
+    /// Test seam: the same client against a local token endpoint.
+    #[cfg(test)]
     pub fn with_endpoints(authorize_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
             authorize_url: authorize_url.into(),
             token_url: token_url.into(),
         }
@@ -125,9 +184,24 @@ impl MicrosoftOAuthClient {
             ])
             .send()
             .await
-            .context("failed to refresh Microsoft access token")?
-            .error_for_status()
-            .context("Microsoft refresh token endpoint returned an error")?;
+            .context("failed to refresh Microsoft access token")?;
+        let status = response.status();
+        if !status.is_success() {
+            #[derive(Deserialize)]
+            struct TokenErrorBody {
+                error: Option<String>,
+            }
+            let error = response
+                .json::<TokenErrorBody>()
+                .await
+                .ok()
+                .and_then(|body| body.error);
+            return Err(anyhow::Error::new(MicrosoftTokenEndpointError {
+                status: status.as_u16(),
+                error,
+            })
+            .context("Microsoft refresh token endpoint returned an error"));
+        }
 
         response
             .json::<MicrosoftTokenResponse>()
@@ -165,6 +239,16 @@ pub struct AccountRecord {
     /// row; written only by `set_plays_offline`: `upsert_account` saves a
     /// sign-in and leaves the choice as it was, so this field is ignored there.
     pub plays_offline: bool,
+}
+
+/// The columns `AccountsRepository::update_session_tokens` writes. The refresh
+/// token always; `None` in any other field keeps what the row has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTokenUpdate {
+    pub refresh_token_enc: Vec<u8>,
+    pub access_token_enc: Option<Vec<u8>>,
+    pub minecraft_uuid: Option<String>,
+    pub profile_data: Option<String>,
 }
 
 pub struct AccountsRepository<'connection> {
@@ -245,14 +329,35 @@ impl<'connection> AccountsRepository<'connection> {
         Ok(())
     }
 
+    /// Deletes one saved account. When it was the active one and others are
+    /// left, the most recently signed-in of them becomes active in the same
+    /// transaction: the launch reads the active row (its sign-in and its
+    /// «Play offline», D115), and a database with accounts but none active
+    /// would launch with nobody while the interface shows the first row.
     pub fn delete_account(&self, microsoft_id: &str) -> Result<()> {
-        let deleted = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let was_active: Option<bool> = transaction
+            .query_row(
+                "SELECT is_active FROM accounts WHERE microsoft_id = ?1",
+                [microsoft_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(was_active) = was_active else {
+            bail!("account '{}' does not exist", microsoft_id);
+        };
+        transaction.execute(
             "DELETE FROM accounts WHERE microsoft_id = ?1",
             [microsoft_id],
         )?;
-        if deleted == 0 {
-            bail!("account '{}' does not exist", microsoft_id);
+        if was_active {
+            transaction.execute(
+                "UPDATE accounts SET is_active = TRUE WHERE id = \
+                 (SELECT id FROM accounts ORDER BY last_login DESC, id DESC LIMIT 1)",
+                [],
+            )?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -343,6 +448,55 @@ impl<'connection> AccountsRepository<'connection> {
             .map_err(Into::into)
     }
 
+    /// Saves the tokens of a refresh made by the launch on the row it read at
+    /// the start (concorrenza-8): the token blobs, and the identity the fresh
+    /// sign-in reported, when there is one. `last_login` is not touched: it
+    /// orders Manage Accounts by sign-in, and a launch is not one. Not an upsert: `is_active`, the
+    /// play-offline choice and the other rows stay as they are, so an account
+    /// switched away from, or removed, during the launch is not made active
+    /// again or re-created. Returns whether the row still existed.
+    pub fn update_session_tokens(
+        &self,
+        microsoft_id: &str,
+        tokens: &SessionTokenUpdate,
+    ) -> Result<bool> {
+        let updated_rows = self.connection.execute(
+            r#"
+            UPDATE accounts SET
+                access_token_enc = COALESCE(?2, access_token_enc),
+                refresh_token_enc = ?3,
+                minecraft_uuid = COALESCE(?4, minecraft_uuid),
+                profile_data = COALESCE(?5, profile_data)
+            WHERE microsoft_id = ?1
+            "#,
+            params![
+                microsoft_id,
+                &tokens.access_token_enc,
+                &tokens.refresh_token_enc,
+                &tokens.minecraft_uuid,
+                &tokens.profile_data,
+            ],
+        )?;
+        Ok(updated_rows > 0)
+    }
+
+    /// D143: Microsoft refused the saved refresh token for good, so it is
+    /// dropped and the row reads as signed out, which is what offers «Sign in
+    /// again». Only if the row still holds the blob the launch read: a sign-in
+    /// saved in the meantime is not thrown away. Returns whether it cleared.
+    pub fn clear_rejected_refresh_token(
+        &self,
+        microsoft_id: &str,
+        rejected_refresh_token_enc: &[u8],
+    ) -> Result<bool> {
+        let updated_rows = self.connection.execute(
+            "UPDATE accounts SET refresh_token_enc = NULL \
+             WHERE microsoft_id = ?1 AND refresh_token_enc = ?2",
+            params![microsoft_id, rejected_refresh_token_enc],
+        )?;
+        Ok(updated_rows > 0)
+    }
+
     /// Sets every token blob to NULL and keeps the rows. Only the explicit
     /// "Sign in again" path calls it, when no blob can be decrypted any more.
     pub fn discard_encrypted_tokens(&self) -> Result<usize> {
@@ -381,46 +535,61 @@ pub fn build_authorization_url(
     Ok(url)
 }
 
+/// What one request on the loopback `/callback` means for the sign-in that
+/// is waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallbackOutcome {
+    /// The authorization code of this sign-in.
+    Code(AuthorizationCallback),
+    /// This sign-in's answer, and it is not a code: the user refused, or
+    /// Microsoft reported an error. The text says which.
+    Failed(String),
+    /// Not this sign-in's answer: the state is missing or another one. The
+    /// sign-in keeps waiting (sicurezza-3).
+    Foreign,
+}
+
+/// Reads a callback URL against the state this sign-in sent. The state is
+/// checked first, so that neither a code nor an error from a request that
+/// does not carry it can end the sign-in.
+fn classify_callback(callback_url: &str, expected_state: &str) -> Result<CallbackOutcome> {
+    let url = Url::parse(callback_url)
+        .with_context(|| format!("invalid Microsoft callback URL '{callback_url}'"))?;
+    let query_pairs = url.query_pairs().collect::<Vec<_>>();
+    let value = |name: &str| {
+        query_pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string())
+    };
+
+    let Some(state) = value("state").filter(|state| state == expected_state) else {
+        return Ok(CallbackOutcome::Foreign);
+    };
+
+    if let Some(error) = value("error") {
+        let description = value("error_description").unwrap_or_default();
+        let message = format!("Microsoft OAuth error: {} {}", error, description)
+            .trim()
+            .to_string();
+        return Ok(CallbackOutcome::Failed(message));
+    }
+
+    Ok(match value("code") {
+        Some(code) => CallbackOutcome::Code(AuthorizationCallback { code, state }),
+        None => CallbackOutcome::Failed("callback is missing authorization code".to_string()),
+    })
+}
+
 pub fn parse_authorization_callback(
     callback_url: &str,
     expected_state: &str,
 ) -> Result<AuthorizationCallback> {
-    let url = Url::parse(callback_url)
-        .with_context(|| format!("invalid Microsoft callback URL '{callback_url}'"))?;
-    let query_pairs = url.query_pairs().collect::<Vec<_>>();
-
-    if let Some(error) = query_pairs
-        .iter()
-        .find(|(key, _)| key == "error")
-        .map(|(_, value)| value.to_string())
-    {
-        let description = query_pairs
-            .iter()
-            .find(|(key, _)| key == "error_description")
-            .map(|(_, value)| value.to_string())
-            .unwrap_or_default();
-        let message = format!("Microsoft OAuth error: {} {}", error, description)
-            .trim()
-            .to_string();
-        return Err(anyhow!(message));
+    match classify_callback(callback_url, expected_state)? {
+        CallbackOutcome::Code(callback) => Ok(callback),
+        CallbackOutcome::Failed(message) => Err(anyhow!(message)),
+        CallbackOutcome::Foreign => bail!("callback state mismatch"),
     }
-
-    let code = query_pairs
-        .iter()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.to_string())
-        .context("callback is missing authorization code")?;
-    let state = query_pairs
-        .iter()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.to_string())
-        .context("callback is missing state")?;
-
-    if state != expected_state {
-        bail!("callback state mismatch");
-    }
-
-    Ok(AuthorizationCallback { code, state })
 }
 
 pub fn build_pkce_code_challenge(code_verifier: &str) -> String {
@@ -642,7 +811,7 @@ impl Default for MinecraftAuthChain {
 impl MinecraftAuthChain {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: auth_http_client(),
         }
     }
 
@@ -808,7 +977,16 @@ pub const REGISTERED_LOOPBACK_REDIRECT_URI: &str = "http://localhost/callback";
 /// Opens the system browser, receives the Microsoft redirect on localhost,
 /// validates state, exchanges the code, then continues through Xbox and
 /// Minecraft services.
-pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult> {
+///
+/// `on_authorization_url` receives the page the browser is sent to, before
+/// the browser is asked to open it: the interface shows it, so that a
+/// browser that opens in the wrong profile, or not at all, still leaves the
+/// user a link to copy (account-3). A browser that can't be opened is
+/// therefore not an error: the link is the way on.
+pub async fn run_microsoft_login(
+    client_id: &str,
+    on_authorization_url: impl FnOnce(&str),
+) -> Result<MinecraftLoginResult> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("localhost:0")
@@ -825,10 +1003,12 @@ pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult
     let oauth_client = MicrosoftOAuthClient::new();
     let session = oauth_client.start_session(&config)?;
 
-    open::that(session.authorization_url.as_str()).context("failed to open system browser")?;
+    on_authorization_url(session.authorization_url.as_str());
+    if let Err(error) = open::that(session.authorization_url.as_str()) {
+        eprintln!("[Login] Could not open the system browser, the link is shown instead: {error}");
+    }
 
-    let callback_url = serve_loopback_callback(&listener, port).await?;
-    let callback = parse_authorization_callback(&callback_url, &session.state)?;
+    let callback = serve_loopback_callback(&listener, port, &session.state).await?;
     let ms_tokens = oauth_client
         .exchange_authorization_code(&config, &callback, &session.code_verifier)
         .await?;
@@ -844,7 +1024,16 @@ pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult
         .await
 }
 
-async fn serve_loopback_callback(listener: &tokio::net::TcpListener, port: u16) -> Result<String> {
+/// Waits for this sign-in's answer on the loopback listener. The page the
+/// browser shows says what the launcher concluded: success only for a code
+/// with this sign-in's state, an error page when Microsoft answered with an
+/// error, and a 400 for a request that is not this sign-in's, after which
+/// the wait goes on (sicurezza-3).
+async fn serve_loopback_callback(
+    listener: &tokio::net::TcpListener,
+    port: u16,
+    expected_state: &str,
+) -> Result<AuthorizationCallback> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     loop {
@@ -860,20 +1049,36 @@ async fn serve_loopback_callback(listener: &tokio::net::TcpListener, port: u16) 
 
         let first_line = request.lines().next().unwrap_or("");
 
-        if let Some(callback_url) = callback_url_from_request_line(first_line, port) {
-            let body = success_callback_page();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            return Ok(callback_url);
-        } else {
+        let Some(callback_url) = callback_url_from_request_line(first_line, port) else {
             let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes()).await;
+            continue;
+        };
+
+        let outcome = classify_callback(&callback_url, expected_state)?;
+        let _ = stream
+            .write_all(callback_response(&outcome).as_bytes())
+            .await;
+        match outcome {
+            CallbackOutcome::Code(callback) => return Ok(callback),
+            CallbackOutcome::Failed(message) => return Err(anyhow!(message)),
+            CallbackOutcome::Foreign => continue,
         }
     }
+}
+
+/// The whole HTTP response the browser gets for one callback request.
+fn callback_response(outcome: &CallbackOutcome) -> String {
+    let (status, body) = match outcome {
+        CallbackOutcome::Code(_) => ("200 OK", success_callback_page().to_string()),
+        CallbackOutcome::Failed(message) => ("200 OK", failed_callback_page(message)),
+        CallbackOutcome::Foreign => ("400 Bad Request", foreign_callback_page().to_string()),
+    };
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
 fn callback_url_from_request_line(first_line: &str, port: u16) -> Option<String> {
@@ -893,14 +1098,56 @@ fn callback_url_from_request_line(first_line: &str, port: u16) -> Option<String>
     Some(format!("http://localhost:{port}{target}"))
 }
 
-fn success_callback_page() -> &'static str {
-    r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cubic Launcher</title></head>
+fn callback_page(title: &str, text: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cubic Launcher</title></head>
 <body style="font-family:system-ui;background:#101014;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
 <main style="text-align:center;max-width:420px;padding:24px">
-<h1 style="font-size:20px;margin:0 0 8px">Microsoft sign-in complete</h1>
-<p style="color:#a1a1aa;margin:0">You can close this tab and return to Cubic Launcher.</p>
+<h1 style="font-size:20px;margin:0 0 8px">{title}</h1>
+<p style="color:#a1a1aa;margin:0">{text}</p>
 </main>
 </body></html>"#
+    )
+}
+
+fn success_callback_page() -> String {
+    callback_page(
+        "Microsoft sign-in complete",
+        "You can close this tab and return to Cubic Launcher.",
+    )
+}
+
+fn failed_callback_page(message: &str) -> String {
+    callback_page(
+        "Microsoft sign-in did not complete",
+        &format!(
+            "{}<br><br>You can close this tab; Cubic Launcher shows the same error.",
+            escape_html(message)
+        ),
+    )
+}
+
+fn foreign_callback_page() -> String {
+    callback_page(
+        "This is not the sign-in Cubic Launcher is waiting for",
+        "The link belongs to another or an older sign-in. Cubic Launcher keeps waiting: finish the sign-in from the link it shows.",
+    )
+}
+
+/// Microsoft's error text goes into the page as text, never as markup.
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 pub fn microsoft_client_id_from_env(env_file_path: &Path) -> Result<Option<String>> {
@@ -923,11 +1170,15 @@ pub fn microsoft_client_id_from_env(env_file_path: &Path) -> Result<Option<Strin
     Ok(None)
 }
 
-pub fn configured_microsoft_client_id(env_file_path: &Path) -> Result<Option<String>> {
+/// The client id for Microsoft sign-in: the launcher's `.env`, then the
+/// process environment, then the build environment, then the id bundled in
+/// the launcher. There is always one, so the only error is an unreadable
+/// `.env`.
+pub fn configured_microsoft_client_id(env_file_path: &Path) -> Result<String> {
     Ok(microsoft_client_id_from_env(env_file_path)?
         .or_else(microsoft_client_id_from_runtime_env)
         .or_else(microsoft_client_id_from_build_env)
-        .or_else(|| Some(BUNDLED_MICROSOFT_CLIENT_ID.to_string())))
+        .unwrap_or_else(|| BUNDLED_MICROSOFT_CLIENT_ID.to_string()))
 }
 
 fn microsoft_client_id_from_runtime_env() -> Option<String> {
@@ -961,11 +1212,13 @@ mod tests {
     use crate::database::initialize_database;
 
     use super::{
-        build_authorization_url, build_pkce_code_challenge, callback_url_from_request_line,
-        default_agent_author_name, default_loopback_redirect_uri, generate_url_safe_random_bytes,
-        join_scopes, microsoft_client_id_from_env, parse_authorization_callback,
-        validate_oauth_config, AccountRecord, AccountsRepository, MicrosoftOAuthClient,
-        MicrosoftOAuthConfig, MinecraftProfile, SkinVariant, TextureState,
+        build_authorization_url, build_pkce_code_challenge, callback_response,
+        callback_url_from_request_line, classify_callback, default_agent_author_name,
+        default_loopback_redirect_uri, generate_url_safe_random_bytes, join_scopes,
+        microsoft_client_id_from_env, parse_authorization_callback, refresh_needs_sign_in_again,
+        serve_loopback_callback, validate_oauth_config, AccountRecord, AccountsRepository,
+        AuthorizationCallback, CallbackOutcome, MicrosoftOAuthClient, MicrosoftOAuthConfig,
+        MinecraftProfile, SessionTokenUpdate, SkinVariant, TextureState,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -1093,6 +1346,174 @@ mod tests {
         assert!(callback_url_from_request_line("GET /favicon.ico HTTP/1.1", 43821).is_none());
         assert!(callback_url_from_request_line("GET /callbackevil HTTP/1.1", 43821).is_none());
         assert!(callback_url_from_request_line("POST /callback HTTP/1.1", 43821).is_none());
+    }
+
+    #[test]
+    fn callback_without_this_sign_ins_state_is_foreign_even_with_a_code_or_an_error() {
+        let base = "http://localhost:43821/callback";
+        for url in [
+            format!("{base}?code=abc&state=other"),
+            format!("{base}?code=abc"),
+            format!("{base}?error=access_denied&state=other"),
+            format!("{base}?error=access_denied"),
+        ] {
+            assert_eq!(
+                classify_callback(&url, "state123").expect("url should parse"),
+                CallbackOutcome::Foreign,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_error_with_this_sign_ins_state_fails_the_sign_in() {
+        let outcome = classify_callback(
+            "http://localhost:43821/callback?error=access_denied&error_description=The+user+said+no&state=state123",
+            "state123",
+        )
+        .expect("url should parse");
+        assert_eq!(
+            outcome,
+            CallbackOutcome::Failed("Microsoft OAuth error: access_denied The user said no".into())
+        );
+        assert_eq!(
+            classify_callback("http://localhost:43821/callback?state=state123", "state123")
+                .expect("url should parse"),
+            CallbackOutcome::Failed("callback is missing authorization code".into())
+        );
+    }
+
+    #[test]
+    fn callback_page_says_what_the_launcher_concluded() {
+        let success = callback_response(&CallbackOutcome::Code(AuthorizationCallback {
+            code: "abc".into(),
+            state: "state123".into(),
+        }));
+        assert!(success.starts_with("HTTP/1.1 200 OK"));
+        assert!(success.contains("Microsoft sign-in complete"));
+
+        let failed = callback_response(&CallbackOutcome::Failed(
+            "Microsoft OAuth error: <script>".into(),
+        ));
+        assert!(failed.starts_with("HTTP/1.1 200 OK"));
+        assert!(failed.contains("did not complete"));
+        assert!(failed.contains("&lt;script&gt;"));
+        assert!(!failed.contains("<script>"));
+        assert!(!failed.contains("sign-in complete"));
+
+        let foreign = callback_response(&CallbackOutcome::Foreign);
+        assert!(foreign.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(!foreign.contains("sign-in complete"));
+    }
+
+    #[tokio::test]
+    async fn loopback_answers_400_to_a_foreign_callback_and_keeps_waiting_for_its_own() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let server =
+            tokio::spawn(async move { serve_loopback_callback(&listener, port, "state123").await });
+
+        let send = |target: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("loopback should accept");
+            stream
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .expect("request should send");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("response should read");
+            response
+        };
+
+        let foreign = send("/callback?code=stolen&state=other").await;
+        assert!(foreign.starts_with("HTTP/1.1 400"), "{foreign}");
+        let own = send("/callback?code=abc123&state=state123").await;
+        assert!(own.starts_with("HTTP/1.1 200"), "{own}");
+
+        let callback = server
+            .await
+            .expect("server task should finish")
+            .expect("the own callback should be accepted");
+        assert_eq!(callback.code, "abc123");
+    }
+
+    #[test]
+    fn deleting_the_active_account_activates_the_most_recent_other_one() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        for (microsoft_id, last_login, is_active) in [
+            ("account-old", "2026-01-01 10:00:00", false),
+            ("account-recent", "2026-06-01 10:00:00", false),
+            ("account-active", "2026-03-01 10:00:00", true),
+        ] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: None,
+                    minecraft_uuid: None,
+                    access_token_enc: None,
+                    refresh_token_enc: None,
+                    profile_data: None,
+                    is_active,
+                    plays_offline: false,
+                })
+                .expect("account should insert");
+            connection
+                .execute(
+                    "UPDATE accounts SET last_login = ?1 WHERE microsoft_id = ?2",
+                    [last_login, microsoft_id],
+                )
+                .expect("last login should set");
+        }
+
+        // An inactive row goes without touching which one is active.
+        repository
+            .delete_account("account-old")
+            .expect("inactive account should delete");
+        assert_eq!(
+            repository
+                .load_active_account()
+                .expect("active query should succeed")
+                .map(|account| account.microsoft_id),
+            Some("account-active".into())
+        );
+
+        repository
+            .delete_account("account-active")
+            .expect("active account should delete");
+        assert_eq!(
+            repository
+                .load_active_account()
+                .expect("active query should succeed")
+                .map(|account| account.microsoft_id),
+            Some("account-recent".into())
+        );
+
+        repository
+            .delete_account("account-recent")
+            .expect("last account should delete");
+        assert!(repository
+            .load_active_account()
+            .expect("active query should succeed")
+            .is_none());
+        assert!(repository.delete_account("account-recent").is_err());
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 
     #[test]
@@ -1288,5 +1709,172 @@ mod tests {
                 .expect("our own spelling must read back"),
             SkinVariant::Slim
         );
+    }
+
+    /// A local token endpoint that answers one request with `status` and a
+    /// JSON `body`.
+    fn one_shot_token_endpoint(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}/token")
+    }
+
+    async fn refresh_against(status: &'static str, body: &'static str) -> anyhow::Error {
+        let token_url = one_shot_token_endpoint(status, body);
+        MicrosoftOAuthClient::with_endpoints("http://127.0.0.1:9/authorize", token_url)
+            .refresh_access_token(&sample_config(), "saved-refresh-token")
+            .await
+            .expect_err("the endpoint refuses the refresh")
+    }
+
+    /// D143 (account-1): a refresh token Microsoft refuses for good asks for a
+    /// new sign-in; a refusal of the client or a server error does not, and
+    /// the error never carries the token that was sent.
+    #[tokio::test]
+    async fn only_a_dead_grant_asks_to_sign_in_again() {
+        let invalid_grant = refresh_against(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"AADSTS70000: expired"}"#,
+        )
+        .await;
+        assert!(refresh_needs_sign_in_again(&invalid_grant));
+        assert!(format!("{invalid_grant:#}").contains("invalid_grant"));
+        assert!(!format!("{invalid_grant:#}").contains("saved-refresh-token"));
+
+        let interaction =
+            refresh_against("400 Bad Request", r#"{"error":"interaction_required"}"#).await;
+        assert!(refresh_needs_sign_in_again(&interaction));
+
+        let client = refresh_against("400 Bad Request", r#"{"error":"invalid_client"}"#).await;
+        assert!(!refresh_needs_sign_in_again(&client));
+
+        let unavailable = refresh_against("503 Service Unavailable", "").await;
+        assert!(!refresh_needs_sign_in_again(&unavailable));
+    }
+
+    fn signed_in_account(microsoft_id: &str, is_active: bool) -> AccountRecord {
+        AccountRecord {
+            microsoft_id: microsoft_id.into(),
+            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+            access_token_enc: Some(vec![1, 2, 3]),
+            refresh_token_enc: Some(vec![4, 5, 6]),
+            profile_data: Some("{\"name\":\"Before\"}".into()),
+            is_active,
+            plays_offline: false,
+        }
+    }
+
+    /// concorrenza-8: the launch's refresh writes the tokens of its own row and
+    /// nothing else; `None` keeps what the row has.
+    #[test]
+    fn session_token_update_touches_only_the_tokens_of_its_row() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        repository
+            .upsert_account(&signed_in_account("account-a", true))
+            .expect("A should insert");
+        repository
+            .set_plays_offline("account-a", true)
+            .expect("A's choice should save");
+        repository
+            .upsert_account(&signed_in_account("account-b", true))
+            .expect("B should insert and become active");
+
+        let updated = repository
+            .update_session_tokens(
+                "account-a",
+                &SessionTokenUpdate {
+                    refresh_token_enc: vec![9, 9, 9],
+                    access_token_enc: None,
+                    minecraft_uuid: None,
+                    profile_data: None,
+                },
+            )
+            .expect("update should run");
+        assert!(updated);
+        let missing = repository
+            .update_session_tokens(
+                "account-gone",
+                &SessionTokenUpdate {
+                    refresh_token_enc: vec![9],
+                    access_token_enc: None,
+                    minecraft_uuid: None,
+                    profile_data: None,
+                },
+            )
+            .expect("update should run");
+        assert!(!missing);
+
+        let accounts = repository.list_accounts().expect("accounts should list");
+        assert_eq!(accounts.len(), 2, "no row is created");
+        let account_a = accounts
+            .iter()
+            .find(|account| account.microsoft_id == "account-a")
+            .expect("A exists");
+        assert_eq!(account_a.refresh_token_enc.as_deref(), Some(&[9, 9, 9][..]));
+        assert_eq!(account_a.access_token_enc.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(account_a.minecraft_uuid.as_deref(), Some("account-a-uuid"));
+        assert!(!account_a.is_active);
+        assert!(account_a.plays_offline);
+        assert_eq!(
+            repository
+                .load_active_account()
+                .expect("active should load")
+                .expect("one is active")
+                .microsoft_id,
+            "account-b"
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    /// D143: the refused refresh token is dropped only while the row still
+    /// holds it; a sign-in saved during the launch is kept.
+    #[test]
+    fn a_rejected_refresh_token_is_cleared_only_if_it_is_still_the_saved_one() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        repository
+            .upsert_account(&signed_in_account("account-a", true))
+            .expect("A should insert");
+
+        let stale = repository
+            .clear_rejected_refresh_token("account-a", &[7, 7, 7])
+            .expect("clear should run");
+        assert!(!stale, "a newer sign-in is not thrown away");
+        let cleared = repository
+            .clear_rejected_refresh_token("account-a", &[4, 5, 6])
+            .expect("clear should run");
+        assert!(cleared);
+
+        let account_a = repository
+            .load_active_account()
+            .expect("active should load")
+            .expect("A stays active");
+        assert_eq!(account_a.refresh_token_enc, None);
+        assert_eq!(account_a.minecraft_uuid.as_deref(), Some("account-a-uuid"));
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
 }

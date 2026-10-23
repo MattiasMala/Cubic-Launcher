@@ -13,6 +13,9 @@ import { MaterialIcon, XIcon } from "./icons";
 interface ActionBarProps {
   onAddMod: () => void;
   onDeleteSelected: () => void;
+  // Creating a group can move its members next to each other: the new order is saved through these.
+  onReorder?: (orderedIds: string[]) => void;
+  onReorderAlts?: (parentId: string, orderedIds: string[]) => void;
 }
 
 export function ActionBar(props: ActionBarProps) {
@@ -27,7 +30,7 @@ export function ActionBar(props: ActionBarProps) {
         </span>
         <div class="flex items-center gap-2">
           <button
-            onClick={createGroup}
+            onClick={() => createGroup({ onReorder: props.onReorder, onReorderAlts: props.onReorderAlts })}
             class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
           >
             <MaterialIcon name="folder_open" size="md" />
@@ -131,7 +134,7 @@ export function ActionBar(props: ActionBarProps) {
 
   const NormalBar = () => (
     <div class="px-6 py-2 bg-bgPanel border-b border-borderColor shrink-0 flex items-center justify-between gap-3">
-      {/* Left: Add Content + Sort + Tags dropdown + Links + Clear */}
+      {/* Left: Add Mods + Tags dropdown + Links + Clear */}
       <div class="flex items-center gap-2 flex-wrap">
         {/* Add Mods */}
         <button
@@ -201,12 +204,12 @@ export function ActionBar(props: ActionBarProps) {
           </button>
         </Show>
 
-        {/* Clear filters */}
+        {/* Clear the tag filter */}
         <Show when={hasActiveFilters()}>
           <button
             onClick={() => setTagFilter(new Set<string>())}
             class="flex items-center gap-1 px-2 py-0.5 rounded-md text-xs text-textMuted hover:text-white hover:bg-muted/40 border border-dashed border-borderColor transition-colors duration-75"
-            title="Reset all filters and sort"
+            title="Clear the tag filter"
           >
             <XIcon class="h-3 w-3" />
             Clear

@@ -9,6 +9,7 @@ import { Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  activePlaysOffline,
   mcWithSnapshots,
   minecraftVersions,
   parentIdByChildId,
@@ -33,6 +34,8 @@ type PinContext = {
   modName: string;
   /** The pin already in place, if any — its backend mod_id. */
   pinnedModId?: string;
+  /** Whether removing that pin deletes its jar (audit 101, modlist-2). */
+  pinOwnsJar: boolean;
 };
 
 function pinContext(row: ModRow): PinContext {
@@ -40,14 +43,24 @@ function pinContext(row: ModRow): PinContext {
   // parked under it, which is also the only thing that can be re-pinned.
   if (pinnedRowIds().has(row.id)) {
     const dynamic = (row.alternatives ?? []).find(alt => alt.kind === "modrinth") ?? null;
-    return { dynamic, modName: dynamic?.name ?? row.name, pinnedModId: row.primaryModId };
+    return {
+      dynamic,
+      modName: dynamic?.name ?? row.name,
+      pinnedModId: row.primaryModId,
+      pinOwnsJar: row.pin?.ownsJar === true,
+    };
   }
 
   const parentId = parentIdByChildId().get(row.id);
   const parent = parentId ? rowMap().get(parentId) : undefined;
-  const pinnedModId = parent && pinnedRowIds().has(parent.id) ? parent.primaryModId : undefined;
+  const pinParent = parent && pinnedRowIds().has(parent.id) ? parent : undefined;
 
-  return { dynamic: row, modName: row.name, pinnedModId };
+  return {
+    dynamic: row,
+    modName: row.name,
+    pinnedModId: pinParent?.primaryModId,
+    pinOwnsJar: pinParent?.pin?.ownsJar === true,
+  };
 }
 
 export function PinVersionDialog() {
@@ -77,9 +90,14 @@ export function PinVersionDialog() {
             initialMcVersion={selectedMcVersion()}
             loader={loader}
             pinnedLabel={context.pinnedModId}
+            removePinDeletesJar={context.pinOwnsJar}
             canPin={context.dynamic !== null}
             loadReleases={mcVersion =>
-              slug ? fetchPinReleases(slug, mcVersion, loader) : Promise.resolve([])
+              // D140: the release list is Modrinth's, and an account that
+              // plays offline asks nobody.
+              activePlaysOffline()
+                ? Promise.reject("this account plays offline, and the release list comes from Modrinth. Turn off Play offline in Manage Accounts to pin a version.")
+                : slug ? fetchPinReleases(slug, mcVersion, loader) : Promise.resolve([])
             }
             onSave={async choice => {
               await invoke("pin_mod_version_command", {

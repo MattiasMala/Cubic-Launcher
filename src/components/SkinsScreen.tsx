@@ -17,16 +17,26 @@
 // Errors are objects; the screen reads `kind`, never the message text, to
 // decide what to say. A profile that can't be read is not an error of the
 // screen: the library shows, and no card is marked as worn.
+//
+// **An account that plays offline sees its library and nothing else**
+// (D141): the backend answers with the `playsOffline` profile error without
+// asking Mojang, and the screen hides what would reach Mojang — Apply, the
+// reset, the capes — saying why instead.
 
-import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
+import { For, Show, Suspense, createEffect, createMemo, createSignal, lazy, on, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { inferModelType, loadImage, loadSkinToCanvas } from "skinview-utils";
-import { activeAccountId, setAccountsModalOpen } from "../store";
+import { accountsRevision, setAccountsModalOpen } from "../store";
 import type { SkinCard, SkinError, SkinVariant, SkinsView } from "../lib/types";
 import { AlertTriangleIcon, CheckIcon, Loader2Icon, PencilIcon, PlusIcon, Trash2Icon, XIcon } from "./icons";
 import { CapeFigure, SkinFigure } from "./skins/SkinFigures";
-import { SkinPreview, type PreviewLoad } from "./skins/SkinPreview";
+import type { PreviewLoad } from "./skins/SkinPreview";
+
+// skinview3d brings three.js, more than half of the app's JavaScript: the
+// preview loads in its own chunk the first time the Skins screen draws it,
+// not at every start of the launcher (todo.md:1589).
+const SkinPreview = lazy(() => import("./skins/SkinPreview").then(module => ({ default: module.SkinPreview })));
 
 type CardId = Pick<SkinCard, "source" | "textureKey" | "variant">;
 
@@ -60,7 +70,11 @@ function actionErrorText(error: SkinError, wait: number): { title: string; detai
         detail: null,
       };
     case "notSignedIn":
-      return { title: "Sign in again to change your skin.", detail: error.message };
+      return { title: "Your sign-in needs renewing to change your skin: open Manage accounts.", detail: error.message };
+    case "playsOffline":
+      return { title: "This account plays offline, so nothing is sent to Mojang. Turn off Play offline in Manage accounts to change your skin.", detail: null };
+    case "keyringUnavailable":
+      return { title: "The system keyring can't be reached. Start or unlock it, then reopen the launcher.", detail: error.message };
     case "invalidSkin":
       return { title: "That isn't a skin Minecraft can use.", detail: error.message };
     case "network":
@@ -77,7 +91,11 @@ function profileErrorText(error: SkinError) {
     case "network":
       return "Mojang isn't answering, so the skin and capes on your profile can't be shown. Your library is still here.";
     case "notSignedIn":
-      return "Your sign-in needs renewing before your profile can be read. Your library is still here.";
+      return "Your sign-in needs renewing before your profile can be read: open Manage accounts. Your library is still here.";
+    case "playsOffline":
+      return "This account plays offline, so Skins shows your library only: nothing is read from or sent to Mojang. Turn off Play offline in Manage accounts to wear a skin or a cape.";
+    case "keyringUnavailable":
+      return "The system keyring can't be reached, so your sign-in can't be read. Start or unlock your keyring, then reopen the launcher. Your library is still here.";
     case "rateLimited":
       return "Mojang asked to slow down before your profile can be read again. Your library is still here.";
     default:
@@ -165,6 +183,8 @@ export function SkinsScreen() {
     return pending !== null && pending.id !== (activeCape()?.id ?? null);
   };
   const previewing = () => skinChanged() || capeChanged();
+  /** D141: the account plays offline; the backend asked Mojang nothing. */
+  const playsOffline = () => view()?.profileError?.kind === "playsOffline";
 
   // A new selection starts with no half-finished rename or removal.
   createEffect(on(selectedCard, () => {
@@ -172,20 +192,36 @@ export function SkinsScreen() {
     setConfirmRemove(false);
   }));
 
+  /**
+   * The last read of the screen asked for (review-frontend-shell-24): a slow
+   * answer for the account as it was — online, or the one before a switch —
+   * must not land over the one for the account as it is now. A command run
+   * from the screen counts as a read too.
+   */
+  let viewSeq = 0;
+
   async function load() {
+    const seq = ++viewSeq;
     setLoading(true);
     try {
-      setView(await invoke<SkinsView>("load_skins_command"));
+      const next = await invoke<SkinsView>("load_skins_command");
+      if (seq !== viewSeq) return;
+      setView(next);
       setLoadError(null);
       setPendingCape(null);
     } catch (error) {
+      if (seq !== viewSeq) return;
       setView(null);
       setLoadError(asSkinError(error));
     } finally {
-      setLoading(false);
+      if (seq === viewSeq) setLoading(false);
     }
   }
-  createEffect(on(activeAccountId, () => {
+  // Reloaded whenever the accounts are read back after a change — a switch,
+  // a «Play offline» toggle, a new sign-in of the same account — and not on
+  // the active id alone, which changes before the backend has switched and
+  // not at all on a new sign-in (account-6).
+  createEffect(on(accountsRevision, () => {
     setSelectedId(null);
     void load();
   }));
@@ -199,9 +235,10 @@ export function SkinsScreen() {
   async function run(label: string, command: string, args: Record<string, unknown> = {}): Promise<SkinsView | null> {
     if (busy()) return null;
     setBusy(label);
+    const seq = ++viewSeq;
     try {
       const next = await invoke<SkinsView>(command, args);
-      setView(next);
+      if (seq === viewSeq) setView(next);
       setActionError(null);
       return next;
     } catch (error) {
@@ -212,7 +249,8 @@ export function SkinsScreen() {
         setRetryAt(Date.now() + (skinError.retryAfterSeconds ?? 60) * 1000);
       }
       try {
-        setView(await invoke<SkinsView>("load_skins_command"));
+        const current = await invoke<SkinsView>("load_skins_command");
+        if (seq === viewSeq) setView(current);
       } catch {
         // The screen keeps what it showed; the banner already says why.
       }
@@ -349,13 +387,15 @@ export function SkinsScreen() {
               </div>
 
               <div class="relative h-[calc(80vh-9rem)] min-h-[320px] rounded-xl border border-borderColor bg-bgPanel overflow-hidden">
-                <SkinPreview
-                  skinUrl={selectedCard()?.textureUrl ?? null}
-                  variant={selectedCard()?.variant ?? "classic"}
-                  capeUrl={previewCape()?.textureUrl ?? null}
-                  onSkinLoad={setSkinLoad}
-                  onCapeLoad={setCapeLoad}
-                />
+                <Suspense>
+                  <SkinPreview
+                    skinUrl={selectedCard()?.textureUrl ?? null}
+                    variant={selectedCard()?.variant ?? "classic"}
+                    capeUrl={previewCape()?.textureUrl ?? null}
+                    onSkinLoad={setSkinLoad}
+                    onCapeLoad={setCapeLoad}
+                  />
+                </Suspense>
                 <Show when={previewing()}>
                   <span class="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-full border border-primary bg-primary/15 px-3 py-1 text-xs font-semibold text-white">
                     Previewing
@@ -373,7 +413,14 @@ export function SkinsScreen() {
                 </Show>
               </div>
 
-              <Show when={previewing()}>
+              <Show when={playsOffline()}>
+                <p class="text-xs text-textMuted">
+                  Previewing only: this account plays offline, so a skin can't be applied to your
+                  Mojang profile.
+                </p>
+              </Show>
+
+              <Show when={previewing() && !playsOffline()}>
                 <div class="flex gap-2">
                   {/* With the profile unread nothing is worn, so there is nothing to go back to. */}
                   <Show when={activeCard() || capeChanged()}>
@@ -480,7 +527,7 @@ export function SkinsScreen() {
                       </div>
                     </Show>
 
-                    <Show when={card().source === "external"}>
+                    <Show when={card().source === "external" && !playsOffline()}>
                       <button type="button" class={secondaryButton} disabled={!!busy()} onClick={() => void saveWorn()}>
                         <PlusIcon class="h-4 w-4" /> Save to your skins
                       </button>
@@ -489,15 +536,17 @@ export function SkinsScreen() {
                 )}
               </Show>
 
-              <button
-                type="button"
-                class="self-start text-xs text-textMuted hover:text-white underline-offset-2 hover:underline cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!!busy() || waitSeconds() > 0}
-                onClick={() => void resetToDefault()}
-                title="Mojang puts one of its default skins on; the one you wear now is kept in your skins."
-              >
-                Reset to Mojang's default skin
-              </button>
+              <Show when={!playsOffline()}>
+                <button
+                  type="button"
+                  class="self-start text-xs text-textMuted hover:text-white underline-offset-2 hover:underline cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!!busy() || waitSeconds() > 0}
+                  onClick={() => void resetToDefault()}
+                  title="Mojang puts one of its default skins on; the one you wear now is kept in your skins."
+                >
+                  Reset to Mojang's default skin
+                </button>
+              </Show>
             </div>
 
             {/* ── The library and the capes ───────────────────────────── */}
@@ -508,16 +557,20 @@ export function SkinsScreen() {
                     <AlertTriangleIcon class="h-5 w-5 shrink-0 text-warning" />
                     <div class="min-w-0 flex-1">
                       <p class="text-sm text-white">{profileErrorText(error())}</p>
-                      <p class="mt-0.5 text-xs text-textMuted">Nothing is marked as worn until Mojang answers.</p>
+                      <Show when={error().kind !== "playsOffline"}>
+                        <p class="mt-0.5 text-xs text-textMuted">Nothing is marked as worn until Mojang answers.</p>
+                      </Show>
                     </div>
-                    <Show when={error().kind === "notSignedIn"}>
+                    <Show when={error().kind === "notSignedIn" || error().kind === "playsOffline" || error().kind === "keyringUnavailable"}>
                       <button type="button" class={secondaryButton} onClick={() => setAccountsModalOpen(true)}>
                         Manage accounts
                       </button>
                     </Show>
-                    <button type="button" class={secondaryButton} disabled={loading()} onClick={() => void load()}>
-                      Try again
-                    </button>
+                    <Show when={error().kind !== "playsOffline"}>
+                      <button type="button" class={secondaryButton} disabled={loading()} onClick={() => void load()}>
+                        Try again
+                      </button>
+                    </Show>
                   </div>
                 )}
               </Show>
@@ -532,7 +585,7 @@ export function SkinsScreen() {
                         {detail => <p class="mt-0.5 text-xs text-textMuted break-words">{detail()}</p>}
                       </Show>
                     </div>
-                    <Show when={error().kind === "notSignedIn"}>
+                    <Show when={error().kind === "notSignedIn" || error().kind === "playsOffline" || error().kind === "keyringUnavailable"}>
                       <button type="button" class={secondaryButton} onClick={() => setAccountsModalOpen(true)}>
                         Manage accounts
                       </button>
@@ -587,9 +640,11 @@ export function SkinsScreen() {
                   when={capes().length > 0}
                   fallback={
                     <p class="text-xs text-textMuted">
-                      {current().profileError
-                        ? "Your capes show up when Mojang answers."
-                        : "This account owns no capes."}
+                      {playsOffline()
+                        ? "Capes live on your Mojang profile, which isn't read while this account plays offline."
+                        : current().profileError
+                          ? "Your capes show up when Mojang answers."
+                          : "This account owns no capes."}
                     </p>
                   }
                 >

@@ -33,6 +33,11 @@ static LAST_PROFILE_RECORDING: parking_lot::Mutex<Option<PathBuf>> = parking_lot
 /// launches of the same (modlist, mc version, loader) triple within one second.
 static LAUNCH_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// D156 (lancio-12): quante cartelle di `logs/launches/` restano, quella del
+/// lancio che parte compresa. Le più vecchie si cancellano all'avvio di un
+/// lancio; prima la cartella cresceva per sempre (52 cartelle, 51 MB).
+const KEPT_LAUNCH_LOG_DIRS: usize = 20;
+
 #[derive(Debug)]
 pub(super) struct LaunchLogSession {
     dir: PathBuf,
@@ -67,6 +72,8 @@ impl LaunchLogSession {
         let dir = launcher_paths.launch_logs_dir().join(launch_id);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create launch log directory {}", dir.display()))?;
+        // Una potatura che non riesce non ferma il lancio: ci riprova il prossimo.
+        let _ = prune_launch_log_dirs(launcher_paths.launch_logs_dir(), KEPT_LAUNCH_LOG_DIRS);
 
         let session = Arc::new(Self { dir });
         session.append_summary_line(&format!("modlist={modlist_name}"))?;
@@ -98,15 +105,15 @@ impl LaunchLogSession {
         Ok(())
     }
 
+    /// L'output del gioco va solo in `minecraft.log` (lancio-12): prima ogni
+    /// riga si scriveva anche in `all.log`, e l'output, che è quasi tutto il
+    /// peso della cartella, occupava il doppio. `all.log` resta il diario del
+    /// launcher, con l'uscita del gioco.
     fn append_minecraft_log(&self, event: &ProcessLogEvent) -> Result<()> {
         let stream_label = match event.stream {
             ProcessLogStream::Stdout => "stdout",
             ProcessLogStream::Stderr => "stderr",
         };
-        self.append_line(
-            "all.log",
-            &format!("[minecraft:{stream_label}] {}", event.line),
-        )?;
         self.append_line("minecraft.log", &format!("[{stream_label}] {}", event.line))
     }
 
@@ -289,9 +296,15 @@ impl ProcessEventSink for LoggingProcessEventSink {
     }
 
     fn emit_exit(&self, event: ProcessExitEvent) -> Result<()> {
-        let events = self.ui_throttle.lock().unwrap().flush();
+        // concorrenza-10: le righe trattenute dal filtro che non arrivano al
+        // pannello non devono fermare `minecraft-exit`.
+        let events = self
+            .ui_throttle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush();
         for event in events {
-            self.inner.emit_log(event)?;
+            let _ = self.inner.emit_log(event);
         }
         let _ = self.session.append_exit_event(&event);
         self.inner.emit_exit(event)
@@ -515,6 +528,51 @@ fn sanitize_log_path_component(value: &str) -> String {
     }
 }
 
+/// Cancella le cartelle di sessione più vecchie di `launch_logs_dir` finché ne
+/// restano `keep` (D156). Tocca solo le cartelle col nome di una sessione,
+/// `<secondi>-…`: un file o una cartella messi lì a mano restano. Ritorna
+/// quante ne ha cancellate.
+pub(super) fn prune_launch_log_dirs(launch_logs_dir: &Path, keep: usize) -> Result<usize> {
+    let entries = std::fs::read_dir(launch_logs_dir)
+        .with_context(|| format!("failed to read {}", launch_logs_dir.display()))?;
+    let mut sessions = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let started_at = launch_log_dir_started_at(&entry.file_name().to_string_lossy())?;
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            Some(((started_at, modified, entry.file_name()), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    if sessions.len() <= keep {
+        return Ok(0);
+    }
+
+    // Dalla più nuova alla più vecchia: i secondi del nome, poi l'ultima
+    // scrittura per le sessioni dello stesso secondo.
+    sessions.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut removed = 0;
+    for (_, path) in sessions.into_iter().skip(keep) {
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// I secondi con cui comincia il nome di una cartella di sessione
+/// (`LaunchLogSession::create`), o `None` se il nome non è di una sessione.
+fn launch_log_dir_started_at(name: &str) -> Option<u64> {
+    let (seconds, rest) = name.split_once('-')?;
+    if rest.is_empty() || seconds.is_empty() || !seconds.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    seconds.parse().ok()
+}
+
 fn launcher_category_file(line: &str) -> Option<&'static str> {
     if line.starts_with("[Resolver]") {
         Some("resolver.log")
@@ -537,7 +595,10 @@ fn unique_error_id() -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{LaunchLogSession, LogUiThrottleState, ProcessLogEvent, ProcessLogStream};
+    use super::{
+        prune_launch_log_dirs, LaunchLogSession, LogUiThrottleState, ProcessLogEvent,
+        ProcessLogStream, KEPT_LAUNCH_LOG_DIRS,
+    };
     use crate::launcher_paths::LauncherPaths;
     use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -621,5 +682,118 @@ mod tests {
             .line
             .contains("Previous launch log line repeated 2 additional times"));
         assert_eq!(events[1].line, "next");
+    }
+
+    fn session_dir_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .expect("launch logs dir should read")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// D156: restano le ultime `keep` sessioni, ordinate per i secondi del
+    /// nome (non per l'ordine alfabetico, che metterebbe `999-` dopo `1000-`);
+    /// quello che non ha il nome di una sessione non si tocca.
+    #[test]
+    fn prune_keeps_the_newest_sessions_and_nothing_else_is_touched() {
+        let root = unique_test_root();
+        std::fs::create_dir_all(&root).expect("root");
+        for seconds in [999_u64, 1000, 1001, 1002, 1003] {
+            std::fs::create_dir(root.join(format!("{seconds}-pack-1-21-1-fabric-0-0")))
+                .expect("session dir");
+        }
+        std::fs::create_dir(root.join("kept-by-hand")).expect("manual dir");
+        std::fs::write(root.join("12-notes.txt"), "x").expect("manual file");
+
+        let removed = prune_launch_log_dirs(&root, 3).expect("prune");
+
+        assert_eq!(removed, 2);
+        assert_eq!(
+            session_dir_names(&root),
+            vec![
+                "1001-pack-1-21-1-fabric-0-0",
+                "1002-pack-1-21-1-fabric-0-0",
+                "1003-pack-1-21-1-fabric-0-0",
+                "12-notes.txt",
+                "kept-by-hand",
+            ]
+        );
+        assert_eq!(prune_launch_log_dirs(&root, 3).expect("prune again"), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// D156 (lancio-12): la potatura avviene all'avvio di un lancio, e la
+    /// sessione nuova è fra le 20 che restano.
+    #[test]
+    fn a_new_launch_leaves_the_latest_twenty_session_dirs() {
+        let root = unique_test_root();
+        let launcher_paths = LauncherPaths::new(&root);
+        launcher_paths
+            .create_required_directories()
+            .expect("dirs should create");
+        for seconds in 0..30_u64 {
+            std::fs::create_dir(
+                launcher_paths
+                    .launch_logs_dir()
+                    .join(format!("{}-old-1-20-1-forge-0-0", 1_000 + seconds)),
+            )
+            .expect("old session dir");
+        }
+        let target = ResolutionTarget {
+            minecraft_version: "1.21.1".into(),
+            mod_loader: ModLoader::Fabric,
+        };
+
+        let session =
+            LaunchLogSession::create(&launcher_paths, "My Pack", &target).expect("session");
+
+        let names = session_dir_names(launcher_paths.launch_logs_dir());
+        assert_eq!(names.len(), KEPT_LAUNCH_LOG_DIRS, "{names:?}");
+        assert!(session.dir().is_dir());
+        assert!(!names.contains(&"1010-old-1-20-1-forge-0-0".to_string()));
+        assert!(names.contains(&"1029-old-1-20-1-forge-0-0".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// lancio-12: l'output del gioco si scrive una volta sola, in
+    /// `minecraft.log`, dove lo legge il verificatore.
+    #[test]
+    fn game_output_is_written_once() {
+        let root = unique_test_root();
+        let launcher_paths = LauncherPaths::new(&root);
+        launcher_paths
+            .create_required_directories()
+            .expect("dirs should create");
+        let target = ResolutionTarget {
+            minecraft_version: "1.21.1".into(),
+            mod_loader: ModLoader::Fabric,
+        };
+        let session =
+            LaunchLogSession::create(&launcher_paths, "My Pack", &target).expect("session");
+
+        session
+            .append_minecraft_log(&stdout("[Render thread/INFO]: Setting user: Player"))
+            .expect("game line");
+
+        let minecraft_log =
+            std::fs::read_to_string(session.dir().join("minecraft.log")).expect("minecraft.log");
+        assert_eq!(
+            minecraft_log,
+            "[stdout] [Render thread/INFO]: Setting user: Player\n"
+        );
+        let all_log = std::fs::read_to_string(session.dir().join("all.log")).unwrap_or_default();
+        assert!(!all_log.contains("Setting user"), "{all_log}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -3,9 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::oneshot;
 
 use crate::account_manager::{
     AccountManager, AccountSummary, ManagedAccountProfile, ManagedAccountTokens,
@@ -20,9 +22,22 @@ use crate::token_storage::{CredentialState, KeyringSecretStore, SecretStore};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
     pub modlists: Vec<ShellModListSummary>,
+    /// Mod list folders whose `rules.json` could not be read. They are left
+    /// out of `modlists` instead of failing the whole snapshot (todo.md:1414):
+    /// one broken folder must not hide the others, the settings and the
+    /// accounts, nor stop the launch of another mod list.
+    pub unreadable_modlists: Vec<ShellUnreadableModList>,
     pub active_account: Option<ShellAccount>,
     pub global_settings: ShellGlobalSettings,
     pub selected_modlist_overrides: ShellModListOverrides,
+}
+
+/// A mod list folder left out of the snapshot, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellUnreadableModList {
+    /// The folder name under `mod-lists/`.
+    pub folder: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +71,10 @@ pub struct ShellAccount {
     /// with it is offline, whatever `credentials` says. A second sign apart
     /// from `status` on purpose: choosing offline is not a broken sign-in.
     pub plays_offline: bool,
+    /// The row the launch uses. The account list carries it so that the
+    /// interface learns which account is active from the list alone, without
+    /// depending on the snapshot (todo.md:1414, todo.md:1390).
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -70,8 +89,9 @@ pub struct ShellGlobalSettings {
     /// be installed.
     pub update_notifications_enabled: bool,
     /// The content categories the popup may report on. Mods are always
-    /// included and have no flag. Persisted only: the content-pack side of the
-    /// pre-check is C4, so nothing reads these three yet.
+    /// included and have no flag. The frontend reads these three: a category
+    /// switched off keeps its rows out of the update popup and its entries at
+    /// the version on disk.
     pub update_notifications_resource_packs: bool,
     pub update_notifications_data_packs: bool,
     pub update_notifications_shaders: bool,
@@ -121,17 +141,36 @@ pub struct ShellModListOverridesInput {
     pub mod_loader: Option<String>,
 }
 
+/// A mod list's target alone: what the version and loader dropdowns write, and
+/// what a new mod list starts on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellModListTargetInput {
+    pub modlist_name: String,
+    pub minecraft_version: String,
+    pub mod_loader: String,
+}
+
+/// Async, with the database and the keyring on a blocking thread: a
+/// synchronous Tauri command runs on the main thread, and on Linux a locked
+/// keyring can hold the call for as long as its unlock prompt stays open,
+/// freezing the whole window (account-8).
 #[tauri::command]
-pub fn load_shell_snapshot_command(
+pub async fn load_shell_snapshot_command(
     launcher_paths: State<'_, LauncherPaths>,
     selected_modlist_name: Option<String>,
 ) -> Result<ShellSnapshot, String> {
-    load_shell_snapshot_from_root(
-        launcher_paths.root_dir(),
-        selected_modlist_name.as_deref(),
-        KeyringSecretStore::new(),
-    )
-    .map_err(|error| error.to_string())
+    let root_dir = launcher_paths.root_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_shell_snapshot_from_root(
+            &root_dir,
+            selected_modlist_name.as_deref(),
+            KeyringSecretStore::new(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -148,15 +187,36 @@ pub fn switch_active_account_command(
 }
 
 /// Every saved account, the active one first (D113): the list the Accounts
-/// window shows and switches between.
+/// window shows and switches between. Off the main thread for the same
+/// reason as the snapshot (account-8): it asks the keyring.
 #[tauri::command]
-pub fn list_accounts_command(
+pub async fn list_accounts_command(
     launcher_paths: State<'_, LauncherPaths>,
 ) -> Result<Vec<ShellAccount>, String> {
-    let connection =
-        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
-    load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
-        .map_err(|error| error.to_string())
+    let database_path = launcher_paths.database_path().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
+        load_account_list_with_secret_store(&connection, KeyringSecretStore::new())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Whether the active account plays offline (D115), from its row. The app's
+/// own requests ask this before going to the network (D140): with it the
+/// launcher works from what it has on disk, and asks nobody. No active
+/// account plays online, as before.
+pub fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    Ok(AccountsRepository::new(&connection)
+        .load_active_account()?
+        .is_some_and(|account| account.plays_offline))
 }
 
 /// Saves the choice to play one account offline (D115). The launch and the
@@ -174,46 +234,164 @@ pub fn set_account_plays_offline_command(
         .map_err(|error| error.to_string())
 }
 
+/// The event that carries the Microsoft page the browser was sent to, so
+/// that the Accounts window can show it as a link (account-3).
+pub const MICROSOFT_LOGIN_URL_EVENT: &str = "microsoft-login-url";
+
+/// What `microsoft_login_command` answers when the user pressed Cancel. The
+/// frontend compares against it to tell a cancel from a failure.
+pub const MICROSOFT_LOGIN_CANCELLED: &str = "Microsoft sign-in cancelled";
+
+/// The sign-in in progress, if any: the sender that cancels it (account-3),
+/// with the number of the sign-in it belongs to.
+#[derive(Default)]
+pub struct MicrosoftLoginState {
+    cancel: Mutex<Option<(u64, oneshot::Sender<()>)>>,
+    started: std::sync::atomic::AtomicU64,
+}
+
+/// Holds the cancel slot for the length of one sign-in and empties it however
+/// the sign-in ends — unless a newer sign-in took it over.
+struct LoginInProgress<'a> {
+    state: &'a MicrosoftLoginState,
+    id: u64,
+}
+
+impl<'a> LoginInProgress<'a> {
+    /// A sign-in already waiting is cancelled and replaced, not refused
+    /// (review-frontend-shell-26): after a reload of the window the frontend
+    /// no longer knows about it and shows no Cancel, and it would block every
+    /// new sign-in for up to five minutes.
+    fn start(state: &'a MicrosoftLoginState) -> (Self, oneshot::Receiver<()>) {
+        let id = state
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        let previous = state.cancel.lock().replace((id, sender));
+        if let Some((_, previous)) = previous {
+            let _ = previous.send(());
+        }
+        (Self { state, id }, receiver)
+    }
+}
+
+impl Drop for LoginInProgress<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.state.cancel.lock();
+        if slot.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            slot.take();
+        }
+    }
+}
+
+/// Stops the sign-in in progress: the loopback listener closes and
+/// `microsoft_login_command` answers `MICROSOFT_LOGIN_CANCELLED`. Nothing is
+/// saved. Without a sign-in in progress it does nothing.
+#[tauri::command]
+pub fn cancel_microsoft_login_command(login_state: State<'_, MicrosoftLoginState>) {
+    if let Some((_, sender)) = login_state.cancel.lock().take() {
+        let _ = sender.send(());
+    }
+}
+
+/// Whether a "Sign in again" on one row came back with another Microsoft
+/// account (todo.md:1417). The Microsoft id is the row's key; the Minecraft
+/// UUID also counts as the same player, for a row saved before Microsoft
+/// returned its own user id.
+fn signed_in_as_another_account(
+    expected_microsoft_id: &str,
+    expected_minecraft_uuid: Option<&str>,
+    login_microsoft_id: &str,
+    login_minecraft_uuid: &str,
+) -> bool {
+    let same_uuid = expected_minecraft_uuid.is_some_and(|uuid| {
+        !uuid.is_empty() && uuid.replace('-', "") == login_minecraft_uuid.replace('-', "")
+    });
+    expected_microsoft_id != login_microsoft_id && !same_uuid
+}
+
 /// Starts the Microsoft OAuth login flow, opens the browser, waits for
 /// callback, exchanges tokens through Xbox Live → XSTS → Minecraft, and
 /// saves the account to the database.
 ///
 /// `replace_unreadable` is the "Sign in again" button (F1): it allows the save
 /// to discard saved sign-ins that the keyring says nobody can decrypt.
+///
+/// `expected_microsoft_id` is the row a "Sign in again" belongs to: when the
+/// browser signs in another Microsoft account, nothing is saved and the
+/// answer says so, instead of adding or activating that other account while
+/// the row stays as it was (todo.md:1417).
+///
+/// The page the browser is sent to goes out as `MICROSOFT_LOGIN_URL_EVENT`,
+/// and `cancel_microsoft_login_command` ends the wait (account-3).
 #[tauri::command]
 pub async fn microsoft_login_command(
+    app: AppHandle,
     launcher_paths: State<'_, LauncherPaths>,
+    login_state: State<'_, MicrosoftLoginState>,
     replace_unreadable: Option<bool>,
+    expected_microsoft_id: Option<String>,
 ) -> Result<String, String> {
+    // The cancel slot first (review-frontend-shell-26): the window shows
+    // "Cancel sign-in" at once, and the keyring check below can wait on an
+    // unlock prompt. A Cancel pressed meanwhile is kept, and answered there.
+    let (_in_progress, mut cancelled) = LoginInProgress::start(&login_state);
     let replace_unreadable = replace_unreadable.unwrap_or(false);
     let env_path = launcher_paths.root_dir().join(".env");
-    let client_id = configured_microsoft_client_id(&env_path)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| {
-            [
-                "Microsoft login is not configured.",
-                "Set MICROSOFT_CLIENT_ID in the launcher .env file, process environment,",
-                "or build environment to a public Microsoft Entra app registration",
-                "that allows personal Microsoft accounts and redirects to",
-                "http://localhost/callback.",
-            ]
-            .join(" ")
-        })?;
+    let client_id = configured_microsoft_client_id(&env_path).map_err(|e| e.to_string())?;
 
     let db_path = launcher_paths.database_path().to_path_buf();
 
     // Before the browser: a sign-in that could not be saved must not cost the
     // user the whole OAuth round trip first.
-    {
+    let expected_account = {
         let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
         AccountManager::new(&connection, KeyringSecretStore::new())
             .check_login_can_be_saved(replace_unreadable)
             .map_err(|e| format!("{e:#}"))?;
-    }
+        match expected_microsoft_id.as_deref() {
+            Some(expected) => Some(
+                AccountsRepository::new(&connection)
+                    .list_accounts()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|account| account.microsoft_id == expected)
+                    .ok_or_else(|| format!("account '{expected}' does not exist"))?,
+            ),
+            None => None,
+        }
+    };
 
-    let login_result = run_microsoft_login(&client_id)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    if cancelled.try_recv().is_ok() {
+        return Err(MICROSOFT_LOGIN_CANCELLED.to_string());
+    }
+    let url_app = app.clone();
+    let login = run_microsoft_login(&client_id, move |url| {
+        let _ = url_app.emit(MICROSOFT_LOGIN_URL_EVENT, url.to_string());
+    });
+    let login_result = tokio::select! {
+        result = login => result.map_err(|e| format!("{e:#}"))?,
+        _ = cancelled => return Err(MICROSOFT_LOGIN_CANCELLED.to_string()),
+    };
+
+    if let Some(expected) = &expected_account {
+        if signed_in_as_another_account(
+            &expected.microsoft_id,
+            expected.minecraft_uuid.as_deref(),
+            &login_result.microsoft_id,
+            &login_result.minecraft_uuid,
+        ) {
+            let row_name = resolve_row_name(expected);
+            return Err(format!(
+                "You signed in as {signed_in}, a different Microsoft account from {row_name}. \
+                 Nothing was saved, and {row_name} still needs signing in: press \"Sign in again\" \
+                 on its row and choose its account in the browser (\"Use another account\" if \
+                 Microsoft signs you straight in). To add {signed_in} as well, use \
+                 \"Login with Microsoft\".",
+                signed_in = login_result.minecraft_username,
+            ));
+        }
+    }
 
     // Save to database
     let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
@@ -241,6 +419,22 @@ pub async fn microsoft_login_command(
     Ok(login_result
         .xbox_gamertag
         .unwrap_or(login_result.microsoft_id))
+}
+
+/// The name a row shows: the Minecraft name saved with it, else its gamertag,
+/// else its Microsoft id.
+fn resolve_row_name(account: &crate::microsoft_auth::AccountRecord) -> String {
+    account
+        .profile_data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("username")
+                .and_then(|u| u.as_str())
+                .map(String::from)
+        })
+        .or_else(|| account.xbox_gamertag.clone())
+        .unwrap_or_else(|| account.microsoft_id.clone())
 }
 
 /// Build the profile_data JSON stored for an account.
@@ -291,6 +485,17 @@ pub fn save_modlist_overrides_command(
     save_modlist_overrides(&connection, &overrides).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub fn save_modlist_target_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ShellModListTargetInput,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
+
+    save_modlist_target(&connection, &input).map_err(|error| error.to_string())
+}
+
 /// `secret_store` is where the active account's token key lives. The commands
 /// pass the system keyring; tests pass a store in memory, so that a test run
 /// never reaches anyone's real credentials (F1b).
@@ -307,7 +512,8 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
         )
     })?;
 
-    let raw_modlists = load_modlist_summaries(launcher_paths.modlists_dir())?;
+    let (raw_modlists, unreadable_modlists) =
+        load_modlist_summaries(launcher_paths.modlists_dir())?;
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
         .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
@@ -330,6 +536,7 @@ pub fn load_shell_snapshot_from_root<S: SecretStore>(
 
     Ok(ShellSnapshot {
         modlists,
+        unreadable_modlists,
         active_account,
         global_settings,
         selected_modlist_overrides,
@@ -364,12 +571,18 @@ fn load_all_modlist_version_loaders(connection: &Connection) -> Result<VersionLo
     Ok(map)
 }
 
-fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary>> {
+/// The mod lists under `mod-lists/`, and the folders left out because their
+/// `rules.json` can't be read. Only a `mod-lists/` that can't be scanned at
+/// all is an error.
+fn load_modlist_summaries(
+    modlists_dir: &Path,
+) -> Result<(Vec<ShellModListSummary>, Vec<ShellUnreadableModList>)> {
     if !modlists_dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut summaries = Vec::new();
+    let mut unreadable = Vec::new();
 
     for entry in fs::read_dir(modlists_dir)
         .with_context(|| format!("failed to scan {}", modlists_dir.display()))?
@@ -379,19 +592,53 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
         if !path.is_dir() {
             continue;
         }
+        // An import in progress, or one cut short, is not a mod list; nor is
+        // what a permanent deletion could not remove yet.
+        if crate::modlist_manager::is_launcher_work_dir(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        // `dati-6`: the folder name is the mod list. Every command — editor,
+        // launch, export, delete — finds it by that name, so the sidebar
+        // shows that name too; `modlist_name` inside rules.json is only a
+        // label. A folder copied by hand («Pack copy») then stays itself, and
+        // deleting it can never reach the original «Pack».
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            eprintln!(
+                "[shell] skipping {}: its name is not valid UTF-8",
+                path.display()
+            );
+            continue;
+        };
 
         let rules_path = path.join(RULES_FILENAME);
         if rules_path.exists() {
-            let modlist = ModList::read_from_file(&rules_path)?;
+            let modlist = match ModList::read_from_file(&rules_path) {
+                Ok(modlist) => modlist,
+                Err(error) => {
+                    let folder = name.to_string();
+                    eprintln!("[Shell] Skipping mod list '{folder}': {error:#}");
+                    unreadable.push(ShellUnreadableModList {
+                        folder,
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
+            if modlist.modlist_name != name {
+                eprintln!(
+                    "[shell] the mod list in folder '{name}' calls itself '{}' in its {RULES_FILENAME}: the folder name is used",
+                    modlist.modlist_name
+                );
+            }
             summaries.push(ShellModListSummary {
-                name: modlist.modlist_name,
+                name: name.to_string(),
                 description: modlist.description,
                 author: Some(modlist.author),
                 rule_count: modlist.rules.len(),
                 minecraft_version: None,
                 mod_loader: None,
             });
-        } else if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        } else {
             summaries.push(ShellModListSummary {
                 name: name.to_string(),
                 description: String::new(),
@@ -404,7 +651,8 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
     }
 
     summaries.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(summaries)
+    unreadable.sort_by(|left, right| left.folder.cmp(&right.folder));
+    Ok((summaries, unreadable))
 }
 
 fn load_active_account_summary_with_secret_store<S: SecretStore>(
@@ -469,6 +717,7 @@ fn shell_account(summary: AccountSummary) -> ShellAccount {
         credentials: summary.credentials.as_str().to_string(),
         credentials_detail,
         plays_offline: summary.plays_offline,
+        is_active: summary.is_active,
     }
 }
 
@@ -570,10 +819,55 @@ pub fn save_global_settings(
     upsert_global_settings(connection, &values)
 }
 
+/// shell-5: la RAM che un lancio di questa mod list userebbe davvero, cioè
+/// l'override dove c'è e il valore globale altrove, va bene insieme. Min e
+/// max si combinano ognuno per conto suo, quindi un «Max RAM» di 1536 sopra
+/// un minimo globale di 2048 passava il salvataggio e faceva fallire il
+/// lancio solo alla fine della preparazione, download compresi.
+pub fn validate_effective_ram(
+    global_min_ram_mb: u32,
+    global_max_ram_mb: u32,
+    override_min_ram_mb: Option<u32>,
+    override_max_ram_mb: Option<u32>,
+) -> Result<()> {
+    let describe = |value: u32, from_override: bool| {
+        if from_override {
+            format!("{value} MB, set for this mod list")
+        } else {
+            format!("{value} MB, from the global settings")
+        }
+    };
+    let min = override_min_ram_mb.unwrap_or(global_min_ram_mb);
+    let max = override_max_ram_mb.unwrap_or(global_max_ram_mb);
+    let min_label = describe(min, override_min_ram_mb.is_some());
+    let max_label = describe(max, override_max_ram_mb.is_some());
+
+    if min == 0 {
+        bail!("Minimum RAM ({min_label}) must be greater than zero.");
+    }
+    if max == 0 {
+        bail!("Maximum RAM ({max_label}) must be greater than zero.");
+    }
+    if min > max {
+        bail!(
+            "Minimum RAM ({min_label}) cannot exceed maximum RAM ({max_label}). Change one of them in Settings."
+        );
+    }
+    Ok(())
+}
+
 pub fn save_modlist_overrides(
     connection: &Connection,
     overrides: &ShellModListOverridesInput,
 ) -> Result<()> {
+    let global = load_global_settings(connection)?;
+    validate_effective_ram(
+        global.min_ram_mb,
+        global.max_ram_mb,
+        overrides.min_ram_mb,
+        overrides.max_ram_mb,
+    )?;
+
     let mut values = Vec::new();
 
     if let Some(value) = overrides.min_ram_mb {
@@ -602,6 +896,29 @@ pub fn save_modlist_overrides(
     }
 
     replace_modlist_settings(connection, &overrides.modlist_name, &values)
+}
+
+/// Write a mod list's Minecraft version and loader, leaving its overrides
+/// alone. The dropdowns used to go through `save_modlist_overrides` with the
+/// overrides the frontend had on screen, which could be another list's.
+pub fn save_modlist_target(connection: &Connection, input: &ShellModListTargetInput) -> Result<()> {
+    let minecraft_version = input.minecraft_version.trim();
+    let mod_loader = input.mod_loader.trim();
+    if minecraft_version.is_empty() {
+        bail!("minecraft_version cannot be empty");
+    }
+    if mod_loader.is_empty() {
+        bail!("mod_loader cannot be empty");
+    }
+
+    upsert_modlist_settings(
+        connection,
+        &input.modlist_name,
+        &[
+            ("minecraft_version", minecraft_version.to_string()),
+            ("mod_loader", mod_loader.to_string()),
+        ],
+    )
 }
 
 fn load_key_value_settings(
@@ -682,25 +999,63 @@ fn upsert_global_settings(connection: &Connection, values: &[(&str, String)]) ->
     Ok(())
 }
 
+/// The overrides of the settings form: a key missing from what the form sends
+/// means "override off", so these are cleared before the write.
+const MODLIST_OVERRIDE_KEYS: [&str; 5] = [
+    "min_ram_mb",
+    "max_ram_mb",
+    "custom_jvm_args",
+    "profiler_enabled",
+    "wrapper_command",
+];
+
+/// Write the settings form's keys of one mod list, leaving every other row of
+/// that list alone.
+///
+/// It used to delete every key of the list first (todo.md:1618), the same trap
+/// `upsert_global_settings` was freed of: the version and loader went with a
+/// save that did not carry them, and so would any key another writer adds.
+/// Only the overrides are cleared — off means absent — and the rest is upserted.
 fn replace_modlist_settings(
     connection: &Connection,
     modlist_name: &str,
     values: &[(&str, String)],
 ) -> Result<()> {
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute(
-        "DELETE FROM modlist_settings WHERE modlist_name = ?1",
-        [modlist_name],
-    )?;
-
-    for (key, value) in values {
+    for key in MODLIST_OVERRIDE_KEYS {
         transaction.execute(
-            "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3)",
+            "DELETE FROM modlist_settings WHERE modlist_name = ?1 AND key = ?2",
+            [modlist_name, key],
+        )?;
+    }
+    upsert_modlist_settings_in(&transaction, modlist_name, values)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_modlist_settings(
+    connection: &Connection,
+    modlist_name: &str,
+    values: &[(&str, String)],
+) -> Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    upsert_modlist_settings_in(&transaction, modlist_name, values)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_modlist_settings_in(
+    connection: &Connection,
+    modlist_name: &str,
+    values: &[(&str, String)],
+) -> Result<()> {
+    for (key, value) in values {
+        connection.execute(
+            "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(modlist_name, key) DO UPDATE SET value = excluded.value",
             [modlist_name, *key, value.as_str()],
         )?;
     }
-
-    transaction.commit()?;
     Ok(())
 }
 
@@ -721,11 +1076,13 @@ mod tests {
     use crate::token_storage::{AccountTokenCipher, SecretStore};
 
     use super::{
-        account_profile_data_json, load_account_list_with_secret_store,
-        load_active_account_summary_with_secret_store, load_shell_snapshot_from_root,
-        save_global_settings, save_modlist_overrides, ShellGlobalSettingsInput,
-        ShellModListOverridesInput,
+        account_profile_data_json, active_account_plays_offline,
+        load_account_list_with_secret_store, load_active_account_summary_with_secret_store,
+        load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
+        save_modlist_target, signed_in_as_another_account, ShellGlobalSettingsInput,
+        ShellModListOverridesInput, ShellModListTargetInput,
     };
+    use crate::launcher_paths::LauncherPaths;
 
     fn unique_test_root() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -758,6 +1115,35 @@ mod tests {
                 .insert(key.to_string(), secret.to_string());
             Ok(())
         }
+    }
+
+    /// review-frontend-shell-26: a new sign-in cancels and replaces one left
+    /// waiting (a reloaded window), and the old one ending does not empty the
+    /// slot of the new one; a Cancel then reaches the new one.
+    #[test]
+    fn a_new_sign_in_takes_over_the_one_left_waiting() {
+        let state = super::MicrosoftLoginState::default();
+        let (old, mut old_cancelled) = super::LoginInProgress::start(&state);
+        let (new, mut new_cancelled) = super::LoginInProgress::start(&state);
+        assert!(
+            old_cancelled.try_recv().is_ok(),
+            "the old sign-in is cancelled"
+        );
+        drop(old);
+        assert!(
+            state.cancel.lock().is_some(),
+            "the new sign-in keeps its slot"
+        );
+
+        if let Some((_, sender)) = state.cancel.lock().take() {
+            let _ = sender.send(());
+        }
+        assert!(
+            new_cancelled.try_recv().is_ok(),
+            "Cancel reaches the new one"
+        );
+        drop(new);
+        assert!(state.cancel.lock().is_none());
     }
 
     #[test]
@@ -908,6 +1294,44 @@ mod tests {
         assert!(snapshot.global_settings.update_notifications_data_packs);
         assert!(snapshot.global_settings.update_notifications_shaders);
         assert_eq!(snapshot.selected_modlist_overrides.modlist_name, None);
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn a_folder_copied_by_hand_is_listed_under_its_own_name() {
+        // `dati-6`: «Pack copy» has the rules.json of «Pack», which still says
+        // «Pack». The sidebar must show two different names, the folders'.
+        let root_dir = unique_test_root();
+        initialize_database(&root_dir.join("launcher_data.db"))
+            .expect("database should initialize");
+        for folder in [
+            "Pack",
+            "Pack copy",
+            ".cubic-delete-1-2",
+            ".cubic-import-1-2",
+        ] {
+            let dir = root_dir.join("mod-lists").join(folder);
+            fs::create_dir_all(&dir).expect("modlist directory should exist");
+            ModList {
+                modlist_name: "Pack".into(),
+                author: "Author".into(),
+                description: String::new(),
+                rules: vec![],
+            }
+            .write_to_file(&dir.join("rules.json"))
+            .expect("rules should write");
+        }
+
+        let snapshot = load_shell_snapshot_from_root(&root_dir, None, MemorySecretStore::default())
+            .expect("snapshot should load");
+
+        let names: Vec<&str> = snapshot
+            .modlists
+            .iter()
+            .map(|modlist| modlist.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Pack", "Pack copy"]);
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
@@ -1078,7 +1502,7 @@ mod tests {
             &connection,
             &ShellModListOverridesInput {
                 modlist_name: "Beta Pack".into(),
-                min_ram_mb: Some(8192),
+                min_ram_mb: Some(4096),
                 max_ram_mb: None,
                 custom_jvm_args: Some("-Dbeta=true".into()),
                 profiler_enabled: Some(false),
@@ -1114,7 +1538,7 @@ mod tests {
             snapshot.selected_modlist_overrides.modlist_name.as_deref(),
             Some("Beta Pack")
         );
-        assert_eq!(snapshot.selected_modlist_overrides.min_ram_mb, Some(8192));
+        assert_eq!(snapshot.selected_modlist_overrides.min_ram_mb, Some(4096));
         assert_eq!(
             snapshot
                 .selected_modlist_overrides
@@ -1136,6 +1560,162 @@ mod tests {
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
+    #[test]
+    fn an_unreadable_rules_json_skips_that_mod_list_and_keeps_the_rest() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let good_root = root_dir.join("mod-lists").join("Good Pack");
+        let broken_root = root_dir.join("mod-lists").join("Broken Pack");
+        fs::create_dir_all(&good_root).expect("good modlist directory should exist");
+        fs::create_dir_all(&broken_root).expect("broken modlist directory should exist");
+        initialize_database(&database_path).expect("database should initialize");
+        ModList {
+            modlist_name: "Good Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: Vec::new(),
+        }
+        .write_to_file(&good_root.join("rules.json"))
+        .expect("good rules should write");
+        fs::write(broken_root.join("rules.json"), "{ not json").expect("broken rules should write");
+        let connection = Connection::open(&database_path).expect("database should open");
+        AccountsRepository::new(&connection)
+            .upsert_account(&AccountRecord {
+                microsoft_id: "account-a".into(),
+                xbox_gamertag: Some("PlayerA".into()),
+                minecraft_uuid: Some("uuid-a".into()),
+                access_token_enc: None,
+                refresh_token_enc: None,
+                profile_data: None,
+                is_active: true,
+                plays_offline: false,
+            })
+            .expect("account should insert");
+        drop(connection);
+
+        // Selecting the good one, as a launch of it does.
+        let snapshot = load_shell_snapshot_from_root(
+            &root_dir,
+            Some("Good Pack"),
+            MemorySecretStore::default(),
+        )
+        .expect("one broken mod list must not fail the snapshot");
+
+        let names: Vec<&str> = snapshot.modlists.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["Good Pack"]);
+        assert_eq!(snapshot.unreadable_modlists.len(), 1);
+        assert_eq!(snapshot.unreadable_modlists[0].folder, "Broken Pack");
+        assert!(!snapshot.unreadable_modlists[0].error.is_empty());
+        assert_eq!(
+            snapshot
+                .active_account
+                .as_ref()
+                .map(|account| account.microsoft_id.as_str()),
+            Some("account-a")
+        );
+
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn the_account_list_says_which_row_is_active() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        for (microsoft_id, is_active) in [("account-a", false), ("account-b", true)] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: None,
+                    minecraft_uuid: None,
+                    access_token_enc: None,
+                    refresh_token_enc: None,
+                    profile_data: None,
+                    is_active,
+                    plays_offline: false,
+                })
+                .expect("account should insert");
+        }
+
+        let list = load_account_list_with_secret_store(&connection, MemorySecretStore::default())
+            .expect("account list should load");
+        let flags: Vec<(&str, bool)> = list
+            .iter()
+            .map(|account| (account.microsoft_id.as_str(), account.is_active))
+            .collect();
+        assert_eq!(flags, vec![("account-b", true), ("account-a", false)]);
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn plays_offline_is_read_from_the_active_row_only() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        initialize_database(&database_path).expect("database should initialize");
+        let paths = LauncherPaths::new(root_dir.clone());
+        assert!(!active_account_plays_offline(&paths).expect("no account reads as online"));
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = AccountsRepository::new(&connection);
+        for (microsoft_id, is_active) in [("offline-row", false), ("online-row", true)] {
+            repository
+                .upsert_account(&AccountRecord {
+                    microsoft_id: microsoft_id.into(),
+                    xbox_gamertag: None,
+                    minecraft_uuid: None,
+                    access_token_enc: None,
+                    refresh_token_enc: None,
+                    profile_data: None,
+                    is_active,
+                    plays_offline: false,
+                })
+                .expect("account should insert");
+        }
+        repository
+            .set_plays_offline("offline-row", true)
+            .expect("choice should save");
+        assert!(!active_account_plays_offline(&paths).expect("active row plays online"));
+
+        repository
+            .set_active_account("offline-row")
+            .expect("switch should work");
+        assert!(active_account_plays_offline(&paths).expect("active row plays offline"));
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn sign_in_again_with_another_microsoft_account_is_told_apart() {
+        // Same Microsoft id: the row's own account.
+        assert!(!signed_in_as_another_account(
+            "ms-a",
+            Some("uuid-a"),
+            "ms-a",
+            "uuid-a"
+        ));
+        // A row saved with the Minecraft UUID as its id, signed in again with
+        // the same player: still the same account.
+        assert!(!signed_in_as_another_account(
+            "0f1e2d3c-0000-0000-0000-000000000001",
+            Some("0f1e2d3c-0000-0000-0000-000000000001"),
+            "ms-a",
+            "0f1e2d3c000000000000000000000001"
+        ));
+        // Another player altogether.
+        assert!(signed_in_as_another_account(
+            "ms-a",
+            Some("uuid-a"),
+            "ms-b",
+            "uuid-b"
+        ));
+        assert!(signed_in_as_another_account("ms-a", None, "ms-b", "uuid-b"));
+    }
+
     #[test]
     fn save_global_settings_rejects_invalid_ram() {
         let connection = Connection::open_in_memory().expect("in-memory database should open");
@@ -1175,5 +1755,151 @@ mod tests {
 
         save_global_settings(&connection, &settings(1024, 4096))
             .expect("valid RAM settings should save");
+    }
+    fn modlist_settings_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("in-memory database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE modlist_settings (
+                    modlist_name TEXT NOT NULL,
+                    key          TEXT NOT NULL,
+                    value        TEXT NOT NULL,
+                    PRIMARY KEY (modlist_name, key)
+                );
+                -- save_modlist_overrides checks the effective RAM pair
+                -- against the global settings (shell-5).
+                CREATE TABLE global_settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );",
+            )
+            .expect("modlist settings schema should initialize");
+        connection
+    }
+
+    fn modlist_setting(connection: &Connection, modlist_name: &str, key: &str) -> Option<String> {
+        connection
+            .query_row(
+                "SELECT value FROM modlist_settings WHERE modlist_name = ?1 AND key = ?2",
+                params![modlist_name, key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn overrides_off(modlist_name: &str) -> ShellModListOverridesInput {
+        ShellModListOverridesInput {
+            modlist_name: modlist_name.into(),
+            min_ram_mb: None,
+            max_ram_mb: None,
+            custom_jvm_args: None,
+            profiler_enabled: None,
+            wrapper_command: None,
+            minecraft_version: None,
+            mod_loader: None,
+        }
+    }
+
+    /// todo.md:1618: saving the form clears the overrides it switches off, and
+    /// nothing else — not the target, not a key some other writer put there.
+    #[test]
+    fn save_modlist_overrides_clears_only_the_overrides_it_owns() {
+        let connection = modlist_settings_connection();
+        save_modlist_overrides(
+            &connection,
+            &ShellModListOverridesInput {
+                min_ram_mb: Some(4096),
+                wrapper_command: Some("mangohud".into()),
+                minecraft_version: Some("1.20.1".into()),
+                mod_loader: Some("Fabric".into()),
+                ..overrides_off("Pack")
+            },
+        )
+        .expect("overrides should save");
+        connection
+            .execute(
+                "INSERT INTO modlist_settings (modlist_name, key, value) VALUES ('Pack', 'some_other_key', 'kept')",
+                [],
+            )
+            .expect("foreign key should insert");
+
+        save_modlist_overrides(&connection, &overrides_off("Pack")).expect("overrides should save");
+
+        assert_eq!(modlist_setting(&connection, "Pack", "min_ram_mb"), None);
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "wrapper_command"),
+            None
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.20.1")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "mod_loader").as_deref(),
+            Some("Fabric")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "some_other_key").as_deref(),
+            Some("kept")
+        );
+    }
+
+    /// The version dropdown writes the target and leaves the overrides as they
+    /// are: it can no longer copy another list's RAM or wrapper onto this one.
+    #[test]
+    fn save_modlist_target_writes_only_version_and_loader() {
+        let connection = modlist_settings_connection();
+        save_modlist_overrides(
+            &connection,
+            &ShellModListOverridesInput {
+                max_ram_mb: Some(6144),
+                minecraft_version: Some("1.20.1".into()),
+                mod_loader: Some("Fabric".into()),
+                ..overrides_off("Pack")
+            },
+        )
+        .expect("overrides should save");
+
+        save_modlist_target(
+            &connection,
+            &ShellModListTargetInput {
+                modlist_name: "Pack".into(),
+                minecraft_version: "1.21.1".into(),
+                mod_loader: "NeoForge".into(),
+            },
+        )
+        .expect("target should save");
+
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.21.1")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "mod_loader").as_deref(),
+            Some("NeoForge")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "max_ram_mb").as_deref(),
+            Some("6144")
+        );
+        assert_eq!(
+            modlist_setting(&connection, "Other", "minecraft_version"),
+            None
+        );
+
+        let error = save_modlist_target(
+            &connection,
+            &ShellModListTargetInput {
+                modlist_name: "Pack".into(),
+                minecraft_version: " ".into(),
+                mod_loader: "Fabric".into(),
+            },
+        )
+        .expect_err("an empty version must be refused");
+        assert_eq!(error.to_string(), "minecraft_version cannot be empty");
+        assert_eq!(
+            modlist_setting(&connection, "Pack", "minecraft_version").as_deref(),
+            Some("1.21.1")
+        );
     }
 }

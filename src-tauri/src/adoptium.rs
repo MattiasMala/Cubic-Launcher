@@ -16,16 +16,17 @@ pub struct AdoptiumClient {
 }
 
 impl AdoptiumClient {
+    /// The download client of the launch (review-lancio-4, rete-4): a
+    /// connect timeout and an inactivity timeout, so a server that accepts the
+    /// connection and then goes silent fails the launch instead of holding the
+    /// "preparing" slot until the app restarts.
     pub fn new() -> Self {
-        Self {
-            http_client: reqwest::Client::new(),
-            base_url: ADOPTIUM_API_BASE_URL.to_string(),
-        }
+        Self::with_base_url(ADOPTIUM_API_BASE_URL)
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: crate::modrinth::build_download_client(),
             base_url: base_url.into(),
         }
     }
@@ -37,10 +38,7 @@ impl AdoptiumClient {
         architecture: &str,
     ) -> Result<Option<AdoptiumPackage>> {
         let url = build_latest_assets_url(&self.base_url, java_version, os, architecture)?;
-        let response = self
-            .http_client
-            .get(url)
-            .send()
+        let response = crate::modrinth::send_with_retry(|| self.http_client.get(url.clone()))
             .await
             .with_context(|| {
                 format!(
@@ -245,10 +243,23 @@ pub fn host_adoptium_os() -> &'static str {
     }
 }
 
-pub fn normalize_adoptium_architecture(architecture: &str) -> &'static str {
+/// The Adoptium name of an architecture (`std::env::consts::ARCH` or a Java
+/// `os.arch`), or `None` when Adoptium has no name for it.
+///
+/// Before, everything that was not arm became `x64`: a 32-bit or exotic
+/// machine downloaded a runtime it cannot run, and the launch then failed
+/// on a binary that does not execute (todo.md:1768).
+pub fn normalize_adoptium_architecture(architecture: &str) -> Option<&'static str> {
     match architecture.to_ascii_lowercase().as_str() {
-        "aarch64" | "arm64" => "aarch64",
-        _ => "x64",
+        "x86_64" | "amd64" | "x64" => Some("x64"),
+        "x86" | "i386" | "i486" | "i586" | "i686" => Some("x86"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        "arm" => Some("arm"),
+        "powerpc64" if cfg!(target_endian = "little") => Some("ppc64le"),
+        "powerpc64" => Some("ppc64"),
+        "s390x" => Some("s390x"),
+        "riscv64" => Some("riscv64"),
+        _ => None,
     }
 }
 
@@ -352,6 +363,44 @@ mod tests {
         ]"#
     }
 
+    /// review-lancio-4: the Adoptium client is the launch's download client
+    /// (its User-Agent shows it), so it has the connect and inactivity
+    /// timeouts of rete-4 instead of none.
+    #[tokio::test]
+    async fn the_adoptium_client_is_the_download_client_with_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let port = listener.local_addr().expect("server address").port();
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one request should arrive");
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let _ = sent.send(String::from_utf8_lossy(&request[..read]).to_string());
+            let body = b"[]";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.write_all(body).expect("body");
+        });
+
+        let client = AdoptiumClient::with_base_url(format!("http://127.0.0.1:{port}"));
+        let package = client
+            .fetch_latest_jre_package(21, "linux", "x64")
+            .await
+            .expect("an empty answer is no package");
+        assert!(package.is_none());
+        let request = received.recv().expect("the request").to_lowercase();
+        assert!(
+            request.contains(&format!(
+                "user-agent: {}",
+                crate::modrinth::USER_AGENT.to_lowercase()
+            )),
+            "{request}"
+        );
+    }
+
     #[test]
     fn builds_expected_adoptium_latest_assets_url() {
         let url = build_latest_assets_url("https://api.adoptium.net/v3", 21, "windows", "x64")
@@ -426,9 +475,18 @@ mod tests {
 
     #[test]
     fn normalizes_supported_adoptium_architectures() {
-        assert_eq!(normalize_adoptium_architecture("arm64"), "aarch64");
-        assert_eq!(normalize_adoptium_architecture("aarch64"), "aarch64");
-        assert_eq!(normalize_adoptium_architecture("x86_64"), "x64");
+        assert_eq!(normalize_adoptium_architecture("arm64"), Some("aarch64"));
+        assert_eq!(normalize_adoptium_architecture("aarch64"), Some("aarch64"));
+        assert_eq!(normalize_adoptium_architecture("x86_64"), Some("x64"));
+        assert_eq!(normalize_adoptium_architecture("x86"), Some("x86"));
+        assert_eq!(normalize_adoptium_architecture("riscv64"), Some("riscv64"));
+    }
+
+    #[test]
+    fn unknown_architectures_are_not_mapped_to_x64() {
+        assert_eq!(normalize_adoptium_architecture("loongarch64"), None);
+        assert_eq!(normalize_adoptium_architecture("mips64"), None);
+        assert_eq!(normalize_adoptium_architecture(""), None);
     }
     #[tokio::test]
     async fn runtime_archive_lands_whole_and_replaces_a_stale_partial() {

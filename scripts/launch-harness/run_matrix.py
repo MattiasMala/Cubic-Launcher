@@ -2,11 +2,19 @@
 
 Mandated order (design):
   1. API pass — full matrix with the modlist default source ("ask Modrinth").
-  2. Cache pass — runs ONLY if the API pass is entirely green. Flips each modlist
-     to "prioritize downloaded jars" (cache_only) on the cache the API pass
-     populated, in the SAME workspace, and verifies the same combos still launch.
+  2. Cache pass — runs ONLY if the API pass is entirely green. Switches the
+     harness account to «Play offline» (`plays_offline`, D115) in the SAME
+     workspace, so every launch takes the zero-request path and runs only from
+     what the API pass left in the cache — Minecraft (D142), Java (D158), loader
+     metadata (D137) — and verifies the same positive combos still launch. The account
+     goes back online afterwards, so a reused workspace is left as it was.
+     (Before audit 101 this pass wrote a `cache_only_mode` key the launcher no
+     longer reads, and ran the API pass a second time: build-doc-3.)
 
 For a negative fixture, "green" == the launch fails with the expected state.
+Negative fixtures run in the API pass only: offline they would stop on "never
+launched online" whatever the pair, so their cache-pass green proved nothing
+(review-lancio-5).
 
 Never aborts the matrix on a red combo: records state/durationMs/failureKind,
 saves minecraftLogTail + launchLogDir, continues, and highlights reds in the
@@ -30,7 +38,7 @@ from pathlib import Path
 
 from matrix import Combo, ci_matrix, full_local_matrix
 from run_combo import ComboResult, ComboSpec, run_combo
-from workspace import HarnessWorkspace, Modlist, h6_modlist, vanilla_modlist
+from workspace import HARNESS_ACCOUNT, HarnessWorkspace, Modlist, h6_modlist, vanilla_modlist
 
 # One modlist per loader; vanilla uses an empty list, modded loaders reuse it
 # (no mods) for the base matrix. H6/S1 fixtures are separate, opt-in.
@@ -176,12 +184,25 @@ def run_matrix(
 
         cache_results: list[ComboResult] | None = None
         if api_green:
-            print("[harness] API pass all green -> cache pass")
-            ws.set_modlist_cache_only(BASE_MODLIST, True)
-            cache_results = _run_pass(
-                combos, ws, mod_source="cache", display=display,
-                binary=binary, success_after=success_after, timeout=timeout,
-            )
+            print("[harness] API pass all green -> cache pass (account plays offline)")
+            # review-lancio-5: a negative fixture proves that the incompatible pair
+            # is detected, and only the API pass detects it. Offline its combo was
+            # never launched online (the metadata fetch failed), so it stops on
+            # "has never been launched online" whatever the pair: a green that
+            # says nothing. The cache pass runs the positives only.
+            cache_combos = [c for c in combos if c.expect_state is None]
+            skipped = len(combos) - len(cache_combos)
+            if skipped:
+                print(f"[harness] cache pass leaves out {skipped} negative fixture(s): "
+                      "the API pass is where they are proven")
+            ws.set_plays_offline(HARNESS_ACCOUNT, True)
+            try:
+                cache_results = _run_pass(
+                    cache_combos, ws, mod_source="cache", display=display,
+                    binary=binary, success_after=success_after, timeout=timeout,
+                )
+            finally:
+                ws.set_plays_offline(HARNESS_ACCOUNT, False)
         else:
             print("[harness] API pass has reds -> cache pass SKIPPED")
 

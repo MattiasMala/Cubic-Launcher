@@ -23,7 +23,19 @@ pub struct EditorRow {
     /// `None` for every other row: Modrinth rows get their icon from the
     /// Modrinth CDN in the frontend. Filled by [`crate::mod_icons`].
     pub icon_image: Option<String>,
+    /// Set when the row is a pinned version (audit 101, modlist-2): the
+    /// backend decides, from the marker next to the jar, so the editor never
+    /// infers a pin from a local jar with an "Only when".
+    pub pin: Option<EditorPin>,
     pub alternatives: Vec<EditorRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorPin {
+    /// Whether removing the pin deletes its jar: only a pin with its marker
+    /// owns it. A pin from before the marker keeps the jar.
+    pub owns_jar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,6 +198,16 @@ pub struct SaveCustomConfigInput {
 pub struct ToggleRuleEnabledInput {
     pub modlist_name: String,
     pub mod_id: String,
+    pub enabled: bool,
+}
+
+/// The switch of several rules at once — a group of the editor — written with
+/// one read and one write of rules.json (audit 101, r2-scala-mod-list-grandi-4).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToggleRulesEnabledInput {
+    pub modlist_name: String,
+    pub mod_ids: Vec<String>,
     pub enabled: bool,
 }
 

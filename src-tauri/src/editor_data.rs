@@ -10,7 +10,7 @@ use tauri::State;
 // live in `editor_data_tests.rs`, so new editor behavior should usually extend
 // those files instead of growing unrelated modules.
 use crate::launcher_paths::LauncherPaths;
-use crate::path_safety::validate_path_component;
+use crate::path_safety::{normalize_relative_dir, validate_path_component};
 use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
 };
@@ -98,14 +98,6 @@ pub fn save_incompatibilities_command(
 }
 
 #[tauri::command]
-pub fn save_rule_advanced_command(
-    launcher_paths: State<'_, LauncherPaths>,
-    input: SaveRuleAdvancedInput,
-) -> Result<(), String> {
-    save_rule_advanced_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn save_advanced_batch_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveAdvancedBatchInput,
@@ -130,12 +122,35 @@ pub fn toggle_rule_enabled_command(
     toggle_rule_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn toggle_rules_enabled_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ToggleRulesEnabledInput,
+) -> Result<(), String> {
+    toggle_rules_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
+}
+
 fn toggle_rule_enabled_from_root(root_dir: &Path, input: &ToggleRuleEnabledInput) -> Result<()> {
+    toggle_rules_enabled_from_root(
+        root_dir,
+        &ToggleRulesEnabledInput {
+            modlist_name: input.modlist_name.clone(),
+            mod_ids: vec![input.mod_id.clone()],
+            enabled: input.enabled,
+        },
+    )
+}
+
+/// Un solo giro di lettura e scrittura di rules.json per tutto l'insieme. Se
+/// un id manca non si scrive niente: o cambiano tutti, o nessuno.
+fn toggle_rules_enabled_from_root(root_dir: &Path, input: &ToggleRulesEnabledInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
-    let rule = modlist
-        .find_rule_mut(&input.mod_id)
-        .with_context(|| format!("rule '{}' not found", input.mod_id))?;
-    set_enabled_recursive(rule, input.enabled);
+    for mod_id in &input.mod_ids {
+        let rule = modlist
+            .find_rule_mut(mod_id)
+            .with_context(|| format!("rule '{}' not found", mod_id))?;
+        set_enabled_recursive(rule, input.enabled);
+    }
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
 
@@ -169,7 +184,27 @@ fn save_modlist(root_dir: &Path, modlist_name: &str, modlist: &ModList) -> Resul
         .modlists_dir()
         .join(modlist_name)
         .join(RULES_FILENAME);
-    modlist.write_to_file(&rules_path)
+    modlist.write_to_file(&rules_path)?;
+
+    // todo.md:1291: the bytes of a file taken off a custom config, or of a
+    // config that is gone, leave `config-files/` with it. The rules are saved
+    // by now, so a cleanup that fails is a line in the log, not a failed save.
+    let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
+    match crate::instance_configs::prune_orphan_custom_config_files(&modlist_dir, &modlist.rules)
+    {
+        Ok(removed) => {
+            for path in removed {
+                eprintln!(
+                    "[config-files] removed {}: no custom config lists it any more",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "[config-files] could not clean up the files of removed custom configs in '{modlist_name}': {error:#}"
+        ),
+    }
+    Ok(())
 }
 
 pub fn load_editor_snapshot_from_root(
@@ -255,6 +290,8 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
 
     let ids_to_remove: std::collections::HashSet<&str> =
         input.mod_ids.iter().map(|s| s.as_str()).collect();
+    let mut original_ids = std::collections::HashSet::new();
+    collect_tree_ids(&modlist.rules, &mut original_ids);
 
     modlist
         .rules
@@ -264,7 +301,31 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
         remove_from_alternatives(rule, &ids_to_remove);
     }
 
-    save_modlist(root_dir, &input.modlist_name, &modlist)
+    // Un `requires` o un `exclude_if` verso un mod che non c'è più resta nel
+    // file e nessuno lo vede: X requires Y, si cancella Y, e X resta rossa per
+    // sempre senza nessun link visibile (audit 101, editor-logica-5). Si
+    // tolgono, in tutto l'albero, i riferimenti a ogni id che non c'è più: i
+    // mod cancellati e le alternative che spariscono insieme a loro.
+    let mut remaining = std::collections::HashSet::new();
+    collect_tree_ids(&modlist.rules, &mut remaining);
+    let gone = original_ids
+        .into_iter()
+        .filter(|mod_id| !remaining.contains(mod_id))
+        .collect::<std::collections::HashSet<_>>();
+    remove_references(&mut modlist.rules, &gone);
+
+    save_modlist(root_dir, &input.modlist_name, &modlist)?;
+
+    // review-risoluzione-8: a pin deleted with Delete takes its marker along,
+    // or a jar added by hand later under the same name would count as a pin
+    // that owns it. The jar itself stays, as for any deleted local entry.
+    let modlist_dir = LauncherPaths::new(root_dir.to_path_buf())
+        .modlists_dir()
+        .join(&input.modlist_name);
+    for mod_id in &gone {
+        crate::mod_version_pin::forget_pin_marker(&modlist_dir, mod_id)?;
+    }
+    Ok(())
 }
 
 fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&str>) {
@@ -272,6 +333,21 @@ fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&st
         .retain(|alt| !ids.contains(alt.mod_id.as_str()));
     for alt in &mut rule.alternatives {
         remove_from_alternatives(alt, ids);
+    }
+}
+
+fn collect_tree_ids(rules: &[Rule], ids: &mut std::collections::HashSet<String>) {
+    for rule in rules {
+        ids.insert(rule.mod_id.clone());
+        collect_tree_ids(&rule.alternatives, ids);
+    }
+}
+
+fn remove_references(rules: &mut [Rule], gone: &std::collections::HashSet<String>) {
+    for rule in rules {
+        rule.requires.retain(|mod_id| !gone.contains(mod_id));
+        rule.exclude_if.retain(|mod_id| !gone.contains(mod_id));
+        remove_references(&mut rule.alternatives, gone);
     }
 }
 
@@ -622,11 +698,20 @@ fn custom_config_from_input(input: &SaveCustomConfigInput) -> Result<CustomConfi
             .with_context(|| format!("invalid custom config id '{}'", input.id))?;
         input.id.clone()
     };
+    // `modlist-10`: the «Path» is checked here, where the user can still fix
+    // it, and stored in one form (`/`, no `.`), so a launch never meets one
+    // that leaves the instance.
+    let target_path = normalize_relative_dir(&input.target_path).with_context(|| {
+        format!(
+            "the Path '{}' of a custom config must be a folder inside the instance, like 'config' or 'config/create'",
+            input.target_path
+        )
+    })?;
     Ok(CustomConfig {
         id,
         mc_versions: input.mc_versions.clone(),
         loader: input.loader.clone(),
-        target_path: input.target_path.clone(),
+        target_path,
         files: input.files.clone(),
     })
 }
@@ -734,6 +819,9 @@ fn build_editor_row(rule: &Rule, modlist_dir: &Path) -> EditorRow {
             }
             ModSource::Modrinth => None,
         },
+        pin: crate::mod_version_pin::pin_kind(rule, modlist_dir).map(|kind| EditorPin {
+            owns_jar: kind == crate::mod_version_pin::PinKind::Marked,
+        }),
         enabled: rule.enabled,
         exclude_if: rule.exclude_if.clone(),
         requires: rule.requires.clone(),

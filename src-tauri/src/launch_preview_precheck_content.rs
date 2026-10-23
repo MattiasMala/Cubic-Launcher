@@ -8,27 +8,28 @@
 // What is different from the mods, and it is the whole difficulty: there is no
 // table that records which version of a pack is installed. `mod_cache` answers
 // that for a mod; for a pack the only local trace is the file the launch
-// linked into the instance — and since C5 that link points at
-// `cache/content-packs/<version id>/<filename>` (`content_pack_cache_path`),
-// so the version id is readable from the link target and nowhere else. The
-// manifest stores names only (`instance_content.rs`), so the chain is
-// entry → its versions for this target → the id the link names.
+// linked into the instance. Since precheck-3 the manifest records, for every
+// Modrinth file, the entry and the version id it was linked as
+// (`instance_content.rs`); a manifest written before that only has names, and
+// then the version id is read from the link target, which since C5 points at
+// `cache/content-packs/<version id>/<filename>` (`content_pack_cache_path`).
+// The chain is entry → its versions for this target → the installed id.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::content_packs::{load_content_list, ContentEntry, ContentList};
+use crate::content_packs::{load_content_list, ContentEntry};
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
-use crate::resolver::ResolutionTarget;
+use crate::resolver::{ModLoader, ResolutionTarget};
 
 use super::{
     build_instance_root, emit_log, is_content_entry_active, preferred_version,
-    ResolvedContentVersions, CONTENT_CATEGORIES,
+    versions_for_category, ResolvedContentVersions, CONTENT_CATEGORIES, DATAPACK_CATEGORY,
 };
 
 /// One content-pack row of the popup.
@@ -104,44 +105,98 @@ pub(super) struct ContentPrecheck {
     pub(super) lookup_failures: Vec<ContentLookupFailure>,
 }
 
-/// The Modrinth version id of every pack this launcher linked into one
-/// instance category.
-///
-/// Read from the link target, because that is the only place it exists: C5 put
-/// the version id in the cache path, the manifest records file names only, and
-/// no table knows a pack's version. A name whose link cannot be followed
-/// contributes nothing — a pre-C5 flat path, a hard link (the Windows fallback
-/// of `create_file_link`), a real file the user dropped in. "Unknown" costs a
-/// row, never a wrong one: the entry then looks like a first install, which is
-/// exactly what D17 already covers.
-pub(super) fn installed_content_version_ids(
-    cache_dir: &Path,
-    instance_root: &Path,
-    instance_subdir: &str,
-) -> HashSet<String> {
-    let manifest_path = crate::instance_content::manifest_path(instance_root, instance_subdir);
-    let instance_dir = instance_root.join(instance_subdir);
-    let mut version_ids = HashSet::new();
+/// What one category of the instance has installed, as far as the launcher
+/// can tell.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct InstalledPacks {
+    /// Every Modrinth version id found, attributed to an entry or not.
+    pub(super) version_ids: HashSet<String>,
+    /// `entry id → version id`, for the files the manifest attributes: what a
+    /// failed lookup keeps (contentpack-4).
+    pub(super) by_entry: HashMap<String, String>,
+}
 
-    for name in crate::instance_content::read_manifest_files(&manifest_path) {
-        let Ok(link_target) = std::fs::read_link(instance_dir.join(&name)) else {
+/// The directories whose `.cubic/` manifest describes one category: the
+/// instance root, and for data packs every world as well (D144). The instance
+/// root stays in for data packs because a launch before D144 linked them
+/// there, and the installed version is the one the user has.
+///
+/// Each root comes with the category of its manifest: in a world it is this
+/// instance's own (review-decisioni-33), not the packs another mod list put
+/// into a shared world.
+pub(super) fn category_manifest_roots(
+    category: &str,
+    instance_subdir: &str,
+    instance_root: &Path,
+) -> Vec<(PathBuf, String)> {
+    let mut roots = Vec::new();
+    if category == DATAPACK_CATEGORY {
+        let own = crate::instance_content::world_datapacks_category(instance_root);
+        roots.extend(
+            crate::instance_content::instance_world_dirs(instance_root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|world| (world, own.clone())),
+        );
+    }
+    roots.push((instance_root.to_path_buf(), instance_subdir.to_string()));
+    roots
+}
+
+/// The Modrinth versions this launcher linked into one category.
+///
+/// The manifest's origin is the answer when there is one (precheck-3): it is
+/// written at link time and does not depend on the shape of the link, so it
+/// holds for the hard link Windows without Developer Mode gets. A manifest
+/// written before origins existed falls back to the link target, the only
+/// place the version id was then: C5 put it in the cache path. A name whose
+/// link cannot be followed contributes nothing — a pre-C5 flat path, an old
+/// hard link, a real file the user dropped in. "Unknown" costs a row, never a
+/// wrong one: the entry then looks like a first install, which is exactly
+/// what D17 already covers.
+pub(super) fn installed_content_versions(
+    cache_dir: &Path,
+    manifest_roots: &[(PathBuf, String)],
+    instance_subdir: &str,
+) -> InstalledPacks {
+    let mut installed = InstalledPacks::default();
+
+    for (root, manifest_category) in manifest_roots {
+        let manifest_path = crate::instance_content::manifest_path(root, manifest_category);
+        let Some(manifest) = crate::instance_content::read_manifest(&manifest_path) else {
             continue;
         };
-        let Some(version_dir) = link_target.parent() else {
-            continue;
-        };
-        // The one shape that means anything: `<cache dir>/<version id>/<file>`.
-        // Anything else is not a version the launcher can name.
-        if version_dir.parent() != Some(cache_dir) {
-            continue;
+        let instance_dir = root.join(instance_subdir);
+
+        for name in &manifest.files {
+            if let Some(origin) = manifest.origins.get(name) {
+                installed.version_ids.insert(origin.version_id.clone());
+                installed
+                    .by_entry
+                    .entry(origin.entry_id.clone())
+                    .or_insert_with(|| origin.version_id.clone());
+                continue;
+            }
+
+            let Ok(link_target) = std::fs::read_link(instance_dir.join(name)) else {
+                continue;
+            };
+            let Some(version_dir) = link_target.parent() else {
+                continue;
+            };
+            // The one shape that means anything: `<cache dir>/<version id>/<file>`.
+            // Anything else is not a version the launcher can name.
+            if version_dir.parent() != Some(cache_dir) {
+                continue;
+            }
+            let Some(version_id) = version_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            installed.version_ids.insert(version_id.to_string());
         }
-        let Some(version_id) = version_dir.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        version_ids.insert(version_id.to_string());
     }
 
-    version_ids
+    installed
 }
 
 /// Build one category's rows and version map from what the network answered.
@@ -149,15 +204,18 @@ pub(super) fn installed_content_version_ids(
 /// Pure on purpose, like `build_precheck_result`: D16, D17, D56 and D60 are all
 /// decided here, and this is what the tests can exercise without a request.
 ///
-/// An entry missing from `versions_by_entry` had a failed lookup and appears
-/// nowhere — not as a row, not in `resolved`, not as "no versions". The launch
-/// then resolves it the usual way, which is the mods' D19 degradation applied
-/// to a single entry.
+/// An entry missing from `versions_by_entry` had a failed lookup and is no
+/// row and no "no versions". When the manifest says which version of it is
+/// installed, that version goes into `resolved`, so the launch keeps it
+/// instead of looking it up again — what the popup promises with "the launch
+/// keeps what you have" (contentpack-4). With nothing installed there is
+/// nothing to keep, and the launch resolves it the usual way, which is the
+/// mods' D19 degradation applied to a single entry.
 pub(super) fn build_category_precheck(
     category: &str,
     entries: &[&ContentEntry],
     versions_by_entry: &HashMap<&str, Vec<ModrinthVersion>>,
-    installed_version_ids: &HashSet<String>,
+    installed: &InstalledPacks,
 ) -> CategoryPrecheck {
     let mut result = CategoryPrecheck::default();
     let mut seen = HashSet::new();
@@ -171,6 +229,9 @@ pub(super) fn build_category_precheck(
             continue;
         }
         let Some(versions) = versions_by_entry.get(entry.id.as_str()) else {
+            if let Some(version_id) = installed.by_entry.get(&entry.id) {
+                result.resolved.insert(entry.id.clone(), version_id.clone());
+            }
             continue;
         };
 
@@ -196,7 +257,7 @@ pub(super) fn build_category_precheck(
         // stays in `resolved` or it would never be installed.
         let Some(current) = versions
             .iter()
-            .find(|version| installed_version_ids.contains(&version.id))
+            .find(|version| installed.version_ids.contains(&version.id))
         else {
             continue;
         };
@@ -243,13 +304,26 @@ pub(super) async fn run_content_precheck(
     let mut precheck = ContentPrecheck::default();
 
     for (category, instance_subdir) in CONTENT_CATEGORIES {
-        // A missing category file is an empty list, not an error, exactly as
-        // it is for the launch (`content_packs.rs:86-94`).
-        let list = load_content_list(&modlist_dir, category).unwrap_or_else(|_| ContentList {
-            content_type: category.to_string(),
-            entries: vec![],
-            groups: vec![],
-        });
+        // The launch skips shaders on Vanilla (contentpack-3): no row for a
+        // pack it will not install.
+        if category == "shader" && target.mod_loader == ModLoader::Vanilla {
+            continue;
+        }
+        // A missing category file is an empty list, exactly as it is for the
+        // launch. One that cannot be read offers no row and promises nothing:
+        // the launch leaves that category as it is and reports it as an
+        // error the user sees (contentpack-11), so one notice, not two.
+        let list = match load_content_list(&modlist_dir, category) {
+            Ok(list) => list,
+            Err(error) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!("[Precheck] could not read the {category} list; no update is offered for it ({error:#})"),
+                );
+                continue;
+            }
+        };
         let active_entries: Vec<&ContentEntry> = list
             .entries
             .iter()
@@ -259,6 +333,11 @@ pub(super) async fn run_content_precheck(
             continue;
         }
 
+        let installed = installed_content_versions(
+            cache_dir,
+            &category_manifest_roots(category, instance_subdir, &instance_root),
+            instance_subdir,
+        );
         let mut versions_by_entry: HashMap<&str, Vec<ModrinthVersion>> = HashMap::new();
         for entry in active_entries
             .iter()
@@ -272,7 +351,17 @@ pub(super) async fn run_content_precheck(
                 .await
             {
                 Ok(versions) => {
-                    versions_by_entry.insert(entry.id.as_str(), versions);
+                    // contentpack-8: the same filter the launch applies, so
+                    // the popup never offers a mod `.jar` as a pack update.
+                    versions_by_entry
+                        .insert(entry.id.as_str(), versions_for_category(category, versions));
+                }
+                // review-risoluzione-10, as precheck-5 does for the mods: no
+                // connection is about every pack that follows, each with its
+                // retries (~14 s apiece). The whole check fails at once and the
+                // frontend takes its D19 branch.
+                Err(error) if crate::modrinth::is_connection_failure(&error) => {
+                    anyhow::bail!("Modrinth could not be reached: {error:#}");
                 }
                 Err(error) => {
                     // Left out of the rows and of the map — promising a
@@ -282,11 +371,16 @@ pub(super) async fn run_content_precheck(
                     // because "no version exists" and "I could not ask" are
                     // different sentences to the user.
                     let error = format!("{error:#}");
+                    let outcome = if installed.by_entry.contains_key(&entry.id) {
+                        "the launch keeps the installed version"
+                    } else {
+                        "the launch will resolve it"
+                    };
                     let _ = emit_log(
                         app_handle,
                         ProcessLogStream::Stderr,
                         format!(
-                            "[Precheck] could not read the versions of '{}' ({category}); the launch will resolve it ({error})",
+                            "[Precheck] could not read the versions of '{}' ({category}); {outcome} ({error})",
                             entry.id
                         ),
                     );
@@ -299,14 +393,8 @@ pub(super) async fn run_content_precheck(
             }
         }
 
-        let installed_version_ids =
-            installed_content_version_ids(cache_dir, &instance_root, instance_subdir);
-        let category_precheck = build_category_precheck(
-            category,
-            &active_entries,
-            &versions_by_entry,
-            &installed_version_ids,
-        );
+        let category_precheck =
+            build_category_precheck(category, &active_entries, &versions_by_entry, &installed);
 
         precheck.updates.extend(category_precheck.updates);
         precheck
@@ -362,11 +450,14 @@ mod tests {
         }
     }
 
-    fn installed(version_ids: &[&str]) -> HashSet<String> {
-        version_ids
-            .iter()
-            .map(|version_id| (*version_id).to_string())
-            .collect()
+    fn installed(version_ids: &[&str]) -> InstalledPacks {
+        InstalledPacks {
+            version_ids: version_ids
+                .iter()
+                .map(|version_id| (*version_id).to_string())
+                .collect(),
+            by_entry: HashMap::new(),
+        }
     }
 
     fn resolved_pairs(result: &CategoryPrecheck) -> Vec<(String, String)> {
@@ -559,7 +650,7 @@ mod tests {
         // `boss-refreshed` is absent from the map: its lookup failed.
         let versions = HashMap::from([("visual-effects-plus", Vec::new())]);
 
-        let result = build_category_precheck("resourcepack", &entries, &versions, &HashSet::new());
+        let result = build_category_precheck("resourcepack", &entries, &versions, &installed(&[]));
 
         assert_eq!(
             result.without_versions,
@@ -617,12 +708,144 @@ mod tests {
         )
         .expect("manifest");
 
-        let found = installed_content_version_ids(&cache_dir, &instance_root, "resourcepacks");
+        let found = installed_content_versions(
+            &cache_dir,
+            &[(instance_root.clone(), "resourcepacks".to_string())],
+            "resourcepacks",
+        );
 
         assert_eq!(
             found,
             installed(&["fzlnlUF3"]),
             "only the versioned cache path names a version"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// precheck-3: on Windows without Developer Mode the link is a hard link,
+    /// with no target to read. The manifest's origin names the version all
+    /// the same — here with `fs::hard_link`, the shape the fallback leaves.
+    #[test]
+    fn a_hard_linked_pack_is_recognised_through_the_manifest() {
+        let root = unique_test_root("hard-link");
+        let cache_dir = root.join("cache/content-packs");
+        let instance_root = root.join("instances/1.20.1-forge");
+        let instance_dir = instance_root.join("shaderpacks");
+        fs::create_dir_all(&instance_dir).expect("instance dir");
+        fs::create_dir_all(instance_root.join(".cubic")).expect("manifest dir");
+        let versioned = cache_dir.join("olderrrr");
+        fs::create_dir_all(&versioned).expect("cache entry");
+        fs::write(versioned.join("BSL.zip"), b"pack").expect("cached file");
+        fs::hard_link(versioned.join("BSL.zip"), instance_dir.join("BSL.zip"))
+            .expect("the fallback's hard link");
+        fs::write(
+            crate::instance_content::manifest_path(&instance_root, "shaderpacks"),
+            r#"{"version":1,"category":"shaderpacks","files":["BSL.zip"],"origins":{"BSL.zip":{"entryId":"bsl-shaders","versionId":"olderrrr"}}}"#,
+        )
+        .expect("manifest");
+
+        let found = installed_content_versions(
+            &cache_dir,
+            &[(instance_root.clone(), "shaderpacks".to_string())],
+            "shaderpacks",
+        );
+
+        assert_eq!(found.version_ids, installed(&["olderrrr"]).version_ids);
+        assert_eq!(
+            found.by_entry.get("bsl-shaders").map(String::as_str),
+            Some("olderrrr")
+        );
+
+        // And so the row exists, which it never did with read_link alone.
+        let entries = [entry("bsl-shaders", "modrinth")];
+        let entries: Vec<&ContentEntry> = entries.iter().collect();
+        let versions = HashMap::from([(
+            "bsl-shaders",
+            vec![
+                version("Q1vvjJYV", "olderrrr", "8.2.08", "release", "2025-01-01"),
+                version("Q1vvjJYV", "newerrrr", "8.2.09", "release", "2026-01-01"),
+            ],
+        )]);
+        let result = build_category_precheck("shader", &entries, &versions, &found);
+        assert_eq!(
+            result
+                .updates
+                .iter()
+                .map(|row| row.current_version_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["olderrrr"]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// contentpack-4: «the launch keeps what you have». A failed lookup is no
+    /// row, but the installed version goes into the map, so the launch
+    /// installs that one instead of asking Modrinth again. An entry with
+    /// nothing installed still promises nothing.
+    #[test]
+    fn a_failed_lookup_keeps_the_installed_version_in_the_map() {
+        let entries = [
+            entry("nature-x", "modrinth"),
+            entry("never-installed", "modrinth"),
+        ];
+        let entries: Vec<&ContentEntry> = entries.iter().collect();
+        let mut installed = installed(&["3c40Y4EH"]);
+        installed
+            .by_entry
+            .insert("nature-x".to_string(), "3c40Y4EH".to_string());
+
+        let result = build_category_precheck("resourcepack", &entries, &HashMap::new(), &installed);
+
+        assert!(result.updates.is_empty());
+        assert!(result.without_versions.is_empty());
+        assert_eq!(
+            resolved_pairs(&result),
+            vec![("nature-x".to_string(), "3c40Y4EH".to_string())]
+        );
+    }
+
+    /// D144: the data packs' manifests live in the worlds, and the pre-check
+    /// reads them there.
+    #[test]
+    fn the_installed_data_packs_are_read_from_the_worlds() {
+        let root = unique_test_root("world-datapacks");
+        let instance_root = root.join("instances/1.20.1-fabric");
+        let world = instance_root.join("saves/Survival");
+        fs::create_dir_all(world.join(".cubic")).expect("world manifest dir");
+        fs::write(world.join("level.dat"), b"nbt").expect("level.dat");
+        let own = crate::instance_content::world_datapacks_category(&instance_root);
+        fs::write(
+            crate::instance_content::manifest_path(&world, &own),
+            r#"{"version":1,"category":"datapacks","files":["Terralith.zip"],"origins":{"Terralith.zip":{"entryId":"terralith","versionId":"dataZip1"}}}"#,
+        )
+        .expect("world manifest");
+        // Another mod list's packs in the same (shared) world are not ours.
+        fs::write(
+            crate::instance_content::manifest_path(&world, "datapacks-0000000000000000"),
+            r#"{"version":1,"category":"datapacks","files":["Other.zip"],"origins":{"Other.zip":{"entryId":"other","versionId":"otherZip"}}}"#,
+        )
+        .expect("another instance's manifest");
+
+        let roots = category_manifest_roots("datapack", "datapacks", &instance_root);
+        let found = installed_content_versions(&root.join("cache"), &roots, "datapacks");
+
+        assert_eq!(
+            roots,
+            vec![
+                (world.clone(), own.clone()),
+                (instance_root.clone(), "datapacks".to_string())
+            ]
+        );
+        assert_eq!(
+            found.by_entry.get("terralith").map(String::as_str),
+            Some("dataZip1")
+        );
+        assert!(!found.by_entry.contains_key("other"));
+        assert_eq!(
+            category_manifest_roots("resourcepack", "resourcepacks", &instance_root),
+            vec![(instance_root.clone(), "resourcepacks".to_string())]
         );
 
         let _ = fs::remove_dir_all(&root);

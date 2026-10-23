@@ -15,24 +15,69 @@ import { modListCards, pushUiError } from "../store";
 import type { ScreenshotEntry, ScreenshotListing } from "../lib/types";
 import { MaterialIcon } from "./icons";
 
-/** Thumbnails are read one by one, on mount, so the grid paints before the megabytes arrive. */
+/** Width of a grid thumbnail, in pixels: a grid cell is about 330 CSS pixels wide, and this covers it at 1.5×. */
+const THUMBNAIL_WIDTH = 480;
+
+/** Past this the full file is not sent over the IPC (`read_image_as_data_url`), and the preview is a wide thumbnail. */
+const MAX_WHOLE_BYTES = 16 * 1024 * 1024;
+
+/** Widest preview made for a file too large to send whole. */
+const LARGE_PREVIEW_WIDTH = 2560;
+
+const thumbnailOf = (entry: ScreenshotEntry, maxWidth: number) =>
+  invoke<string>("screenshot_thumbnail_command", {
+    modlistName: entry.modlistName,
+    instanceName: entry.instanceName,
+    fileName: entry.fileName,
+    maxWidth,
+  });
+
+/**
+ * One grid thumbnail: a downscaled copy the backend makes once and caches,
+ * asked for only when the cell comes near the viewport. Before, every
+ * screenshot was read at full size as base64, all of them on mount, through a
+ * synchronous command (condivisi-7).
+ */
 function Thumbnail(props: { entry: ScreenshotEntry }) {
+  let cell: HTMLDivElement | undefined;
+  const [near, setNear] = createSignal(false);
+
+  onMount(() => {
+    if (!cell) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        setNear(true);
+        observer.disconnect();
+      },
+      { rootMargin: "400px 0px" },
+    );
+    observer.observe(cell);
+    onCleanup(() => observer.disconnect());
+  });
+
   const [source] = createResource(
-    () => props.entry.path,
-    async (path) => await invoke<string>("read_image_as_data_url_command", { path }),
+    () => (near() ? props.entry : null),
+    async (entry) => await thumbnailOf(entry, THUMBNAIL_WIDTH),
   );
 
   return (
-    <Show
-      when={source()}
-      fallback={
-        <div class="w-full h-full flex items-center justify-center bg-bgHover text-textMuted">
-          <MaterialIcon name={source.error ? "broken_image" : "image"} size="lg" />
-        </div>
-      }
-    >
-      <img src={source()} alt={props.entry.fileName} class="w-full h-full object-cover" />
-    </Show>
+    <div ref={cell} class="w-full h-full">
+      <Show
+        // Reading an errored resource throws in Solid: the error is checked first.
+        when={source.error ? undefined : source()}
+        fallback={
+          <div
+            class="w-full h-full flex items-center justify-center bg-bgHover text-textMuted"
+            title={source.error ? String(source.error) : undefined}
+          >
+            <MaterialIcon name={source.error ? "broken_image" : "image"} size="lg" />
+          </div>
+        }
+      >
+        <img src={source()} alt={props.entry.fileName} class="w-full h-full object-cover" />
+      </Show>
+    </div>
   );
 }
 
@@ -320,17 +365,32 @@ export function ScreenshotsView() {
   );
 }
 
-/** The full-size read, separate from the thumbnail so closing frees it. */
+/**
+ * The full-size read, separate from the thumbnail so closing frees it. A file
+ * past 16 MB is not sent whole: it gets a wide thumbnail instead, where it used
+ * to stay on «Loading…» for good (condivisi-8). A failed read says so.
+ */
 function LargePreview(props: { entry: ScreenshotEntry }) {
   const [source] = createResource(
-    () => props.entry.path,
-    async (path) => await invoke<string>("read_image_as_data_url_command", { path }),
+    () => props.entry,
+    async (entry) =>
+      entry.sizeBytes > MAX_WHOLE_BYTES
+        ? await thumbnailOf(entry, LARGE_PREVIEW_WIDTH)
+        : await invoke<string>("read_image_as_data_url_command", { path: entry.path }),
   );
 
   return (
     <Show
-      when={source()}
-      fallback={<div class="w-[60vw] h-[40vh] flex items-center justify-center text-textMuted">Loading…</div>}
+      when={source.error ? undefined : source()}
+      fallback={
+        <div class="w-[60vw] h-[40vh] flex flex-col items-center justify-center gap-2 text-textMuted">
+          <Show when={source.error} fallback={<span>Loading…</span>}>
+            <MaterialIcon name="broken_image" size="lg" />
+            <span class="text-sm">This screenshot could not be shown.</span>
+            <span class="text-xs max-w-[50vw] break-words text-center">{String(source.error)}</span>
+          </Show>
+        </div>
+      }
     >
       <img src={source()} alt={props.entry.fileName} class="block max-h-[80vh] max-w-[90vw] object-contain" />
     </Show>

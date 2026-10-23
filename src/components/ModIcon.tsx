@@ -1,6 +1,6 @@
 import { Show } from "solid-js";
 import type { ModRow } from "../lib/types";
-import { modIcons } from "../store";
+import { modIcons, offlineSafeImageUrl } from "../store";
 import { PackageIcon } from "./icons";
 
 /**
@@ -17,8 +17,8 @@ import { PackageIcon } from "./icons";
  */
 export function ModIcon(props: { row?: ModRow; name?: string; class?: string }) {
   const size = () => props.class ?? "h-4 w-4";
-  const url = () =>
-    (props.row?.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row?.iconImage;
+  const url = () => offlineSafeImageUrl(
+    (props.row?.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined) ?? props.row?.iconImage);
   return (
     <div class={`${size()} shrink-0 overflow-hidden rounded`}>
       <Show when={url()} fallback={<PackageIcon class={`${size()} text-muted-foreground`} />}>

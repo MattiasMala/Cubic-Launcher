@@ -5,9 +5,8 @@
 // put the write path in `store-actions.ts` or a feature-level handler.
 
 import { createMemo } from "solid-js";
-import type { FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
+import type { AccountSummary, FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
 import {
-  downloadItems,
   accounts,
   activeAccountId,
   aestheticGroups,
@@ -16,7 +15,6 @@ import {
   functionalGroups,
   incompatibilityFocusId,
   launchProgress,
-  launcherErrors,
   launchStageDetail,
   launchStageLabel,
   launchState,
@@ -29,8 +27,15 @@ import {
   selectedModListName,
   tagFilter,
   advancedPanelModId,
-  versionRules,
+  updateCheckRunning,
 } from "./store-state";
+
+/**
+ * From Play to the spawn: the pre-check and the launch work on the selection
+ * Play was pressed with, so the version, the loader, the mod list and the
+ * account cannot change under them (precheck-1).
+ */
+export const launchPreparing = () => updateCheckRunning() || launchState() === "resolving";
 
 function collectRowsRecursive(rows: ModRow[], map: Map<string, ModRow>) {
   for (const row of rows) {
@@ -49,9 +54,39 @@ export const selectedModList = createMemo(() =>
   modListCards().find(card => card.name === selectedModListName()) ?? modListCards()[0] ?? null
 );
 
+// No fallback to the first row: the launch uses the active row and nothing
+// else, so with no active row the interface must not show one either
+// (todo.md:1390).
 export const activeAccount = createMemo(() =>
-  accounts().find(account => account.id === activeAccountId()) ?? accounts()[0] ?? null
+  accounts().find(account => account.id === activeAccountId()) ?? null
 );
+
+/**
+ * The active account plays offline (D115), so the app makes no request of its
+ * own (D140): no metadata, no search, no avatars. The backend checks the same
+ * choice for the requests it makes, from the database.
+ */
+export const activePlaysOffline = createMemo(() => activeAccount()?.playsOffline ?? false);
+
+/** An account's avatar, or none while the active account plays offline (D140): the initials stand in. */
+export function accountAvatarUrl(account: AccountSummary | null | undefined): string | undefined {
+  if (!account || activePlaysOffline()) return undefined;
+  return account.avatarUrl;
+}
+
+/**
+ * An image URL as the page may draw it: a remote one (the Modrinth CDN) only
+ * while the active account plays online (D140). The icons fetched earlier in
+ * the session stay in their maps, so switching to «Play offline» mid-session
+ * no longer lets a row scrolled into view ask cdn.modrinth.com
+ * (review-frontend-shell-28); a local `data:` or `asset:` icon is drawn
+ * either way.
+ */
+export function offlineSafeImageUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  if (activePlaysOffline() && /^https?:/i.test(url)) return undefined;
+  return url;
+}
 
 export const selectedCount = createMemo(() => selectedIds().length);
 
@@ -64,7 +99,26 @@ export type TopLevelItem =
   | { kind: "group"; id: string; name: string; collapsed: boolean; blocks: ModRow[] }
   | { kind: "row"; row: ModRow };
 
-export const topLevelItems = createMemo<TopLevelItem[]>(() => {
+function sameRows(a: ModRow[], b: ModRow[]): boolean {
+  return a.length === b.length && a.every((row, index) => row === b[index]);
+}
+
+/**
+ * The editor's top level. `For` keys its children by object identity, so an
+ * item is reused from the previous run whenever what it shows is the same
+ * object: a row keeps its item while the row object is unchanged, a group
+ * while its name, collapse state and block rows are. A new wrapper every run
+ * made one change rebuild every row of the editor (audit 101,
+ * r2-scala-mod-list-grandi-3).
+ */
+export const topLevelItems = createMemo<TopLevelItem[]>(previous => {
+  const previousRowItems = new Map<ModRow, TopLevelItem>();
+  const previousGroupItems = new Map<string, Extract<TopLevelItem, { kind: "group" }>>();
+  for (const item of previous) {
+    if (item.kind === "row") previousRowItems.set(item.row, item);
+    else previousGroupItems.set(item.id, item);
+  }
+
   const topGroups = aestheticGroups().filter(group => !group.scopeRowId);
   const groupByRow = new Map<string, string>();
   for (const group of topGroups) {
@@ -74,11 +128,13 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
   const query = search().trim().toLowerCase();
   const tags = tagFilter();
   const fGroups = functionalGroups();
+  const rows = modRowsState();
+  const rowById = new Map(rows.map(row => [row.id, row]));
 
   const addedGroups = new Set<string>();
   const items: TopLevelItem[] = [];
 
-  for (const row of modRowsState()) {
+  for (const row of rows) {
     const groupId = groupByRow.get(row.id);
     if (groupId) {
       if (addedGroups.has(groupId)) continue;
@@ -86,56 +142,35 @@ export const topLevelItems = createMemo<TopLevelItem[]>(() => {
       const group = topGroups.find(candidate => candidate.id === groupId);
       if (!group) continue;
       const blocks = group.blockIds
-        .map(id => modRowsState().find(candidate => candidate.id === id))
+        .map(id => rowById.get(id))
         .filter((candidate): candidate is ModRow => Boolean(candidate))
         .filter(candidate => !query || rowMatchesQuery(candidate, query))
         .filter(candidate => tags.size === 0 || rowOrDescendantMatchesTag(candidate, fGroups, tags));
       if (blocks.length > 0 || (!query && tags.size === 0)) {
-        items.push({ kind: "group", id: groupId, name: group.name, collapsed: group.collapsed, blocks });
+        const reusable = previousGroupItems.get(groupId);
+        items.push(
+          reusable && reusable.name === group.name && reusable.collapsed === group.collapsed && sameRows(reusable.blocks, blocks)
+            ? reusable
+            : { kind: "group", id: groupId, name: group.name, collapsed: group.collapsed, blocks },
+        );
       }
       continue;
     }
 
     if (query && !rowMatchesQuery(row, query)) continue;
     if (tags.size > 0 && !rowOrDescendantMatchesTag(row, fGroups, tags)) continue;
-    items.push({ kind: "row", row });
+    items.push(previousRowItems.get(row) ?? { kind: "row", row });
   }
 
-  return items;
-});
-
-export const filteredRows = createMemo(() => {
-  const query = search().trim().toLowerCase();
-  const tags = tagFilter();
-  const fGroups = functionalGroups();
-  let rows = modRowsState();
-  if (query) rows = rows.filter(row => rowMatchesQuery(row, query));
-  if (tags.size > 0) rows = rows.filter(row => rowOrDescendantMatchesTag(row, fGroups, tags));
-  return rows;
-});
-
-export const manualModRows = createMemo(() => {
-  const alternatives = modRowsState().flatMap(row => (row.alternatives ?? []).filter(alt => alt.kind === "local"));
-  return [...modRowsState().filter(row => row.kind === "local"), ...alternatives];
-});
-
-export const manualModWarningCount = createMemo(() => manualModRows().length);
-
-export const completedDownloads = createMemo(() => downloadItems().filter(item => item.status === "complete"));
-
-export const latestError = createMemo(() => launcherErrors()[0] ?? null);
+  // Nothing changed: the same array, so nothing downstream reruns.
+  return items.length === previous.length && items.every((item, index) => item === previous[index]) ? previous : items;
+}, []);
 
 export const activeLaunchStage = createMemo(() => ({
   label: launchStageLabel(),
   detail: launchStageDetail(),
   progress: launchProgress(),
 }));
-
-export const playButtonLabel = createMemo(() => {
-  if (launchState() === "resolving") return `Resolving ${launchProgress()}%`;
-  if (launchState() === "ready") return "Launch Ready";
-  return "Play";
-});
 
 export const functionalGroupsByBlockId = createMemo(() => {
   const map = new Map<string, FunctionalGroup[]>();
@@ -155,17 +190,17 @@ export const advancedPanelMod = createMemo(() => {
 });
 
 /**
- * Rows that are a pinned version: a local entry carrying an `only` version
- * rule. That rule is what the pin writes, and it is what tells a pin apart
- * from a jar the user uploaded by hand — whose jar must never be deleted.
+ * Rows that are a pinned version, as the backend marks them (`row.pin`). A
+ * local jar with an "Only when" is not a pin: inferring one from that shape
+ * made "Remove pin" delete a jar the user uploaded by hand (audit 101,
+ * modlist-2).
  */
 export const pinnedRowIds = createMemo(() => {
-  const rows = rowMap();
-  return new Set(
-    versionRules()
-      .filter(rule => rule.kind === "only" && rows.get(rule.modId)?.kind === "local")
-      .map(rule => rule.modId)
-  );
+  const ids = new Set<string>();
+  for (const row of rowMap().values()) {
+    if (row.pin) ids.add(row.id);
+  }
+  return ids;
 });
 
 /** Top-level rows, the only ones a version can be pinned on (plus the dynamic entry of a pin). */
@@ -226,14 +261,6 @@ export const linksByModId = createMemo(() => {
   return map;
 });
 
-export const groupNameByBlockId = createMemo(() => {
-  const map = new Map<string, string>();
-  for (const group of aestheticGroups()) {
-    for (const id of group.blockIds) map.set(id, group.name);
-  }
-  return map;
-});
-
 export function findDirectParentId(rows: ModRow[], targetId: string): string | null {
   for (const row of rows) {
     if ((row.alternatives ?? []).some(alt => alt.id === targetId)) return row.id;
@@ -242,20 +269,6 @@ export function findDirectParentId(rows: ModRow[], targetId: string): string | n
   }
   return null;
 }
-
-export const filteredGroupSections = createMemo(() => {
-  const query = search().trim().toLowerCase();
-  const tags = tagFilter();
-  const fGroups = functionalGroups();
-  return aestheticGroups().filter(group => !group.scopeRowId).map(group => {
-    const blocks = group.blockIds
-      .map(id => rowMap().get(id))
-      .filter((row): row is ModRow => Boolean(row))
-      .filter(row => !query || rowMatchesQuery(row, query))
-      .filter(row => tags.size === 0 || rowOrDescendantMatchesTag(row, fGroups, tags));
-    return { ...group, blocks };
-  });
-});
 
 export const tagFilterForcedExpanded = createMemo(() => {
   const tags = tagFilter();
@@ -283,16 +296,6 @@ export const tagFilterForcedExpanded = createMemo(() => {
   for (const row of modRowsState()) processRow(row);
   return forced;
 });
-
-export function resolveToTopLevelId(rowId: string): string {
-  const match = rowId.match(/^(rule-\d+)-alternative-/);
-  if (!match) return rowId;
-  const prefix = `${match[1]}-`;
-  for (const row of modRowsState()) {
-    if (row.id.startsWith(prefix) && !row.id.includes("-alternative-")) return row.id;
-  }
-  return rowId;
-}
 
 export const alternativesPanelParent = createMemo(() => {
   const id = alternativesPanelParentId();
@@ -378,14 +381,4 @@ function createsPriorityParadox(rules: IncompatibilityRule[], allIds: string[]):
     if (!visited.has(id) && dfs(id)) return true;
   }
   return false;
-}
-
-export function moveItemBefore<T extends { id: string }>(items: T[], draggedId: string, targetId: string): T[] {
-  const dragged = items.find(item => item.id === draggedId);
-  if (!dragged) return items;
-  const rest = items.filter(item => item.id !== draggedId);
-  const idx = rest.findIndex(item => item.id === targetId);
-  if (idx < 0) return items;
-  rest.splice(idx, 0, dragged);
-  return rest;
 }

@@ -20,6 +20,12 @@ export type ModRow = {
   links?: string[];
   /** Visual groups inside this row's alternatives panel. */
   altGroups?: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
+  /**
+   * Set when the row is a pinned version, as the backend decides it from the
+   * marker next to the jar (audit 101, modlist-2). `ownsJar` says whether
+   * removing the pin deletes the jar: a pin from before the marker keeps it.
+   */
+  pin?: { ownsJar: boolean };
 };
 
 export type ModListCard = {
@@ -31,6 +37,8 @@ export type ModListCard = {
   iconImage?: string;
   iconLabel?: string;
   iconAccent?: string;
+  /** The `author` of rules.json (`ShellModListSummary.author`): who made the list, not who is signed in. */
+  author?: string;
   mcVersion?: string;
   modLoader?: string;
 };
@@ -89,12 +97,6 @@ export type CustomConfig = {
   files: string[];
 };
 
-export type DownloadProgressItem = {
-  filename: string;
-  progress: number;
-  status: "queued" | "downloading" | "complete";
-};
-
 export type LauncherUiError = {
   id: string;
   title: string;
@@ -102,6 +104,13 @@ export type LauncherUiError = {
   detail: string;
   severity: "warning" | "error";
   scope: "launch" | "download" | "account";
+  /** One button next to the notice, e.g. "Show log" after a crash (concorrenza-9). */
+  action?: { label: string; run: () => void };
+  /**
+   * The notice tells how one launch went (it failed, the game crashed, a mod
+   * was left out): the next launch replaces it, so Play clears it.
+   */
+  fromLaunch?: boolean;
 };
 
 /** Why an account is online or not (F1): mirrors `CredentialState` in `token_storage.rs`. */
@@ -133,21 +142,29 @@ export type LaunchResolutionStage = {
 export type ShellAccount = {
   microsoft_id: string;
   xbox_gamertag?: string | null;
+  minecraft_uuid?: string | null;
   avatar_url?: string | null;
   status: "online" | "offline";
   last_mode: "microsoft" | "offline";
   credentials: AccountCredentials;
   credentials_detail?: string | null;
   plays_offline: boolean;
+  /** The row the launch uses: the list alone says which account is active. */
+  is_active: boolean;
 };
 
+/** `load_shell_snapshot_command`'s payload (`ShellSnapshot` in `app_shell.rs`). */
 export type ShellSnapshot = {
   modlists: Array<{
     name: string;
     description: string;
     author?: string | null;
     rule_count: number;
+    minecraft_version?: string | null;
+    mod_loader?: string | null;
   }>;
+  /** Folders whose rules.json can't be read: left out of `modlists`, not fatal. */
+  unreadable_modlists?: Array<{ folder: string; error: string }>;
   active_account?: ShellAccount | null;
   global_settings: {
     min_ram_mb: number;
@@ -171,30 +188,6 @@ export type ShellSnapshot = {
     minecraft_version?: string | null;
     mod_loader?: string | null;
   };
-};
-
-export type EditorSnapshot = {
-  modlist_name: string;
-  rows: ModRow[];
-  incompatibilities: IncompatibilityRule[];
-  groups: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
-};
-
-export type LaunchProgressEvent = {
-  state: "idle" | "resolving" | "ready" | "running";
-  progress: number;
-  stage: string;
-  detail: string;
-};
-
-export type ProcessLogEvent = {
-  stream: "stdout" | "stderr";
-  line: string;
-};
-
-export type ProcessExitEvent = {
-  success: boolean;
-  exitCode?: number | null;
 };
 
 /** One row of `update_precheck_command`'s `updates` (`launch_preview_precheck.rs:40-58`). */
@@ -390,7 +383,7 @@ export type CapeCard = {
   active: boolean;
 };
 
-export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library";
+export type SkinErrorKind = "notSignedIn" | "rateLimited" | "invalidSkin" | "network" | "mojang" | "library" | "playsOffline" | "keyringUnavailable";
 
 /** Every skin command rejects with this object, never a string: read `kind`, not `message`. */
 export type SkinError = {

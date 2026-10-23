@@ -55,9 +55,9 @@ pub fn maybe_start_automation_verifier(
 
     tauri::async_runtime::spawn(async move {
         append_automation_trace(&launcher_paths, "automation task started");
-        // Route through the SAME verification path as verify_launch_command, so
-        // the env entry-point observes the launch (timeout/successAfter/terminate*)
-        // and emits a full LaunchVerificationResult with the 5 states.
+        // Route through the full verification path, so the env entry-point
+        // observes the launch (timeout/successAfter/terminate*) and emits a
+        // full LaunchVerificationResult with the 5 states.
         let verification =
             run_launch_verification(app_handle.clone(), launcher_paths.clone(), request).await;
 
@@ -154,10 +154,11 @@ pub(super) async fn run_launch_verification(
     launcher_paths: LauncherPaths,
     request: LaunchVerificationRequest,
 ) -> Result<LaunchVerificationResult> {
-    anyhow::ensure!(
-        current_minecraft_pid().is_none(),
-        "cannot verify launch while another Minecraft process is already tracked"
-    );
+    // The same slot as an ordinary launch (concorrenza-4): held until the
+    // pipeline is over, when the PID takes over.
+    let preparing = super::ACTIVE_LAUNCH
+        .claim()
+        .map_err(|refusal| anyhow::anyhow!("cannot verify launch: {refusal}"))?;
 
     let started_at = Instant::now();
     let timeout = Duration::from_secs(request.timeout_seconds.max(5));
@@ -166,7 +167,10 @@ pub(super) async fn run_launch_verification(
 
     let started_launch =
         match run_launch_pipeline(app_handle.clone(), launcher_paths, launch_request).await {
-            Ok(started_launch) => started_launch,
+            Ok(started_launch) => {
+                drop(preparing);
+                started_launch
+            }
             Err(error) => {
                 let detail = format!("{error:#}");
                 let _ = emit_launch_failure(&app_handle, &detail);

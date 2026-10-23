@@ -82,8 +82,8 @@ impl<'connection, S: SecretStore> AccountManager<'connection, S> {
     }
 
     /// Every saved account, including those whose tokens no longer decrypt:
-    /// a summary needs no token, so it reads the rows as stored and does not
-    /// go through `list_accounts`, which can only return what it decrypted.
+    /// a summary needs no token, so it reads the rows as stored and decrypts
+    /// nothing.
     pub fn list_account_summaries(&self) -> Result<Vec<AccountSummary>> {
         Ok(self
             .encrypted_accounts

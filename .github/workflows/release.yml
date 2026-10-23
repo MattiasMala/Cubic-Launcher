@@ -9,7 +9,37 @@ permissions:
   contents: write
 
 jobs:
+  # Il tag deve dire la stessa versione dei tre manifest (docs/ARCHITECTURE.md,
+  # «Versioning»): un tag v0.1.3 su un tauri.conf.json rimasto a 0.1.2
+  # pubblicherebbe asset e latest.json con la versione vecchia, e l'updater non
+  # vedrebbe niente di nuovo. Si controlla una volta, prima delle due build
+  # (audit 101, build-doc-4).
+  version-check:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches package.json, Cargo.toml and tauri.conf.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          package_json=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+          tauri_conf=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          # La prima riga `version = ` a inizio riga è quella di [package], che
+          # in src-tauri/Cargo.toml è la prima sezione.
+          cargo_toml=$(grep -m1 -oP '^version\s*=\s*"\K[^"]+' src-tauri/Cargo.toml)
+          echo "tag=$tag package.json=$package_json Cargo.toml=$cargo_toml tauri.conf.json=$tauri_conf"
+          failed=0
+          for pair in "package.json:$package_json" "src-tauri/Cargo.toml:$cargo_toml" "src-tauri/tauri.conf.json:$tauri_conf"; do
+            if [ "${pair#*:}" != "$tag" ]; then
+              echo "::error file=${pair%%:*}::version ${pair#*:} does not match the tag $GITHUB_REF_NAME"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
   release:
+    needs: version-check
     strategy:
       matrix:
         platform:
@@ -52,9 +82,12 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Cubic Launcher ${{ github.ref_name }}
+          # tauri-action copia questo testo anche nelle `notes` di latest.json,
+          # che il banner di aggiornamento dentro l'app mostra (UpdateBanner.tsx):
+          # una frase fissa per ogni versione non diventa mai falsa, e le note
+          # vere si scrivono nella bozza della release prima di pubblicarla
+          # (audit 101, build-doc-5).
           releaseBody: |
-            Fixed: Microsoft login no longer falls back to offline mode silently.
-            Fixed: mod selection now prefers stable releases over alpha and beta builds.
-            Updates install only after your confirmation.
+            Cubic Launcher ${{ github.ref_name }} for Windows and Linux. See the release notes on GitHub for what changed.
           releaseDraft: true
           includeUpdaterJson: true

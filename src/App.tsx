@@ -7,6 +7,7 @@
 
 import { Match, Show, Switch, batch, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
 import { updateAltsDeep } from "./lib/dragUtils";
@@ -17,16 +18,16 @@ import type { LocalPickMode, LocalUploadContentType } from "./components/add-mod
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   activeRailView, setActiveRailView, setQuickPlayWorldFolder, quickPlayWorldFolder,
-  modRowsState, setModRowsState, setActiveAccountId,
+  modRowsState, setModRowsState, activeAccountId, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
-  setLaunchLogs,
-  modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
+  appendLaunchLog,
+  selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
-  setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
+  setSettingsModalOpen,
   globalSettings, setGlobalSettings, setModlistOverrides,
-  pushUiError, resetLaunchUiState,
+  pushUiError, resetLaunchUiState, launchPreparing, activePlaysOffline,
   setAestheticGroups, setFunctionalGroups,
   setSavedIncompatibilities,
   setSavedLinks,
@@ -35,6 +36,7 @@ import {
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
   alternativesPanelParent, setAlternativesPanelParentId,
   setAdvancedPanelModId, rowMap, setOnToggleEnabled,
+  setVersionRules, setCustomConfigs,
   launchState, selectedModList,
   setUpdateInfo,
   updateCheckRunning, setUpdateCheckRunning, pendingUpdatePrecheck, setPendingUpdatePrecheck,
@@ -48,26 +50,39 @@ import type { GlobalSettingsState, ModlistOverridesState, UpdateCheckResponse } 
 import {
   buildIdRemap,
   collectRowIds,
+  collectSubtreeIds,
   findRowIdByNamePath,
   findRowNamePath,
   rebuildRowIds,
   remapAestheticGroups,
+  remapByRowId,
   remapFunctionalGroups,
   remapIds,
+  remapIncompatibilities,
+  remapLinks,
+  removeRowsDeep,
   reorderAlternativesInRows,
+  rowIdResolver,
+  setEnabledDeep,
 } from "./app/row-state";
 import {
+  defaultMinecraftVersion,
   fetchModMetadata,
   fetchMetadataForIds,
   seedModName,
   isTauri,
-  loadAllCardIcons,
   loadEditorSnapshot,
   loadModlistGroups,
   loadModlistPresentation,
   loadShellSnapshot,
   modlistVersionLoaderCache,
   runResolution,
+  saveModlistTarget,
+  beginModlistSelection,
+  isCurrentSelection,
+  setModlistReselector,
+  minecraftVersionsAreKnown,
+  settleProvisionalTarget,
 } from "./app/backend-loaders";
 import { useAppBootstrap } from "./app/use-app-bootstrap";
 import { useAppPersistence } from "./app/persistence-effects";
@@ -102,10 +117,9 @@ import { PinVersionDialog } from "./components/PinVersionDialog";
 /**
  * The Advanced checkbox that governs one pre-check category.
  *
- * The three settings were written and read by nobody until now
- * (`app_shell.rs:59` said so in a comment); this table is the whole of
- * "reading" them. A category with no entry here — there is none today — is
- * treated as on, because silence must not hide an update.
+ * This table is the only place that reads the three settings. A category with
+ * no entry here — there is none today — is treated as on, because silence
+ * must not hide an update.
  */
 const CONTENT_CATEGORY_SETTINGS: Record<string, "updateNotificationsResourcePacks" | "updateNotificationsDataPacks" | "updateNotificationsShaders"> = {
   resourcepack: "updateNotificationsResourcePacks",
@@ -132,6 +146,8 @@ export default function App() {
 
     void (async () => {
       try {
+        // With the active account playing offline the backend asks nobody
+        // and answers `offline` (D140), which needs nothing here.
         const result = await invoke<UpdateCheckResponse>("check_for_updates");
         if (result.status === "available" && result.version) {
           setUpdateInfo({
@@ -152,12 +168,65 @@ export default function App() {
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
+  // precheck-1: from Play to the spawn the launch works on the selection Play
+  // was pressed with. Switching version, loader, mod list or account in the
+  // meantime installed the builds of one target into the instance of another.
+  const refuseWhileLaunchPreparing = (what: string) => {
+    if (!launchPreparing()) return false;
+    pushUiError({ title: "Launch in progress", message: `${what} can change once the game has started or the launch has stopped.`, detail: "", severity: "warning", scope: "launch" });
+    return true;
+  };
+
+  /**
+   * Row ids are positional (`rule-<i>[-alternative-<n>]*-<name>`): after the
+   * rows moved or some were deleted, rebuild them and carry every state keyed
+   * by them along — groups, tags, links, incompatibilities, version rules,
+   * custom configs, selection, panels. Entries of `removedIds` are dropped.
+   * Without it the advanced save sent ids of rows that had moved, and the
+   * backend refused every later save (audit 101, modlist-5, editor-logica-3).
+   */
+  const rebuildRowIdsAndRemap = (removedIds: ReadonlySet<string> = new Set()) => {
+    const currentRows = modRowsState();
+    const rebuiltRows = rebuildRowIds(currentRows);
+    const resolve = rowIdResolver(buildIdRemap(currentRows, rebuiltRows), collectRowIds(rebuiltRows), removedIds);
+    batch(() => {
+      setModRowsState(rebuiltRows);
+      setAestheticGroups(groups => remapAestheticGroups(groups, resolve));
+      setFunctionalGroups(groups => remapFunctionalGroups(groups, resolve));
+      setSavedIncompatibilities(rules => remapIncompatibilities(rules, resolve));
+      setSavedLinks(links => remapLinks(links, resolve));
+      setVersionRules(rules => remapByRowId(rules, resolve));
+      setCustomConfigs(configs => remapByRowId(configs, resolve));
+      setSelectedIds(ids => remapIds(ids, resolve));
+      setExpandedRows(ids => remapIds(ids, resolve));
+      setAlternativesPanelParentId(id => (id ? resolve(id) : id));
+      setAdvancedPanelModId(id => (id ? resolve(id) : id));
+    });
+  };
+
   const handleSelectModList = async (name: string) => {
+    if (refuseWhileLaunchPreparing("The mod list")) return;
+    await selectModList(name);
+  };
+
+  /**
+   * Opens `name` in the editor. Unguarded: deleting or creating a mod list
+   * has to move the selection off the one that is gone, even while another
+   * launch is being prepared; that launch works on its own snapshot
+   * (precheck-1).
+   */
+  const selectModList = async (name: string) => {
     logger.info("App", "handleSelectModList started", { name });
     appendDebugTrace("modlist.select", { name });
+    // This selection's number: a click on another list while this one loads
+    // makes every answer below stale, and this one stops before applying or
+    // priming anything (review-frontend-stato-16).
+    const generation = beginModlistSelection();
+    // First: the persistence effects must not see the new name with the old
+    // list's state, or they save it there.
+    resetPersistenceState();
     setSelectedModListName(name);
     setSelectedIds([]);
-    resetPersistenceState();
 
     // Immediately show cached presentation data so there's no flicker
     const cached = modListCards().find(c => c.name === name);
@@ -174,15 +243,22 @@ export default function App() {
     const cachedVL = modlistVersionLoaderCache.get(name);
     if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(normalizeModLoader(cachedVL.loader)); }
     if (!isTauri()) { logger.warn("App", "handleSelectModList skipped — no backend"); return; }
-    await loadShellSnapshot(name);
-    await loadEditorSnapshot(name, true);
-    await loadModlistPresentation(name);
-    await loadModlistGroups(name, modRowsState());
+    await loadShellSnapshot(name, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadEditorSnapshot(name, true, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadModlistPresentation(name, generation);
+    if (!isCurrentSelection(generation)) return;
+    await loadModlistGroups(name, modRowsState(), generation);
+    if (!isCurrentSelection(generation)) return;
     primePersistenceState();
 
     void fetchModMetadata(modRowsState());
     void runResolution(name, selectedMcVersion(), selectedModLoader());
   };
+
+  // The open list vanished from a snapshot: the next one opens the same way.
+  setModlistReselector(selectModList);
 
   const handleReorderRules = async (orderedIds: string[]) => {
     logger.info("App", "handleReorderRules started", { count: orderedIds.length });
@@ -191,27 +267,7 @@ export default function App() {
       await invoke("reorder_rules_command", {
         input: { modlistName: selectedModListName(), orderedModIds: orderedIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
       });
-      const currentRows = modRowsState();
-      const rebuiltRows = rebuildRowIds(currentRows);
-      const idRemap = buildIdRemap(currentRows, rebuiltRows);
-      const validIds = collectRowIds(rebuiltRows);
-      batch(() => {
-        setModRowsState(rebuiltRows);
-        setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-        setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-        setSavedIncompatibilities(rules => rules.map(r => ({
-          winnerId: idRemap.get(r.winnerId) ?? r.winnerId,
-          loserId:  idRemap.get(r.loserId)  ?? r.loserId,
-        })));
-        setSavedLinks(links => links.map(l => ({
-          fromId: idRemap.get(l.fromId) ?? l.fromId,
-          toId:   idRemap.get(l.toId)   ?? l.toId,
-        })).filter(l => validIds.has(l.fromId) && validIds.has(l.toId)));
-        setSelectedIds(ids => remapIds(ids, idRemap, validIds));
-        setExpandedRows(ids => remapIds(ids, idRemap, validIds));
-        setAlternativesPanelParentId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
-        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
-      });
+      rebuildRowIdsAndRemap();
       void runResolution();
     } catch (err) {
       logger.error("App", "handleReorderRules failed", err);
@@ -221,23 +277,32 @@ export default function App() {
   };
 
   const handleSaveAlternativeOrder = async (parentId: string, orderedAltIds: string[]) => {
-    if (!selectedModListName()) return;
-    appendDebugTrace("alts.reorder.frontend", { parentId, orderedAltIds, modlistName: selectedModListName() });
+    const modlistName = selectedModListName();
+    if (!modlistName) return;
+    appendDebugTrace("alts.reorder.frontend", { parentId, orderedAltIds, modlistName });
 
-    // Optimistic: reorder alternatives in local state immediately, at any depth.
+    // The mod ids are read before the row ids are rebuilt below.
+    const parentModId = rowMap().get(parentId)?.primaryModId ?? parentId;
+    const orderedAltModIds = orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id);
+
+    // Optimistic: reorder alternatives in local state immediately, at any depth,
+    // then renumber their positional ids so tags and groups follow them.
     setModRowsState(cur => reorderAlternativesInRows(cur, parentId, orderedAltIds));
+    rebuildRowIdsAndRemap();
 
     if (!isTauri()) { logger.warn("App", "handleSaveAlternativeOrder skipped — no backend"); return; }
     try {
       await invoke("save_alternative_order_command", {
-        input: { modlistName: selectedModListName(), parentModId: rowMap().get(parentId)?.primaryModId ?? parentId, orderedAltIds: orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
+        input: { modlistName, parentModId, orderedAltIds: orderedAltModIds },
       });
       void runResolution();
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "saved" });
     } catch (err) {
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "error", detail: String(err) });
       pushUiError({ title: "Could not save alternative order", message: "The fallback order could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
-      await loadEditorSnapshot(selectedModListName()); // restore on failure
+      // Restore on failure: the order on disk, and the groups that follow it.
+      await loadEditorSnapshot(modlistName);
+      await loadModlistGroups(modlistName, modRowsState());
     }
   };
 
@@ -382,14 +447,19 @@ export default function App() {
   };
 
   const handleSwitchAccount = async (id: string) => {
+    if (refuseWhileLaunchPreparing("The account")) return;
+    const previousId = activeAccountId();
     setActiveAccountId(id);
     if (!isTauri()) { logger.warn("App", "handleSwitchAccount skipped — no backend"); return; }
     try {
       await invoke("switch_active_account_command", { microsoftId: id });
-      await loadShellSnapshot(selectedModListName() || null);
     } catch (err) {
+      // The backend kept the previous account: so does the interface.
+      setActiveAccountId(previousId);
       pushUiError({ title: "Account switch failed", message: "Could not activate the selected account.", detail: String(err), severity: "error", scope: "account" });
+      return;
     }
+    await loadShellSnapshot(selectedModListName() || null);
   };
 
   const handleCreateModlist = async () => {
@@ -409,20 +479,31 @@ export default function App() {
       return;
     }
 
+    // The target a new list starts on is written with it, so it never follows
+    // the next Mojang release (audit 101, r2-primo-avvio-ambiente-degradato-1).
+    // Only a real latest release: the placeholder list (Mojang not answered
+    // yet, or not at all) would pin "1.21.1" for good; without one the list is
+    // given the default when the version list arrives (review-frontend-shell-29).
+    const minecraftVersion = minecraftVersionsAreKnown() ? defaultMinecraftVersion() : null;
+    const modLoader = normalizeModLoader(null);
     try {
       await invoke("create_modlist_command", {
         input: {
           name,
           author: activeAccount()?.gamertag ?? "Author",
           description: createModlistDescription().trim(),
+          minecraftVersion,
+          modLoader,
         },
       });
+      // The create command saves the two fields itself, before the folder is
+      // born: if the database refuses them nothing is created, and there is
+      // no second write that could fail on its own.
       setCreateModlistModalOpen(false);
-      await loadShellSnapshot(name);
-      await loadEditorSnapshot(name);
-      await loadModlistPresentation(name);
-      await loadModlistGroups(name, modRowsState());
-      primePersistenceState();
+      // The same path as picking a list in the sidebar: the persistence state
+      // of the previous list is dropped before anything of the new one loads
+      // (audit 101, contratto-4).
+      await selectModList(name);
 
       logger.debug("App", "handleCreateModlist completed", { name });
     } catch (err) {
@@ -433,11 +514,16 @@ export default function App() {
     }
   };
 
-  const handleAddModrinth = async (modId: string, displayName: string) => {
+  /**
+   * Add a Modrinth mod as a new rule. Resolves to `null` when the rule is on
+   * disk, or to the reason it is not: the Add dialog marks a result «Added»
+   * only on `null` (audit 101, todo.md:1711).
+   */
+  const handleAddModrinth = async (modId: string, displayName: string): Promise<string | null> => {
     // Must have a mod list selected before we can add anything
     if (!selectedModListName()) {
       pushUiError({ title: "No mod list selected", message: "Create or select a mod list in the sidebar before adding mods.", detail: "", severity: "warning", scope: "launch" });
-      return;
+      return "No mod list is selected.";
     }
     logger.info("App", "handleAddModrinth started", { modId, displayName });
     // Optimistic insert: append a placeholder row immediately so the list
@@ -462,20 +548,37 @@ export default function App() {
     seedModName(modId, displayName);
     void fetchModMetadata([tempRow]);
 
-    if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
+    if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return null; }
     try {
       await invoke("add_mod_rule_command", {
         input: { modlistName: selectedModListName(), modId, source: "modrinth", fileName: null },
       });
-      // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
-      await loadEditorSnapshot(selectedModListName());
-      logger.debug("App", "handleAddModrinth completed", { modId, displayName });
     } catch (err) {
       logger.error("App", "handleAddModrinth failed", err);
       // Remove the optimistic row on failure.
       setModRowsState(c => c.filter(r => r.id !== tempId));
       pushUiError({ title: "Failed to add mod", message: `'${displayName}' could not be added.`, detail: String(err), severity: "error", scope: "launch" });
+      return String(err);
     }
+    // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
+    await loadEditorSnapshot(selectedModListName());
+    logger.debug("App", "handleAddModrinth completed", { modId, displayName });
+    return null;
+  };
+
+  /** The pack half of the Add dialog: same contract as `handleAddModrinth`. */
+  const handleAddContent = async (contentType: string, id: string, name: string): Promise<string | null> => {
+    if (!selectedModListName()) return "No mod list is selected.";
+    try {
+      await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
+    } catch (err) {
+      logger.error("App", "handleAddContent failed", err);
+      pushUiError({ title: "Failed to add content", message: `Could not add '${name}'.`, detail: String(err), severity: "error", scope: "launch" });
+      return String(err);
+    }
+    seedContentName(id, name);
+    bumpContentVersion();
+    return null;
   };
 
   /**
@@ -509,6 +612,32 @@ export default function App() {
   };
 
   /**
+   * Copy a local `.jar` into the mod list's `local-jars/` and add its rule
+   * (`copy_local_jar_command`). The rule is named after the file, as every
+   * local rule is: the launch finds the jar as `local-jars/<mod_id>.jar`.
+   *
+   * Like `importLocalContentPack`, a refusal comes back to the Upload tab
+   * instead of going to the notice banner the dialog covers.
+   */
+  const copyLocalJar = async (sourcePath: string): Promise<LocalImportFailure | null> => {
+    const modlistName = selectedModListName();
+    if (!modlistName) return null;
+    try {
+      await invoke("copy_local_jar_command", { input: { sourcePath, modlistName } });
+    } catch (err) {
+      logger.error("App", "copyLocalJar failed", err);
+      return {
+        title: "Failed to upload JAR",
+        message: `The JAR could not be copied into the local-jars folder of '${modlistName}'.`,
+        detail: String(err),
+      };
+    }
+    setAddModModalOpen(false);
+    await loadEditorSnapshot(modlistName);
+    return null;
+  };
+
+  /**
    * The Browse buttons of the Upload tab.
    *
    * A mod is a `.jar` and keeps the local-JAR command. A pack is a `.zip` or a
@@ -531,25 +660,15 @@ export default function App() {
       });
       return null;
     }
-    const { open } = await import("@tauri-apps/plugin-dialog");
     if (contentType === "mod") {
       try {
         const selected = await open({ title: "Select a mod JAR", filters: [{ name: "JAR files", extensions: ["jar"] }], multiple: false, directory: false });
         if (!selected || !selectedModListName()) return null;
-        await invoke("copy_local_jar_command", {
-          input: {
-            sourcePath: selected as string,
-            ruleName: localJarRuleName().trim(),
-            modlistName: selectedModListName(),
-          },
-        });
-        setLocalJarRuleName("");
-        setAddModModalOpen(false);
-        await loadEditorSnapshot(selectedModListName());
+        return await copyLocalJar(selected as string);
       } catch (err) {
-        pushUiError({ title: "Failed to upload JAR", message: "The file could not be copied to the mod cache.", detail: String(err), severity: "error", scope: "launch" });
+        logger.error("App", "handleUploadLocal picker failed", err);
+        return { title: "The JAR picker could not be opened", message: "The file dialog did not open, so nothing was added.", detail: String(err) };
       }
-      return null;
     }
 
     const noun = CONTENT_TYPE_NOUN[contentType] ?? "pack";
@@ -576,17 +695,7 @@ export default function App() {
   ): Promise<LocalImportFailure | null> => {
     if (!selectedModListName()) return null;
     if (contentType !== "mod") return await importLocalContentPack(path, contentType);
-    try {
-      await invoke("copy_local_jar_command", {
-        input: { sourcePath: path, ruleName: localJarRuleName().trim(), modlistName: selectedModListName() },
-      });
-      setLocalJarRuleName("");
-      setAddModModalOpen(false);
-      await loadEditorSnapshot(selectedModListName());
-    } catch (err) {
-      pushUiError({ title: "Failed to upload JAR", message: "The dropped file could not be added.", detail: String(err), severity: "error", scope: "launch" });
-    }
-    return null;
+    return await copyLocalJar(path);
   };
 
   const handleDeleteSelected = async () => {
@@ -597,34 +706,21 @@ export default function App() {
 
     // Capture real mod IDs BEFORE the optimistic removal clears them from rowMap.
     const backendModIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
+    // Every row that goes away: the selected ones and what sits below them.
+    const removedIds = new Set<string>();
+    for (const id of ids) {
+      const row = rowMap().get(id);
+      if (row) collectSubtreeIds(row, removedIds);
+      else removedIds.add(id);
+    }
 
-    // Optimistic update: remove top-level rules AND nested alternatives.
-    setModRowsState(cur =>
-      cur
-        .filter(r => !idSet.has(r.id))
-        .map(r => {
-          if (!r.alternatives?.length) return r;
-          const filteredAlts = r.alternatives.filter(a => !idSet.has(a.id));
-          // Preserve reference if nothing changed.
-          return filteredAlts.length === r.alternatives.length
-            ? r
-            : { ...r, alternatives: filteredAlts };
-        })
-    );
+    // Optimistic update: remove the rows at any depth, as the backend does.
+    setModRowsState(cur => removeRowsDeep(cur, idSet));
     setSelectedIds([]);
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleDeleteSelected skipped — no backend"); return; }
     try {
       await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), modIds: backendModIds } });
-      const currentRows = modRowsState();
-      const rebuiltRows = rebuildRowIds(currentRows);
-      const idRemap = buildIdRemap(currentRows, rebuiltRows);
-      const validIds = collectRowIds(rebuiltRows);
-      batch(() => {
-        setModRowsState(rebuiltRows);
-        setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-        setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : (id && validIds.has(id) ? id : null)));
-      });
+      rebuildRowIdsAndRemap(removedIds);
       void runResolution();
       logger.debug("App", "handleDeleteSelected completed");
     } catch (err) {
@@ -683,40 +779,59 @@ export default function App() {
     }
   };
 
-  const saveVersionLoader = async (modlistName: string, version: string, loader: string) => {
+  /**
+   * Write the version and loader just picked. Only those two keys: the RAM,
+   * JVM and wrapper overrides on screen may still be another list's, and
+   * sending them copied them onto this one (todo.md:1618). A failed save is
+   * shown and the previous pick comes back, instead of the dropdown claiming a
+   * target that the next reload forgets (audit 101 "Noto 1", 069 M3).
+   */
+  const saveVersionLoader = async (
+    modlistName: string,
+    version: string,
+    loader: string,
+    previous: { version: string; loader: string },
+  ) => {
     if (!isTauri() || !modlistName) { logger.warn("App", "saveVersionLoader skipped — no backend"); return; }
-    const ov = modlistOverrides();
-    await invoke("save_modlist_overrides_command", {
-      overrides: {
-        modlistName,
-        minRamMb: ov.minRamEnabled ? ov.minRamMb : null,
-        maxRamMb: ov.maxRamEnabled ? ov.maxRamMb : null,
-        customJvmArgs: ov.customArgsEnabled ? ov.customJvmArgs : null,
-        profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
-        wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
-        minecraftVersion: version || null,
-        modLoader: normalizeModLoader(loader) || null,
-      },
-    }).catch(() => {});
+    try {
+      await saveModlistTarget(modlistName, version, loader);
+    } catch (err) {
+      logger.error("App", "saveVersionLoader failed", err);
+      pushUiError({ title: "Version not saved", message: `The Minecraft version and loader of '${modlistName}' could not be saved, so the previous ones are back.`, detail: String(err), severity: "error", scope: "launch" });
+      // Undo only what this save set: a later pick has its own save.
+      const cached = modlistVersionLoaderCache.get(modlistName);
+      if (cached?.version !== version || cached.loader !== loader) return;
+      modlistVersionLoaderCache.set(modlistName, previous);
+      setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: previous.version, modLoader: previous.loader } : c));
+      if (selectedModListName() === modlistName) {
+        setSelectedMcVersion(previous.version);
+        setSelectedModLoader(previous.loader);
+        void runResolution(modlistName, previous.version, previous.loader);
+      }
+    }
   };
 
   const handleVersionChange = (version: string) => {
+    if (refuseWhileLaunchPreparing("The Minecraft version")) return;
     const modlistName = selectedModListName();
-    setSelectedMcVersion(version);
     const loader = normalizeModLoader(selectedModLoader());
+    const previous = { version: selectedMcVersion(), loader };
+    setSelectedMcVersion(version);
     modlistVersionLoaderCache.set(modlistName, { version, loader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: version } : c));
-    void saveVersionLoader(modlistName, version, loader);
+    void saveVersionLoader(modlistName, version, loader, previous);
     void runResolution(modlistName, version, loader);
   };
 
   const handleLoaderChange = (loader: string) => {
+    if (refuseWhileLaunchPreparing("The mod loader")) return;
     const modlistName = selectedModListName();
     const normalizedLoader = normalizeModLoader(loader);
+    const previous = { version: selectedMcVersion(), loader: normalizeModLoader(selectedModLoader()) };
     setSelectedModLoader(normalizedLoader);
     modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader: normalizedLoader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: normalizedLoader } : c));
-    void saveVersionLoader(modlistName, selectedMcVersion(), normalizedLoader);
+    void saveVersionLoader(modlistName, selectedMcVersion(), normalizedLoader, previous);
     void runResolution(modlistName, selectedMcVersion(), normalizedLoader);
   };
 
@@ -758,38 +873,36 @@ export default function App() {
   const handleToggleEnabled = async (rowId: string | string[], enabled: boolean) => {
     const ids = Array.isArray(rowId) ? rowId : [rowId];
     const modIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
-    if (!isTauri() || !selectedModListName()) return;
+    const modlistName = selectedModListName();
+    if (!isTauri() || !modlistName) return;
 
-    // Lock scroll position across all re-renders (optimistic + resolution).
+    // Lock the scroll position across the optimistic re-render and the save,
+    // which is a local file write. Not across the resolution: that one can hit
+    // the network, and the list stayed frozen until it returned (audit 101,
+    // stato-frontend-9).
     const scrollEl = document.querySelector<HTMLElement>(".flex-1.p-4");
     const savedScroll = scrollEl?.scrollTop ?? 0;
     let scrollGuardId = 0;
     const guardScroll = () => { if (scrollEl) scrollEl.scrollTop = savedScroll; scrollGuardId = requestAnimationFrame(guardScroll); };
     scrollGuardId = requestAnimationFrame(guardScroll);
 
-    // Optimistic update — toggle all target IDs and their alternatives.
-    const idSet = new Set(ids);
-    const setEnabledDeep = (r: ModRow, en: boolean): ModRow => {
-      const next = r.enabled === en ? r : { ...r, enabled: en };
-      if (!next.alternatives?.length) return next;
-      const alts = next.alternatives.map(a => setEnabledDeep(a, en));
-      return alts === next.alternatives ? next : { ...next, alternatives: alts };
-    };
-    setModRowsState(cur => cur.map(r =>
-      idSet.has(r.id) ? setEnabledDeep(r, enabled) : r
-    ));
+    // Optimistic update — the target rows at any depth (an alternative has its
+    // own switch too) and everything below them, as the backend does.
+    setModRowsState(cur => setEnabledDeep(cur, new Set(ids), enabled));
+    let saved = false;
     try {
-      await Promise.all(modIds.map(modId =>
-        invoke("toggle_rule_enabled_command", { input: { modlistName: selectedModListName(), modId, enabled } })
-      ));
-      await runResolution();
+      // One command for the whole set: a group toggle used to be one full
+      // read and write of rules.json per mod (r2-scala-mod-list-grandi-4).
+      await invoke("toggle_rules_enabled_command", { input: { modlistName, modIds, enabled } });
+      saved = true;
     } catch (err) {
       pushUiError({ title: "Toggle failed", message: `Could not ${enabled ? "enable" : "disable"} the mod(s).`, detail: String(err), severity: "error", scope: "launch" });
-      await loadEditorSnapshot(selectedModListName());
+      await loadEditorSnapshot(modlistName);
     } finally {
       cancelAnimationFrame(scrollGuardId);
       if (scrollEl) scrollEl.scrollTop = savedScroll;
     }
+    if (saved) void runResolution();
   };
 
   setOnToggleEnabled(() => handleToggleEnabled);
@@ -821,44 +934,62 @@ export default function App() {
     }
   };
 
-  const handleDeleteModList = async () => {
+  // D153: the mod list goes to the trash. Resolves to the reason the trash
+  // refused (nothing was deleted, the dialog asks again saying "permanently"),
+  // or null when it is done or failed for another reason (shown as an error).
+  const handleDeleteModList = async (allowPermanent: boolean): Promise<string | null> => {
     const name = selectedModListName();
-    if (!name) return;
+    if (!name) return null;
 
     if (!isTauri()) {
       setInstancePresentationOpen(false);
-      return;
+      return null;
     }
 
     try {
-      await invoke("delete_modlist_command", { modlistName: name });
-      setInstancePresentationOpen(false);
-      // Reload shell to refresh mod-list sidebar
-      const snap: any = await invoke("load_shell_snapshot_command");
-      const cards = (snap.modlists ?? []).map((m: any) => ({
-        name: m.name,
-        status: "Ready" as const,
-        accent: "from-primary/30 via-primary/10 to-transparent",
-        description: m.description || (m.rule_count > 0 ? `${m.rule_count} rules` : "Empty mod list"),
-      }));
-      setModListCards(cards);
-      void loadAllCardIcons(cards.map((c: { name: string }) => c.name));
-      const next = cards[0]?.name ?? null;
-      if (next) {
-        setSelectedModListName(next);
-        await loadEditorSnapshot(next, true);
-        await loadModlistPresentation(next);
-        await loadModlistGroups(next, modRowsState());
-        primePersistenceState();
+      await invoke("delete_modlist_command", { modlistName: name, allowPermanent });
+    } catch (err) {
+      const reported = String(err);
+      if (reported.includes("trash-unavailable:")) {
+        return reported.split("trash-unavailable:").pop()?.trim() || reported;
+      }
+      pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: reported, severity: "error", scope: "launch" });
+      // The folder is gone but its saved settings stayed: the sidebar still
+      // has to forget it.
+      if (!reported.includes("was deleted, but")) return null;
+    }
 
+    try {
+      // The deleted list's tags, groups and rules must not be saved under the
+      // next one's name (audit 101, ui-schermate-1).
+      resetPersistenceState();
+      setInstancePresentationOpen(false);
+      modlistVersionLoaderCache.delete(name);
+      const next = modListCards().find(card => card.name !== name)?.name ?? null;
+      if (next) {
+        // The same path as the sidebar: shell snapshot (cards, target and
+        // overrides of the next list), editor, presentation, groups.
+        await selectModList(next);
       } else {
-        setSelectedModListName("");
-        setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
-        setModRowsState([]);
+        await loadShellSnapshot(null);
+        batch(() => {
+          setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+          setModRowsState([]);
+          setFunctionalGroups([]);
+          setAestheticGroups([]);
+          setSavedLinks([]);
+          setSavedIncompatibilities([]);
+          setVersionRules([]);
+          setCustomConfigs([]);
+          setExpandedRows([]);
+          setSelectedIds([]);
+        });
+        void runResolution("");
       }
     } catch (err) {
-      pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Could not reload the mod lists", message: `'${name}' was deleted, but the sidebar could not be refreshed.`, detail: String(err), severity: "error", scope: "launch" });
     }
+    return null;
   };
 
   const handleExport = async () => {
@@ -870,7 +1001,6 @@ export default function App() {
     }
 
     try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
       const destination = await save({
         title: "Export Mod List",
         defaultPath: `${selectedModListName()}.zip`,
@@ -888,6 +1018,7 @@ export default function App() {
           resourcePacks: options.resourcePacks,
           dataPacks: options.dataPacks,
           shaders: options.shaders,
+          selectedContentPaths: options.selectedContentPaths,
           otherFiles: options.otherFiles,
           selectedOtherPaths: options.selectedOtherPaths,
         },
@@ -898,7 +1029,17 @@ export default function App() {
     }
   };
 
+  /**
+   * What Play was pressed on, read once before the pre-check's `await` and
+   * handed to the pre-check, the popup and the launch (precheck-1). Reading
+   * the signals again after the await launched whatever the selectors showed
+   * by then.
+   */
+  type LaunchTarget = { modlistName: string; minecraftVersion: string; modLoader: string };
+  let pendingLaunchTarget: LaunchTarget | null = null;
+
   const startLaunch = async (
+    target: LaunchTarget,
     resolvedVersions?: Record<string, string>,
     resolvedContent?: Record<string, Record<string, string>>,
   ) => {
@@ -906,9 +1047,9 @@ export default function App() {
     try {
       await invoke("start_launch_command", {
         request: {
-          modlistName: selectedModListName(),
-          minecraftVersion: selectedMcVersion(),
-          modLoader: normalizeModLoader(selectedModLoader()),
+          modlistName: target.modlistName,
+          minecraftVersion: target.minecraftVersion,
+          modLoader: target.modLoader,
           // Omitted, not `undefined`: a request without the field is the
           // pre-feature request, and the backend reads its absence (D19).
           ...(resolvedVersions ? { resolvedVersions } : {}),
@@ -919,7 +1060,7 @@ export default function App() {
         },
       });
     } catch (err) {
-      pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Launch failed", message: "The backend could not start the launch.", detail: String(err), severity: "error", scope: "launch", fromLaunch: true });
     } finally {
       // One launch, one world: a second Play from the panel must not inherit
       // the world the card asked for.
@@ -942,28 +1083,51 @@ export default function App() {
       return;
     }
     resetLaunchUiState();
+    // A list shown with the placeholder version waits for the real default,
+    // or Play would launch the placeholder's (empty) instance
+    // (review-frontend-shell-21).
+    // Play stays disabled meanwhile, as during the pre-check.
+    setUpdateCheckRunning(true);
+    try {
+      await settleProvisionalTarget(selectedModListName());
+    } finally {
+      setUpdateCheckRunning(false);
+    }
+    const target: LaunchTarget = {
+      modlistName: selectedModListName(),
+      minecraftVersion: selectedMcVersion(),
+      modLoader: normalizeModLoader(selectedModLoader()),
+    };
+    // Read with the target: the account cannot change before the launch
+    // starts (precheck-1), and the message below has to describe this one.
+    const playsOffline = activePlaysOffline();
 
     if (isTauri()) {
-      // The pre-check runs before every launch: making it conditional on a
-      // setting is A3. Two commands instead of one widen the double-click
+      // The pre-check command runs before every launch. With an account that
+      // plays online it asks Modrinth whatever the notification setting says
+      // (the setting only decides whether the popup may stop the launch);
+      // with one that plays offline it asks nothing and reads the cache
+      // (D115, D116). Two commands instead of one widen the double-click
       // window, hence the guard above and the disabled Play button.
       setUpdateCheckRunning(true);
       let precheck: UpdatePrecheckResult;
       try {
-        precheck = await invoke<UpdatePrecheckResult>("update_precheck_command", {
-          request: {
-            modlistName: selectedModListName(),
-            minecraftVersion: selectedMcVersion(),
-            modLoader: normalizeModLoader(selectedModLoader()),
-          },
-        });
+        precheck = await invoke<UpdatePrecheckResult>("update_precheck_command", { request: target });
       } catch (err) {
         // D19: an update check must never be the reason the game does not
         // start. No map means the launch picks versions exactly as it did
-        // before this feature existed.
-        pushUiError({ title: "Update check failed", message: "Launching with the versions already in your cache.", detail: String(err), severity: "warning", scope: "launch" });
-        setLaunchLogs(current => [...current, `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`]);
-        await startLaunch();
+        // before this feature existed — and the message says what that is
+        // (todo.md:1492). An account that plays offline reads the cache
+        // (D115); any other resolves again online, and a mod with a newer
+        // build is updated without the popup.
+        const message = playsOffline
+          ? "Launching with the versions already in your cache."
+          : "The launch looks the mods up again and may install newer versions without asking.";
+        pushUiError({ title: "Update check failed", message, detail: String(err), severity: "warning", scope: "launch" });
+        appendLaunchLog(playsOffline
+          ? `[Launcher] WARN update check failed, launching from the cached versions — ${String(err)}`
+          : `[Launcher] WARN update check failed, the launch resolves the mods again and may update them without asking — ${String(err)}`);
+        await startLaunch(target);
         return;
       } finally {
         setUpdateCheckRunning(false);
@@ -983,7 +1147,7 @@ export default function App() {
         new Map(precheck.contentLookupFailures.map(failure => [`${failure.category}/${failure.entryId}`, failure.error])),
       );
 
-      // The three Advanced checkboxes, finally read. A category that is off
+      // The three Advanced checkboxes. A category that is off
       // keeps its rows out of the popup **and** out of the accepted set, so
       // its entries stay at the version on disk — D30's rule, per category
       // instead of globally. An entry that was never installed has no row, so
@@ -1007,6 +1171,7 @@ export default function App() {
       // refuses every update exactly like this branch does.
       if (!globalSettings().updateNotificationsEnabled && precheck.droppedMods.length === 0) {
         await startLaunch(
+          target,
           buildResolvedVersions(precheck.resolved, precheck.updates, new Set()),
           buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
         );
@@ -1020,6 +1185,7 @@ export default function App() {
         // that is switched off are updates nobody accepted, and handing over
         // their candidates would install them behind the checkbox's back.
         await startLaunch(
+          target,
           precheck.resolved,
           buildResolvedContent(precheck.resolvedContent, precheck.contentUpdates, new Set()),
         );
@@ -1028,6 +1194,7 @@ export default function App() {
       // The **whole** payload is kept: the popup shows the categories that are
       // on, and the rows of the ones that are off still have to reach
       // `buildResolvedContent` to be refused there.
+      pendingLaunchTarget = target;
       setPendingUpdatePrecheck(precheck);
       return; // the popup decides, then launches
     }
@@ -1038,7 +1205,7 @@ export default function App() {
       setLaunchProgress(stage.progress);
       setLaunchStageLabel(stage.label);
       setLaunchStageDetail(stage.detail);
-      setLaunchLogs(c => [...c, `[Resolver] ${stage.label} — ${stage.detail}`]);
+      appendLaunchLog(`[Resolver] ${stage.label} — ${stage.detail}`);
       await wait(500);
     }
     setLaunchState("ready");
@@ -1085,6 +1252,19 @@ export default function App() {
     await handleLaunch(openTheWorld ? through.folderName : null);
   };
 
+  /**
+   * A mod list just imported (modlist-3): opened like a sidebar pick. While a
+   * launch is being prepared the selection stays where it is (precheck-1), but
+   * the sidebar still learns the new list.
+   */
+  const handleImportedModList = async (modlistName: string) => {
+    if (refuseWhileLaunchPreparing(`'${modlistName}' was imported; the open mod list`)) {
+      await loadShellSnapshot(selectedModListName() || null);
+      return;
+    }
+    await selectModList(modlistName);
+  };
+
   const handleOpenModlist = async (modlistName: string) => {
     setActiveRailView("modlist");
     await handleSelectModList(modlistName);
@@ -1121,6 +1301,7 @@ export default function App() {
             <div class="flex flex-col flex-1 min-w-0">
               <ModListEditor
                 onAddMod={() => setAddModModalOpen(true)}
+                onImported={handleImportedModList}
                 onDeleteSelected={handleDeleteSelected}
                 onReorder={orderedIds => void handleReorderRules(orderedIds)}
                 onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
@@ -1139,16 +1320,7 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={async (contentType, id, name) => {
-        if (!selectedModListName()) return;
-        try {
-          await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
-          seedContentName(id, name);
-          bumpContentVersion();
-        } catch (err) {
-          pushUiError({ title: "Failed to add content", message: `Could not add '${id}'.`, detail: String(err), severity: "error", scope: "launch" });
-        }
-      }} onUploadLocal={handleUploadLocal} onDropLocal={handleDropLocal} />
+      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={handleAddContent} onUploadLocal={handleUploadLocal} onDropLocal={handleDropLocal} />
       <CreateModlistModal onCreate={handleCreateModlist} />
       <SettingsModal onSave={handleSaveSettings} />
       <AccountsModal onSwitchAccount={handleSwitchAccount} />
@@ -1178,8 +1350,12 @@ export default function App() {
               versionNumberLookupError={notifyUpdates ? precheck.versionNumberLookupError : null}
               droppedMods={precheck.droppedMods}
               onChoose={(accepted, acceptedContent) => {
+                const target = pendingLaunchTarget;
+                pendingLaunchTarget = null;
                 setPendingUpdatePrecheck(null);
+                if (!target) return;
                 void startLaunch(
+                  target,
                   buildResolvedVersions(precheck.resolved, precheck.updates, accepted),
                   // Every row, not only the ones on screen: a category whose
                   // checkbox is off was filtered out of `contentUpdates` before
@@ -1191,7 +1367,7 @@ export default function App() {
               // "launch without updating"; closing means "I have not decided".
               // A cancelled launch also drops the world it was going to open,
               // which would otherwise sit there until the next Play took it.
-              onCancel={() => { setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
+              onCancel={() => { pendingLaunchTarget = null; setPendingUpdatePrecheck(null); setQuickPlayWorldFolder(null); }}
             />
           );
         }}

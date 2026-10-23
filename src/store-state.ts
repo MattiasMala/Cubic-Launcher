@@ -9,13 +9,11 @@ import type {
   AccountSummary,
   AestheticGroup,
   CustomConfig,
-  DownloadProgressItem,
   FunctionalGroup,
   IncompatibilityRule,
   LauncherUiError,
   LinkRule,
   ModListCard,
-  ModrinthResult,
   ModRow,
   UpdatePrecheckResult,
   VersionRule,
@@ -28,32 +26,14 @@ export type UpdateInfo = {
   notes: string | null;
   currentVersion: string;
 };
-export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error";
+export type UpdateCheckState = "idle" | "checking" | "upToDate" | "available" | "error" | "offline";
 export type UpdateCheckResponse = {
-  status: "upToDate" | "available" | "error";
+  /** `offline`: the active account plays offline and GitHub was not asked (D140). */
+  status: "upToDate" | "available" | "error" | "offline";
   currentVersion: string;
   version: string | null;
   notes: string | null;
 };
-
-export const DEMO_MOD_LISTS: ModListCard[] = [
-  { name: "My First Pack", status: "Ready", accent: "from-primary/30 via-primary/10 to-transparent", description: "Create a mod list by clicking + above." },
-];
-
-export const DEMO_ACCOUNTS: AccountSummary[] = [
-  { id: "demo", gamertag: "Not logged in", email: "", status: "offline", lastMode: "offline", playsOffline: false },
-];
-
-export const MOCK_MODRINTH: ModrinthResult[] = [
-  { id: "sodium", name: "Sodium", author: "jellysquid3", description: "Modern rendering optimization mod with strong Fabric support.", categories: ["Optimization", "Rendering"] },
-  { id: "iris", name: "Iris Shaders", author: "coderbot", description: "Shader support compatible with Sodium.", categories: ["Shaders", "Rendering"] },
-  { id: "xaeros-minimap", name: "Xaero's Minimap", author: "xaero96", description: "Compact minimap for utility and navigation.", categories: ["Utility", "Map"] },
-  { id: "fabric-api", name: "FabricMC", author: "FabricMC", description: "Core modding API - almost always required by Fabric mods.", categories: ["Library", "Core"] },
-  { id: "lithium", name: "Lithium", author: "jellysquid3", description: "General-purpose optimization mod.", categories: ["Optimization"] },
-  { id: "create", name: "Create", author: "simibubi", description: "Automation and aesthetics with rotating contraptions.", categories: ["Content", "Tech"] },
-  { id: "journeymap", name: "JourneyMap", author: "techbrew", description: "Real-time in-game mapping.", categories: ["Utility", "Map"] },
-  { id: "modmenu", name: "Mod Menu", author: "Prospector", description: "Adds a mod menu to view installed mods.", categories: ["Utility"] },
-];
 
 export const [modListCards, setModListCards] = createSignal<ModListCard[]>([]);
 export const [selectedModListName, setSelectedModListName] = createSignal<string>("");
@@ -78,6 +58,13 @@ export const [librarySearch, setLibrarySearch] = createSignal("");
 export const [search, setSearch] = createSignal("");
 export const [minecraftVersions, setMinecraftVersions] = createSignal<string[]>(["1.21.1", "1.20.6", "1.20.4", "1.19.4"]);
 export const [mcWithSnapshots, setMcWithSnapshots] = createSignal<string[]>([]);
+/**
+ * Why the version list may be missing versions, or `null` when it is
+ * Mojang's full list as fetched now: the list was built from the last saved
+ * manifest and the versions on disk because Mojang was not asked or did not
+ * answer (r2-primo-avvio-ambiente-degradato-2).
+ */
+export const [minecraftVersionsNotice, setMinecraftVersionsNotice] = createSignal<string | null>(null);
 export const [showSnapshots, setShowSnapshots] = createSignal(false);
 export const [selectedMcVersion, setSelectedMcVersion] = createSignal("1.21.1");
 export const [selectedModLoader, setSelectedModLoader] = createSignal<string>("Fabric");
@@ -93,7 +80,8 @@ export const [launchStageDetail, setLaunchStageDetail] = createSignal(LAUNCH_STA
 export const [profileRecordingPath, setProfileRecordingPath] = createSignal<string | null>(null);
 export const [launchLogs, setLaunchLogs] = createSignal<string[]>([]);
 export const [logViewerOpen, setLogViewerOpen] = createSignal(false);
-export const [downloadItems, setDownloadItems] = createSignal<DownloadProgressItem[]>([]);
+/** Set by STOP: the exit that follows is the user's, not a crash to report (concorrenza-9). */
+export const [launchStopRequested, setLaunchStopRequested] = createSignal(false);
 export const [launcherErrors, setLauncherErrors] = createSignal<LauncherUiError[]>([]);
 export const [updateInfo, setUpdateInfo] = createSignal<UpdateInfo | null>(null);
 export const [updateBusy, setUpdateBusy] = createSignal(false);
@@ -102,11 +90,19 @@ export const [errorCenterOpen, setErrorCenterOpen] = createSignal(false);
 export const [accountsModalOpen, setAccountsModalOpen] = createSignal(false);
 export const [accounts, setAccounts] = createSignal<AccountSummary[]>([]);
 export const [activeAccountId, setActiveAccountId] = createSignal<string>("");
+/**
+ * Bumped every time the account list is read back from the backend, i.e.
+ * after every change to the accounts: a sign-in (also "Sign in again" on the
+ * same row), a switch, a removal, a «Play offline» toggle. What depends on
+ * the active account's state reloads on it, not on the id alone, which is set
+ * before the backend has switched and does not change on a new sign-in of the
+ * same account (account-6).
+ */
+export const [accountsRevision, setAccountsRevision] = createSignal(0);
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
-export const [verificationModalOpen, setVerificationModalOpen] = createSignal(false);
 export const [instancePresentation, setInstancePresentation] = createSignal({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
 export const [exportModalOpen, setExportModalOpen] = createSignal(false);
-export const [exportOptions, setExportOptions] = createSignal({ rulesJson: true, configFiles: false, resourcePacks: false, dataPacks: false, shaders: false, otherFiles: false, selectedOtherPaths: [] as string[] });
+export const [exportOptions, setExportOptions] = createSignal({ rulesJson: true, configFiles: false, resourcePacks: false, dataPacks: false, shaders: false, otherFiles: false, selectedOtherPaths: [] as string[], selectedContentPaths: [] as string[] });
 export const [settingsModalOpen, setSettingsModalOpen] = createSignal(false);
 export const [settingsTab, setSettingsTab] = createSignal<"global" | "modlist">("global");
 export const [globalSettings, setGlobalSettings] = createSignal({ minRamMb: 2048, maxRamMb: 4096, customJvmArgs: "-XX:+UseG1GC -XX:+ParallelRefProcEnabled", profilerEnabled: false, updateNotificationsEnabled: true, updateNotificationsResourcePacks: true, updateNotificationsDataPacks: true, updateNotificationsShaders: true, wrapperCommand: "", javaPathOverride: "" });
@@ -138,8 +134,6 @@ export const [createModlistModalOpen, setCreateModlistModalOpen] = createSignal(
 export const [createModlistName, setCreateModlistName] = createSignal("");
 export const [createModlistDescription, setCreateModlistDescription] = createSignal("");
 export const [createModlistBusy, setCreateModlistBusy] = createSignal(false);
-export const [localJarRuleName, setLocalJarRuleName] = createSignal("");
-export const [appLoading, setAppLoading] = createSignal(true);
 export const [modIcons, setModIcons] = createSignal<Map<string, string>>(new Map());
 /** Readable Modrinth names by project id/slug, filled by `fetchMetadataForIds`. */
 export const [modNames, setModNames] = createSignal<Map<string, string>>(new Map());

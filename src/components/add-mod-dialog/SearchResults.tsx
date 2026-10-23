@@ -2,7 +2,15 @@ import { For, Show } from "solid-js";
 import { addModSearch } from "../../store";
 import type { ModrinthResult } from "../../lib/types";
 import { SearchIcon, XIcon, PackageIcon, CheckIcon, Loader2Icon } from "../icons";
-import { formatDownloads } from "./shared";
+import { formatDownloads, type SearchContentType } from "./shared";
+
+/** What a tab's results are called, for the empty and error states (todo.md:1720). */
+const RESULT_NOUN: Record<SearchContentType, string> = {
+  mod: "mods",
+  resourcepack: "resource packs",
+  datapack: "data packs",
+  shader: "shaders",
+};
 
 function PaginationControls(props: {
   totalPages: number;
@@ -36,8 +44,13 @@ function PaginationControls(props: {
 }
 
 export function SearchResults(props: {
-  contentType: "mod" | "resourcepack" | "datapack" | "shader";
+  contentType: SearchContentType;
   searching: boolean;
+  /** Why the last search failed; the results are then empty, never made up. */
+  searchError: string | null;
+  retrySearch: () => void;
+  /** Set when the entries already in the mod list could not be read: «Added» is then incomplete. */
+  existingError: string | null;
   searchResults: ModrinthResult[];
   totalPages: number;
   page: number;
@@ -47,8 +60,11 @@ export function SearchResults(props: {
   handleAdd: (id: string, name: string) => Promise<void>;
   addingIds: Set<string>;
   addedIds: Set<string>;
+  /** Results whose add failed, with the reason; clicking one tries again. */
+  failedIds: Map<string, string>;
   existingIds: Set<string>;
 }) {
+  const noun = () => RESULT_NOUN[props.contentType];
   return (
     <div class="flex-1 min-h-0 overflow-y-auto p-4">
       <div class="relative mb-3">
@@ -71,6 +87,12 @@ export function SearchResults(props: {
         />
       </div>
 
+      <Show when={props.existingError}>
+        <div class="mb-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-muted-foreground" role="status">
+          The {noun()} already in this mod list could not be read, so they are not marked «Added». {props.existingError}
+        </div>
+      </Show>
+
       <div class="space-y-1.5">
         <PaginationControls
           totalPages={props.totalPages}
@@ -82,6 +104,7 @@ export function SearchResults(props: {
           {mod => {
             const isAdded = () => props.addedIds.has(mod.id) || props.existingIds.has(mod.id);
             const isAdding = () => props.addingIds.has(mod.id);
+            const failure = () => (isAdded() || isAdding()) ? undefined : props.failedIds.get(mod.id);
 
             return (
               <div class="flex items-center gap-3 rounded-lg p-2.5 transition-colors hover:bg-muted/40 cursor-pointer group" onClick={() => { if (!isAdded() && !isAdding()) void props.handleAdd(mod.id, mod.name); }}>
@@ -123,7 +146,16 @@ export function SearchResults(props: {
                       <Loader2Icon class="h-4 w-4 animate-spin text-muted-foreground" />
                     </span>
                   </Show>
-                  <Show when={!isAdded() && !isAdding()}>
+                  <Show when={failure()}>
+                    <span
+                      class="flex h-8 items-center gap-1 rounded-lg px-3 text-xs font-medium bg-destructive/15 text-destructive"
+                      title={failure()}
+                    >
+                      <XIcon class="h-3.5 w-3.5" />
+                      Failed - retry
+                    </span>
+                  </Show>
+                  <Show when={!isAdded() && !isAdding() && !failure()}>
                     <button
                       class="flex h-8 items-center rounded-lg px-3 text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 opacity-0 group-hover:opacity-100 transition-opacity"
                     >
@@ -135,14 +167,29 @@ export function SearchResults(props: {
             );
           }}
         </For>
-        <Show when={props.searchResults.length === 0 && !props.searching}>
+        <Show when={props.searchError && !props.searching}>
+          <div class="flex flex-col items-center justify-center py-12 text-center" role="alert">
+            <PackageIcon class="mb-4 h-12 w-12 text-destructive/50" />
+            <p class="text-foreground">Could not search Modrinth</p>
+            <p class="mt-1 max-w-md text-sm text-muted-foreground/80">{props.searchError}</p>
+            <button
+              onClick={props.retrySearch}
+              class="mt-4 rounded-md bg-secondary px-4 py-1.5 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+            >
+              Try again
+            </button>
+          </div>
+        </Show>
+        <Show when={props.searchResults.length === 0 && !props.searching && !props.searchError}>
           <div class="flex flex-col items-center justify-center py-12 text-center">
             <PackageIcon class="mb-4 h-12 w-12 text-muted-foreground/40" />
             <p class="text-muted-foreground">
-              No mods found for "{addModSearch()}"
+              <Show when={addModSearch().trim()} fallback={<>No {noun()} found</>}>
+                No {noun()} found for "{addModSearch()}"
+              </Show>
             </p>
             <p class="mt-1 text-sm text-muted-foreground/60">
-              Try a different search term
+              Try a different search term or fewer filters
             </p>
           </div>
         </Show>

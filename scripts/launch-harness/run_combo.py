@@ -30,6 +30,14 @@ from pathlib import Path
 
 from workspace import HarnessWorkspace
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Besides `src-tauri/src/`: what, when it changes, changes the binary.
+SOURCE_FILES = ("src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json")
+BINARY_CANDIDATES = (
+    REPO_ROOT / "src-tauri/target/release/cubic_launcher",
+    REPO_ROOT / "src-tauri/target/debug/cubic_launcher",
+)
+
 # The 5 verifier states + the automation-only error state.
 VERIFIER_STATES = {"launch_failed", "crashed", "exited", "running", "timed_out"}
 AUTOMATION_ERROR_STATE = "automation_error"
@@ -95,23 +103,45 @@ class ComboResult:
         }
 
 
+def stale_binary_reason(binary: Path) -> str | None:
+    """Why `binary` cannot be the measurement, or None.
+
+    A binary older than the sources measures other code, and does it silently:
+    the offline guard of wave 8a took a three-week-old release binary this way
+    (todo.md:1224).
+    """
+    if not binary.is_file():
+        return f"no launcher binary at {binary}: build it with `cargo build --bin cubic_launcher`"
+    sources = [
+        path
+        for path in (REPO_ROOT / "src-tauri/src").rglob("*")
+        if path.is_file()
+    ] + [REPO_ROOT / name for name in SOURCE_FILES if (REPO_ROOT / name).is_file()]
+    newest = max(sources, key=lambda path: path.stat().st_mtime)
+    if newest.stat().st_mtime > binary.stat().st_mtime:
+        return f"{binary} is older than {newest}: rebuild it before measuring"
+    return None
+
+
 def _resolve_binary(explicit: str | None) -> Path:
     if explicit:
         path = Path(explicit)
         if not path.exists():
             raise FileNotFoundError(f"launcher binary not found: {path}")
         return path
-    # Prefer release, fall back to debug.
-    here = Path(__file__).resolve().parents[2]  # repo root
-    for candidate in (
-        here / "src-tauri/target/release/cubic_launcher",
-        here / "src-tauri/target/debug/cubic_launcher",
-    ):
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "no cubic_launcher binary found; build with `cargo build` (or --release) first"
-    )
+    # The most recently built of release and debug, never one just because it is
+    # release: a release left over from weeks ago would win over today's debug
+    # build. And even the newest must not predate the sources (todo.md:1224).
+    built = [candidate for candidate in BINARY_CANDIDATES if candidate.is_file()]
+    if not built:
+        raise FileNotFoundError(
+            "no cubic_launcher binary found; build with `cargo build` (or --release) first"
+        )
+    newest = max(built, key=lambda candidate: candidate.stat().st_mtime)
+    stale = stale_binary_reason(newest)
+    if stale:
+        raise RuntimeError(stale)
+    return newest
 
 
 def _build_command(binary: Path, display: str) -> list[str]:
@@ -145,7 +175,7 @@ def run_combo(
     process is always killed.
 
     reset_db_before defaults to False: the DB is seeded ONCE at workspace setup,
-    and the cache pass relies on modlist_settings (cache_only) + accumulated
+    and the cache pass relies on the account's plays_offline flag + accumulated
     mod_cache surviving across launches. Resetting per-launch would wipe both.
     (The launcher still re-runs its token migration at every startup, so the
     token-free security property holds regardless.)

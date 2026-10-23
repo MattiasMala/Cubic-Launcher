@@ -12,14 +12,16 @@ use crate::adoptium::{
     host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download, AdoptiumClient,
 };
 use crate::java_runtime::{
-    discover_java_installations, persist_java_installations, select_exact_java_for_requirement,
-    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
+    discover_java_installations, host_java_architecture, java_architecture_matches_host,
+    persist_java_installations, select_exact_java_for_requirement, select_java_for_requirement,
+    CommandJavaBinaryInspector, JavaBinaryInspector, JavaInstallation,
 };
-use crate::launch_command::PreparedLaunchCommand;
+use crate::launch_command::{path_for_java, PreparedLaunchCommand};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{
     LibraryDownloadArtifact, LoaderLibrary, LoaderMetadata, LoaderMetadataClient,
 };
+use crate::minecraft_downloader::MinecraftCachePolicy;
 use crate::offline_account::deterministic_offline_uuid;
 use crate::path_safety::{contained_join, validate_path_component};
 use crate::process_streaming::{spawn_and_stream_process, ProcessEventSink, ProcessLogStream};
@@ -28,31 +30,57 @@ use crate::resolver::{ModLoader, ResolutionTarget};
 use super::artifacts::extract_artifact_name;
 use super::{
     download_file, emit_launcher_issue, emit_log, emit_progress, EffectiveLaunchSettings,
-    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_MC_PID,
+    LaunchPlaceholders, LoggingProcessEventSink, PlayerIdentity, StartedLaunch, ACTIVE_LAUNCH,
 };
 
 /// Main class of the modern ForgeWrapper installer (Forge 1.13+ and NeoForge).
 /// Legacy Forge (<=1.12.2) instead uses `net.minecraft.launchwrapper.Launch`.
 const FORGE_WRAPPER_MAIN_CLASS: &str = "io.github.zekerzhayard.forgewrapper.installer.Main";
 
+/// Da dove arriva un file del loader che manca nell'istanza.
+pub(super) enum LoaderArtifactSource<'a> {
+    /// Account online: si scarica.
+    Download(&'a reqwest::Client),
+    /// Account offline (D132, review-lancio-1): nessuna richiesta. Un file che
+    /// manca ferma il lancio con il messaggio di `loader_not_installed_message`
+    /// per questi metadati, invece di un errore di rete.
+    InstanceOnly(&'a LoaderMetadata),
+}
+
+impl LoaderArtifactSource<'_> {
+    async fn fetch(&self, url: &str, destination_path: &Path, library_root: &Path) -> Result<()> {
+        match self {
+            Self::Download(http_client) => download_file(http_client, url, destination_path).await,
+            Self::InstanceOnly(metadata) => {
+                let shown = destination_path
+                    .strip_prefix(library_root.parent().unwrap_or(library_root))
+                    .unwrap_or(destination_path);
+                bail!(super::loader_cache::loader_not_installed_message(
+                    metadata, shown
+                ))
+            }
+        }
+    }
+}
+
 pub(super) async fn materialize_loader_libraries(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     loader_metadata: &LoaderMetadata,
 ) -> Result<Vec<PathBuf>> {
-    materialize_loader_artifacts(http_client, library_root, &loader_metadata.libraries).await
+    materialize_loader_artifacts(source, library_root, &loader_metadata.libraries).await
 }
 
 pub(super) async fn materialize_loader_maven_files(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     loader_metadata: &LoaderMetadata,
 ) -> Result<Vec<PathBuf>> {
-    materialize_loader_artifacts(http_client, library_root, &loader_metadata.maven_files).await
+    materialize_loader_artifacts(source, library_root, &loader_metadata.maven_files).await
 }
 
 async fn materialize_loader_artifacts(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
     library_root: &Path,
     artifacts: &[LoaderLibrary],
 ) -> Result<Vec<PathBuf>> {
@@ -80,7 +108,9 @@ async fn materialize_loader_artifacts(
                 continue; // no way to obtain this library
             };
 
-            download_file(http_client, &download_url, &destination_path).await?;
+            source
+                .fetch(&download_url, &destination_path, library_root)
+                .await?;
         }
 
         paths.push(destination_path);
@@ -100,7 +130,9 @@ pub(super) fn contained_loader_library_path(
 }
 
 pub(super) async fn prepare_forge_wrapper_launch(
-    http_client: &reqwest::Client,
+    source: &LoaderArtifactSource<'_>,
+    // La cartella di lavoro di Java: installer e librerie le passano relative.
+    working_directory: &Path,
     library_root: &Path,
     minecraft_jar_path: &Path,
     loader_metadata: &mut LoaderMetadata,
@@ -112,23 +144,55 @@ pub(super) async fn prepare_forge_wrapper_launch(
     let installer_path =
         contained_loader_library_path(library_root, &installer_artifact.relative_path)?;
     if !installer_path.exists() {
-        download_file(http_client, &installer_artifact.url, &installer_path).await?;
+        source
+            .fetch(&installer_artifact.url, &installer_path, library_root)
+            .await?;
     }
 
-    loader_metadata.jvm_arguments.extend([
-        format!("-Dforgewrapper.installer={}", installer_path.display()),
-        format!("-Dforgewrapper.librariesDir={}", library_root.display()),
-        format!("-Dforgewrapper.minecraft={}", minecraft_jar_path.display()),
-    ]);
+    loader_metadata
+        .jvm_arguments
+        .extend(forge_wrapper_jvm_arguments(
+            working_directory,
+            &installer_path,
+            library_root,
+            minecraft_jar_path,
+        ));
 
     let profile_libraries = read_forge_installer_profile_libraries(&installer_path)?;
     let profile_library_paths =
-        materialize_loader_artifacts(http_client, library_root, &profile_libraries).await?;
+        materialize_loader_artifacts(source, library_root, &profile_libraries).await?;
 
     Ok(Some(ForgeWrapperLaunchPreparation {
         installer_path,
         profile_library_paths,
     }))
+}
+
+/// Le tre proprietà di ForgeWrapper. Installer e librerie stanno nell'istanza e vanno
+/// relative alla cartella di lavoro (r2-percorsi-non-ascii-e-limiti-windows-2: con un nome
+/// fuori dalla code page ANSI `-Dforgewrapper.installer` arrivava rotto); il client di
+/// Minecraft sta nella cache condivisa e resta assoluto.
+pub(super) fn forge_wrapper_jvm_arguments(
+    working_directory: &Path,
+    installer_path: &Path,
+    library_root: &Path,
+    minecraft_jar_path: &Path,
+) -> [String; 3] {
+    let for_java = |path: &Path| path_for_java(path, working_directory);
+    [
+        format!(
+            "-Dforgewrapper.installer={}",
+            for_java(installer_path).display()
+        ),
+        format!(
+            "-Dforgewrapper.librariesDir={}",
+            for_java(library_root).display()
+        ),
+        format!(
+            "-Dforgewrapper.minecraft={}",
+            for_java(minecraft_jar_path).display()
+        ),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,12 +417,72 @@ pub(super) fn maven_artifact_relative_path(coordinates: &str) -> Result<PathBuf>
         .join(file_name))
 }
 
+/// I `.part` lasciati da download interrotti (un kill, il launcher chiuso a
+/// metà), più vecchi di un'ora, si tolgono a ogni lancio
+/// (r2-primo-avvio-ambiente-degradato-5): nessuno li riprende se quel file
+/// non viene più chiesto. Le cache per intero; `java-runtimes/` solo al primo
+/// livello, dove arrivano gli archivi di Adoptium, senza entrare nei runtime.
+pub(super) fn remove_stale_partial_downloads(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+) {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let removed = [
+        launcher_paths.mods_cache_dir().to_path_buf(),
+        launcher_paths.configs_cache_dir().to_path_buf(),
+        launcher_paths.content_packs_cache_dir().to_path_buf(),
+        launcher_paths.mc_cache_dir(),
+    ]
+    .iter()
+    .map(|cache| crate::atomic_write::remove_stale_partials(cache, STALE_AFTER, true))
+    .sum::<usize>()
+        + crate::atomic_write::remove_stale_partials(
+            launcher_paths.java_runtimes_dir(),
+            STALE_AFTER,
+            false,
+        );
+    if removed > 0 {
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!("[Cache] Removed {removed} leftover partial download(s) (*.part)"),
+        );
+    }
+}
+
+/// D142: l'account offline non scarica Minecraft, lo trova in cache.
+pub(super) fn minecraft_cache_policy(plays_offline: bool) -> MinecraftCachePolicy {
+    if plays_offline {
+        MinecraftCachePolicy::CacheOnly
+    } else {
+        MinecraftCachePolicy::Download
+    }
+}
+
+/// I metadati del loader del lancio modded: online dalla rete, scritti in
+/// cache appena arrivano; offline dalla cache, senza richieste (D137).
 pub(super) async fn fetch_launch_loader_metadata(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    instance_root: &Path,
     target: &ResolutionTarget,
+    plays_offline: bool,
 ) -> Result<LoaderMetadata> {
-    LoaderMetadataClient::new()
-        .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
-        .await
+    super::loader_cache::loader_metadata_for_launch(
+        &launcher_paths.loader_metadata_cache_dir(),
+        instance_root,
+        target,
+        plays_offline,
+        || async {
+            LoaderMetadataClient::new()
+                .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
+                .await
+        },
+        |line| {
+            let _ = emit_log(app_handle, ProcessLogStream::Stdout, line);
+        },
+    )
+    .await
 }
 
 /// Quello che serve dopo l'uscita del gioco per riportare i tre file
@@ -379,10 +503,28 @@ pub(super) fn spawn_minecraft_process(
         app_handle.clone(),
         launch_log_session.clone(),
     ));
+    // D153: finché il gioco gira (e finché i file condivisi non sono tornati
+    // nella modlist) la mod list non si cancella.
+    let in_use = crate::modlist_manager::mark_modlist_in_use(&shared_files.modlist_name);
     let process = spawn_and_stream_process(prepared_command, sink)?;
 
     let pid = process.pid;
-    *ACTIVE_MC_PID.lock().unwrap() = Some(pid);
+    ACTIVE_LAUNCH.set_running(pid, process.exit_signal());
+    // D153 anche dopo un «Close anyway» (review-decisioni-36): il PID su disco
+    // dice a un launcher riaperto che il gioco di questa mod list è aperto.
+    let modlist_dir = shared_files
+        .launcher_paths
+        .modlists_dir()
+        .join(&shared_files.modlist_name);
+    if let Err(error) =
+        crate::modlist_manager::record_running_game(&modlist_dir, pid, &shared_files.instance_root)
+    {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stderr,
+            format!("[Launch] Could not record the running game for this mod list: {error:#}"),
+        )?;
+    }
 
     emit_progress(
         &app_handle,
@@ -400,18 +542,24 @@ pub(super) fn spawn_minecraft_process(
     let app_for_wait = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _ = process.wait();
-        *ACTIVE_MC_PID.lock().unwrap() = None;
+        // Only its own PID: never the one of a launch that came after.
+        ACTIVE_LAUNCH.clear_running_if(pid);
         super::set_active_launch_log_session(None);
         // Il gioco è uscito: da adesso nessuno sta più scrivendo i tre file
         // condivisi, e quello che l'istanza ha in mano può tornare alla
-        // modlist. Se il launcher viene chiuso mentre il gioco gira questo
-        // punto non viene mai raggiunto e le modifiche restano solo
-        // nell'istanza — è il buco dichiarato di questa fase.
+        // modlist. Se il launcher viene chiuso o aggiornato mentre il gioco
+        // gira questo punto non viene mai raggiunto: le modifiche restano
+        // nell'istanza fino al lancio dopo, e lì la copia dentro le riconosce
+        // dall'impronta dell'ultima copia e le riporta indietro prima di
+        // scrivere (D152, `shared_files::copy_into_instance`). Prima di D152
+        // quella copia dentro ci scriveva sopra senza `.bak`.
         let _ = emit_log(
             &app_for_wait,
             ProcessLogStream::Stdout,
             format!("[shared] {}", copy_shared_files_back(&shared_files)),
         );
+        crate::modlist_manager::clear_running_game(&modlist_dir, pid);
+        drop(in_use);
         let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
     });
 
@@ -507,17 +655,17 @@ pub(super) fn merge_minecraft_and_loader_jvm_arguments(
     let mut merged = filter_minecraft_launch_jvm_arguments(minecraft_arguments);
     merged.extend(loader_arguments);
 
+    // `${natives_directory}` arriva a Java relativo (`natives`), e la JVM lo risolve
+    // contro la cartella di lavoro. Il launcher non aggiunge più
+    // `-Dorg.lwjgl.librarypath`, come il launcher di Mojang: LWJGL 2 (1.12.2 e prima) lo
+    // passa a `System.load`, che vuole un percorso assoluto, e assoluto avrebbe di nuovo il
+    // nome della mod list (r2-percorsi-non-ascii-e-limiti-windows-2). Senza, LWJGL 2 usa
+    // `System.loadLibrary` e LWJGL 3 cerca in `java.library.path`, che bastano a tutti e due.
     if !merged
         .iter()
         .any(|argument| argument.starts_with("-Djava.library.path="))
     {
         merged.push("-Djava.library.path=${natives_directory}".to_string());
-    }
-    if !merged
-        .iter()
-        .any(|argument| argument.starts_with("-Dorg.lwjgl.librarypath="))
-    {
-        merged.push("-Dorg.lwjgl.librarypath=${natives_directory}".to_string());
     }
 
     merged
@@ -605,21 +753,34 @@ pub(super) fn build_instance_root(
         )))
 }
 
-pub(super) fn load_active_account_for_launch_with_diagnostics<
-    S: crate::token_storage::SecretStore,
->(
-    connection: &Connection,
+/// The active account's row as the launch reads it: once, at the start
+/// (concorrenza-8). The resolution path, the content step and the identity all
+/// come from this one reading; before audit 101 the identity re-read the row at
+/// ~90%, so an account switched to during the download was refreshed and
+/// launched online, against D115 and D132. `None` when no account is active.
+pub(super) fn load_launch_account(
+    launcher_paths: &LauncherPaths,
+) -> Result<Option<crate::microsoft_auth::AccountRecord>> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    crate::microsoft_auth::AccountsRepository::new(&connection).load_active_account()
+}
+
+/// The non-secret identity of `account`, with its refresh token decrypted when
+/// the keyring allows it, and the decryption error otherwise.
+pub(super) fn decrypt_launch_account<S: crate::token_storage::SecretStore>(
+    account: &crate::microsoft_auth::AccountRecord,
     secret_store: S,
-) -> Result<(
-    Option<crate::token_storage::PlaintextAccountRecord>,
+) -> (
+    crate::token_storage::PlaintextAccountRecord,
     Option<anyhow::Error>,
-)> {
-    use crate::microsoft_auth::AccountsRepository;
+) {
     use crate::token_storage::{AccountTokenCipher, PlaintextAccountRecord};
 
-    let Some(account) = AccountsRepository::new(connection).load_active_account()? else {
-        return Ok((None, None));
-    };
     let token_cipher = AccountTokenCipher::new(secret_store);
     let (refresh_token, refresh_token_error) = match account.refresh_token_enc.as_deref() {
         Some(payload) => match token_cipher.decrypt_token(payload) {
@@ -629,48 +790,55 @@ pub(super) fn load_active_account_for_launch_with_diagnostics<
         None => (None, None),
     };
 
-    Ok((
-        Some(PlaintextAccountRecord {
-            microsoft_id: account.microsoft_id,
-            xbox_gamertag: account.xbox_gamertag,
-            minecraft_uuid: account.minecraft_uuid,
+    (
+        PlaintextAccountRecord {
+            microsoft_id: account.microsoft_id.clone(),
+            xbox_gamertag: account.xbox_gamertag.clone(),
+            minecraft_uuid: account.minecraft_uuid.clone(),
             access_token: None,
             refresh_token,
-            profile_data: account.profile_data,
+            profile_data: account.profile_data.clone(),
             is_active: account.is_active,
-        }),
+        },
         refresh_token_error,
-    ))
+    )
 }
 
-/// Whether the active account plays offline (D115), from its database row.
-/// The launch reads it once, before it chooses anything, and the update
-/// pre-check reads it to know it must not run: both decisions come from the
-/// row, never from an argument the frontend passes. No active account plays
-/// online, as before.
-pub(super) fn active_account_plays_offline(launcher_paths: &LauncherPaths) -> Result<bool> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    Ok(crate::microsoft_auth::AccountsRepository::new(&connection)
-        .load_active_account()?
-        .is_some_and(|account| account.plays_offline))
-}
+/// Whether the active account plays offline (D115), from its database row:
+/// the one helper the app's own requests use too (D140). The update pre-check
+/// reads it to know it must not run; the launch takes it from
+/// `load_launch_account`, the same reading its identity comes from. Both
+/// decisions come from the row, never from an argument the frontend passes.
+pub(super) use crate::app_shell::active_account_plays_offline;
 
-fn persist_rotated_refresh_token<S: crate::token_storage::SecretStore>(
+/// Saves the tokens of the launch's refresh on the row of `microsoft_id` only
+/// (concorrenza-8): an `UPDATE` of the token columns, never an upsert with
+/// `is_active: true`. `identity` is the fresh sign-in's uuid and profile data,
+/// when the whole chain ran. Returns whether the row still existed: an account
+/// removed during the launch stays removed.
+fn persist_refreshed_session<S: crate::token_storage::SecretStore>(
     connection: &Connection,
     secret_store: S,
-    account: &crate::token_storage::PlaintextAccountRecord,
+    microsoft_id: &str,
     refresh_token: &str,
-) -> Result<()> {
-    use crate::token_storage::EncryptedAccountsRepository;
+    access_token: Option<&str>,
+    identity: Option<(&str, &str)>,
+) -> Result<bool> {
+    use crate::microsoft_auth::{AccountsRepository, SessionTokenUpdate};
+    use crate::token_storage::AccountTokenCipher;
 
-    let mut refreshed_account = account.clone();
-    refreshed_account.refresh_token = Some(refresh_token.to_string());
-    EncryptedAccountsRepository::new(connection, secret_store).upsert_account(&refreshed_account)
+    // The launch decrypted a refresh token with the key: it exists, and no
+    // new key is ever born here (only the explicit «Sign in again» does that).
+    let token_cipher = AccountTokenCipher::new(secret_store);
+    let update = SessionTokenUpdate {
+        refresh_token_enc: token_cipher.encrypt_token_with_key_creation(refresh_token, false)?,
+        access_token_enc: access_token
+            .map(|token| token_cipher.encrypt_token_with_key_creation(token, false))
+            .transpose()?,
+        minecraft_uuid: identity.map(|(uuid, _)| uuid.to_string()),
+        profile_data: identity.map(|(_, profile_data)| profile_data.to_string()),
+    };
+    AccountsRepository::new(connection).update_session_tokens(microsoft_id, &update)
 }
 
 fn emit_auth_log(app_handle: &tauri::AppHandle, detail: impl AsRef<str>) {
@@ -681,289 +849,361 @@ fn emit_auth_log(app_handle: &tauri::AppHandle, detail: impl AsRef<str>) {
     }
 }
 
-/// `plays_offline` is the active account's choice, read once by the launch
-/// (`active_account_plays_offline`): with it the identity is offline even
+fn offline_identity(username: String, uuid: String) -> PlayerIdentity {
+    PlayerIdentity {
+        username,
+        uuid,
+        access_token: "0".to_string(),
+        user_type: "offline".to_string(),
+        version_type: "Cubic".to_string(),
+    }
+}
+
+/// What the user is told when a launch that should have been online starts
+/// offline (D143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OfflineFallback {
+    /// The session could not be refreshed this time (network, Xbox, keyring):
+    /// the saved sign-in stays, and the next launch tries again.
+    SessionNotRefreshed,
+    /// The saved sign-in is gone (refused by Microsoft, or never saved): only
+    /// «Sign in again» brings the account back online.
+    SignInAgain,
+}
+
+impl OfflineFallback {
+    /// Title and message of the launcher issue. `reason` goes in its detail.
+    pub(super) fn issue_text(self) -> (&'static str, &'static str) {
+        match self {
+            OfflineFallback::SessionNotRefreshed => (
+                "Playing offline",
+                "Your Microsoft session could not be refreshed, so the game starts in offline mode. Online-mode servers will refuse to connect; the next launch tries again.",
+            ),
+            OfflineFallback::SignInAgain => (
+                "Sign in again to play online",
+                "Your Microsoft sign-in is no longer valid, so the game starts in offline mode. Sign in again from Manage Accounts to play online.",
+            ),
+        }
+    }
+}
+
+/// Every branch where an online launch falls back to offline goes through
+/// here (audit 101, account-1, D143): the launch log line as before, and a
+/// visible warning, because the account pill still said «online». `reason`
+/// is an error chain or a sentence of ours, never a token.
+fn fall_back_to_offline(
+    app_handle: &tauri::AppHandle,
+    username: String,
+    uuid: String,
+    fallback: OfflineFallback,
+    reason: &str,
+) -> PlayerIdentity {
+    emit_auth_log(
+        app_handle,
+        format!("{reason}; launch continues in offline mode"),
+    );
+    let (title, message) = fallback.issue_text();
+    if let Err(error) =
+        emit_launcher_issue(app_handle, title, message, reason, "warning", "account")
+    {
+        eprintln!("[Auth] Failed to report the offline fallback: {error:#}");
+    }
+    offline_identity(username, uuid)
+}
+
+/// D143: Microsoft refused the saved refresh token for good. The row drops it,
+/// so Manage Accounts shows the account as signed out with «Sign in again»,
+/// instead of «online» at every launch that then plays offline.
+fn forget_rejected_refresh_token(
+    app_handle: &tauri::AppHandle,
+    db_path: &Path,
+    account: &crate::microsoft_auth::AccountRecord,
+) {
+    let Some(rejected) = account.refresh_token_enc.as_deref() else {
+        return;
+    };
+    let cleared = Connection::open(db_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|connection| {
+            crate::microsoft_auth::AccountsRepository::new(&connection)
+                .clear_rejected_refresh_token(&account.microsoft_id, rejected)
+        });
+    match cleared {
+        Ok(true) => emit_auth_log(
+            app_handle,
+            "Microsoft refused the saved sign-in; the account now needs «Sign in again»",
+        ),
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "Microsoft refused the saved sign-in, but the account changed during the launch; left as it is",
+        ),
+        Err(error) => emit_auth_log(
+            app_handle,
+            format!("Could not mark the account as needing sign-in again: {error:#}"),
+        ),
+    }
+}
+
+/// `launch_account` is the active account's row, read once by the launch
+/// (`load_launch_account`): the identity comes from it, never from a second
+/// reading (concorrenza-8). When it plays offline the identity is offline even
 /// when the saved sign-in works, and no token refresh is attempted, because a
 /// refresh is network.
 pub(super) async fn load_player_identity(
     app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
-    plays_offline: bool,
+    launch_account: Option<&crate::microsoft_auth::AccountRecord>,
 ) -> Result<PlayerIdentity> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
+    let Some(account) = launch_account else {
+        emit_auth_log(
+            app_handle,
+            "No active Microsoft account is available; launch continues in offline mode",
+        );
+        // No active account at all: no session to refresh, fully offline mode.
+        return Ok(offline_identity(
+            "CubicPlayer".to_string(),
+            deterministic_offline_uuid("CubicPlayer").to_string(),
+        ));
+    };
 
     // SECURITY (C1): profile_data no longer carries tokens. Preserve the
     // non-secret identity fields even when the OS keyring is unavailable or a
     // token blob is corrupt; only the refresh token needs decryption here.
-    // Extract everything BEFORE async work (Connection is not Send).
-    let (raw_account, refresh_token_error) = match load_active_account_for_launch_with_diagnostics(
-        &connection,
-        crate::token_storage::KeyringSecretStore::new(),
-    ) {
-        Ok(account) => account,
-        Err(error) => {
-            emit_auth_log(
-                app_handle,
-                format!(
-                    "Failed to load active account metadata: {error:#}; launch continues in offline mode"
-                ),
-            );
-            (None, None)
-        }
-    };
-    if let Some(error) = refresh_token_error.as_ref() {
+    let (raw, refresh_token_error) =
+        decrypt_launch_account(account, crate::token_storage::KeyringSecretStore::new());
+    let db_path = launcher_paths.database_path().to_path_buf();
+
+    let profile = raw
+        .profile_data
+        .as_deref()
+        .and_then(|pd| serde_json::from_str::<serde_json::Value>(pd).ok());
+
+    let username = profile
+        .as_ref()
+        .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
+        .or(raw.xbox_gamertag.clone())
+        .unwrap_or_else(|| "CubicPlayer".to_string());
+
+    let uuid = format_uuid_with_dashes(
+        &raw.minecraft_uuid
+            .clone()
+            .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
+    );
+
+    if account.plays_offline {
         emit_auth_log(
             app_handle,
-            format!("Refresh-token decryption failed: {error:#}; launch continues in offline mode"),
+            "The active account is set to play offline; no token refresh, launching in offline mode",
         );
+        return Ok(offline_identity(username, uuid));
     }
-    let db_path = launcher_paths.database_path().to_path_buf();
-    drop(connection); // Release connection before async work.
 
-    if let Some(raw) = raw_account {
-        let profile = raw
-            .profile_data
-            .as_deref()
-            .and_then(|pd| serde_json::from_str::<serde_json::Value>(pd).ok());
-
-        let username = profile
-            .as_ref()
-            .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
-            .or(raw.xbox_gamertag.clone())
-            .unwrap_or_else(|| "CubicPlayer".to_string());
-
-        let uuid = format_uuid_with_dashes(
-            &raw.minecraft_uuid
-                .clone()
-                .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
-        );
-
-        let microsoft_id = raw.microsoft_id.clone();
-
-        if plays_offline {
-            emit_auth_log(
-                app_handle,
-                "The active account is set to play offline; no token refresh, launching in offline mode",
-            );
-            return Ok(PlayerIdentity {
-                username,
-                uuid,
-                access_token: "0".to_string(),
-                user_type: "offline".to_string(),
-                version_type: "Cubic".to_string(),
-            });
-        }
-
-        // Refresh the Minecraft access token using the decrypted MS refresh token.
-        let ms_refresh = raw.refresh_token.clone();
-
-        if let Some(refresh_token) = ms_refresh {
-            if !refresh_token.is_empty() {
-                eprintln!("[Auth] Has refresh token, attempting refresh...");
-
-                let env_path = launcher_paths.root_dir().join(".env");
-                let client_id = match crate::microsoft_auth::configured_microsoft_client_id(
-                    &env_path,
-                ) {
-                    Ok(Some(client_id)) => client_id,
-                    Ok(None) => {
-                        emit_auth_log(
-                                app_handle,
-                                "Microsoft token refresh failed because MICROSOFT_CLIENT_ID is not configured; launch continues in offline mode",
-                            );
-                        return Ok(PlayerIdentity {
-                            username,
-                            uuid,
-                            access_token: "0".to_string(),
-                            user_type: "offline".to_string(),
-                            version_type: "Cubic".to_string(),
-                        });
-                    }
-                    Err(error) => {
-                        emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Microsoft token refresh configuration failed: {error:#}; launch continues in offline mode"
-                                ),
-                            );
-                        return Ok(PlayerIdentity {
-                            username,
-                            uuid,
-                            access_token: "0".to_string(),
-                            user_type: "offline".to_string(),
-                            version_type: "Cubic".to_string(),
-                        });
-                    }
-                };
-
-                let config = crate::microsoft_auth::MicrosoftOAuthConfig {
-                    client_id,
-                    redirect_uri: crate::microsoft_auth::REGISTERED_LOOPBACK_REDIRECT_URI
-                        .to_string(),
-                    scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
-                };
-                let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
-
-                match oauth_client
-                    .refresh_access_token(&config, &refresh_token)
-                    .await
-                {
-                    Ok(ms_tokens) => {
-                        let rotated_refresh = ms_tokens
-                            .refresh_token
-                            .clone()
-                            .unwrap_or_else(|| refresh_token.clone());
-                        let persistence_result = (|| -> Result<()> {
-                            let connection = Connection::open(&db_path).with_context(|| {
-                                format!(
-                                    "failed to reopen launcher database at {}",
-                                    db_path.display()
-                                )
-                            })?;
-                            persist_rotated_refresh_token(
-                                &connection,
-                                crate::token_storage::KeyringSecretStore::new(),
-                                &raw,
-                                &rotated_refresh,
-                            )
-                        })();
-                        if let Err(error) = persistence_result {
-                            emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Rotated-token persistence failed: {error:#}; launch continues in offline mode"
-                                ),
-                            );
-                            return Ok(PlayerIdentity {
-                                username,
-                                uuid,
-                                access_token: "0".to_string(),
-                                user_type: "offline".to_string(),
-                                version_type: "Cubic".to_string(),
-                            });
-                        }
-
-                        eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
-                        let chain = crate::microsoft_auth::MinecraftAuthChain::new();
-                        match chain
-                            .authenticate(
-                                &ms_tokens.access_token,
-                                ms_tokens.refresh_token.as_deref(),
-                                ms_tokens.user_id.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(login) => {
-                                eprintln!(
-                                    "[Auth] Full auth chain OK: username={}",
-                                    login.minecraft_username
-                                );
-                                // SECURITY (C1): persist refreshed access and identity
-                                // data into encrypted/token-free columns.
-                                let new_profile = crate::app_shell::account_profile_data_json(
-                                    &login.minecraft_username,
-                                    &login.minecraft_uuid,
-                                );
-                                let persistence_result = (|| -> Result<()> {
-                                    use crate::token_storage::{
-                                        EncryptedAccountsRepository, KeyringSecretStore,
-                                        PlaintextAccountRecord,
-                                    };
-
-                                    let connection =
-                                        Connection::open(&db_path).with_context(|| {
-                                            format!(
-                                                "failed to reopen launcher database at {}",
-                                                db_path.display()
-                                            )
-                                        })?;
-                                    EncryptedAccountsRepository::new(
-                                        &connection,
-                                        KeyringSecretStore::new(),
-                                    )
-                                    .upsert_account(&PlaintextAccountRecord {
-                                        microsoft_id: microsoft_id.clone(),
-                                        xbox_gamertag: raw.xbox_gamertag.clone(),
-                                        minecraft_uuid: Some(login.minecraft_uuid.clone()),
-                                        access_token: Some(login.minecraft_access_token.clone()),
-                                        refresh_token: Some(rotated_refresh),
-                                        profile_data: Some(new_profile),
-                                        is_active: true,
-                                    })
-                                })();
-                                if let Err(error) = persistence_result {
-                                    emit_auth_log(
-                                        app_handle,
-                                        format!(
-                                            "Authenticated account persistence failed: {error:#}; this launch remains online, but the saved account may require sign-in again"
-                                        ),
-                                    );
-                                }
-
-                                return Ok(PlayerIdentity {
-                                    username: login.minecraft_username,
-                                    uuid: format_uuid_with_dashes(&login.minecraft_uuid),
-                                    access_token: login.minecraft_access_token,
-                                    user_type: "msa".to_string(),
-                                    version_type: "Cubic".to_string(),
-                                });
-                            }
-                            Err(error) => emit_auth_log(
-                                app_handle,
-                                format!(
-                                    "Minecraft auth chain failed: {error:#}; launch continues in offline mode"
-                                ),
-                            ),
-                        }
-                    }
-                    Err(error) => emit_auth_log(
-                        app_handle,
-                        format!(
-                            "Microsoft token refresh failed: {error:#}; launch continues in offline mode"
-                        ),
-                    ),
-                }
-            } else {
-                emit_auth_log(
-                    app_handle,
-                    "Stored Microsoft refresh token is empty; launch continues in offline mode",
-                );
-            }
-        } else if refresh_token_error.is_none() {
-            emit_auth_log(
-                app_handle,
-                "No stored Microsoft refresh token is available; launch continues in offline mode",
-            );
-        }
-
-        emit_auth_log(app_handle, "Falling back to offline mode");
-        // No refresh token or refresh failed; use offline mode with the correct name.
-        return Ok(PlayerIdentity {
+    if let Some(error) = refresh_token_error.as_ref() {
+        return Ok(fall_back_to_offline(
+            app_handle,
             username,
             uuid,
-            access_token: "0".to_string(),
-            user_type: "offline".to_string(),
-            version_type: "Cubic".to_string(),
-        });
+            OfflineFallback::SessionNotRefreshed,
+            &format!("Refresh-token decryption failed: {error:#}"),
+        ));
     }
 
-    emit_auth_log(
-        app_handle,
-        "No active Microsoft account is available; launch continues in offline mode",
+    // Refresh the Minecraft access token using the decrypted MS refresh token.
+    let refresh_token = match raw.refresh_token.clone() {
+        Some(refresh_token) if !refresh_token.is_empty() => refresh_token,
+        Some(_) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SignInAgain,
+                "Stored Microsoft refresh token is empty",
+            ));
+        }
+        None => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SignInAgain,
+                "No stored Microsoft refresh token is available",
+            ));
+        }
+    };
+    eprintln!("[Auth] Has refresh token, attempting refresh...");
+
+    let env_path = launcher_paths.root_dir().join(".env");
+    let client_id = match crate::microsoft_auth::configured_microsoft_client_id(&env_path) {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Microsoft token refresh configuration failed: {error:#}"),
+            ));
+        }
+    };
+
+    let config = crate::microsoft_auth::MicrosoftOAuthConfig {
+        client_id,
+        redirect_uri: crate::microsoft_auth::REGISTERED_LOOPBACK_REDIRECT_URI.to_string(),
+        scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
+    };
+    let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
+
+    let ms_tokens = match oauth_client
+        .refresh_access_token(&config, &refresh_token)
+        .await
+    {
+        Ok(ms_tokens) => ms_tokens,
+        Err(error) => {
+            let fallback = if crate::microsoft_auth::refresh_needs_sign_in_again(&error) {
+                forget_rejected_refresh_token(app_handle, &db_path, account);
+                OfflineFallback::SignInAgain
+            } else {
+                OfflineFallback::SessionNotRefreshed
+            };
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                fallback,
+                &format!("Microsoft token refresh failed: {error:#}"),
+            ));
+        }
+    };
+
+    let rotated_refresh = ms_tokens
+        .refresh_token
+        .clone()
+        .unwrap_or_else(|| refresh_token.clone());
+    let persistence_result = Connection::open(&db_path)
+        .with_context(|| {
+            format!(
+                "failed to reopen launcher database at {}",
+                db_path.display()
+            )
+        })
+        .and_then(|connection| {
+            persist_refreshed_session(
+                &connection,
+                crate::token_storage::KeyringSecretStore::new(),
+                &account.microsoft_id,
+                &rotated_refresh,
+                None,
+                None,
+            )
+        });
+    match persistence_result {
+        Ok(true) => {}
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "The account was removed during the launch; the refreshed sign-in is not saved",
+        ),
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Rotated-token persistence failed: {error:#}"),
+            ));
+        }
+    }
+
+    eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
+    let chain = crate::microsoft_auth::MinecraftAuthChain::new();
+    let login = match chain
+        .authenticate(
+            &ms_tokens.access_token,
+            ms_tokens.refresh_token.as_deref(),
+            ms_tokens.user_id.as_deref(),
+        )
+        .await
+    {
+        Ok(login) => login,
+        Err(error) => {
+            return Ok(fall_back_to_offline(
+                app_handle,
+                username,
+                uuid,
+                OfflineFallback::SessionNotRefreshed,
+                &format!("Minecraft auth chain failed: {error:#}"),
+            ));
+        }
+    };
+    eprintln!(
+        "[Auth] Full auth chain OK: username={}",
+        login.minecraft_username
     );
-    // No active account at all; use fully offline mode.
+
+    // SECURITY (C1): persist refreshed access and identity data into
+    // encrypted/token-free columns, on this account's row only.
+    let new_profile = crate::app_shell::account_profile_data_json(
+        &login.minecraft_username,
+        &login.minecraft_uuid,
+    );
+    let persistence_result = Connection::open(&db_path)
+        .with_context(|| {
+            format!(
+                "failed to reopen launcher database at {}",
+                db_path.display()
+            )
+        })
+        .and_then(|connection| {
+            persist_refreshed_session(
+                &connection,
+                crate::token_storage::KeyringSecretStore::new(),
+                &account.microsoft_id,
+                &rotated_refresh,
+                Some(&login.minecraft_access_token),
+                Some((&login.minecraft_uuid, &new_profile)),
+            )
+        });
+    match persistence_result {
+        Ok(true) => {}
+        Ok(false) => emit_auth_log(
+            app_handle,
+            "The account was removed during the launch; this launch remains online, the refreshed sign-in is not saved",
+        ),
+        Err(error) => emit_auth_log(
+            app_handle,
+            format!(
+                "Authenticated account persistence failed: {error:#}; this launch remains online, but the saved account may require sign-in again"
+            ),
+        ),
+    }
+
     Ok(PlayerIdentity {
-        username: "CubicPlayer".to_string(),
-        uuid: deterministic_offline_uuid("CubicPlayer").to_string(),
-        access_token: "0".to_string(),
-        user_type: "offline".to_string(),
+        username: login.minecraft_username,
+        uuid: format_uuid_with_dashes(&login.minecraft_uuid),
+        access_token: login.minecraft_access_token,
+        user_type: "msa".to_string(),
         version_type: "Cubic".to_string(),
     })
+}
+
+/// La Java che il lancio userà e la sua major.
+///
+/// todo.md:1800: le decisioni che dipendono dalla JVM che parte (il profiler
+/// JFR) guardano `major`, non il requisito della versione di Minecraft. Un
+/// Java Path Override o una major sostituita possono essere più nuovi del
+/// requisito, e il log diceva «this launch uses Java 8» su una Java 17.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SelectedJava {
+    pub(super) path: PathBuf,
+    pub(super) major: u32,
+}
+
+impl SelectedJava {
+    fn from_installation(installation: JavaInstallation) -> Self {
+        Self {
+            path: installation.path,
+            major: installation.version,
+        }
+    }
 }
 
 pub(super) async fn select_or_download_java(
@@ -974,7 +1214,7 @@ pub(super) async fn select_or_download_java(
     required_version: u32,
     // The active account's choice (D115), read once by the caller.
     plays_offline: bool,
-) -> Result<PathBuf> {
+) -> Result<SelectedJava> {
     if let Some(path) = &settings.java_path_override {
         let inspector = CommandJavaBinaryInspector;
         let probe = inspector
@@ -991,7 +1231,10 @@ pub(super) async fn select_or_download_java(
             );
         }
 
-        return Ok(path.clone());
+        return Ok(SelectedJava {
+            path: path.clone(),
+            major: probe.version,
+        });
     }
 
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
@@ -1002,19 +1245,32 @@ pub(super) async fn select_or_download_java(
         )
     })?;
     persist_java_installations(&connection, &installations)?;
+    let installations = installations_for_this_computer(app_handle, installations)?;
 
-    if let Some(path) = installed_java_for_launch(
+    if let Some(installation) = installed_java_for_launch(
         &installations,
         required_version,
         plays_offline,
         launcher_paths.java_runtimes_dir(),
     )? {
-        return Ok(path);
+        if installation.version != required_version {
+            emit_offline_java_substitution_notice(
+                app_handle,
+                required_version,
+                installation.version,
+            )?;
+        }
+        return Ok(SelectedJava::from_installation(installation));
     }
 
     let adoptium = AdoptiumClient::new();
     let os = host_adoptium_os();
-    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
+    let arch = normalize_adoptium_architecture(std::env::consts::ARCH).with_context(|| {
+        format!(
+            "No Java {required_version} runtime is installed, and Adoptium has no runtime for this computer's architecture ({}). Install Java {required_version} yourself and set its path in the settings.",
+            std::env::consts::ARCH
+        )
+    })?;
 
     // Resolve the nearest major Adoptium actually ships. EOL majors (e.g. Java
     // 16) return an empty asset list, so this walks upward to the next
@@ -1028,7 +1284,7 @@ pub(super) async fn select_or_download_java(
         if let Some(installation) =
             select_exact_java_for_requirement(&installations, effective_version)
         {
-            return Ok(installation.path);
+            return Ok(SelectedJava::from_installation(installation));
         }
     }
 
@@ -1077,9 +1333,10 @@ pub(super) async fn select_or_download_java(
     // original requirement.
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
     persist_java_installations(&connection, &installations)?;
+    let installations = installations_for_this_computer(app_handle, installations)?;
 
     select_java_for_requirement(&installations, required_version)
-        .map(|installation| installation.path)
+        .map(SelectedJava::from_installation)
         .with_context(|| {
             format!(
                 "Java {} was downloaded but could not be found after extraction. Check {}",
@@ -1087,6 +1344,40 @@ pub(super) async fn select_or_download_java(
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+/// Le Java che possono far partire il gioco su questo computer: quelle di
+/// un'altra architettura si scartano, con una riga nel log (download-4). Una
+/// Java 8 a 32 bit nel PATH vinceva su quella a 64 bit del launcher a parità
+/// di major, e la JVM non partiva con la memoria chiesta.
+fn installations_for_this_computer(
+    app_handle: &tauri::AppHandle,
+    installations: Vec<JavaInstallation>,
+) -> Result<Vec<JavaInstallation>> {
+    let (usable, foreign) = split_installations_by_host_architecture(installations);
+    for installation in &foreign {
+        emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Java] Skipping {} (Java {}, {}): this computer needs a {} runtime",
+                installation.path.display(),
+                installation.version,
+                installation.architecture,
+                host_java_architecture()
+            ),
+        )?;
+    }
+    Ok(usable)
+}
+
+/// `(adatte, scartate)` secondo l'architettura di questo computer.
+pub(super) fn split_installations_by_host_architecture(
+    installations: Vec<JavaInstallation>,
+) -> (Vec<JavaInstallation>, Vec<JavaInstallation>) {
+    installations
+        .into_iter()
+        .partition(|installation| java_architecture_matches_host(&installation.architecture))
 }
 
 /// La Java già installata per questo lancio, oppure `None` quando va scaricata.
@@ -1099,18 +1390,26 @@ pub(super) async fn select_or_download_java(
 /// comunque un fallimento, solo più lento e con un messaggio che parla di rete
 /// invece di dire quale Java manca. Conseguenza voluta: un account offline con
 /// la rete funzionante non si vede più scaricare Java da solo.
+///
+/// D158: offline, senza la major esatta si usa la più vicina superiore già
+/// installata (il chiamante mostra l'avviso «Java version substituted»);
+/// l'errore resta solo se non c'è niente da quella major in su. Online la
+/// sostituzione la decide Adoptium, che non serve le major EOL.
 pub(super) fn installed_java_for_launch(
     installations: &[JavaInstallation],
     required_version: u32,
     plays_offline: bool,
     java_runtimes_dir: &Path,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<JavaInstallation>> {
     if let Some(installation) = select_exact_java_for_requirement(installations, required_version) {
-        return Ok(Some(installation.path));
+        return Ok(Some(installation));
     }
     if plays_offline {
+        if let Some(installation) = select_java_for_requirement(installations, required_version) {
+            return Ok(Some(installation));
+        }
         bail!(
-            "No Java {required_version} runtime is installed (looked in {} and on the system), and the active account plays offline, so it is not downloaded. Install Java {required_version} there, set a Java path in the settings, or switch the account to online for one launch.",
+            "No Java {required_version} or newer runtime is installed (looked in {} and on the system), and the active account plays offline, so it is not downloaded. Install Java {required_version} there, set a Java path in the settings, or switch the account to online for one launch.",
             java_runtimes_dir.display()
         );
     }
@@ -1161,6 +1460,27 @@ fn emit_java_substitution_notice(
         ),
         &format!(
             "This Minecraft version targets Java {required_version}, which Adoptium no longer distributes (end-of-life). The launcher selected the nearest available runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
+        ),
+        "warning",
+        "launch",
+    )
+}
+
+/// D158: the same notice when an offline launch runs on a newer installed
+/// major because the exact one is not installed and is not downloaded.
+fn emit_offline_java_substitution_notice(
+    app_handle: &tauri::AppHandle,
+    required_version: u32,
+    effective_version: u32,
+) -> Result<()> {
+    emit_launcher_issue(
+        app_handle,
+        "Java version substituted",
+        &format!(
+            "Java {required_version} is not installed; using the installed Java {effective_version} instead."
+        ),
+        &format!(
+            "This Minecraft version targets Java {required_version}, which is not installed, and the active account plays offline, so it is not downloaded. The launcher selected the nearest newer installed runtime, Java {effective_version}. If you hit issues, install Java {required_version} manually and set a Java override in settings."
         ),
         "warning",
         "launch",
@@ -1308,6 +1628,16 @@ pub(super) fn substitute_known_placeholders(
             "${resolution_height}",
             placeholders.resolution_height.as_str(),
         ),
+        // Segnaposto che il launcher non ha da riempire, ma che non possono
+        // restare letterali. 1.7.10–1.8.9 passano `--userProperties
+        // ${user_properties}` a Gson come `PropertyMap`: alla lettera il Main
+        // esce con un'eccezione, `{}` è la mappa vuota. `${clientid}` e
+        // `${auth_xuid}` (1.19+) sono argomenti facoltativi del Main, e la
+        // stringa vuota è proprio il suo «assente».
+        ("${user_properties}", "{}"),
+        ("${user_property_map}", "{}"),
+        ("${clientid}", ""),
+        ("${auth_xuid}", ""),
     ]
     .into_iter()
     .fold(argument.to_string(), |current, (needle, replacement)| {
@@ -1323,14 +1653,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
-    use zip::write::FileOptions;
+    use zip::write::SimpleFileOptions;
 
     use crate::database::initialize_database;
     use crate::token_storage::{EncryptedAccountsRepository, PlaintextAccountRecord, SecretStore};
 
     use super::{
-        extract_java_archive, forge_profile_libraries_from_json, persist_rotated_refresh_token,
-        read_forge_installer_profile_libraries,
+        extract_java_archive, forge_profile_libraries_from_json, persist_refreshed_session,
+        read_forge_installer_profile_libraries, OfflineFallback,
     };
 
     #[derive(Clone, Default)]
@@ -1389,19 +1719,18 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("old refresh blob should load");
-        let account = repository
-            .load_active_account()
-            .expect("account should load")
-            .expect("active account should exist");
         drop(repository);
 
-        persist_rotated_refresh_token(
+        let saved = persist_refreshed_session(
             &connection,
             secret_store.clone(),
-            &account,
+            "account-a",
             "refresh-after-rotation",
+            None,
+            None,
         )
         .expect("rotated refresh token should persist");
+        assert!(saved);
 
         let new_blob: Vec<u8> = connection
             .query_row(
@@ -1422,6 +1751,130 @@ mod tests {
 
         drop(connection);
         std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    fn temporary_accounts_database(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let database_path =
+            std::env::temp_dir().join(format!("cubic-{label}-{unique}-{}.db", std::process::id()));
+        initialize_database(&database_path).expect("database should initialize");
+        database_path
+    }
+
+    fn signed_in(microsoft_id: &str, is_active: bool) -> PlaintextAccountRecord {
+        PlaintextAccountRecord {
+            microsoft_id: microsoft_id.into(),
+            xbox_gamertag: Some(format!("{microsoft_id}-tag")),
+            minecraft_uuid: Some(format!("{microsoft_id}-uuid")),
+            access_token: Some(format!("{microsoft_id}-access")),
+            refresh_token: Some(format!("{microsoft_id}-refresh")),
+            profile_data: Some(r#"{"username":"Before"}"#.into()),
+            is_active,
+        }
+    }
+
+    /// concorrenza-8: the launch refreshed A, but during the download the user
+    /// switched to B. Saving A's new tokens leaves B active; before audit 101
+    /// the upsert with `is_active: true` made A active again.
+    #[test]
+    fn a_refresh_saved_after_an_account_switch_does_not_reactivate_the_old_account() {
+        let database_path = temporary_accounts_database("refresh-after-switch");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        let repository = EncryptedAccountsRepository::new(&connection, secret_store.clone());
+        repository
+            .upsert_account(&signed_in("account-a", true))
+            .expect("account A should store");
+        repository
+            .upsert_account(&signed_in("account-b", true))
+            .expect("account B should store and become active");
+        drop(repository);
+
+        let saved = persist_refreshed_session(
+            &connection,
+            secret_store.clone(),
+            "account-a",
+            "account-a-rotated",
+            Some("account-a-minecraft-access"),
+            Some(("account-a-new-uuid", r#"{"username":"After"}"#)),
+        )
+        .expect("A's tokens should save");
+        assert!(saved);
+
+        let accounts = EncryptedAccountsRepository::new(&connection, secret_store);
+        let active = accounts
+            .load_active_account()
+            .expect("active account should load")
+            .expect("one account should be active");
+        assert_eq!(active.microsoft_id, "account-b");
+        let account_a = crate::microsoft_auth::AccountsRepository::new(&connection)
+            .list_accounts()
+            .expect("accounts should list")
+            .into_iter()
+            .find(|account| account.microsoft_id == "account-a")
+            .expect("A should still exist");
+        assert!(!account_a.is_active);
+        assert_eq!(
+            account_a.minecraft_uuid.as_deref(),
+            Some("account-a-new-uuid")
+        );
+        assert_eq!(
+            account_a.profile_data.as_deref(),
+            Some(r#"{"username":"After"}"#)
+        );
+
+        drop(accounts);
+        drop(connection);
+        std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    /// concorrenza-8: an account removed during the launch is not re-created by
+    /// the refresh that the launch had already started for it.
+    #[test]
+    fn a_refresh_saved_after_the_account_was_removed_does_not_recreate_it() {
+        let database_path = temporary_accounts_database("refresh-after-remove");
+        let connection = Connection::open(&database_path).expect("database should open");
+        let secret_store = MemorySecretStore::default();
+        EncryptedAccountsRepository::new(&connection, secret_store.clone())
+            .upsert_account(&signed_in("account-a", true))
+            .expect("account A should store");
+        crate::microsoft_auth::AccountsRepository::new(&connection)
+            .delete_account("account-a")
+            .expect("account A should delete");
+
+        let saved = persist_refreshed_session(
+            &connection,
+            secret_store,
+            "account-a",
+            "account-a-rotated",
+            None,
+            None,
+        )
+        .expect("a missing row is not an error");
+        assert!(!saved);
+        assert!(crate::microsoft_auth::AccountsRepository::new(&connection)
+            .list_accounts()
+            .expect("accounts should list")
+            .is_empty());
+
+        drop(connection);
+        std::fs::remove_file(database_path).expect("temporary database should be removable");
+    }
+
+    /// D143: the two warnings say different things, and only one sends the
+    /// user to «Sign in again».
+    #[test]
+    fn the_offline_fallback_warning_says_whether_to_sign_in_again() {
+        let (_, not_refreshed) = OfflineFallback::SessionNotRefreshed.issue_text();
+        let (title, sign_in_again) = OfflineFallback::SignInAgain.issue_text();
+        assert!(not_refreshed.contains("offline mode"));
+        assert!(!not_refreshed.contains("Sign in again"));
+        assert!(sign_in_again.contains("offline mode"));
+        assert!(sign_in_again.contains("Sign in again"));
+        assert!(title.contains("Sign in again"));
     }
 
     fn forge_version_json() -> &'static str {
@@ -1493,7 +1946,7 @@ mod tests {
             let file = std::fs::File::create(&path).expect("test jar should be created");
             let mut archive = zip::ZipWriter::new(file);
             archive
-                .start_file("version.json", FileOptions::default())
+                .start_file("version.json", SimpleFileOptions::default())
                 .expect("version.json entry should start");
             archive
                 .write_all(forge_version_json().as_bytes())
@@ -1574,5 +2027,74 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// review-lancio-1: offline un file del loader che l'istanza non ha non si
+    /// scarica (l'URL punta a una porta chiusa: una richiesta darebbe un altro
+    /// errore); il lancio si ferma con il messaggio che nomina loader e file.
+    #[tokio::test]
+    async fn offline_loader_artifacts_come_only_from_the_instance() {
+        use crate::loader_metadata::{LoaderLibrary, LoaderMetadata};
+        use crate::resolver::ModLoader;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let instance = std::env::temp_dir().join(format!(
+            "cubic-offline-loader-{unique}-{}",
+            std::process::id()
+        ));
+        let library_root = instance.join("libraries");
+        let present =
+            library_root.join("net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, b"jar").unwrap();
+
+        let library = |name: &str| LoaderLibrary {
+            name: name.to_string(),
+            url: Some("http://127.0.0.1:9/".to_string()),
+            download: None,
+        };
+        let metadata = LoaderMetadata {
+            mod_loader: ModLoader::Fabric,
+            minecraft_version: "1.20.1".to_string(),
+            loader_version: "0.16.10".to_string(),
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            libraries: vec![library("net.fabricmc:fabric-loader:0.16.10")],
+            maven_files: vec![],
+            jvm_arguments: vec![],
+            game_arguments: vec![],
+            min_java_version: None,
+        };
+        let source = super::LoaderArtifactSource::InstanceOnly(&metadata);
+
+        let paths = super::materialize_loader_libraries(&source, &library_root, &metadata)
+            .await
+            .expect("a library already in the instance needs nothing");
+        assert_eq!(paths, vec![present]);
+
+        let mut newer = metadata.clone();
+        newer.loader_version = "0.16.14".to_string();
+        newer.libraries = vec![library("net.fabricmc:fabric-loader:0.16.14")];
+        let source = super::LoaderArtifactSource::InstanceOnly(&newer);
+        let message = format!(
+            "{:#}",
+            super::materialize_loader_libraries(&source, &library_root, &newer)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            message
+                .contains("Fabric 0.16.14 for Minecraft 1.20.1 is not installed in this mod list"),
+            "{message}"
+        );
+        assert!(message.contains("fabric-loader-0.16.14.jar"), "{message}");
+        assert!(!message.contains("failed to request"), "{message}");
+        assert!(!library_root
+            .join("net/fabricmc/fabric-loader/0.16.14")
+            .exists());
+
+        std::fs::remove_dir_all(&instance).ok();
     }
 }

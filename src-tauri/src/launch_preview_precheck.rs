@@ -22,10 +22,10 @@ use crate::rules::ModSource;
 
 use super::{
     active_account_plays_offline, dropped_reason_clause, dropped_reason_detail, emit_log,
-    load_cached_version_ids_for_selected, load_modlist, parse_mod_loader,
-    resolve_compatible_versions_hybrid, resolve_offline_selection, resolve_online_selection,
-    run_content_precheck, ContentEntryWithoutVersions, ContentLookupFailure, ContentUpdateRow,
-    DroppedMod, ResolvedContentVersions, SelectedMod,
+    load_cached_version_ids_for_selected, load_modlist, load_modlist_pins, parse_mod_loader,
+    read_instance_jars, resolve_offline_selection, resolve_online_selection, run_content_precheck,
+    versions_for_final_selection, ContentEntryWithoutVersions, ContentLookupFailure,
+    ContentPrecheck, ContentUpdateRow, DroppedMod, ResolvedContentVersions, SelectedMod,
 };
 
 /// Same input as a launch: the mod-list and the target it is launched on.
@@ -167,17 +167,28 @@ pub struct UpdatePrecheckResult {
     pub dropped_mods: Vec<DroppedModGroup>,
 }
 
-/// A vanilla target loads no mods: an empty payload, not an error, and no
-/// mod-list read at all. `None` means the target needs the full selection.
+/// A vanilla target loads no mods, so its pre-check has no mod half: no
+/// selection, no mod rows, no mod map.
 ///
-/// Empty covers the packs too, and that is not an omission: the vanilla
-/// pipeline installs none (`launch_preview_vanilla.rs:31-35`, "skipping mod
-/// resolution, mod downloads and content packs"), so a pack row would promise
-/// something no launch would do.
-pub(super) fn empty_precheck_for_loaderless_target(
-    target: &ResolutionTarget,
-) -> Option<UpdatePrecheckResult> {
-    matches!(target.mod_loader, ModLoader::Vanilla).then(UpdatePrecheckResult::default)
+/// It still has packs. Since audit 101 (contentpack-3) the vanilla pipeline
+/// installs resource packs and data packs, so the packs get their rows and
+/// their map like on a modded target (review-risoluzione-6): without the map
+/// the launch would resolve every pack to its newest version, and an update
+/// nobody accepted would land in silence (D16, D17, D58).
+pub(super) fn target_loads_mods(target: &ResolutionTarget) -> bool {
+    !matches!(target.mod_loader, ModLoader::Vanilla)
+}
+
+/// The pack half of the payload, copied in.
+fn with_content(
+    mut result: UpdatePrecheckResult,
+    content: ContentPrecheck,
+) -> UpdatePrecheckResult {
+    result.content_updates = content.updates;
+    result.resolved_content = content.resolved;
+    result.content_without_versions = content.without_versions;
+    result.content_lookup_failures = content.lookup_failures;
+    result
 }
 
 /// The registered version ids a row would have to name, and whose version
@@ -315,7 +326,8 @@ pub(super) fn offline_precheck_for_active_account(
     }
 
     let modlist = load_modlist(launcher_paths, modlist_name)?;
-    let selection = resolve_offline_selection(launcher_paths, &modlist, target, None)?;
+    let pins = load_modlist_pins(launcher_paths, modlist_name, &modlist);
+    let selection = resolve_offline_selection(launcher_paths, &modlist, &pins, target, None)?;
 
     Ok(Some(UpdatePrecheckResult {
         dropped_mods: dropped_mod_groups(&selection.dropped, target),
@@ -342,8 +354,30 @@ pub(super) async fn run_update_precheck(
     let modlist_name = request.modlist_name.trim().to_string();
     anyhow::ensure!(!modlist_name.is_empty(), "modlist_name cannot be empty");
 
-    if let Some(empty) = empty_precheck_for_loaderless_target(&target) {
-        return Ok(empty);
+    if !target_loads_mods(&target) {
+        // Offline the launch leaves the Modrinth packs as they are (D139), so
+        // there is nothing to promise and nothing is asked.
+        if active_account_plays_offline(launcher_paths)? {
+            return Ok(UpdatePrecheckResult::default());
+        }
+        return tokio::time::timeout(
+            PRECHECK_TIME_LIMIT,
+            run_content_precheck(
+                app_handle,
+                launcher_paths,
+                &ModrinthClient::new(),
+                &modlist_name,
+                &target,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the update check took longer than {} s",
+                PRECHECK_TIME_LIMIT.as_secs()
+            )
+        })?
+        .map(|content| with_content(UpdatePrecheckResult::default(), content));
     }
 
     // D115, D116: an account that plays offline launches with zero requests,
@@ -363,7 +397,38 @@ pub(super) async fn run_update_precheck(
         return Ok(offline);
     }
 
+    // Precheck-5: a bounded wait. Past it the check fails, and the frontend
+    // launches from the cached versions with its warning (D19), instead of a
+    // PLAY button stuck on "CHECKING".
+    tokio::time::timeout(
+        PRECHECK_TIME_LIMIT,
+        run_online_precheck(app_handle, launcher_paths, &modlist_name, &target),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the update check took longer than {} s",
+            PRECHECK_TIME_LIMIT.as_secs()
+        )
+    })?
+}
+
+/// The longest the online pre-check may take (audit 101, precheck-5). A list
+/// of 300 mods asked one request per mod, ten at a time, takes a few seconds;
+/// this bounds a network that accepts connections and then stays silent.
+const PRECHECK_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The online half of `run_update_precheck`.
+async fn run_online_precheck(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<UpdatePrecheckResult> {
+    let modlist_name = modlist_name.to_string();
+    let target = target.clone();
     let modlist = load_modlist(launcher_paths, &modlist_name)?;
+    let pins = load_modlist_pins(launcher_paths, &modlist_name, &modlist);
     let modrinth_client = ModrinthClient::new();
     let http_client = crate::modrinth::build_download_client();
 
@@ -372,28 +437,42 @@ pub(super) async fn run_update_precheck(
         launcher_paths,
         &http_client,
         &modlist,
+        &pins,
         &modrinth_client,
         &target,
-        // The pre-check is the thing that decides: it has nothing handed down.
-        None,
     )
     .await?;
 
     // The second pass, for the same reason the launch runs one: the
-    // authoritative set is the one after the re-resolution, and it can contain
-    // alternatives the first pass never saw.
-    let candidates = resolve_compatible_versions_hybrid(
+    // authoritative set is the one after the re-resolution. It reuses what the
+    // availability pass already asked (audit 101, r2-scala-mod-list-grandi-2).
+    let lookup = versions_for_final_selection(
         app_handle,
         launcher_paths,
         &http_client,
         &selection.selected_mods,
+        &selection.lookups,
         &modrinth_client,
         &target,
     )
     .await?;
+    // Precheck-5: Modrinth out of reach is a failure of the whole check, not
+    // a list of mods with no update. The frontend's D19 branch takes it from
+    // here: a warning, and the launch from the cached versions.
+    if let Some(error) = &lookup.network_error {
+        anyhow::bail!("Modrinth could not be reached: {error}");
+    }
+    let candidates = lookup.versions;
 
-    let cached_version_ids =
-        load_cached_version_ids_for_selected(launcher_paths, &selection.selected_mods, &target)?;
+    // D147: "current" is what this mod list's instance holds, not the newest
+    // row of the target (audit 101, precheck-2).
+    let instance_jars = read_instance_jars(launcher_paths, &modlist_name, &target)?;
+    let cached_version_ids = load_cached_version_ids_for_selected(
+        launcher_paths,
+        &selection.selected_mods,
+        &target,
+        &instance_jars,
+    )?;
     let wanted_numbers = version_ids_needing_a_number(&cached_version_ids, &candidates);
     // Degraded, not propagated: `resolved` is the part the launch cannot do
     // without (D16), and it is already complete here. One malformed version id
@@ -412,7 +491,7 @@ pub(super) async fn run_update_precheck(
         );
     }
 
-    let mut result = build_precheck_result(
+    let result = build_precheck_result(
         &selection.selected_mods,
         &candidates,
         &cached_version_ids,
@@ -430,16 +509,13 @@ pub(super) async fn run_update_precheck(
         &target,
     )
     .await?;
-    result.content_updates = content.updates;
-    result.resolved_content = content.resolved;
-    result.content_without_versions = content.without_versions;
-    result.content_lookup_failures = content.lookup_failures;
 
-    Ok(result)
+    Ok(with_content(result, content))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::resolver::PinAliases;
     use crate::rules::{ModList, Rule, VersionRule, VersionRuleKind};
 
     use super::super::collect_selected_mods;
@@ -737,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vanilla_target_has_nothing_to_check() {
+    fn a_vanilla_target_has_no_mod_half() {
         // The command path parses the loader string first, so the short-circuit
         // is only reachable if "vanilla" parses instead of erroring.
         let vanilla = ResolutionTarget {
@@ -746,11 +822,26 @@ mod tests {
         };
 
         assert_eq!(vanilla.mod_loader, ModLoader::Vanilla);
-        assert_eq!(
-            empty_precheck_for_loaderless_target(&vanilla),
-            Some(UpdatePrecheckResult::default())
-        );
-        assert_eq!(empty_precheck_for_loaderless_target(&target()), None);
+        assert!(!target_loads_mods(&vanilla));
+        assert!(target_loads_mods(&target()));
+    }
+
+    /// review-risoluzione-6: the pack half lands in the payload whole, so a
+    /// vanilla launch gets the map and keeps a refused pack update.
+    #[test]
+    fn the_pack_half_is_copied_into_the_payload() {
+        let mut resolved = ResolvedContentVersions::default();
+        resolved
+            .entry("resourcepack".to_string())
+            .or_default()
+            .insert("faithful".to_string(), "v1".to_string());
+        let content = ContentPrecheck {
+            resolved: resolved.clone(),
+            ..ContentPrecheck::default()
+        };
+        let result = with_content(UpdatePrecheckResult::default(), content);
+        assert_eq!(result.resolved_content, resolved);
+        assert!(result.updates.is_empty());
     }
 
     #[test]
@@ -1003,8 +1094,14 @@ mod tests {
         let launcher_paths = offline_root("jar-gone", true);
         let modlist = load_modlist(&launcher_paths, "Offline Pack").expect("mod-list");
 
-        let offline = resolve_offline_selection(&launcher_paths, &modlist, &target(), None)
-            .expect("the offline selection should run");
+        let offline = resolve_offline_selection(
+            &launcher_paths,
+            &modlist,
+            &PinAliases::new(),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
         assert_eq!(
             offline
                 .dropped
@@ -1013,7 +1110,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("sodium", DropReason::RegisteredJarGoneOffline),
-                ("lithium", DropReason::NoChosenVersionAndNothingCached),
+                ("lithium", DropReason::NothingCachedOffline),
             ]
         );
         assert!(!offline
@@ -1022,9 +1119,14 @@ mod tests {
             .any(|selected| selected.mod_id == "sodium"));
 
         let map = HashMap::from([("sodium".to_string(), "sodium-v2".to_string())]);
-        let preresolved =
-            resolve_offline_selection(&launcher_paths, &modlist, &target(), Some(&map))
-                .expect("the pre-resolved selection should run");
+        let preresolved = resolve_offline_selection(
+            &launcher_paths,
+            &modlist,
+            &PinAliases::new(),
+            &target(),
+            Some(&map),
+        )
+        .expect("the pre-resolved selection should run");
         assert!(preresolved
             .selected_mods
             .iter()
@@ -1034,6 +1136,121 @@ mod tests {
             .iter()
             .any(|lost| lost.mod_id == "sodium"));
 
+        std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
+    }
+
+    /// Audit 101, risoluzione-3 (D138 con le alternative): il primario e la
+    /// sua prima alternativa hanno la riga registrata e il jar sparito. Prima
+    /// le sonde si facevano solo sulla prima selezione, l'alternativa entrava
+    /// senza essere sondata e il lancio offline la riscaricava dalla CDN. Ora
+    /// ogni giro sonda i mod nuovi: la catena va avanti fino a un'alternativa
+    /// col jar sul disco, e senza di essa il mod esce col suo motivo.
+    #[test]
+    fn offline_an_alternative_whose_jar_is_gone_is_probed_and_never_selected() {
+        use super::super::DropReason;
+
+        let launcher_paths = offline_root("alternatives", true);
+        let connection =
+            rusqlite::Connection::open(launcher_paths.database_path()).expect("open database");
+        let repository = crate::mod_cache::SqliteModCacheRepository::new(
+            &connection,
+            launcher_paths.mods_cache_dir(),
+        );
+        let register = |mod_id: &str, jar_on_disk: bool| {
+            let mut version = candidate(mod_id, &format!("{mod_id}-v1"), "1.0.0");
+            version.project_id = mod_id.into();
+            version.files = vec![crate::modrinth::ModrinthFile {
+                hashes: HashMap::from([("sha1".to_string(), format!("{mod_id}-sha1"))]),
+                url: format!("https://cdn.modrinth.com/data/{mod_id}/{mod_id}.jar"),
+                filename: format!("{mod_id}.jar"),
+                primary: true,
+                size: 100,
+            }];
+            repository
+                .upsert_modrinth_version(&version, &target())
+                .expect("register the mod for the target");
+            if jar_on_disk {
+                let record = repository
+                    .find_registered_by_project_or_alias(mod_id, &target())
+                    .expect("read the row back")
+                    .expect("the row was just written");
+                let path = crate::mod_cache::cached_artifact_path_for_record(
+                    launcher_paths.mods_cache_dir(),
+                    &record,
+                );
+                std::fs::create_dir_all(path.parent().unwrap()).expect("jar directory");
+                std::fs::write(&path, crate::mod_cache::test_jar_bytes("jar"))
+                    .expect("write the jar");
+            }
+        };
+        // `sodium` è già registrato da `offline_root`, col jar sparito.
+        register("embeddium", false);
+        register("rubidium", true);
+
+        let alternative = |mod_id: &str| Rule {
+            mod_id: mod_id.into(),
+            source: ModSource::Modrinth,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives: vec![],
+        };
+        let chain = |alternatives: Vec<Rule>| ModList {
+            modlist_name: "Offline Pack".into(),
+            author: "Author".into(),
+            description: "Test".into(),
+            rules: vec![Rule {
+                alternatives,
+                ..alternative("sodium")
+            }],
+        };
+        let selected = |selection: &super::super::TargetSelection| {
+            selection
+                .selected_mods
+                .iter()
+                .map(|selected| selected.mod_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Con rubidium sul disco la catena arriva fin lì, e nessuno è perso.
+        let reaches_rubidium = resolve_offline_selection(
+            &launcher_paths,
+            &chain(vec![alternative("embeddium"), alternative("rubidium")]),
+            &PinAliases::new(),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
+        assert_eq!(selected(&reaches_rubidium), vec!["rubidium".to_string()]);
+        assert!(reaches_rubidium.dropped.is_empty());
+        assert_eq!(
+            reaches_rubidium.unavailable,
+            vec!["sodium".to_string(), "embeddium".to_string()]
+        );
+
+        // Senza rubidium embeddium non entra (niente download offline), e il
+        // mod esce col motivo del jar sparito.
+        let nothing_on_disk = resolve_offline_selection(
+            &launcher_paths,
+            &chain(vec![alternative("embeddium")]),
+            &PinAliases::new(),
+            &target(),
+            None,
+        )
+        .expect("the offline selection should run");
+        assert!(selected(&nothing_on_disk).is_empty());
+        assert_eq!(
+            nothing_on_disk
+                .dropped
+                .iter()
+                .map(|lost| (lost.mod_id.as_str(), lost.reason))
+                .collect::<Vec<_>>(),
+            vec![("sodium", DropReason::RegisteredJarGoneOffline)]
+        );
+
+        drop(connection);
         std::fs::remove_dir_all(launcher_paths.root_dir()).expect("remove root");
     }
 

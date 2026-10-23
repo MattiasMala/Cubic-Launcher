@@ -26,7 +26,8 @@ use crate::microsoft_auth::{
     MinecraftAuthChain, MinecraftProfile, SkinVariant, REGISTERED_LOOPBACK_REDIRECT_URI,
 };
 use crate::token_storage::{
-    AccountTokenCipher, EncryptedAccountsRepository, KeyringSecretStore, PlaintextAccountRecord,
+    AccountTokenCipher, CredentialState, EncryptedAccountsRepository, KeyringSecretStore,
+    PlaintextAccountRecord,
 };
 
 use super::{SkinsState, MAX_SKIN_BYTES};
@@ -69,6 +70,13 @@ pub enum SkinErrorKind {
     Mojang,
     /// The launcher's own side: database, files.
     Library,
+    /// The active account plays offline (D141): the screen is the local
+    /// library, and nothing is read from or sent to Mojang.
+    PlaysOffline,
+    /// The system keyring can't be reached, so the saved sign-in can't be
+    /// read; signing in again does not help, unlocking the keyring does
+    /// (account-5).
+    KeyringUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,6 +110,13 @@ impl SkinError {
 
     fn not_signed_in(message: impl Into<String>) -> Self {
         Self::new(SkinErrorKind::NotSignedIn, message)
+    }
+
+    pub(crate) fn plays_offline() -> Self {
+        Self::new(
+            SkinErrorKind::PlaysOffline,
+            "This account plays offline, so Skins shows your library only: nothing is read from or sent to Mojang",
+        )
     }
 
     fn network(error: impl fmt::Display) -> Self {
@@ -310,7 +325,7 @@ impl<'a> LiveBackend<'a> {
             }
         }
         Err(SkinError::not_signed_in(
-            "Minecraft refused the sign-in even after refreshing it; sign in again from Manage Accounts",
+            "Minecraft refused the sign-in even after refreshing it; sign in again with \"Login with Microsoft\" in Manage Accounts",
         ))
     }
 
@@ -488,6 +503,23 @@ fn stored_access_token(db_path: &Path) -> Result<Option<AccessToken>, SkinError>
         .map(AccessToken))
 }
 
+/// Why a saved sign-in could not be decrypted, in the words of what fixes it:
+/// the row's "Sign in again" exists only for a sign-in that is unreadable, a
+/// keyring that can't be reached needs unlocking instead (account-5).
+fn unreadable_sign_in(credentials: CredentialState) -> SkinError {
+    match credentials {
+        CredentialState::KeyringUnavailable(detail) => SkinError::new(
+            SkinErrorKind::KeyringUnavailable,
+            format!(
+                "The system keyring can't be reached, so the saved sign-in can't be read. Start or unlock your keyring, then reopen the launcher ({detail})"
+            ),
+        ),
+        _ => SkinError::not_signed_in(
+            "The saved sign-in can't be read; use \"Sign in again\" on its row in Manage Accounts",
+        ),
+    }
+}
+
 /// Refreshes the active account's sign-in with its Microsoft refresh token,
 /// through the same chain and the same persistence order as a launch
 /// (`launch_preview_runtime::load_player_identity`): the rotated refresh token
@@ -504,24 +536,18 @@ async fn refresh_minecraft_token(paths: &LauncherPaths) -> Result<AccessToken, S
             .refresh_token_enc
             .as_deref()
             .filter(|payload| !payload.is_empty())
-            .ok_or_else(|| SkinError::not_signed_in("The account has no saved sign-in; sign in again from Manage Accounts"))
+            .ok_or_else(|| SkinError::not_signed_in("The account has no saved sign-in; use \"Sign in again\" on its row in Manage Accounts"))
             .and_then(|payload| {
-                AccountTokenCipher::new(KeyringSecretStore::new())
+                let cipher = AccountTokenCipher::new(KeyringSecretStore::new());
+                cipher
                     .decrypt_token(payload)
-                    .map_err(|_| {
-                        SkinError::not_signed_in(
-                            "The saved sign-in can't be read; use \"Sign in again\" in Manage Accounts",
-                        )
-                    })
+                    .map_err(|_| unreadable_sign_in(cipher.credential_state(Some(payload), None)))
             })?;
         (account, refresh_token)
     };
 
     let client_id = configured_microsoft_client_id(&paths.root_dir().join(".env"))
-        .map_err(SkinError::library)?
-        .ok_or_else(|| {
-            SkinError::not_signed_in("Microsoft sign-in is not configured in this build")
-        })?;
+        .map_err(SkinError::library)?;
     let config = MicrosoftOAuthConfig {
         client_id,
         redirect_uri: REGISTERED_LOOPBACK_REDIRECT_URI.to_string(),
@@ -587,7 +613,7 @@ fn sign_in_failure(error: anyhow::Error) -> SkinError {
         SkinError::network(format!("{error:#}"))
     } else {
         SkinError::not_signed_in(format!(
-            "The saved sign-in could not be refreshed ({error:#}); sign in again from Manage Accounts"
+            "The saved sign-in could not be refreshed ({error:#}); sign in again with \"Login with Microsoft\" in Manage Accounts"
         ))
     }
 }

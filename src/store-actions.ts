@@ -9,6 +9,7 @@ import type { CustomConfig, LauncherUiError, VersionRule } from "./lib/types";
 import {
   aestheticGroups,
   draftLinks,
+  modRowsState,
   editingGroupId,
   functionalGroups,
   functionalGroupTone,
@@ -20,7 +21,6 @@ import {
   setAestheticGroups,
   setAlternativesPanelParentId,
   setCustomConfigs,
-  setDownloadItems,
   setDraftIncompatibilities,
   setDraftLinks,
   setEditingGroupId,
@@ -32,12 +32,14 @@ import {
   setIncompatibilityModalOpen,
   setLauncherErrors,
   setLaunchLogs,
+  setLaunchStopRequested,
   setLaunchProgress,
   setLaunchStageDetail,
   setLaunchStageLabel,
   setLaunchState,
   setLinkModalModIds,
   setLinkModalOpen,
+  setModRowsState,
   setNewFunctionalGroupName,
   setSavedIncompatibilities,
   setSavedLinks,
@@ -47,23 +49,10 @@ import {
 } from "./store-state";
 import {
   parentIdByChildId,
+  rowMap,
 } from "./store-selectors";
+import { contiguousGroupOrder } from "./app/row-state";
 import { LAUNCH_STAGES } from "./lib/types";
-
-export function upsertDownloadProgress(update: { filename: string; progress: number }) {
-  setDownloadItems(current => {
-    const exists = current.some(item => item.filename === update.filename);
-    const next = {
-      filename: update.filename,
-      progress: update.progress,
-      status: update.progress >= 100 ? "complete" as const : "downloading" as const,
-    };
-    if (exists) {
-      return current.map(item => item.filename === update.filename ? next : item);
-    }
-    return [...current, next];
-  });
-}
 
 // Ids have to be unique per notice, not per millisecond: a single launch can
 // push several notices inside the same tick (one per mod left out), and two
@@ -159,7 +148,17 @@ export function commitGroupRename(id: string) {
   setEditingGroupId(null);
 }
 
-export function createAestheticGroup() {
+/**
+ * How a new group's rule order reaches the backend: `onReorder` for the top
+ * level (reorder_rules_command), `onReorderAlts` for the alternatives of one
+ * parent (save_alternative_order_command).
+ */
+export interface GroupOrderPersistence {
+  onReorder?: (orderedIds: string[]) => void;
+  onReorderAlts?: (parentId: string, orderedIds: string[]) => void;
+}
+
+export function createAestheticGroup(persist: GroupOrderPersistence = {}) {
   const context = selectionContext();
   if (context === "empty") {
     pushUiError({
@@ -187,13 +186,40 @@ export function createAestheticGroup() {
   const id = `ag-${Date.now()}`;
   const name = nextAestheticGroupName(scopeRowId);
 
-  setAestheticGroups(current => {
-    const withoutSelected = current.map(group => ({
+  // The members follow the rule order, not the order they were clicked in, and
+  // the rules become contiguous at the place of the first member: the editor
+  // draws a group there, so the launcher must try them there too (audit 101,
+  // editor-logica-8).
+  const scopeRows = scopeRowId ? (rowMap().get(scopeRowId)?.alternatives ?? []) : modRowsState();
+  const scopeIds = scopeRows.map(row => row.id);
+  const selectedSet = new Set(selected);
+  const blockIds = [
+    ...scopeIds.filter(rowId => selectedSet.has(rowId)),
+    ...selected.filter(rowId => !scopeIds.includes(rowId)),
+  ];
+
+  const nextGroups = [
+    ...aestheticGroups().map(group => ({
       ...group,
-      blockIds: group.blockIds.filter(blockId => !selected.includes(blockId)),
-    }));
-    return [...withoutSelected, { id, name, collapsed: false, blockIds: selected, scopeRowId }];
-  });
+      blockIds: group.blockIds.filter(blockId => !selectedSet.has(blockId)),
+    })),
+    { id, name, collapsed: false, blockIds, scopeRowId },
+  ];
+  setAestheticGroups(nextGroups);
+
+  const nextOrder = contiguousGroupOrder(
+    scopeIds,
+    nextGroups.filter(group => (group.scopeRowId ?? null) === scopeRowId),
+  );
+  if (nextOrder.some((rowId, index) => rowId !== scopeIds[index])) {
+    if (scopeRowId) {
+      persist.onReorderAlts?.(scopeRowId, nextOrder);
+    } else {
+      const rowById = new Map(scopeRows.map(row => [row.id, row]));
+      setModRowsState(nextOrder.map(rowId => rowById.get(rowId)!));
+      persist.onReorder?.(nextOrder);
+    }
+  }
   startGroupRename(id, name);
 }
 
@@ -290,14 +316,6 @@ export function openLinkModal() {
   setLinkModalOpen(true);
 }
 
-export function toggleDraftLink(fromId: string, toId: string) {
-  setDraftLinks(current => {
-    const hasLink = current.some(link => link.fromId === fromId && link.toId === toId);
-    if (hasLink) return current.filter(link => !(link.fromId === fromId && link.toId === toId));
-    return [...current, { fromId, toId }];
-  });
-}
-
 export function saveDraftLinks() {
   setSavedLinks(draftLinks().map(link => ({ ...link })));
   setLinkModalOpen(false);
@@ -357,13 +375,54 @@ export function openAlternativesPanel(rowId: string) {
 
 export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: string | string[], enabled: boolean) => void) | null>(null);
 
+/**
+ * The Launch Log keeps the last lines only (ui-schermate-7). A heavy modpack
+ * writes 20,000 lines in one session, and every line used to copy the whole
+ * array and refilter it. The full output is still on disk, in the launch's
+ * own folder under logs/launches.
+ */
+export const LAUNCH_LOG_MAX_LINES = 5000;
+let pendingLaunchLogLines: string[] = [];
+let launchLogFlushScheduled = false;
+
+function flushLaunchLogs() {
+  launchLogFlushScheduled = false;
+  if (pendingLaunchLogLines.length === 0) return;
+  const incoming = pendingLaunchLogLines;
+  pendingLaunchLogLines = [];
+  setLaunchLogs(current => {
+    const next = current.concat(incoming);
+    return next.length > LAUNCH_LOG_MAX_LINES ? next.slice(next.length - LAUNCH_LOG_MAX_LINES) : next;
+  });
+}
+
+/**
+ * Lines arrive one event at a time and reach the signal once per frame. A
+ * hidden window gets no frames: the queue is trimmed every time it doubles
+ * the cap, so it stays bounded without paying a copy per line.
+ */
+export function appendLaunchLog(line: string) {
+  pendingLaunchLogLines.push(line);
+  if (pendingLaunchLogLines.length >= LAUNCH_LOG_MAX_LINES * 2) {
+    pendingLaunchLogLines = pendingLaunchLogLines.slice(-LAUNCH_LOG_MAX_LINES);
+  }
+  if (launchLogFlushScheduled) return;
+  launchLogFlushScheduled = true;
+  requestAnimationFrame(flushLaunchLogs);
+}
+
 export function resetLaunchUiState() {
   setLaunchState("idle");
+  setLaunchStopRequested(false);
   setLaunchProgress(0);
   setLaunchStageLabel(LAUNCH_STAGES[0].label);
   setLaunchStageDetail(LAUNCH_STAGES[0].detail);
+  pendingLaunchLogLines = [];
   setLaunchLogs([]);
-  setDownloadItems([]);
+  // What the previous launch said about itself is not about this one: a
+  // "Launch failed" left on screen while the next launch runs reads as this
+  // launch's failure.
+  setLauncherErrors(current => current.filter(error => !error.fromLaunch));
 }
 
 export function addModToFunctionalGroup(groupId: string, modId: string) {

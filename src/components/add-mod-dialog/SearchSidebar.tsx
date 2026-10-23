@@ -1,10 +1,29 @@
-import { For } from "solid-js";
-import { MOD_CATEGORIES, MOD_LOADERS_SEARCH, SORT_OPTIONS } from "./shared";
+import { For, Show } from "solid-js";
+import {
+  SEARCH_CATEGORIES,
+  SEARCH_ENVIRONMENTS,
+  SEARCH_LOADERS,
+  SORT_OPTIONS,
+  categoryLabel,
+  loaderLabel,
+  type SearchContentType,
+} from "./shared";
 import { Select } from "../Select";
 
 export function SearchSidebar(props: {
+  contentType: SearchContentType;
   sortBy: string;
   setSortBy: (value: string) => void;
+  /**
+   * D149: the search follows the mod list's Minecraft version (and, for mods,
+   * its loader) unless the user turns it off. `compatLabel` says what it is
+   * filtering on, e.g. «1.21.1 · Fabric».
+   */
+  compatFilter: boolean;
+  setCompatFilter: (value: boolean) => void;
+  compatLabel: string;
+  /** True while the compatibility filter already decides the loader: the manual loader boxes are then off. */
+  loaderFromModList: boolean;
   selLoaders: Set<string>;
   selEnvs: Set<string>;
   selCategories: Set<string>;
@@ -16,6 +35,10 @@ export function SearchSidebar(props: {
   hasFilters: boolean;
   clearFilters: () => void;
 }) {
+  const loaders = () => SEARCH_LOADERS[props.contentType];
+  const environments = () => SEARCH_ENVIRONMENTS[props.contentType];
+  const categories = () => SEARCH_CATEGORIES[props.contentType];
+
   return (
     <div class="w-48 shrink-0 border-r border-border overflow-y-auto p-3 space-y-3">
       <div>
@@ -29,47 +52,74 @@ export function SearchSidebar(props: {
       </div>
 
       <div>
-        <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Loaders</h4>
-        <div class="space-y-1">
-          <For each={MOD_LOADERS_SEARCH}>
-            {loader => (
-              <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
-                <input type="checkbox" checked={props.selLoaders.has(loader)} onChange={() => props.toggleLoaders(loader)} class="accent-accentColor w-3 h-3" />
-                {loader.charAt(0).toUpperCase() + loader.slice(1)}
-              </label>
-            )}
-          </For>
-        </div>
+        <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Compatibility</h4>
+        <label class="flex items-start gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
+          <input
+            type="checkbox"
+            checked={props.compatFilter}
+            onChange={event => props.setCompatFilter(event.currentTarget.checked)}
+            class="accent-accentColor w-3 h-3 mt-0.5"
+          />
+          <span>
+            Only for this mod list
+            <span class="block text-[10px] text-muted-foreground">{props.compatLabel}</span>
+          </span>
+        </label>
       </div>
 
-      <div>
-        <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Environment</h4>
-        <div class="space-y-1">
-          <For each={["client", "server"]}>
-            {env => (
-              <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
-                <input type="checkbox" checked={props.selEnvs.has(env)} onChange={() => props.toggleEnvs(env)} class="accent-accentColor w-3 h-3" />
-                {env.charAt(0).toUpperCase() + env.slice(1)}
-              </label>
-            )}
-          </For>
+      <Show when={loaders().length > 0}>
+        <div>
+          <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Loaders</h4>
+          <Show
+            when={!props.loaderFromModList}
+            fallback={<p class="text-[10px] text-muted-foreground">Set by the mod list. Turn off the compatibility filter to pick another loader.</p>}
+          >
+            <div class="space-y-1">
+              <For each={loaders()}>
+                {loader => (
+                  <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
+                    <input type="checkbox" checked={props.selLoaders.has(loader)} onChange={() => props.toggleLoaders(loader)} class="accent-accentColor w-3 h-3" />
+                    {loaderLabel(loader)}
+                  </label>
+                )}
+              </For>
+            </div>
+          </Show>
         </div>
-      </div>
+      </Show>
+
+      <Show when={environments().length > 0}>
+        <div>
+          <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Environment</h4>
+          <div class="space-y-1">
+            <For each={environments()}>
+              {env => (
+                <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
+                  <input type="checkbox" checked={props.selEnvs.has(env)} onChange={() => props.toggleEnvs(env)} class="accent-accentColor w-3 h-3" />
+                  {env.charAt(0).toUpperCase() + env.slice(1)}
+                </label>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
 
       <div>
         <h4 class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">Categories</h4>
         <div class="space-y-1">
-          <For each={props.showMoreCats ? MOD_CATEGORIES : MOD_CATEGORIES.slice(0, 8)}>
+          <For each={props.showMoreCats ? categories() : categories().slice(0, 8)}>
             {category => (
               <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground hover:text-primary transition-colors">
                 <input type="checkbox" checked={props.selCategories.has(category)} onChange={() => props.toggleCategories(category)} class="accent-accentColor w-3 h-3" />
-                {category.replace("-", " ").replace(/\b\w/g, c => c.toUpperCase())}
+                {categoryLabel(category)}
               </label>
             )}
           </For>
-          <button onClick={() => props.setShowMoreCats(!props.showMoreCats)} class="text-[10px] text-primary hover:underline">
-            {props.showMoreCats ? "Show less" : `Show all (${MOD_CATEGORIES.length})`}
-          </button>
+          <Show when={categories().length > 8}>
+            <button onClick={() => props.setShowMoreCats(!props.showMoreCats)} class="text-[10px] text-primary hover:underline">
+              {props.showMoreCats ? "Show less" : `Show all (${categories().length})`}
+            </button>
+          </Show>
         </div>
       </div>
 

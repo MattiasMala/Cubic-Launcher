@@ -106,10 +106,10 @@ fn local_rules_and_local_alternatives_both_get_their_jar_icon() {
     for mod_id in ["top-local", "alt-local"] {
         let file = fs::File::create(jars.join(format!("{mod_id}.jar"))).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("fabric.mod.json", zip::write::FileOptions::default())
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(br#"{"id":"m","icon":"icon.png"}"#).unwrap();
-        zip.start_file("icon.png", zip::write::FileOptions::default())
+        zip.start_file("icon.png", zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(b"\x89PNG\r\n\x1a\nbytes").unwrap();
         zip.finish().unwrap();
@@ -242,6 +242,49 @@ fn delete_rules_removes_from_tree() {
     assert_eq!(snapshot.rows.len(), 1);
     assert_eq!(snapshot.rows[0].mod_id, "sodium");
     assert!(snapshot.rows[0].alternatives.is_empty());
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Audit 101, editor-logica-5: con «X requires Y» si cancella Y, e il link
+/// verso un mod che non c'è più restava nel file — X rossa per sempre, senza
+/// nessun link visibile. Vale anche per `exclude_if`, per le alternative che
+/// spariscono insieme al mod cancellato, e in tutto l'albero.
+#[test]
+fn delete_rules_removes_requires_and_exclusions_towards_the_deleted_mods() {
+    let root = unique_test_root();
+    let mut x = simple_rule("x");
+    x.requires = vec!["y".into(), "keep".into()];
+    x.exclude_if = vec!["y-alt".into(), "keep".into()];
+    let mut nested = simple_rule("nested");
+    nested.requires = vec!["y-alt".into()];
+    x.alternatives = vec![nested];
+    let mut y = simple_rule("y");
+    y.alternatives = vec![simple_rule("y-alt")];
+    let mut z = simple_rule("z");
+    z.requires = vec!["keep".into()];
+    setup_modlist(&root, "Pack", vec![x, y, simple_rule("keep"), z]);
+
+    delete_rules_from_root(
+        &root,
+        &DeleteRulesInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["y".into()],
+        },
+    )
+    .unwrap();
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    let x = modlist.find_rule("x").unwrap();
+    assert_eq!(x.requires, vec!["keep".to_string()]);
+    assert_eq!(x.exclude_if, vec!["keep".to_string()]);
+    assert!(modlist.find_rule("nested").unwrap().requires.is_empty());
+    assert!(modlist.find_rule("y-alt").is_none());
+    // Un link verso un mod che resta non si tocca.
+    assert_eq!(
+        modlist.find_rule("z").unwrap().requires,
+        vec!["keep".to_string()]
+    );
 
     fs::remove_dir_all(&root).unwrap();
 }
@@ -623,6 +666,182 @@ fn import_custom_config_files_does_not_replace_a_listed_file_with_different_byte
         import_custom_config_files_from_root(&root, &import_input(&[&original], &["options.json"]))
             .expect("the same bytes again are not a conflict");
     assert_eq!(again, vec!["options.json".to_string()]);
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn batch_with_config(target_path: &str, files: &[&str]) -> SaveAdvancedBatchInput {
+    SaveAdvancedBatchInput {
+        modlist_name: "Pack".into(),
+        requires_entries: vec![],
+        version_rules_entries: vec![],
+        custom_configs_entries: vec![CustomConfigsEntry {
+            mod_id: "sodium".into(),
+            custom_configs: vec![SaveCustomConfigInput {
+                id: "cc-1".into(),
+                mc_versions: vec![],
+                loader: "any".into(),
+                target_path: target_path.into(),
+                files: files.iter().map(|name| name.to_string()).collect(),
+            }],
+        }],
+    }
+}
+
+/// `modlist-10`: a «Path» that leaves the instance is refused when it is
+/// saved, with the reason, and `rules.json` keeps what it had.
+#[test]
+fn a_custom_config_path_that_leaves_the_instance_is_refused_at_save() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    for bad in ["../outside", "/etc", "C:\\Users\\me\\config"] {
+        let error = save_advanced_batch_from_root(&root, &batch_with_config(bad, &[]))
+            .expect_err("an escaping Path must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains(bad), "{message}");
+        assert!(message.contains("inside the instance"), "{message}");
+    }
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert!(on_disk
+        .find_rule("sodium")
+        .unwrap()
+        .custom_configs
+        .is_empty());
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// `r2-percorsi-non-ascii-e-limiti-windows-4`: backslashes are stored as `/`.
+#[test]
+fn a_custom_config_path_is_stored_with_forward_slashes() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+
+    save_advanced_batch_from_root(&root, &batch_with_config(".\\config\\create\\", &[]))
+        .expect("a relative Path with backslashes is valid");
+
+    let on_disk = load_modlist(&root, "Pack").unwrap();
+    assert_eq!(
+        on_disk.find_rule("sodium").unwrap().custom_configs[0].target_path,
+        "config/create"
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// todo.md:1291: a file taken off a custom config's list leaves
+/// `config-files/` at the save; the one still listed stays.
+#[test]
+fn a_file_taken_off_a_custom_config_leaves_config_files_at_save() {
+    let root = unique_test_root();
+    setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
+    let outside = root.join("user-disk");
+    fs::create_dir_all(&outside).unwrap();
+    let kept = outside.join("kept.json");
+    let dropped = outside.join("dropped.json");
+    fs::write(&kept, b"kept").unwrap();
+    fs::write(&dropped, b"dropped").unwrap();
+    import_custom_config_files_from_root(&root, &import_input(&[&kept, &dropped], &[])).unwrap();
+    save_advanced_batch_from_root(
+        &root,
+        &batch_with_config("", &["kept.json", "dropped.json"]),
+    )
+    .unwrap();
+    let files_dir = root
+        .join("mod-lists")
+        .join("Pack")
+        .join("config-files")
+        .join("sodium")
+        .join("cc-1");
+    assert!(files_dir.join("dropped.json").is_file());
+
+    save_advanced_batch_from_root(&root, &batch_with_config("", &["kept.json"])).unwrap();
+
+    assert!(files_dir.join("kept.json").is_file());
+    assert!(!files_dir.join("dropped.json").exists());
+    assert!(dropped.is_file(), "the user's own file is never touched");
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn rule_with_alternatives(mod_id: &str, alternatives: Vec<Rule>) -> Rule {
+    Rule {
+        alternatives,
+        ..simple_rule(mod_id)
+    }
+}
+
+fn enabled_of(modlist: &ModList, mod_id: &str) -> bool {
+    modlist.find_rule(mod_id).expect("rule exists").enabled
+}
+
+/// Il toggle di un gruppo: più regole, a ogni profondità, in una sola
+/// scrittura; sotto ciascuna si spengono anche le alternative, come per il
+/// toggle singolo (audit 101, r2-scala-mod-list-grandi-4 e ui-schermate-4).
+#[test]
+fn toggle_rules_enabled_switches_every_listed_rule_at_any_depth() {
+    let root = unique_test_root();
+    setup_modlist(
+        &root,
+        "Pack",
+        vec![
+            rule_with_alternatives(
+                "sodium",
+                vec![rule_with_alternatives(
+                    "rubidium",
+                    vec![simple_rule("embeddium")],
+                )],
+            ),
+            simple_rule("lithium"),
+            simple_rule("iris"),
+        ],
+    );
+
+    toggle_rules_enabled_from_root(
+        &root,
+        &ToggleRulesEnabledInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["rubidium".into(), "lithium".into()],
+            enabled: false,
+        },
+    )
+    .unwrap();
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    assert!(enabled_of(&modlist, "sodium"));
+    assert!(!enabled_of(&modlist, "rubidium"));
+    assert!(!enabled_of(&modlist, "embeddium"));
+    assert!(!enabled_of(&modlist, "lithium"));
+    assert!(enabled_of(&modlist, "iris"));
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Un id che non c'è: errore, e nessuna delle altre regole cambia.
+#[test]
+fn toggle_rules_enabled_with_an_unknown_id_writes_nothing() {
+    let root = unique_test_root();
+    setup_modlist(
+        &root,
+        "Pack",
+        vec![simple_rule("sodium"), simple_rule("lithium")],
+    );
+
+    let error = toggle_rules_enabled_from_root(
+        &root,
+        &ToggleRulesEnabledInput {
+            modlist_name: "Pack".into(),
+            mod_ids: vec!["sodium".into(), "missing".into()],
+            enabled: false,
+        },
+    )
+    .expect_err("an unknown id must be refused");
+    assert!(error.to_string().contains("missing"), "{error:#}");
+
+    let modlist = load_modlist(&root, "Pack").unwrap();
+    assert!(enabled_of(&modlist, "sodium"));
+    assert!(enabled_of(&modlist, "lithium"));
 
     fs::remove_dir_all(&root).unwrap();
 }

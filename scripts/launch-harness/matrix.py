@@ -37,6 +37,10 @@ class MatrixVersion:
 STRATUM_A: list[MatrixVersion] = [
     MatrixVersion("1.6.4", "ci", "oldest legacy: LWJGL2 natives + virtual/legacy asset index",
                   loaders=("vanilla",)),
+    MatrixVersion("1.7.10", "ci", "legacy minecraftArguments with --userProperties ${user_properties}",
+                  loaders=("vanilla",)),
+    MatrixVersion("1.8.9", "ci", "last --userProperties ${user_properties} (Gson PropertyMap)",
+                  loaders=("vanilla",)),
     MatrixVersion("1.12.2", "ci", "last legacy minecraftArguments + Java 8; wrapper legacy (Forge)",
                   loaders=("vanilla", "forge")),
     MatrixVersion("1.13.2", "ci", "first modern arguments.game/jvm; Fabric negative side handled as fixture",

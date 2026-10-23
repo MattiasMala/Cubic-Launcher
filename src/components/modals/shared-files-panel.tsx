@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { MaterialIcon } from "../icons";
+import { ToggleSwitch } from "../ToggleSwitch";
 
 /**
  * La condivisione dei tre file d'istanza (`servers.dat`, `hotbar.nbt`,
@@ -30,6 +31,8 @@ export type SharedFilesView = {
   canonical: string;
   linkable: string[];
   files: SharedFileToggle[];
+  /** The game of a mod list in this group is running: linking waits for it to exit. */
+  gameRunning?: boolean;
 };
 
 /**
@@ -92,6 +95,13 @@ export function SharedFilesPanel(props: Props) {
   });
 
   const linked = () => (view()?.group.length ?? 0) > 1;
+  /**
+   * Col gioco aperto il collegamento non si tocca (condivisi-3): la copia
+   * indietro all'uscita va a chi teneva i file al lancio, e un gesto
+   * confermato adesso sembrerebbe valere da subito. Il backend rifiuta
+   * comunque; qui si dice prima.
+   */
+  const gameRunning = () => view()?.gameRunning ?? false;
   /** Le altre del gruppo, cioè tutte tranne questa. */
   const partners = () => (view()?.group ?? []).filter(name => name !== props.modlist);
 
@@ -126,29 +136,20 @@ export function SharedFilesPanel(props: Props) {
                   {toggle.filename}
                 </code>
               </div>
-              <button
-                role="switch"
-                aria-checked={toggle.enabled}
-                aria-label={`Share ${FILE_COPY[toggle.key].title}`}
+              <ToggleSwitch
+                checked={toggle.enabled}
+                label={`Share ${FILE_COPY[toggle.key].title}`}
                 disabled={busy()}
-                data-testid={`shared-file-switch-${toggle.key}`}
-                onClick={() =>
+                testId={`shared-file-switch-${toggle.key}`}
+                onToggle={() =>
                   void run("set_shared_file_enabled_command", {
                     modlist: props.modlist,
                     file: toggle.key,
                     enabled: !toggle.enabled,
                   })
                 }
-                class={`mt-1 h-6 w-11 shrink-0 rounded-full border transition-colors ${
-                  toggle.enabled ? "border-primary bg-primary" : "border-border bg-muted"
-                }`}
-              >
-                <span
-                  class={`block h-4 w-4 rounded-full bg-background transition-transform ${
-                    toggle.enabled ? "translate-x-6" : "translate-x-1"
-                  }`}
-                />
-              </button>
+                class="mt-1"
+              />
             </div>
           )}
         </For>
@@ -172,11 +173,17 @@ export function SharedFilesPanel(props: Props) {
           </p>
         </Show>
 
+        <Show when={gameRunning()}>
+          <p class="mt-2 text-xs text-warning" data-testid="shared-files-game-running">
+            The game is running. Linking and unlinking come back when it exits.
+          </p>
+        </Show>
+
         <div class="mt-3 flex flex-wrap gap-2">
           <Show when={!picking()}>
             <button
               class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-              disabled={busy() || (view()?.linkable.length ?? 0) === 0}
+              disabled={busy() || gameRunning() || (view()?.linkable.length ?? 0) === 0}
               data-testid="shared-files-link-open"
               onClick={() => setPicking(true)}
             >
@@ -186,7 +193,7 @@ export function SharedFilesPanel(props: Props) {
           <Show when={linked()}>
             <button
               class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-              disabled={busy()}
+              disabled={busy() || gameRunning()}
               data-testid="shared-files-unlink-open"
               onClick={() => setConfirmUnlink(true)}
             >
@@ -253,7 +260,7 @@ export function SharedFilesPanel(props: Props) {
             <div class="mt-3 flex gap-2">
               <button
                 class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
-                disabled={busy()}
+                disabled={busy() || gameRunning()}
                 data-testid="shared-files-link-confirm-yes"
                 onClick={() => {
                   const target = other();
@@ -292,7 +299,7 @@ export function SharedFilesPanel(props: Props) {
           <div class="mt-3 flex gap-2">
             <button
               class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
-              disabled={busy()}
+              disabled={busy() || gameRunning()}
               data-testid="shared-files-unlink-confirm-yes"
               onClick={() => {
                 setConfirmUnlink(false);

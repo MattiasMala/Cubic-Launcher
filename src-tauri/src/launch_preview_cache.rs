@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 // Cache and artifact helpers for the launch pipeline.
 //
 // A launch that resolves versions online and one that launches from a version
@@ -18,9 +16,9 @@ use tokio::io::AsyncWriteExt;
 use crate::instance_mods::CachedModJar;
 use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::{
-    cache_record_from_version, cached_artifact_path_for_record, cached_local_artifact_path,
-    pending_download_from_record, pending_download_from_version, CacheProbe, ModAcquisitionPlan,
-    ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
+    cache_record_from_version, cached_artifact_path_for_record, pending_download_from_record,
+    pending_download_from_version, CacheProbe, InstanceJars, ModAcquisitionPlan, ModCacheLookup,
+    ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::ModrinthVersion;
 use crate::path_safety::validate_path_component;
@@ -28,80 +26,20 @@ use crate::process_streaming::ProcessLogStream;
 use crate::resolver::ResolutionTarget;
 use crate::rules::ModSource;
 
-use super::{emit_log, emit_progress, jar_metadata_allows_target, DownloadArtifact, SelectedMod};
+use super::{
+    build_instance_root, emit_log, emit_progress, jar_metadata_allows_target, DownloadArtifact,
+    SelectedMod,
+};
 
-pub(super) async fn ensure_remote_version_cached(
-    http_client: &reqwest::Client,
-    launcher_paths: &LauncherPaths,
-    version: &ModrinthVersion,
-    target: &ResolutionTarget,
-) -> Result<PathBuf> {
-    let record = cache_record_from_version(version, target)?;
-    let destination_path =
-        cached_artifact_path_for_record(launcher_paths.mods_cache_dir(), &record);
-
-    let file = version.primary_file().with_context(|| {
-        format!(
-            "version '{}' for project '{}' does not expose a primary file",
-            version.id, version.project_id
-        )
-    })?;
-    match file.hashes.get("sha1").map(String::as_str) {
-        Some(hash) => {
-            crate::minecraft_downloader::download_file_verified(
-                http_client,
-                &file.url,
-                &destination_path,
-                hash,
-            )
-            .await?
-        }
-        None if !destination_path.exists() => {
-            download_file(http_client, &file.url, &destination_path).await?
-        }
-        None => {}
-    }
-
-    Ok(destination_path)
-}
-
-pub(super) fn load_cached_mod_record_for_target(
-    launcher_paths: &LauncherPaths,
-    project_id: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModCacheRecord>> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_compatible_by_project_or_alias(project_id, target)
-}
-
-pub(super) fn load_cached_mod_record_by_version(
-    launcher_paths: &LauncherPaths,
-    version_id: &str,
-    target: &ResolutionTarget,
-) -> Result<Option<ModCacheRecord>> {
-    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
-        format!(
-            "failed to open launcher database at {}",
-            launcher_paths.database_path().display()
-        )
-    })?;
-    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_by_version_id(version_id, target)
-}
-
-/// `load_cached_mod_record_for_target` plus the answer it cannot give: whether
-/// a mod with no usable artifact was never cached, or is registered and lost
-/// its jar.
+/// The cached record of a project on this target, plus whether a mod with no
+/// usable artifact was never cached or is registered and lost its jar. The
+/// version `instance` holds comes first (D147); an empty one leaves the
+/// project's answer, which is what the availability passes want.
 pub(super) fn probe_cached_mod_for_target(
     launcher_paths: &LauncherPaths,
     project_id: &str,
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<CacheProbe> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -110,7 +48,34 @@ pub(super) fn probe_cached_mod_for_target(
         )
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.probe_project(project_id, target)
+    repository.probe_project_in_instance(project_id, target, instance)
+}
+
+/// The jars the instance of this mod list on this target holds now, read
+/// before the launch rebuilds its `mods/` (D147).
+pub(super) fn read_instance_jars(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+) -> Result<InstanceJars> {
+    InstanceJars::read(&build_instance_root(launcher_paths, modlist_name, target)?.join("mods"))
+}
+
+/// Stamp the versions this launch linked as the last used on the target
+/// (audit 101, risoluzione-8).
+pub(super) fn record_versions_used(
+    launcher_paths: &LauncherPaths,
+    version_ids: &[String],
+    target: &ResolutionTarget,
+) -> Result<()> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir())
+        .mark_versions_used(version_ids, target)
 }
 
 /// Same, for the one version id a pre-check named.
@@ -132,7 +97,7 @@ pub(super) fn probe_cached_version_for_target(
 /// One cache column per selected Modrinth mod, on this target, keyed by the mod
 /// id used in the rules.
 ///
-/// One connection for the whole pass, unlike `load_cached_mod_record_for_target`
+/// One connection for the whole pass, unlike `probe_cached_mod_for_target`
 /// which opens one per mod. Mods with no row — or a row whose column is unusable
 /// — are simply absent from the map.
 fn load_cached_column_for_selected<Lookup>(
@@ -182,16 +147,22 @@ pub(super) fn load_cached_file_hashes_for_selected(
     })
 }
 
-/// Registered `modrinth_version_id` per selected Modrinth mod — the "current"
-/// side of an update row. Absent means "never downloaded for this target",
-/// which by D17 is not an update.
+/// The `modrinth_version_id` this instance holds per selected Modrinth mod —
+/// the "current" side of an update row. Per instance, not per target (D147,
+/// audit 101 precheck-2): two mod lists on one target each keep their own
+/// version, and an update accepted in one never reaches the other unasked.
+/// Absent means the instance has no jar of that mod, which by D17 is a first
+/// install and not an update.
 pub(super) fn load_cached_version_ids_for_selected(
     launcher_paths: &LauncherPaths,
     selected_mods: &[SelectedMod],
     target: &ResolutionTarget,
+    instance: &InstanceJars,
 ) -> Result<HashMap<String, String>> {
     load_cached_column_for_selected(launcher_paths, selected_mods, |repository, mod_id| {
-        repository.find_cached_version_id_by_project_or_alias(mod_id, target)
+        Ok(repository
+            .find_registered_in_instance(mod_id, target, instance)?
+            .map(|record| record.modrinth_version_id))
     })
 }
 
@@ -531,6 +502,49 @@ pub(super) fn local_mod_jar_path(
         .join(file_name))
 }
 
+/// Where the instance link of a local mod points, or why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LocalJarSource {
+    Link(CachedModJar),
+    /// No jar in `local-jars/` under this name.
+    Missing(PathBuf),
+    /// A jar that does not open: the launch skips it instead of stopping on
+    /// "failed to read JAR metadata" (audit 101, risoluzione-9).
+    Unreadable(PathBuf, String),
+    /// The jar's own metadata excludes this target.
+    Incompatible,
+}
+
+/// The jar of a local mod is linked straight from `mod-lists/<name>/local-jars/`
+/// (audit 101, dati-1).
+///
+/// It used to be copied to `cache/mods/<loader>/local/<file>` only when that
+/// copy was missing: the path named neither the mod list nor the bytes, so a
+/// jar replaced in `local-jars/`, or a jar with the same name in another mod
+/// list, never reached the game — the first copy stayed forever. Linking the
+/// source leaves nothing that can go stale; the instance's `mods/` is rebuilt
+/// at every launch, so it always points at the bytes the mod list holds now.
+pub(super) fn local_jar_source(
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
+    mod_id: &str,
+    target: &ResolutionTarget,
+) -> Result<LocalJarSource> {
+    let file_name = format!("{mod_id}.jar");
+    let source = local_mod_jar_path(launcher_paths, modlist_name, &file_name)?;
+    if !source.is_file() {
+        return Ok(LocalJarSource::Missing(source));
+    }
+    match jar_metadata_allows_target(&source, target) {
+        Ok(true) => Ok(LocalJarSource::Link(CachedModJar {
+            jar_filename: file_name,
+            cache_path: source,
+        })),
+        Ok(false) => Ok(LocalJarSource::Incompatible),
+        Err(error) => Ok(LocalJarSource::Unreadable(source, format!("{error:#}"))),
+    }
+}
+
 // Otto input distinti di un passo del lancio. Una struct di parametri
 // cambierebbe i chiamanti del percorso di lancio, fuori da una modifica di
 // solo stile (gate fmt/clippy, D120): il lint è sospeso solo qui.
@@ -547,44 +561,47 @@ pub(super) fn build_cached_mod_jars(
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
-    let mod_loader = target.mod_loader.as_modrinth_loader();
 
-    // Local mods: JAR lives at local-jars/{mod_id}.jar; copy to cache/mods/.
+    // Local mods: the instance links the jar in `local-jars/` itself.
     for selected in selected_mods {
         if !matches!(selected.source, ModSource::Local) {
             continue;
         }
 
         let file_name = format!("{}.jar", selected.mod_id);
-        if seen.insert(file_name.clone()) {
-            let source = local_mod_jar_path(launcher_paths, modlist_name, &file_name)?;
-            let dest =
-                cached_local_artifact_path(launcher_paths.mods_cache_dir(), mod_loader, &file_name);
-            if source.exists() && !jar_metadata_allows_target(&source, target)? {
-                emit_log(
-                    app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Launch] skipping local mod '{}': embedded metadata is incompatible with {} / {}",
-                        selected.mod_id,
-                        target.minecraft_version,
-                        target.mod_loader.as_modrinth_loader()
-                    ),
-                )?;
-                continue;
-            }
-            if source.exists() && !dest.exists() {
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::copy(&source, &dest).with_context(|| {
-                    format!("failed to copy local JAR '{}' to mod cache", file_name)
-                })?;
-            }
-            jars.push(CachedModJar {
-                jar_filename: file_name,
-                cache_path: dest,
-            });
+        if !seen.insert(file_name.clone()) {
+            continue;
+        }
+        match local_jar_source(launcher_paths, modlist_name, &selected.mod_id, target)? {
+            LocalJarSource::Link(jar) => jars.push(jar),
+            LocalJarSource::Missing(path) => emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Launch] skipping local mod '{}': its jar is not in the mod list ({})",
+                    selected.mod_id,
+                    path.display()
+                ),
+            )?,
+            LocalJarSource::Unreadable(path, error) => emit_log(
+                app_handle,
+                ProcessLogStream::Stderr,
+                format!(
+                    "[Launch] skipping local mod '{}': its jar cannot be read ({}: {error})",
+                    selected.mod_id,
+                    path.display()
+                ),
+            )?,
+            LocalJarSource::Incompatible => emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Launch] skipping local mod '{}': embedded metadata is incompatible with {} / {}",
+                    selected.mod_id,
+                    target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader()
+                ),
+            )?,
         }
     }
 
@@ -721,34 +738,136 @@ mod tests {
         path.with_file_name(name)
     }
 
+    /// D3 on the code a launch actually runs (audit 101, risoluzione-9): a
+    /// registered jar truncated in the cache is not handed to the launch, the
+    /// probe reports it missing, and the download stage restores the
+    /// registered version over it from the row alone.
     #[tokio::test]
-    async fn a_truncated_cached_mod_is_not_returned_to_the_launch() {
+    async fn a_truncated_cached_mod_is_restored_by_the_launch_download_stage() {
         let root = scratch_root("truncated-mod");
         let paths = LauncherPaths::new(&root);
-        let complete = b"the complete mod jar";
-        let (url, requests) = fixed_server(complete);
-        let version = version(&url, complete);
-        let destination = paths.remote_mod_artifact_path(
-            target().mod_loader.as_modrinth_loader(),
-            &version.id,
-            "complete.jar",
-        );
+        crate::database::initialize_database(paths.database_path()).expect("database");
+        let complete = crate::mod_cache::test_jar_bytes("the complete mod jar");
+        let body: &'static [u8] = Box::leak(complete.clone().into_boxed_slice());
+        let (url, requests) = fixed_server(body);
+        let version = version(&url, body);
+        let connection = Connection::open(paths.database_path()).expect("database opens");
+        let repository = SqliteModCacheRepository::new(&connection, paths.mods_cache_dir());
+        let record = repository
+            .upsert_modrinth_version(&version, &target())
+            .expect("the version is registered");
+        let destination = cached_artifact_path_for_record(paths.mods_cache_dir(), &record);
         fs::create_dir_all(destination.parent().expect("cache parent")).expect("cache parent");
-        fs::write(&destination, b"the complete").expect("truncated cache fixture");
+        fs::write(&destination, &complete[..complete.len() / 2]).expect("truncated fixture");
 
-        let returned =
-            ensure_remote_version_cached(&reqwest::Client::new(), &paths, &version, &target())
-                .await
-                .expect("the corrupt cache entry should be repaired");
+        let probe = repository
+            .probe_version(&version.id, &target())
+            .expect("the probe answers");
+        let CacheProbe::JarMissing(registered) = probe else {
+            panic!("a truncated jar must not count as cached, got {probe:?}");
+        };
+        let pending = pending_download_from_record(&registered).expect("restorable from the row");
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        download_artifact_streaming(
+            &reqwest::Client::new(),
+            &DownloadArtifact {
+                filename: pending.jar_filename.clone(),
+                url: pending.download_url.clone(),
+                destination_path: crate::mod_cache::cached_artifact_path_for_pending_download(
+                    paths.mods_cache_dir(),
+                    &pending,
+                ),
+                file_hash: pending.file_hash.clone(),
+                file_size: pending.file_size,
+            },
+            progress_tx,
+        )
+        .await
+        .expect("the registered version is restored");
 
-        assert_eq!(returned, destination);
-        assert_eq!(fs::read(&returned).expect("launch-visible jar"), complete);
         assert_eq!(
-            requests.load(Ordering::SeqCst),
-            1,
-            "the truncated jar must not suppress its replacement"
+            fs::read(&destination).expect("launch-visible jar"),
+            complete
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!partial_path(&destination).exists());
+        assert!(matches!(
+            repository.probe_version(&version.id, &target()),
+            Ok(CacheProbe::Ready(_))
+        ));
+        drop(connection);
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    fn local_jar(paths: &LauncherPaths, modlist: &str, mod_id: &str, bytes: &[u8]) -> PathBuf {
+        let path = local_mod_jar_path(paths, modlist, &format!("{mod_id}.jar")).expect("path");
+        fs::create_dir_all(path.parent().expect("local-jars")).expect("local-jars");
+        fs::write(&path, bytes).expect("local jar");
+        path
+    }
+
+    /// Audit 101, dati-1: the link follows the source, so a jar replaced in
+    /// `local-jars/` and a same-named jar in another mod list each reach the
+    /// game with their own bytes.
+    #[test]
+    fn a_local_jar_is_linked_from_its_own_mod_list_with_its_current_bytes() {
+        let root = scratch_root("local-jars");
+        let paths = LauncherPaths::new(&root);
+        let first = local_jar(
+            &paths,
+            "Pack A",
+            "mymod",
+            &crate::mod_cache::test_jar_bytes("v1"),
+        );
+        let other = local_jar(
+            &paths,
+            "Pack B",
+            "mymod",
+            &crate::mod_cache::test_jar_bytes("b"),
+        );
+
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack A", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(jar.cache_path, first);
+        assert_eq!(jar.jar_filename, "mymod.jar");
+
+        fs::write(&first, crate::mod_cache::test_jar_bytes("v2")).expect("updated jar");
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack A", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(
+            fs::read(&jar.cache_path).expect("linked bytes"),
+            crate::mod_cache::test_jar_bytes("v2")
+        );
+
+        let LocalJarSource::Link(jar) =
+            local_jar_source(&paths, "Pack B", "mymod", &target()).expect("source")
+        else {
+            panic!("the jar should be linked");
+        };
+        assert_eq!(jar.cache_path, other);
+        fs::remove_dir_all(root).expect("scratch cleanup");
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_local_jar_is_skipped_not_fatal() {
+        let root = scratch_root("local-jars-bad");
+        let paths = LauncherPaths::new(&root);
+        local_jar(&paths, "Pack A", "broken", b"not a zip");
+
+        assert!(matches!(
+            local_jar_source(&paths, "Pack A", "broken", &target()).expect("source"),
+            LocalJarSource::Unreadable(..)
+        ));
+        assert!(matches!(
+            local_jar_source(&paths, "Pack A", "absent", &target()).expect("source"),
+            LocalJarSource::Missing(_)
+        ));
         fs::remove_dir_all(root).expect("scratch cleanup");
     }
 
