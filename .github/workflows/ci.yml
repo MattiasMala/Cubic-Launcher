@@ -48,7 +48,9 @@ jobs:
       # se stesso.
       - name: No launcher HTTP client sets its own proxy
         run: |
-          if grep -rnE '\.proxy\(|no_proxy' src-tauri/src/; then
+          # Il solo client ammesso è quello dei test di minecraft_downloader.rs,
+          # con il marcatore sulla stessa riga.
+          if grep -rnE '\.proxy\(|no_proxy' src-tauri/src/ | grep -v 'ci-proxy-check: test only'; then
             echo "a client in src-tauri/src/ sets or disables its own proxy: the offline guard cannot see it"
             exit 1
           fi

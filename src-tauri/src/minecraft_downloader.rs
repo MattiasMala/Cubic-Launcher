@@ -1346,11 +1346,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         listener.set_nonblocking(true).expect("nonblocking");
         let port = listener.local_addr().expect("address").port();
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).expect("proxy"))
+        (client_through_proxy(port), listener)
+    }
+
+    /// The only client in `src-tauri/src/` allowed its own proxy: a test one,
+    /// pointed at a local port so the test can count or refuse requests. The
+    /// CI check «No launcher HTTP client sets its own proxy» skips the line by
+    /// its marker; any other proxy call still turns it red.
+    fn client_through_proxy(port: u16) -> reqwest::Client {
+        let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).expect("proxy");
+        reqwest::Client::builder()
+            .proxy(proxy) // ci-proxy-check: test only
             .build()
-            .expect("client");
-        (client, listener)
+            .expect("client")
     }
 
     fn no_request_reached(listener: &TcpListener) -> bool {
@@ -1703,10 +1711,7 @@ mod tests {
             .local_addr()
             .expect("address")
             .port();
-        let refused = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{refusing_port}")).expect("proxy"))
-            .build()
-            .expect("client");
+        let refused = client_through_proxy(refusing_port);
         let online = load_version_json(
             &refused,
             "1.20.1",
