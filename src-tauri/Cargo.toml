@@ -1,6 +1,6 @@
 [package]
 name = "cubic_launcher"
-version = "0.1.2"
+version = "0.1.3"
 description = "Cubic Launcher desktop application"
 authors = ["Cubic Launcher"]
 # Also the `License:` tag of the `.rpm`: without `bundle.license` in
